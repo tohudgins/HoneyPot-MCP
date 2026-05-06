@@ -1,0 +1,69 @@
+# HoneyPot MCP — Default Settings
+# Override any value via environment variables or .env
+
+database:
+  url: "sqlite+aiosqlite:///./honeypot_mcp.db"
+  echo: false
+
+honeypots:
+  default_profiles:
+    ssh:
+      image: "cowrie/cowrie:latest"
+      fake_hostname: "ubuntu-server"
+      fake_kernel: "5.15.0-91-generic"
+      max_sessions: 10
+    http:
+      fake_server_header: "Apache/2.4.41 (Ubuntu)"
+      endpoints:
+        - path: "/admin"
+          template: "admin_panel"
+        - path: "/phpmyadmin"
+          template: "phpmyadmin"
+        - path: "/wp-admin"
+          template: "wordpress_admin"
+        - path: "/.env"
+          template: "env_file"
+        - path: "/login"
+          template: "generic_login"
+    smtp:
+      fake_banner: "220 mail.example.com ESMTP Postfix"
+    ftp:
+      fake_banner: "220 ProFTPD 1.3.5 Server (Debian) ready"
+      fake_users:
+        - username: "ftpuser"
+          password: "password123"
+        - username: "admin"
+          password: "admin"
+    dns:
+      fake_records:
+        - name: "internal.corp.local"
+          type: "A"
+          value: "10.0.0.50"
+
+canary:
+  callback_host: "0.0.0.0"
+  callback_port: 8888
+  public_url: "http://localhost:8888"
+
+intel:
+  virustotal:
+    enabled: true
+    rate_limit_per_minute: 4  # Free tier: 4/min
+  abuseipdb:
+    enabled: true
+    max_age_days: 90           # How far back to look for reports
+  greynoise:
+    enabled: true              # Community API — free, classifies mass scanners vs targeted
+  geoip:
+    enabled: true
+    db_path: "./config/GeoLite2-City.mmdb"
+  mitre:
+    data_path: "./config/mitre_attack.json"
+
+analysis:
+  campaign_correlation_window_minutes: 60
+  min_events_for_campaign: 3
+
+logging:
+  level: "INFO"
+  format: "rich"

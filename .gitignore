@@ -1,0 +1,49 @@
+# Secrets & environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Database files (SQLite created at runtime)
+*.db
+*.sqlite
+*.sqlite3
+
+# Large user-downloaded data files
+config/GeoLite2-City.mmdb
+config/mitre_attack.json
+
+# Generated attack reports
+reports/*.html
+reports/*.md
+
+# Logs
+*.log
+logs/
+
+# IDE & editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+Claude.md
