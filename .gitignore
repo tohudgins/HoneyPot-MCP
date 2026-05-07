@@ -1,3 +1,10 @@
+# Files intentionally tracked (do NOT add them to this gitignore):
+#   uv.lock           — uv lockfile, commit for reproducible installs
+#   alembic.ini       — Alembic config used by `alembic` CLI
+#   pyproject.toml    — project metadata + deps
+#   src/honeypot_mcp/migrations/versions/*.py — schema migration history
+#   .claude/settings.json — shared team Claude Code settings (NOT .local.json)
+
 # Secrets & environment
 .env
 .env.local
@@ -12,15 +19,31 @@ dist/
 *.egg-info/
 *.egg
 
-# Testing & coverage
+# Python tooling caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
 
 # Database files (SQLite created at runtime)
 *.db
 *.sqlite
 *.sqlite3
+# SQLite WAL / shared-memory / journal sidecar files
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Large user-downloaded data files
 config/GeoLite2-City.mmdb
@@ -29,6 +52,10 @@ config/mitre_attack.json
 # Generated attack reports
 reports/*.html
 reports/*.md
+
+# Generated honeytoken artifacts — contain unique tracker UIDs that would let
+# attackers fingerprint your callbacks if the repo were public.
+reports/generated/
 
 # Logs
 *.log
@@ -40,10 +67,15 @@ logs/
 *.swp
 *.swo
 *~
+*.bak
+*.orig
+*.tmp
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Claude
-Claude.md
+# Claude Code per-developer settings — keep .claude/settings.json shared,
+# .claude/settings.local.json is your personal grants/preferences.
+.claude/settings.local.json

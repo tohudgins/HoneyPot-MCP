@@ -7,9 +7,12 @@ from typing import Any
 
 import httpx
 
+from honeypot_mcp.intel import _cache
+
 log = logging.getLogger(__name__)
 
 _VT_BASE = "https://www.virustotal.com/api/v3"
+_CACHE_TTL = 1800  # 30 min — VT data drifts slowly
 
 
 async def lookup_virustotal(ip: str) -> dict[str, Any]:
@@ -17,8 +20,14 @@ async def lookup_virustotal(ip: str) -> dict[str, Any]:
 
     Returns detection counts, reputation score, country, AS owner, and tags.
     Respects the free-tier 4 req/min rate limit via caller-side throttling.
+    Successful responses are cached for 30 minutes per IP.
     """
     from honeypot_mcp.config import get_settings
+
+    cache_key = f"vt:{ip}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     settings = get_settings()
     api_key = settings.virustotal_api_key
@@ -42,7 +51,7 @@ async def lookup_virustotal(ip: str) -> dict[str, Any]:
         suspicious = last_analysis.get("suspicious", 0)
         total_engines = sum(last_analysis.values())
 
-        return {
+        result = {
             "available": True,
             "ip": ip,
             "reputation": data.get("reputation", 0),
@@ -56,10 +65,14 @@ async def lookup_virustotal(ip: str) -> dict[str, Any]:
             "tags": data.get("tags", []),
             "network": data.get("network", ""),
         }
+        _cache.set(cache_key, result, ttl=_CACHE_TTL)
+        return result
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
-            return {"available": True, "ip": ip, "note": "IP not found in VirusTotal database."}
+            result = {"available": True, "ip": ip, "note": "IP not found in VirusTotal database."}
+            _cache.set(cache_key, result, ttl=_CACHE_TTL)
+            return result
         if e.response.status_code == 429:
             return {"available": False, "error": "VT rate limit exceeded — wait 60 seconds."}
         log.warning("VT API error for %s: %s", ip, e)

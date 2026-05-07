@@ -7,9 +7,12 @@ from typing import Any
 
 import httpx
 
+from honeypot_mcp.intel import _cache
+
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.abuseipdb.com/api/v2"
+_CACHE_TTL = 900  # 15 min — abuse data updates faster than VT
 
 
 async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
@@ -22,6 +25,11 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
         num distinct reporters, last reported timestamp, and recent report categories.
     """
     from honeypot_mcp.config import get_settings
+
+    cache_key = f"abuse:{ip}:{max_age_days}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     api_key = get_settings().abuseipdb_api_key
     if not api_key:
@@ -46,7 +54,7 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
                 label = _CATEGORY_NAMES.get(cat, str(cat))
                 report_categories[label] = report_categories.get(label, 0) + 1
 
-        return {
+        result = {
             "available": True,
             "ip": ip,
             "abuse_confidence_score": data.get("abuseConfidenceScore", 0),
@@ -64,6 +72,8 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
             "last_reported_at": data.get("lastReportedAt"),
             "report_categories": report_categories,
         }
+        _cache.set(cache_key, result, ttl=_CACHE_TTL)
+        return result
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:

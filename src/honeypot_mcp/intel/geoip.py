@@ -5,12 +5,22 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from honeypot_mcp.intel import _cache
+
 log = logging.getLogger(__name__)
+
+_CACHE_TTL = 86400  # 24h — geolocation barely changes
 
 
 async def lookup_geoip(ip: str) -> dict[str, Any]:
-    """Return geographic data for an IP using the local MaxMind mmdb file."""
+    """Return geographic data for an IP using the local MaxMind mmdb file.
+    Cached for 24h — IPs almost never relocate."""
     from honeypot_mcp.config import get_settings
+
+    cache_key = f"geo:{ip}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     settings = get_settings()
     db_path = settings.geoip_db_path
@@ -46,7 +56,10 @@ async def lookup_geoip(ip: str) -> dict[str, Any]:
                 except Exception as e:
                     return {"available": True, "ip": ip, "error": str(e)}
 
-        return await loop.run_in_executor(None, _lookup)
+        result = await loop.run_in_executor(None, _lookup)
+        if result.get("available") and "error" not in result:
+            _cache.set(cache_key, result, ttl=_CACHE_TTL)
+        return result
 
     except ImportError:
         return {"available": False, "error": "geoip2 library not installed"}

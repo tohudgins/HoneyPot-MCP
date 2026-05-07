@@ -137,6 +137,58 @@ class AttackerEvent(Base):
     )
 
 
+class Subscription(Base):
+    """Outbound webhook subscription. Delivers JSON-serialised alerts that
+    meet the severity threshold to the configured URL with optional HMAC sig."""
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    url: Mapped[str] = mapped_column(String(512), nullable=False)
+    severity_threshold: Mapped[AlertSeverity] = mapped_column(
+        Enum(AlertSeverity, values_callable=_ev),
+        default=AlertSeverity.MEDIUM,
+        nullable=False,
+    )
+    hmac_secret: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    active: Mapped[bool] = mapped_column(default=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    delivery_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_delivery_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class SuppressionRule(Base):
+    """Drop or rate-limit incoming events that match the IP / event-type pattern.
+
+    `ip_pattern` accepts an exact IP, a CIDR (e.g. 10.0.0.0/8), or empty for any.
+    `event_type_pattern` accepts an exact name or a glob (e.g. ssh_*) or empty.
+    `action` is `drop` or `rate_limit`. Rate-limited rules collapse N events
+    within `rate_limit_window_seconds` into one alert."""
+
+    __tablename__ = "suppression_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    ip_pattern: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_type_pattern: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    action: Mapped[str] = mapped_column(String(16), default="drop", nullable=False)
+    rate_limit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rate_limit_window_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    active: Mapped[bool] = mapped_column(default=True)
+    suppressed_count: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class AttackerProfile(Base):
     __tablename__ = "attacker_profiles"
 

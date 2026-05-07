@@ -1,55 +1,43 @@
-"""HTTP honeypot engine — custom aiohttp server with fake endpoints."""
+"""HTTP honeypot engine — custom aiohttp server with persona-driven fingerprint resistance.
+
+A "persona" (Apache/Nginx/IIS variant) is picked at deploy time and persisted
+to the honeypot's config dict, so the same honeypot keeps a stable identity
+across restarts but two honeypots in one project pick different personas. The
+persona drives Server header, X-Powered-By, session cookie name, 404 page,
+extra headers, and per-response timing jitter.
+
+Body content (login forms, fake .env files) lives in `http_templates.py`.
+Selection of which template a configured endpoint serves stays in `config`,
+so users can map their own paths to templates the same way they always have.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import secrets
-from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
+from sqlalchemy import update
 
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.http_personas import (
+    HTTPPersona,
+    get_persona,
+    pick_random_persona_id,
+)
+from honeypot_mcp.engines.http_templates import get_template
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
-from honeypot_mcp.storage.models import AlertSeverity
+from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
+from honeypot_mcp.storage.models import AlertSeverity, Honeypot
 
 log = logging.getLogger(__name__)
 
-# Fake HTML responses keyed by template name
-_TEMPLATES: dict[str, str] = {
-    "admin_panel": """<!DOCTYPE html><html><head><title>Admin Login</title></head><body>
-<h2>Admin Panel</h2><form method="POST">
-Username: <input name="username"><br>Password: <input type="password" name="password"><br>
-<input type="submit" value="Login"></form></body></html>""",
 
-    "phpmyadmin": """<!DOCTYPE html><html><head><title>phpMyAdmin</title></head><body>
-<h1>phpMyAdmin 5.2.1</h1><form method="POST">
-Username: <input name="username" value="root"><br>Password: <input type="password" name="password"><br>
-<input type="submit" value="Go"></form></body></html>""",
-
-    "wordpress_admin": """<!DOCTYPE html><html><head><title>WordPress Admin</title></head><body>
-<h1>WordPress Login</h1><form method="POST">
-<input name="log" placeholder="Username"><br><input type="password" name="pwd" placeholder="Password"><br>
-<input type="submit" value="Log In"></form></body></html>""",
-
-    "env_file": """APP_KEY=base64:rAndOmKeyHerE1234567890==
-DB_HOST=127.0.0.1
-DB_DATABASE=production_db
-DB_USERNAME=root
-DB_PASSWORD=SuperSecret123!
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-""",
-
-    "generic_login": """<!DOCTYPE html><html><head><title>Login</title></head><body>
-<h2>Please Login</h2><form method="POST">
-Username: <input name="username"><br>Password: <input type="password" name="password"><br>
-<input type="submit" value="Login"></form></body></html>""",
-}
-
-# Map event types to severity
+# Path → severity for known sensitive endpoints.
 _PATH_SEVERITY: dict[str, AlertSeverity] = {
     "/admin": AlertSeverity.HIGH,
     "/phpmyadmin": AlertSeverity.HIGH,
@@ -58,15 +46,46 @@ _PATH_SEVERITY: dict[str, AlertSeverity] = {
     "/login": AlertSeverity.MEDIUM,
 }
 
+_DEFAULT_ENDPOINTS = [
+    {"path": "/admin", "template": "admin_panel"},
+    {"path": "/phpmyadmin", "template": "phpmyadmin_5"},
+    {"path": "/wp-admin", "template": "wordpress_admin"},
+    {"path": "/.env", "template": "env_laravel"},
+    {"path": "/login", "template": "generic_login"},
+]
+
 
 class HTTPEngine(HoneypotEngine):
     """Runs an aiohttp application in a background asyncio task."""
 
     def __init__(self) -> None:
-        self._runners: dict[str, tuple[web.AppRunner, str]] = {}  # container_id → (runner, name)
+        self._runners: dict[str, tuple[web.AppRunner, str]] = {}
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
-        app = self._build_app(name, config)
+        # Resolve DB id once at start so the request handler doesn't have to
+        # round-trip the DB on every request.
+        hp_id: int | None = None
+        async with get_session() as session:
+            hp = await queries.get_honeypot_by_name(session, name)
+            if hp:
+                hp_id = hp.id
+
+        # Pick + persist a persona on first start. Stays stable across restarts
+        # so two probes from the same scanner see the same identity.
+        if "persona" not in config:
+            config["persona"] = pick_random_persona_id()
+            if hp_id is not None:
+                async with get_session() as session:
+                    await session.execute(
+                        update(Honeypot)
+                        .where(Honeypot.id == hp_id)
+                        .values(config=config)
+                    )
+
+        persona = get_persona(config.get("persona"))
+        log.info("HTTP honeypot '%s' deploying as persona=%s", name, persona.id)
+
+        app = self._build_app(name, hp_id, persona, config)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
@@ -74,7 +93,10 @@ class HTTPEngine(HoneypotEngine):
 
         container_id = f"http-{secrets.token_hex(8)}"
         self._runners[container_id] = (runner, name)
-        log.info("HTTP honeypot '%s' listening on port %d (id=%s)", name, port, container_id[:12])
+        log.info(
+            "HTTP honeypot '%s' listening on port %d (id=%s, persona=%s)",
+            name, port, container_id[:12], persona.id,
+        )
         return container_id
 
     async def stop(self, container_id: str, remove: bool = False) -> None:
@@ -88,17 +110,23 @@ class HTTPEngine(HoneypotEngine):
         return {"running": running, "type": "aiohttp_in_process"}
 
     async def get_logs(self, container_id: str, lines: int = 50) -> list[str]:
-        return [f"[HTTP honeypot] In-process server — check application logs for events."]
+        return ["[HTTP honeypot] In-process server — check application logs for events."]
 
-    def _build_app(self, honeypot_name: str, config: dict[str, Any]) -> web.Application:
-        server_header = config.get("fake_server_header", "Apache/2.4.41 (Ubuntu)")
-        endpoints = config.get("endpoints", [
-            {"path": "/admin", "template": "admin_panel"},
-            {"path": "/phpmyadmin", "template": "phpmyadmin"},
-            {"path": "/wp-admin", "template": "wordpress_admin"},
-            {"path": "/.env", "template": "env_file"},
-            {"path": "/login", "template": "generic_login"},
-        ])
+    def _build_app(
+        self,
+        honeypot_name: str,
+        hp_id: int | None,
+        persona: HTTPPersona,
+        config: dict[str, Any],
+    ) -> web.Application:
+        endpoints = config.get("endpoints", _DEFAULT_ENDPOINTS)
+        # Map path → template name, built once at start so the per-request
+        # handler is just a dict lookup.
+        path_to_template: dict[str, str] = {
+            ep["path"]: ep.get("template", "generic_login")
+            for ep in endpoints
+            if "path" in ep
+        }
 
         app = web.Application()
 
@@ -107,80 +135,75 @@ class HTTPEngine(HoneypotEngine):
             method = request.method
             src_ip = request.remote or "0.0.0.0"
             user_agent = request.headers.get("User-Agent", "")
+            host_header = request.headers.get("Host", "localhost")
 
-            body = ""
             post_data: dict = {}
             if method == "POST":
                 try:
                     post_data = dict(await request.post())
-                    body = str(post_data)
                 except Exception:
-                    body = await request.text()
+                    pass
 
+            matched_template = path_to_template.get(path)
             severity = _PATH_SEVERITY.get(path, AlertSeverity.LOW)
             event_type = "http_credential_submit" if post_data else "http_probe"
 
+            # Capture the full POST body — credentials are forensic evidence
+            # (attacker fingerprinting, credential-reuse correlation across honeypots).
             payload = {
                 "method": method,
                 "path": path,
                 "user_agent": user_agent,
                 "headers": dict(request.headers),
-                "post_data": {k: v for k, v in post_data.items() if "pass" not in k.lower()},
+                "post_data": dict(post_data),
                 "has_credentials": bool(post_data),
+                "matched_endpoint": matched_template is not None,
+                "persona": persona.id,
             }
 
-            async with get_session() as session:
-                hp = await queries.get_honeypot_by_name(session, honeypot_name)
-                await queries.create_alert(
-                    session,
-                    honeypot_id=hp.id if hp else None,
-                    source_ip=src_ip,
-                    source_port=None,
-                    event_type=event_type,
-                    payload=payload,
-                    severity=severity,
+            await submit_event(PendingEvent(
+                honeypot_id=hp_id,
+                source_ip=src_ip,
+                event_type=event_type,
+                payload=payload,
+                severity=severity,
+            ))
+
+            # Per-persona response timing jitter — uniform sub-ms responses
+            # are themselves a fingerprint.
+            if persona.jitter_ms_max > 0:
+                delay_s = random.uniform(persona.jitter_ms_min, persona.jitter_ms_max) / 1000.0
+                await asyncio.sleep(delay_s)
+
+            response_headers = {"Server": persona.server_header}
+            if persona.x_powered_by:
+                response_headers["X-Powered-By"] = persona.x_powered_by
+            for k, v in persona.extra_headers:
+                response_headers[k] = v
+
+            # Configured endpoint → serve its template.
+            if matched_template is not None:
+                content_type = "text/plain" if path.endswith(".env") else "text/html"
+                return web.Response(
+                    text=get_template(matched_template),
+                    content_type=content_type,
+                    status=200,
+                    headers=response_headers,
                 )
-                from honeypot_mcp.storage.models import AttackerEvent
-                session.add(AttackerEvent(ip=src_ip, event_type=event_type, extra=payload))
 
-            # Check canary token triggers (for /.env and similar)
-            if path in ("/.env", "/backup", "/.git/config"):
-                from honeypot_mcp.storage.models import Honeytoken, HoneytokenType, HoneytokenStatus
-                from sqlalchemy import select
-                async with get_session() as session:
-                    result = await session.execute(
-                        select(Honeytoken).where(
-                            Honeytoken.type == HoneytokenType.CANARY_URL,
-                            Honeytoken.status == HoneytokenStatus.ACTIVE,
-                        )
-                    )
-                    # Trigger matching tokens
-                    for token in result.scalars().all():
-                        if path in token.token_value:
-                            await queries.mark_honeytoken_triggered(
-                                session, token.id, {"trigger_ip": src_ip, "path": path}
-                            )
-
-            # Match template
-            template_name = "generic_login"
-            for ep in endpoints:
-                if ep.get("path") == path:
-                    template_name = ep.get("template", "generic_login")
-                    break
-
-            html = _TEMPLATES.get(template_name, "<html><body>Not Found</body></html>")
-            status_code = 200 if path != "/.env" else 200
-
+            # Anything else → realistic per-persona 404. Generic-login on every
+            # unknown path was itself a fingerprint.
             return web.Response(
-                text=html,
-                content_type="text/html" if not path.endswith(".env") else "text/plain",
-                status=status_code,
-                headers={"Server": server_header, "X-Powered-By": "PHP/7.4.33"},
+                text=persona.render_not_found(host_header),
+                content_type="text/html",
+                status=404,
+                headers=response_headers,
             )
 
-        # Register all configured endpoints plus a catch-all
         for ep in endpoints:
-            app.router.add_route("*", ep["path"], _handle)
+            if "path" in ep:
+                app.router.add_route("*", ep["path"], _handle)
+        # Catch-all so we capture probes to unknown paths and serve the 404.
         app.router.add_route("*", "/{tail:.*}", _handle)
 
         return app

@@ -141,6 +141,29 @@ async def alerts_acknowledge(alert_id: int) -> dict[str, Any]:
 
 
 @mcp.tool
+async def alerts_prune(older_than_days: int = 90) -> dict[str, Any]:
+    """Delete alerts and attacker_events older than the cutoff. Useful for
+    keeping the DB bounded — by default retains the last 90 days.
+
+    Args:
+        older_than_days: Cutoff age in days (default 90).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if older_than_days < 1:
+        return {"error": "older_than_days must be at least 1 to avoid deleting current data."}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    async with get_session() as session:
+        result = await queries.prune_alerts_before(session, cutoff)
+    return {
+        "older_than_days": older_than_days,
+        "cutoff": cutoff.isoformat(),
+        **result,
+    }
+
+
+@mcp.tool
 async def alerts_export(
     format: Literal["json", "csv"] = "json",
     limit: int = 1000,

@@ -49,8 +49,9 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
 
 
 @lru_cache(maxsize=1)
-def _load_stix() -> list[dict]:
-    """Load the MITRE ATT&CK STIX JSON file (cached after first load)."""
+def _load_stix_index() -> dict[str, dict]:
+    """Load the MITRE ATT&CK STIX JSON file and pre-build a {technique_id: object}
+    index. Cached for the process lifetime — MITRE data is read-only."""
     from honeypot_mcp.config import get_settings
 
     settings = get_settings()
@@ -58,19 +59,25 @@ def _load_stix() -> list[dict]:
 
     if not path.exists():
         log.debug("MITRE ATT&CK STIX file not found at %s — using built-in mappings only.", path)
-        return []
+        return {}
 
     try:
         with path.open() as f:
             bundle = json.load(f)
-        objects = bundle.get("objects", [])
-        return [
-            obj for obj in objects
-            if obj.get("type") == "attack-pattern" and not obj.get("revoked", False)
-        ]
     except Exception as e:
         log.warning("Failed to load MITRE STIX file: %s", e)
-        return []
+        return {}
+
+    by_id: dict[str, dict] = {}
+    for obj in bundle.get("objects", []):
+        if obj.get("type") != "attack-pattern" or obj.get("revoked", False):
+            continue
+        for ref in obj.get("external_references", []):
+            if ref.get("source_name") == "mitre-attack":
+                ext_id = ref.get("external_id", "")
+                if ext_id:
+                    by_id[ext_id] = obj
+    return by_id
 
 
 async def map_to_attack(terms: list[str]) -> list[dict[str, Any]]:
@@ -96,17 +103,8 @@ async def map_to_attack(terms: list[str]) -> list[dict[str, Any]]:
                 if pattern.search(term) and term not in found[tid]["matched_by"]:
                     found[tid]["matched_by"].append(term)
 
-    # Optionally cross-reference with loaded STIX for descriptions
-    stix_objects = _load_stix()
-    if stix_objects:
-        stix_by_id = {}
-        for obj in stix_objects:
-            for ref in obj.get("external_references", []):
-                if ref.get("source_name") == "mitre-attack":
-                    ext_id = ref.get("external_id", "")
-                    if ext_id:
-                        stix_by_id[ext_id] = obj
-
+    stix_by_id = _load_stix_index()
+    if stix_by_id:
         for tid, entry in found.items():
             base_id = tid.split(".")[0]
             stix_obj = stix_by_id.get(tid) or stix_by_id.get(base_id)

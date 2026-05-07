@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import desc, func, select, update
+from sqlalchemy import String, cast, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from honeypot_mcp.storage.models import (
@@ -43,6 +43,22 @@ async def get_honeypot_hit_count(session: AsyncSession, honeypot_id: int) -> int
     return result.scalar_one() or 0
 
 
+async def get_hit_counts(
+    session: AsyncSession, honeypot_ids: list[int] | None = None
+) -> dict[int, int]:
+    """Bulk hit count by honeypot — single GROUP BY query instead of N round-trips.
+    Returns {honeypot_id: count}. Honeypots with zero hits are absent."""
+    q = (
+        select(Alert.honeypot_id, func.count().label("c"))
+        .where(Alert.honeypot_id.is_not(None))
+        .group_by(Alert.honeypot_id)
+    )
+    if honeypot_ids is not None:
+        q = q.where(Alert.honeypot_id.in_(honeypot_ids))
+    result = await session.execute(q)
+    return {row[0]: row[1] for row in result.all()}
+
+
 # ── Alert queries ─────────────────────────────────────────────────────────────
 
 async def create_alert(session: AsyncSession, **kwargs) -> Alert:
@@ -75,9 +91,17 @@ async def get_recent_alerts(
 
 
 async def search_alerts(session: AsyncSession, query: str, limit: int = 50) -> list[Alert]:
+    """Substring search across IP, event type, AND payload contents.
+    Payload search uses TEXT cast — works on SQLite (JSON-as-TEXT) and
+    Postgres (JSON-cast-to-text). Matches anywhere in the serialised JSON,
+    so an analyst can search for commands, usernames, passwords, headers, etc."""
     result = await session.execute(
         select(Alert)
-        .where(Alert.source_ip.contains(query) | Alert.event_type.contains(query))
+        .where(
+            Alert.source_ip.contains(query)
+            | Alert.event_type.contains(query)
+            | cast(Alert.payload, String).contains(query)
+        )
         .order_by(desc(Alert.timestamp))
         .limit(limit)
     )
@@ -169,3 +193,41 @@ async def get_events_for_ip(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+# ── Retention ─────────────────────────────────────────────────────────────────
+
+async def prune_alerts_before(session: AsyncSession, cutoff) -> dict[str, int]:
+    """Delete alerts and attacker_events older than `cutoff`. Returns the count
+    of rows removed from each table — a SOC analyst can confirm scope before
+    re-running."""
+    from sqlalchemy import delete
+
+    alert_result = await session.execute(
+        delete(Alert).where(Alert.timestamp < cutoff)
+    )
+    event_result = await session.execute(
+        delete(AttackerEvent).where(AttackerEvent.timestamp < cutoff)
+    )
+    return {
+        "alerts_deleted": alert_result.rowcount or 0,
+        "attacker_events_deleted": event_result.rowcount or 0,
+    }
+
+
+async def get_top_offenders(
+    session: AsyncSession, hours: int, min_hits: int
+) -> list[tuple[str, int]]:
+    """Return [(ip, count), ...] for IPs with at least `min_hits` alerts in
+    the last `hours`. Used by export_blocklist."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    result = await session.execute(
+        select(Alert.source_ip, func.count().label("c"))
+        .where(Alert.timestamp >= since)
+        .group_by(Alert.source_ip)
+        .having(func.count() >= min_hits)
+        .order_by(desc("c"))
+    )
+    return [(row[0], row[1]) for row in result.all()]

@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     # Threat intel API keys
     virustotal_api_key: str = ""
     abuseipdb_api_key: str = ""
-    greynoise_api_key: str = ""
 
     # GeoIP
     geoip_db_path: Path = Path("./config/GeoLite2-City.mmdb")

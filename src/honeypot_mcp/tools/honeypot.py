@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -91,19 +92,21 @@ async def honeypot_list(
     hp_status = HoneypotStatus(status) if status else None
     async with get_session() as session:
         honeypots = await queries.list_honeypots(session, status=hp_status)
-        result = []
-        for hp in honeypots:
-            hits = await queries.get_honeypot_hit_count(session, hp.id)
-            result.append({
+        ids = [hp.id for hp in honeypots]
+        counts = await queries.get_hit_counts(session, ids) if ids else {}
+        result = [
+            {
                 "id": hp.id,
                 "name": hp.name,
                 "type": hp.type.value,
                 "port": hp.port,
                 "status": hp.status.value,
-                "hits": hits,
+                "hits": counts.get(hp.id, 0),
                 "container_id": hp.container_id,
                 "created_at": hp.created_at.isoformat() if hp.created_at else None,
-            })
+            }
+            for hp in honeypots
+        ]
     return result
 
 
@@ -298,6 +301,260 @@ async def honeypot_templates() -> list[dict[str, Any]]:
             "config_options": ["fake_records"],
         },
     ]
+
+
+@mcp.tool
+async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
+    """Check whether honeypots are actually responding (port probe + container status).
+
+    A honeypot whose process or container has died will still appear 'running'
+    in `honeypot_list` because the DB row says so. This tool actually probes the
+    port and (for SSH) the Docker container, surfacing silent failures.
+
+    Args:
+        name: Specific honeypot to check. Omit to check all running honeypots.
+    """
+    async with get_session() as session:
+        if name:
+            hp = await queries.get_honeypot_by_name(session, name)
+            if not hp:
+                return {"error": f"No honeypot named '{name}'."}
+            honeypots = [hp]
+        else:
+            honeypots = await queries.list_honeypots(session, status=HoneypotStatus.RUNNING)
+
+    results: list[dict[str, Any]] = []
+    for hp in honeypots:
+        entry: dict[str, Any] = {
+            "name": hp.name,
+            "type": hp.type.value,
+            "port": hp.port,
+            "status": hp.status.value,
+        }
+        if hp.container_id is None:
+            entry.update({"alive": False, "detail": "No container_id — never started?", "method": "none"})
+        else:
+            try:
+                engine = get_engine(hp.type)
+                health = await engine.health_check(hp.container_id, hp.port)
+                entry.update(health)
+            except Exception as e:
+                entry.update({"alive": False, "detail": f"Health check error: {e}", "method": "error"})
+        results.append(entry)
+
+    if name and len(results) == 1:
+        return results[0]
+    return results
+
+
+@mcp.tool
+async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, Any]:
+    """End-to-end smoke test: send a synthetic probe to the honeypot's port and
+    confirm an alert with our unique marker shows up in the DB. Catches subtle
+    pipeline breakage that `honeypot_health` can miss — e.g. event buffer dead,
+    suppression eating events, or an engine that accepts connections but never
+    logs them.
+
+    The probe is protocol-appropriate (SSH banner / HTTP request / SMTP AUTH /
+    FTP USER / DNS query) and embeds a random marker in a field that lands in
+    the alert payload. We then poll for an alert containing that marker.
+
+    Args:
+        name: The honeypot name to probe.
+        timeout_seconds: How long to wait for the probe alert to appear
+                         (default 15 — SSH needs ~5-10s due to Cowrie log polling).
+    """
+    from sqlalchemy import String, cast, select
+
+    from honeypot_mcp.storage.models import Alert
+
+    async with get_session() as session:
+        hp = await queries.get_honeypot_by_name(session, name)
+        if not hp:
+            return {"error": f"No honeypot named '{name}'."}
+        if hp.status != HoneypotStatus.RUNNING:
+            return {"error": f"Honeypot '{name}' is not running (status={hp.status.value})."}
+        hp_id = hp.id
+        hp_type = hp.type.value
+        hp_port = hp.port
+
+    marker = f"selftest_{secrets.token_hex(6)}"
+    probe_start = datetime.now(timezone.utc)
+
+    sent_ok, send_detail = await _send_probe(hp_type, hp_port, marker)
+    if not sent_ok:
+        return {
+            "name": name,
+            "type": hp_type,
+            "probe_sent": False,
+            "alert_received": False,
+            "detail": send_detail,
+        }
+
+    deadline_loops = max(1, timeout_seconds)
+    for _ in range(deadline_loops):
+        await asyncio.sleep(1)
+        async with get_session() as session:
+            result = await session.execute(
+                select(Alert)
+                .where(
+                    Alert.honeypot_id == hp_id,
+                    Alert.timestamp >= probe_start,
+                    cast(Alert.payload, String).contains(marker),
+                )
+                .limit(1)
+            )
+            match = result.scalar_one_or_none()
+            if match:
+                duration = (datetime.now(timezone.utc) - probe_start).total_seconds()
+                return {
+                    "name": name,
+                    "type": hp_type,
+                    "probe_marker": marker,
+                    "probe_sent": True,
+                    "probe_detail": send_detail,
+                    "alert_received": True,
+                    "alert_id": match.id,
+                    "alert_event_type": match.event_type,
+                    "duration_seconds": round(duration, 2),
+                    "detail": "End-to-end pipeline working — probe was captured as an alert.",
+                }
+
+    return {
+        "name": name,
+        "type": hp_type,
+        "probe_marker": marker,
+        "probe_sent": True,
+        "probe_detail": send_detail,
+        "alert_received": False,
+        "detail": (
+            f"Probe sent but no matching alert within {timeout_seconds}s. "
+            "Possible causes: honeypot crashed (run honeypot_health), suppression "
+            "rule is dropping the event, or the event buffer flusher has stalled."
+        ),
+    }
+
+
+async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str]:
+    """Dispatch to the per-protocol probe. Each probe embeds `marker` in a
+    field that the engine writes into the alert payload."""
+    try:
+        if hp_type == "ssh":
+            return await _ssh_probe(port, marker)
+        if hp_type == "http":
+            return await _http_probe(port, marker)
+        if hp_type == "smtp":
+            return await _smtp_probe(port, marker)
+        if hp_type == "ftp":
+            return await _ftp_probe(port, marker)
+        if hp_type == "dns":
+            return await _dns_probe(port, marker)
+        return False, f"No self-test probe defined for honeypot type {hp_type}"
+    except Exception as e:
+        return False, f"Probe failed: {e}"
+
+
+async def _ssh_probe(port: int, marker: str) -> tuple[bool, str]:
+    """Open a TCP connection and send an SSH banner containing the marker.
+    Cowrie logs `cowrie.client.version` with the banner — the marker lands in
+    the version field of the alert payload."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=3.0)
+        writer.write(f"SSH-2.0-{marker}\r\n".encode())
+        await writer.drain()
+        # Give Cowrie a beat to log the version event before we tear down.
+        await asyncio.sleep(0.5)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    return True, "SSH banner sent"
+
+
+async def _http_probe(port: int, marker: str) -> tuple[bool, str]:
+    """HTTP GET with marker in the User-Agent — lands in payload['user_agent']."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(
+            f"http://127.0.0.1:{port}/.env",
+            headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
+        )
+    return True, f"HTTP {resp.status_code}"
+
+
+async def _smtp_probe(port: int, marker: str) -> tuple[bool, str]:
+    """AUTH PLAIN with marker as the credentials blob — lands in payload['command']."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=3.0)
+        writer.write(b"EHLO selftest.local\r\n")
+        await writer.drain()
+        await asyncio.wait_for(reader.read(256), timeout=3.0)
+        writer.write(f"AUTH PLAIN {marker}\r\n".encode())
+        await writer.drain()
+        await asyncio.sleep(0.3)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    return True, "SMTP AUTH sent"
+
+
+async def _ftp_probe(port: int, marker: str) -> tuple[bool, str]:
+    """USER + PASS — marker goes in the username, lands in payload['username']."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=3.0)
+        writer.write(f"USER {marker}\r\n".encode())
+        await writer.drain()
+        await asyncio.wait_for(reader.readline(), timeout=3.0)
+        writer.write(b"PASS x\r\n")
+        await writer.drain()
+        await asyncio.sleep(0.3)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    return True, "FTP USER+PASS sent"
+
+
+async def _dns_probe(port: int, marker: str) -> tuple[bool, str]:
+    """DNS query for `<marker>.selftest` — marker lands in payload['qname']."""
+    try:
+        import dnslib
+    except ImportError:
+        return False, "dnslib not installed — cannot self-test DNS"
+
+    class _Probe(asyncio.DatagramProtocol):
+        def __init__(self) -> None:
+            self.received = asyncio.Event()
+
+        def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+            self.received.set()
+
+    loop = asyncio.get_event_loop()
+    proto = _Probe()
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: proto, remote_addr=("127.0.0.1", port)
+    )
+    try:
+        query = dnslib.DNSRecord.question(f"{marker}.selftest").pack()
+        transport.sendto(query)
+        try:
+            await asyncio.wait_for(proto.received.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        transport.close()
+    return True, "DNS query sent"
 
 
 @mcp.tool

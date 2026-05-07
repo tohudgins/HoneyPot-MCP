@@ -2,8 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) -> dict[str, Any]:
+    """Default health-check primitive: open a TCP connection and immediately close.
+    Confirms the OS is actually accepting connections on the port — catches
+    cases where a server crashed but the engine's internal state still says
+    'running'."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return {"alive": True, "detail": "TCP port responsive", "method": "tcp"}
+    except asyncio.TimeoutError:
+        return {"alive": False, "detail": f"TCP probe timed out after {timeout}s", "method": "tcp"}
+    except (ConnectionRefusedError, OSError) as e:
+        return {"alive": False, "detail": f"TCP probe failed: {e}", "method": "tcp"}
 
 
 class HoneypotEngine(ABC):
@@ -37,3 +59,11 @@ class HoneypotEngine(ABC):
 
     async def resume(self, container_id: str) -> None:
         """Resume a paused instance (default: no-op for non-Docker engines)."""
+
+    async def health_check(self, container_id: str, port: int) -> dict[str, Any]:
+        """Return `{alive: bool, detail: str, method: str, ...}`.
+
+        Default: TCP probe to localhost:port. Override for protocols that
+        need a deeper check (Docker container status, UDP, etc.).
+        """
+        return await tcp_probe(port)

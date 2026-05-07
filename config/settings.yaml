@@ -52,8 +52,6 @@ intel:
   abuseipdb:
     enabled: true
     max_age_days: 90           # How far back to look for reports
-  greynoise:
-    enabled: true              # Community API — free, classifies mass scanners vs targeted
   geoip:
     enabled: true
     db_path: "./config/GeoLite2-City.mmdb"

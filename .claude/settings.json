@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "honeypot-mcp": {
+      "command": "uv",
+      "args": ["run", "honeypot-mcp"]
+    }
+  }
+}

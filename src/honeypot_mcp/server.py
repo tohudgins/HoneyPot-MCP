@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-import fastmcp
 from fastmcp import FastMCP
 
+from honeypot_mcp.canary import start_canary_server
 from honeypot_mcp.config import get_settings
-from honeypot_mcp.storage.database import close_db, init_db
+from honeypot_mcp.storage.database import close_db, get_session, init_db
+from honeypot_mcp.storage.event_buffer import get_buffer
 from honeypot_mcp.storage.models import HoneypotStatus, HoneytokenStatus
 from honeypot_mcp.storage import queries
-from honeypot_mcp.storage.database import get_session
+from honeypot_mcp.watchdog import get_watchdog
+from honeypot_mcp.webhooks import get_delivery
 
 log = logging.getLogger(__name__)
 
@@ -30,9 +31,24 @@ async def lifespan(app: FastMCP):
     log.info("HoneyPot MCP starting — initialising database…")
     await init_db()
     log.info("Database ready.")
-    yield
-    log.info("HoneyPot MCP shutting down…")
-    await close_db()
+    buffer = get_buffer()
+    delivery = get_delivery()
+    watchdog = get_watchdog()
+    await delivery.start()
+    buffer.set_on_flush(delivery.enqueue_batch)
+    await buffer.start()
+    canary_runner = await start_canary_server()
+    await watchdog.start()
+    try:
+        yield
+    finally:
+        log.info("HoneyPot MCP shutting down…")
+        await watchdog.stop()
+        if canary_runner is not None:
+            await canary_runner.cleanup()
+        await buffer.stop()
+        await delivery.stop()
+        await close_db()
 
 
 mcp = FastMCP(
@@ -48,10 +64,11 @@ mcp = FastMCP(
 
 # ── Register tool modules ─────────────────────────────────────────────────────
 # Import here so the @mcp.tool decorators execute at module load time.
-import honeypot_mcp.tools.honeypot   # noqa: E402, F401
-import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
-import honeypot_mcp.tools.alerts      # noqa: E402, F401
-import honeypot_mcp.tools.analysis    # noqa: E402, F401
+import honeypot_mcp.tools.honeypot      # noqa: E402, F401
+import honeypot_mcp.tools.honeytoken    # noqa: E402, F401
+import honeypot_mcp.tools.alerts        # noqa: E402, F401
+import honeypot_mcp.tools.analysis      # noqa: E402, F401
+import honeypot_mcp.tools.integrations  # noqa: E402, F401
 
 
 # ── Built-in diagnostic tools ─────────────────────────────────────────────────
@@ -76,12 +93,14 @@ async def resource_active_honeypots() -> str:
     """Live list of all running honeypots with hit counts."""
     async with get_session() as session:
         honeypots = await queries.list_honeypots(session, status=HoneypotStatus.RUNNING)
-        rows = []
-        for hp in honeypots:
-            hits = await queries.get_honeypot_hit_count(session, hp.id)
-            rows.append(f"  [{hp.type.value}] {hp.name} :{hp.port}  hits={hits}")
-    if not rows:
+        ids = [hp.id for hp in honeypots]
+        counts = await queries.get_hit_counts(session, ids) if ids else {}
+    if not honeypots:
         return "No honeypots currently running."
+    rows = [
+        f"  [{hp.type.value}] {hp.name} :{hp.port}  hits={counts.get(hp.id, 0)}"
+        for hp in honeypots
+    ]
     return "Active honeypots:\n" + "\n".join(rows)
 
 

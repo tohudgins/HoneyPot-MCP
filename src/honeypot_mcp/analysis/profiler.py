@@ -16,7 +16,6 @@ async def build_profile(
     geoip: dict[str, Any],
     vt: dict[str, Any],
     abuse: dict[str, Any],
-    noise: dict[str, Any],
 ) -> dict[str, Any]:
     """Merge all intelligence sources into a unified attacker profile."""
 
@@ -40,7 +39,7 @@ async def build_profile(
     last_seen = max(all_timestamps).isoformat() if all_timestamps else None
 
     # Risk score: 0-100
-    risk_score = _calculate_risk(vt, abuse, noise, ttps, sev_counts, len(alerts))
+    risk_score = _calculate_risk(vt, abuse, ttps, sev_counts, len(alerts))
 
     return {
         "ip": ip,
@@ -70,23 +69,13 @@ async def build_profile(
             "last_reported_at": abuse.get("last_reported_at"),
             "report_categories": abuse.get("report_categories", {}),
         } if abuse.get("available") else {"available": False},
-        "greynoise": {
-            "noise": noise.get("noise"),
-            "riot": noise.get("riot"),
-            "classification": noise.get("classification", "unknown"),
-            "name": noise.get("name", ""),
-            "last_seen": noise.get("last_seen"),
-            "analyst_priority": noise.get("analyst_priority"),
-            "analyst_note": noise.get("analyst_note"),
-        } if noise.get("available") else {"available": False},
-        "recommendations": _recommendations(ttps, risk_score, sev_counts, abuse, noise),
+        "recommendations": _recommendations(ttps, risk_score, sev_counts, abuse),
     }
 
 
 def _calculate_risk(
     vt: dict,
     abuse: dict,
-    noise: dict,
     ttps: list[dict],
     sev: dict[str, int],
     event_count: int,
@@ -103,10 +92,6 @@ def _calculate_risk(
     # AbuseIPDB confidence score (max 30 pts — directly maps 0-100 → 0-30)
     abuse_score = abuse.get("abuse_confidence_score", 0) or 0
     score += int(abuse_score * 0.30)
-
-    # GreyNoise: targeted (not noise) = high risk bonus
-    if abuse.get("available") and not noise.get("noise", True) and not noise.get("riot", False):
-        score += 10  # Targeted attacker, not mass scanner
 
     # Severity (max 20 pts)
     score += min(10, sev.get("critical", 0) * 5)
@@ -139,17 +124,9 @@ def _recommendations(
     risk_score: int,
     sev: dict[str, int],
     abuse: dict[str, Any],
-    noise: dict[str, Any],
 ) -> list[str]:
     recs = []
     tactics = {t["tactic"] for t in ttps}
-
-    # GreyNoise-informed recommendations
-    if noise.get("riot"):
-        recs.append("GreyNoise identifies this as a known benign service — likely a false positive.")
-        return recs
-    if noise.get("noise"):
-        recs.append("GreyNoise: mass internet scanner — add to blocklist, low investigation priority.")
 
     if "Initial Access" in tactics:
         recs.append("Block this IP at the perimeter firewall immediately.")

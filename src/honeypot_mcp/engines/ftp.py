@@ -11,6 +11,7 @@ from typing import Any
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
@@ -71,18 +72,14 @@ class _FTPProtocol(asyncio.Protocol):
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
         src_ip, src_port = self._peer
-        async with get_session() as session:
-            await queries.create_alert(
-                session,
-                honeypot_id=self._hp_id,
-                source_ip=src_ip,
-                source_port=src_port,
-                event_type=event_type,
-                payload=payload,
-                severity=severity,
-            )
-            from honeypot_mcp.storage.models import AttackerEvent
-            session.add(AttackerEvent(ip=src_ip, event_type=event_type, extra=payload))
+        await submit_event(PendingEvent(
+            honeypot_id=self._hp_id,
+            source_ip=src_ip,
+            source_port=src_port,
+            event_type=event_type,
+            payload=payload,
+            severity=severity,
+        ))
 
     def connection_lost(self, exc: Exception | None) -> None:
         pass
