@@ -86,7 +86,7 @@ class Settings(BaseSettings):
         return v if v.is_absolute() else _PROJECT_ROOT / v
 
     @classmethod
-    def load(cls, yaml_path: Path | None = None) -> "Settings":
+    def load(cls, yaml_path: Path | None = None) -> Settings:
         instance = cls()
         if yaml_path and yaml_path.exists():
             with yaml_path.open() as f:

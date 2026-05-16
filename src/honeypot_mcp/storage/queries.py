@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import String, cast, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,8 +16,8 @@ from honeypot_mcp.storage.models import (
     HoneytokenStatus,
 )
 
-
 # ── Honeypot queries ──────────────────────────────────────────────────────────
+
 
 async def get_honeypot_by_name(session: AsyncSession, name: str) -> Honeypot | None:
     result = await session.execute(select(Honeypot).where(Honeypot.name == name))
@@ -28,7 +28,9 @@ async def get_honeypot_by_id(session: AsyncSession, hp_id: int) -> Honeypot | No
     return await session.get(Honeypot, hp_id)
 
 
-async def list_honeypots(session: AsyncSession, status: HoneypotStatus | None = None) -> list[Honeypot]:
+async def list_honeypots(
+    session: AsyncSession, status: HoneypotStatus | None = None
+) -> list[Honeypot]:
     q = select(Honeypot)
     if status:
         q = q.where(Honeypot.status == status)
@@ -37,9 +39,7 @@ async def list_honeypots(session: AsyncSession, status: HoneypotStatus | None = 
 
 
 async def get_honeypot_hit_count(session: AsyncSession, honeypot_id: int) -> int:
-    result = await session.execute(
-        select(func.count()).where(Alert.honeypot_id == honeypot_id)
-    )
+    result = await session.execute(select(func.count()).where(Alert.honeypot_id == honeypot_id))
     return result.scalar_one() or 0
 
 
@@ -60,6 +60,7 @@ async def get_hit_counts(
 
 
 # ── Alert queries ─────────────────────────────────────────────────────────────
+
 
 async def create_alert(session: AsyncSession, **kwargs) -> Alert:
     alert = Alert(**kwargs)
@@ -138,10 +139,9 @@ async def get_alert_stats(session: AsyncSession) -> dict:
 
 # ── Honeytoken queries ────────────────────────────────────────────────────────
 
+
 async def get_honeytoken_by_value(session: AsyncSession, value: str) -> Honeytoken | None:
-    result = await session.execute(
-        select(Honeytoken).where(Honeytoken.token_value == value)
-    )
+    result = await session.execute(select(Honeytoken).where(Honeytoken.token_value == value))
     return result.scalar_one_or_none()
 
 
@@ -163,7 +163,7 @@ async def mark_honeytoken_triggered(
         .where(Honeytoken.id == token_id)
         .values(
             status=HoneytokenStatus.TRIGGERED,
-            triggered_at=datetime.now(timezone.utc),
+            triggered_at=datetime.now(UTC),
             trigger_metadata=trigger_meta,
         )
     )
@@ -171,10 +171,9 @@ async def mark_honeytoken_triggered(
 
 # ── Attacker profile queries ──────────────────────────────────────────────────
 
+
 async def get_or_create_profile(session: AsyncSession, ip: str) -> AttackerProfile:
-    result = await session.execute(
-        select(AttackerProfile).where(AttackerProfile.ip == ip)
-    )
+    result = await session.execute(select(AttackerProfile).where(AttackerProfile.ip == ip))
     profile = result.scalar_one_or_none()
     if not profile:
         profile = AttackerProfile(ip=ip)
@@ -197,15 +196,14 @@ async def get_events_for_ip(
 
 # ── Retention ─────────────────────────────────────────────────────────────────
 
+
 async def prune_alerts_before(session: AsyncSession, cutoff) -> dict[str, int]:
     """Delete alerts and attacker_events older than `cutoff`. Returns the count
     of rows removed from each table — a SOC analyst can confirm scope before
     re-running."""
     from sqlalchemy import delete
 
-    alert_result = await session.execute(
-        delete(Alert).where(Alert.timestamp < cutoff)
-    )
+    alert_result = await session.execute(delete(Alert).where(Alert.timestamp < cutoff))
     event_result = await session.execute(
         delete(AttackerEvent).where(AttackerEvent.timestamp < cutoff)
     )
@@ -220,9 +218,9 @@ async def get_top_offenders(
 ) -> list[tuple[str, int]]:
     """Return [(ip, count), ...] for IPs with at least `min_hits` alerts in
     the last `hours`. Used by export_blocklist."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = datetime.now(UTC) - timedelta(hours=hours)
     result = await session.execute(
         select(Alert.source_ip, func.count().label("c"))
         .where(Alert.timestamp >= since)

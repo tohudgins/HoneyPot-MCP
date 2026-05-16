@@ -8,8 +8,8 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
@@ -31,6 +31,7 @@ class _DNSProtocol(asyncio.DatagramProtocol):
         src_ip, src_port = addr
         try:
             import dnslib
+
             request = dnslib.DNSRecord.parse(data)
             qname = str(request.q.qname)
             qtype = dnslib.QTYPE[request.q.qtype]
@@ -43,6 +44,7 @@ class _DNSProtocol(asyncio.DatagramProtocol):
         # Return NXDOMAIN for all queries
         try:
             import dnslib
+
             request = dnslib.DNSRecord.parse(data)
             reply = request.reply()
             reply.header.rcode = dnslib.RCODE.NXDOMAIN
@@ -66,7 +68,9 @@ class _DNSProtocol(asyncio.DatagramProtocol):
             event_type = "dns_canary_callback"
             async with get_session() as session:
                 from sqlalchemy import select
+
                 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
+
                 result = await session.execute(
                     select(Honeytoken).where(
                         Honeytoken.type == HoneytokenType.FILE,
@@ -78,23 +82,24 @@ class _DNSProtocol(asyncio.DatagramProtocol):
                     uid = meta.get("token_uid", "")
                     if uid and uid in labels:
                         await queries.mark_honeytoken_triggered(
-                            session, token.id,
-                            {"trigger_ip": src_ip, "dns_query": qname}
+                            session, token.id, {"trigger_ip": src_ip, "dns_query": qname}
                         )
                         severity = AlertSeverity.CRITICAL
                         matched_token_id = token.id
                         payload["matched_token_id"] = token.id
                         break
 
-        await submit_event(PendingEvent(
-            honeypot_id=self._hp_id,
-            source_ip=src_ip,
-            source_port=src_port,
-            event_type=event_type,
-            payload=payload,
-            severity=severity,
-            honeytoken_id=matched_token_id,
-        ))
+        await submit_event(
+            PendingEvent(
+                honeypot_id=self._hp_id,
+                source_ip=src_ip,
+                source_port=src_port,
+                event_type=event_type,
+                payload=payload,
+                severity=severity,
+                honeytoken_id=matched_token_id,
+            )
+        )
 
     def error_received(self, exc: Exception) -> None:
         log.debug("DNS honeypot error: %s", exc)
@@ -145,7 +150,11 @@ class DNSEngine(HoneypotEngine):
         try:
             import dnslib
         except ImportError:
-            return {"alive": True, "detail": "Transport active (dnslib missing for probe)", "method": "internal"}
+            return {
+                "alive": True,
+                "detail": "Transport active (dnslib missing for probe)",
+                "method": "internal",
+            }
 
         class _Probe(asyncio.DatagramProtocol):
             def __init__(self) -> None:
@@ -165,7 +174,7 @@ class DNSEngine(HoneypotEngine):
             try:
                 await asyncio.wait_for(proto.received.wait(), timeout=2.0)
                 return {"alive": True, "detail": "DNS server answered probe", "method": "udp_dns"}
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return {"alive": False, "detail": "DNS probe timed out", "method": "udp_dns"}
         except Exception as e:
             return {"alive": False, "detail": f"DNS probe error: {e}", "method": "udp_dns"}

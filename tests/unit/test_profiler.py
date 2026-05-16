@@ -1,10 +1,11 @@
 """Unit tests for the attacker profiler."""
 
-import pytest
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
-from datetime import datetime, timezone
 
-from honeypot_mcp.analysis.profiler import build_profile, _calculate_risk, _risk_level
+import pytest
+
+from honeypot_mcp.analysis.profiler import _calculate_risk, _risk_level, build_profile
 
 
 def _alert(ip, event_type, severity="medium"):
@@ -14,7 +15,7 @@ def _alert(ip, event_type, severity="medium"):
     a.severity = MagicMock()
     a.severity.value = severity
     a.payload = {}
-    a.timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    a.timestamp = datetime(2024, 1, 1, tzinfo=UTC)
     return a
 
 

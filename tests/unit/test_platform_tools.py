@@ -6,7 +6,7 @@ Format-stability tests: any downstream tool consuming `export_blocklist` or
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,6 +16,7 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage.database import close_db, init_db
+
     await init_db()
     yield
     await close_db()
@@ -23,21 +24,22 @@ async def setup_db():
 
 async def _seed_alerts(ip: str, count: int, hours_ago: int = 1):
     from honeypot_mcp.storage.database import get_session
-    from honeypot_mcp.storage import queries
     from honeypot_mcp.storage.models import Alert, AlertSeverity
 
-    ts = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    ts = datetime.now(UTC) - timedelta(hours=hours_ago)
     async with get_session() as session:
         for _ in range(count):
-            session.add(Alert(
-                honeypot_id=None,
-                source_ip=ip,
-                source_port=None,
-                event_type="ssh_login_failed",
-                payload={},
-                severity=AlertSeverity.HIGH,
-                timestamp=ts,
-            ))
+            session.add(
+                Alert(
+                    honeypot_id=None,
+                    source_ip=ip,
+                    source_port=None,
+                    event_type="ssh_login_failed",
+                    payload={},
+                    severity=AlertSeverity.HIGH,
+                    timestamp=ts,
+                )
+            )
 
 
 @pytest.mark.asyncio
@@ -84,7 +86,7 @@ async def test_alerts_prune_deletes_old():
     from honeypot_mcp.tools.alerts import alerts_prune
 
     await _seed_alerts("old-1.1.1.1", count=2, hours_ago=24 * 100)  # 100 days old
-    await _seed_alerts("new-2.2.2.2", count=2, hours_ago=1)         # fresh
+    await _seed_alerts("new-2.2.2.2", count=2, hours_ago=1)  # fresh
 
     result = await alerts_prune(older_than_days=90)
     assert result["alerts_deleted"] == 2

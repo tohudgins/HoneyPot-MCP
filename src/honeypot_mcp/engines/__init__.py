@@ -12,18 +12,23 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
     if hp_type not in _engines:
         if hp_type == HoneypotType.SSH:
             from honeypot_mcp.engines.ssh import SSHEngine
+
             _engines[hp_type] = SSHEngine()
         elif hp_type == HoneypotType.HTTP:
             from honeypot_mcp.engines.http import HTTPEngine
+
             _engines[hp_type] = HTTPEngine()
         elif hp_type == HoneypotType.SMTP:
             from honeypot_mcp.engines.smtp import SMTPEngine
+
             _engines[hp_type] = SMTPEngine()
         elif hp_type == HoneypotType.FTP:
             from honeypot_mcp.engines.ftp import FTPEngine
+
             _engines[hp_type] = FTPEngine()
         elif hp_type == HoneypotType.DNS:
             from honeypot_mcp.engines.dns import DNSEngine
+
             _engines[hp_type] = DNSEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")

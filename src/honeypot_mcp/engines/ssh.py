@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-import docker
 import docker.errors
 
+import docker
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
@@ -64,7 +63,9 @@ class SSHEngine(HoneypotEngine):
             config["ssh_hostname"] = pick_hostname(persona_obj)
             async with get_session() as session:
                 from sqlalchemy import update
+
                 from honeypot_mcp.storage.models import Honeypot
+
                 await session.execute(
                     update(Honeypot).where(Honeypot.name == name).values(config=config)
                 )
@@ -83,7 +84,9 @@ class SSHEngine(HoneypotEngine):
 
         log.info(
             "SSH honeypot '%s' deploying as persona=%s hostname=%s",
-            name, persona.id, hostname,
+            name,
+            persona.id,
+            hostname,
         )
 
         loop = asyncio.get_event_loop()
@@ -113,7 +116,10 @@ class SSHEngine(HoneypotEngine):
         container_id = await loop.run_in_executor(None, _run)
         log.info(
             "Cowrie SSH honeypot '%s' started on port %d (container=%s, persona=%s)",
-            name, port, container_id[:12], persona.id,
+            name,
+            port,
+            container_id[:12],
+            persona.id,
         )
         asyncio.create_task(self._ingest_logs(name, container_id))
         return container_id
@@ -159,10 +165,13 @@ class SSHEngine(HoneypotEngine):
             }
 
         from honeypot_mcp.engines.base import tcp_probe
+
         tcp = await tcp_probe(port)
         return {
             "alive": tcp["alive"],
-            "detail": "container running, port responsive" if tcp["alive"] else f"container running but {tcp['detail']}",
+            "detail": "container running, port responsive"
+            if tcp["alive"]
+            else f"container running but {tcp['detail']}",
             "method": "docker+tcp",
             "docker_status": state["docker_status"],
         }
@@ -210,7 +219,9 @@ class SSHEngine(HoneypotEngine):
         if not self._client:
             return
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: self._client.containers.get(container_id).unpause())
+        await loop.run_in_executor(
+            None, lambda: self._client.containers.get(container_id).unpause()
+        )
 
     async def _ingest_logs(self, honeypot_name: str, container_id: str) -> None:
         """Background task: tail Cowrie JSON logs and write alerts to the DB.
@@ -222,7 +233,7 @@ class SSHEngine(HoneypotEngine):
         """
         import json as _json
         from collections import deque
-        from datetime import datetime, timedelta, timezone
+        from datetime import timedelta
 
         if not self._client:
             return
@@ -247,7 +258,7 @@ class SSHEngine(HoneypotEngine):
         seen: set[int] = set()
         # Start two seconds in the past to avoid missing logs written between
         # container start and the first poll.
-        last_check = datetime.now(timezone.utc) - timedelta(seconds=2)
+        last_check = datetime.now(UTC) - timedelta(seconds=2)
 
         while True:
             await asyncio.sleep(2)
@@ -257,13 +268,13 @@ class SSHEngine(HoneypotEngine):
             if container.status != "running":
                 break
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             try:
                 raw_logs = await loop.run_in_executor(
                     None,
-                    lambda c=container, s=last_check: c.logs(
-                        since=s, timestamps=False
-                    ).decode("utf-8", errors="replace"),
+                    lambda c=container, s=last_check: c.logs(since=s, timestamps=False).decode(
+                        "utf-8", errors="replace"
+                    ),
                 )
             except Exception as e:
                 log.debug("Log fetch error for %s: %s", honeypot_name, e)
@@ -293,13 +304,17 @@ class SSHEngine(HoneypotEngine):
                 event_type, severity = _EVENT_MAP[event_id]
                 src_ip = entry.get("src_ip", "0.0.0.0")
                 src_port = entry.get("src_port")
-                payload = {k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")}
+                payload = {
+                    k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")
+                }
 
-                await submit_event(PendingEvent(
-                    honeypot_id=hp_db_id,
-                    source_ip=src_ip,
-                    source_port=src_port,
-                    event_type=event_type,
-                    payload=payload,
-                    severity=severity,
-                ))
+                await submit_event(
+                    PendingEvent(
+                        honeypot_id=hp_db_id,
+                        source_ip=src_ip,
+                        source_port=src_port,
+                        event_type=event_type,
+                        payload=payload,
+                        severity=severity,
+                    )
+                )

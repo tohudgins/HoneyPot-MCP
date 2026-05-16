@@ -1,5 +1,9 @@
 # HoneyPot MCP
 
+[![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+
 A Model Context Protocol server for deploying, monitoring, and analysing honeypots and honeytokens — built on [FastMCP](https://github.com/jlowin/fastmcp) and Python 3.11+.
 
 Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct an attacker's session, map their TTPs to MITRE ATT&CK, push alerts to Slack, or export a STIX 2.1 IOC bundle — all through natural language.
@@ -388,4 +392,4 @@ The honeytoken stack, threat-intel enrichment, MITRE mapping, session reconstruc
 
 ## License
 
-MIT
+Released under the [MIT License](LICENSE).

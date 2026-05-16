@@ -20,7 +20,7 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -109,7 +109,7 @@ class WebhookDelivery:
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("Webhook delivery worker did not exit cleanly.")
             self._task = None
         if self._client is not None:
@@ -124,7 +124,7 @@ class WebhookDelivery:
         while True:
             try:
                 job = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if self._stop.is_set() and self._queue.empty():
                     return
                 continue
@@ -164,7 +164,7 @@ class WebhookDelivery:
                     .where(Subscription.id == sub_id)
                     .values(
                         delivery_count=Subscription.delivery_count + 1,
-                        last_delivery_at=datetime.now(timezone.utc),
+                        last_delivery_at=datetime.now(UTC),
                         failure_count=0,
                         last_error=None,
                     )

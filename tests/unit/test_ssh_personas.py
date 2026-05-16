@@ -105,8 +105,11 @@ async def _seed_honeypot(name: str, port: int, config: dict | None = None) -> in
 
     async with get_session() as session:
         hp = Honeypot(
-            name=name, type=HoneypotType.SSH, port=port,
-            status=HoneypotStatus.STOPPED, config=config or {},
+            name=name,
+            type=HoneypotType.SSH,
+            port=port,
+            status=HoneypotStatus.STOPPED,
+            config=config or {},
         )
         session.add(hp)
         await session.flush()
@@ -127,6 +130,7 @@ def _mock_docker_client():
 @pytest.mark.asyncio
 async def test_ssh_start_picks_persona_and_persists_to_config():
     from sqlalchemy import select
+
     from honeypot_mcp.engines.ssh import SSHEngine
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot
@@ -146,9 +150,7 @@ async def test_ssh_start_picks_persona_and_persists_to_config():
 
     # Persisted to DB so a restart sees the same identity.
     async with get_session() as session:
-        result = await session.execute(
-            select(Honeypot).where(Honeypot.name == "auto-ssh")
-        )
+        result = await session.execute(select(Honeypot).where(Honeypot.name == "auto-ssh"))
         hp = result.scalar_one()
     assert hp.config["ssh_persona"] == config["ssh_persona"]
     assert hp.config["ssh_hostname"] == config["ssh_hostname"]
@@ -159,7 +161,9 @@ async def test_ssh_start_passes_persona_env_vars_to_docker():
     from honeypot_mcp.engines.ssh import SSHEngine
     from honeypot_mcp.engines.ssh_personas import get_persona
 
-    await _seed_honeypot("env-test", 2222, config={"ssh_persona": "debian_12", "ssh_hostname": "git-server"})
+    await _seed_honeypot(
+        "env-test", 2222, config={"ssh_persona": "debian_12", "ssh_hostname": "git-server"}
+    )
 
     engine = SSHEngine()
     engine._client, _ = _mock_docker_client()
@@ -185,10 +189,14 @@ async def test_ssh_start_respects_existing_persona():
     start() must NOT overwrite it."""
     from honeypot_mcp.engines.ssh import SSHEngine
 
-    await _seed_honeypot("pinned", 2222, config={
-        "ssh_persona": "rhel_8",
-        "ssh_hostname": "oracle-app",
-    })
+    await _seed_honeypot(
+        "pinned",
+        2222,
+        config={
+            "ssh_persona": "rhel_8",
+            "ssh_hostname": "oracle-app",
+        },
+    )
 
     engine = SSHEngine()
     engine._client, _ = _mock_docker_client()
@@ -209,12 +217,16 @@ async def test_ssh_start_user_override_wins():
     escape hatch for users who want a specific identity."""
     from honeypot_mcp.engines.ssh import SSHEngine
 
-    await _seed_honeypot("override", 2222, config={
-        "ssh_persona": "ubuntu_22_04",
-        "ssh_hostname": "ubuntu-srv",
-        "fake_hostname": "MY-CUSTOM-HOST",
-        "fake_kernel": "9.9.9-custom",
-    })
+    await _seed_honeypot(
+        "override",
+        2222,
+        config={
+            "ssh_persona": "ubuntu_22_04",
+            "ssh_hostname": "ubuntu-srv",
+            "fake_hostname": "MY-CUSTOM-HOST",
+            "fake_kernel": "9.9.9-custom",
+        },
+    )
 
     engine = SSHEngine()
     engine._client, _ = _mock_docker_client()

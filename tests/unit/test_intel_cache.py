@@ -7,7 +7,6 @@ are NOT cached so callers always retry.
 
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 from honeypot_mcp.intel import _cache

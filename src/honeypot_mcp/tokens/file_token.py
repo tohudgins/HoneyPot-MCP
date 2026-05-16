@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,9 @@ class FileTokenProvider(HoneytokenProvider):
 
         # DNS canary subdomain: {token_uid}.canary.<domain>
         # We use the callback host's domain (or localhost for testing)
-        callback_base = settings.canary_public_url.replace("http://", "").replace("https://", "").split(":")[0]
+        callback_base = (
+            settings.canary_public_url.replace("http://", "").replace("https://", "").split(":")[0]
+        )
         dns_canary = f"{token_uid}.canary.{callback_base}"
 
         output_dir = Path("reports/generated")
@@ -29,9 +30,13 @@ class FileTokenProvider(HoneytokenProvider):
         output_path = output_dir / f"{token_uid}.{file_type}"
 
         if file_type == "pdf":
-            output_path = await _create_pdf(str(output_path), title, dns_canary, token_uid, settings)
+            output_path = await _create_pdf(
+                str(output_path), title, dns_canary, token_uid, settings
+            )
         elif file_type == "docx":
-            output_path = await _create_docx(str(output_path), title, dns_canary, token_uid, settings)
+            output_path = await _create_docx(
+                str(output_path), title, dns_canary, token_uid, settings
+            )
 
         meta = {
             "file_type": file_type,
@@ -64,8 +69,7 @@ async def _create_pdf(
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
-        import io
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
         doc = SimpleDocTemplate(path, pagesize=letter)
         styles = getSampleStyleSheet()
@@ -73,27 +77,29 @@ async def _create_pdf(
 
         story.append(Paragraph(title, styles["Title"]))
         story.append(Spacer(1, 20))
-        story.append(Paragraph(
-            "This document contains sensitive information. Unauthorized access is prohibited.",
-            styles["Normal"]
-        ))
+        story.append(
+            Paragraph(
+                "This document contains sensitive information. Unauthorized access is prohibited.",
+                styles["Normal"],
+            )
+        )
         story.append(Spacer(1, 12))
-        story.append(Paragraph(
-            "CLASSIFICATION: CONFIDENTIAL — INTERNAL USE ONLY",
-            styles["Heading2"]
-        ))
+        story.append(
+            Paragraph("CLASSIFICATION: CONFIDENTIAL — INTERNAL USE ONLY", styles["Heading2"])
+        )
         story.append(Spacer(1, 12))
-        story.append(Paragraph(
-            "Please refer to the appendix for technical details and access credentials.",
-            styles["Normal"]
-        ))
+        story.append(
+            Paragraph(
+                "Please refer to the appendix for technical details and access credentials.",
+                styles["Normal"],
+            )
+        )
 
         # Embed 1x1 transparent pixel image that resolves the DNS canary
         tracking_url = f"http://{dns_canary}/t/{token_uid}.png"
-        story.append(Paragraph(
-            f'<img src="{tracking_url}" width="1" height="1"/>',
-            styles["Normal"]
-        ))
+        story.append(
+            Paragraph(f'<img src="{tracking_url}" width="1" height="1"/>', styles["Normal"])
+        )
 
         doc.build(story)
     except ImportError:
@@ -120,7 +126,6 @@ async def _create_docx(
 ) -> Path:
     try:
         from docx import Document
-        from docx.shared import Pt
 
         doc = Document()
         doc.add_heading(title, 0)
@@ -128,9 +133,7 @@ async def _create_docx(
             "This document contains sensitive information. Unauthorized access is prohibited."
         )
         doc.add_heading("CLASSIFICATION: CONFIDENTIAL", level=1)
-        doc.add_paragraph(
-            "Please refer to the appendix for technical details."
-        )
+        doc.add_paragraph("Please refer to the appendix for technical details.")
 
         # Add tracking URL as a 1x1 invisible image reference in footer
         section = doc.sections[0]

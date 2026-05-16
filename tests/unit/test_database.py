@@ -1,8 +1,8 @@
 """Unit tests for database layer."""
 
-import pytest
 import os
-from sqlalchemy.ext.asyncio import AsyncSession
+
+import pytest
 
 # Use in-memory SQLite for tests
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
@@ -10,7 +10,8 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
 @pytest.fixture(autouse=True)
 async def setup_db():
-    from honeypot_mcp.storage.database import init_db, close_db
+    from honeypot_mcp.storage.database import close_db, init_db
+
     await init_db()
     yield
     await close_db()
@@ -18,15 +19,14 @@ async def setup_db():
 
 @pytest.mark.asyncio
 async def test_create_and_retrieve_honeypot():
-    from honeypot_mcp.storage.database import get_session
-    from honeypot_mcp.storage.models import Honeypot, HoneypotType, HoneypotStatus
     from honeypot_mcp.storage import queries
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
     async with get_session() as session:
         hp = Honeypot(name="test-ssh", type=HoneypotType.SSH, port=2222)
         session.add(hp)
         await session.flush()
-        hp_id = hp.id
 
     async with get_session() as session:
         result = await queries.get_honeypot_by_name(session, "test-ssh")
@@ -37,9 +37,9 @@ async def test_create_and_retrieve_honeypot():
 
 @pytest.mark.asyncio
 async def test_create_alert_and_retrieve():
+    from honeypot_mcp.storage import queries
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import AlertSeverity
-    from honeypot_mcp.storage import queries
 
     async with get_session() as session:
         alert = await queries.create_alert(
@@ -51,7 +51,7 @@ async def test_create_alert_and_retrieve():
             payload={"username": "root", "password": "secret"},
             severity=AlertSeverity.HIGH,
         )
-        alert_id = alert.id
+        assert alert.id is not None
 
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=10, source_ip="10.0.0.1")
@@ -62,9 +62,9 @@ async def test_create_alert_and_retrieve():
 
 @pytest.mark.asyncio
 async def test_alert_stats():
+    from honeypot_mcp.storage import queries
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import AlertSeverity
-    from honeypot_mcp.storage import queries
 
     async with get_session() as session:
         for i in range(5):
@@ -86,9 +86,9 @@ async def test_alert_stats():
 
 @pytest.mark.asyncio
 async def test_acknowledge_alert():
+    from honeypot_mcp.storage import queries
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import AlertSeverity
-    from honeypot_mcp.storage import queries
 
     async with get_session() as session:
         alert = await queries.create_alert(

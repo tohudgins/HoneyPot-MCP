@@ -18,9 +18,9 @@ import logging
 from sqlalchemy import update
 
 from honeypot_mcp.engines import get_engine
+from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
-from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.models import AlertSeverity, Honeypot, HoneypotStatus
 
 log = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ class HoneypotWatchdog:
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("Watchdog did not exit cleanly.")
             self._task = None
 
@@ -59,7 +59,7 @@ class HoneypotWatchdog:
                 log.warning("Watchdog cycle failed: %s", e)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     async def _check_all(self) -> None:
@@ -91,13 +91,15 @@ class HoneypotWatchdog:
             await session.execute(
                 update(Honeypot).where(Honeypot.id == hp_id).values(status=HoneypotStatus.ERROR)
             )
-        await submit_event(PendingEvent(
-            honeypot_id=hp_id,
-            source_ip="0.0.0.0",
-            event_type="honeypot_health_failed",
-            payload={"name": hp_name, **health},
-            severity=AlertSeverity.CRITICAL,
-        ))
+        await submit_event(
+            PendingEvent(
+                honeypot_id=hp_id,
+                source_ip="0.0.0.0",
+                event_type="honeypot_health_failed",
+                payload={"name": hp_name, **health},
+                severity=AlertSeverity.CRITICAL,
+            )
+        )
 
 
 _watchdog: HoneypotWatchdog | None = None

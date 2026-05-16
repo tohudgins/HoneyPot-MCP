@@ -6,8 +6,8 @@ import json
 from typing import Any, Literal
 
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
 from honeypot_mcp.tokens import get_provider
 
@@ -48,7 +48,9 @@ async def honeytoken_create(
         "token_value": token_value,
         "status": "active",
         "metadata": {**(metadata or {}), **extra_meta},
-        "plant_instructions": provider.plant_instructions(token_value, {**(metadata or {}), **extra_meta}),
+        "plant_instructions": provider.plant_instructions(
+            token_value, {**(metadata or {}), **extra_meta}
+        ),
     }
 
 
@@ -88,17 +90,15 @@ async def honeytoken_status(token_id: int) -> dict[str, Any]:
     from sqlalchemy import select
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Honeytoken).where(Honeytoken.id == token_id)
-        )
+        result = await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
         token = result.scalar_one_or_none()
         if not token:
             return {"error": f"No honeytoken with id={token_id}."}
 
-        events = await queries.get_events_for_ip(session, "", limit=0)  # placeholder
-        # Get events tied to this token
         from sqlalchemy import select as sa_select
+
         from honeypot_mcp.storage.models import AttackerEvent
+
         ev_result = await session.execute(
             sa_select(AttackerEvent)
             .where(AttackerEvent.honeytoken_id == token_id)
@@ -136,7 +136,8 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
     Args:
         token_id: The numeric honeytoken ID.
     """
-    from sqlalchemy import select, update
+    from sqlalchemy import update
+
     from honeypot_mcp.storage.models import Honeytoken
 
     async with get_session() as session:
@@ -213,7 +214,9 @@ async def honeytoken_embed_file(
 
 
 @mcp.tool
-async def honeytoken_export(token_id: int, context: Literal["env_file", "aws_credentials", "bash", "json"] = "json") -> str:
+async def honeytoken_export(
+    token_id: int, context: Literal["env_file", "aws_credentials", "bash", "json"] = "json"
+) -> str:
     """Export a honeytoken formatted for planting in a specific context.
 
     Args:
@@ -224,9 +227,7 @@ async def honeytoken_export(token_id: int, context: Literal["env_file", "aws_cre
     from sqlalchemy import select
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Honeytoken).where(Honeytoken.id == token_id)
-        )
+        result = await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
         token = result.scalar_one_or_none()
         if not token:
             return f"Error: No honeytoken with id={token_id}."
@@ -235,7 +236,10 @@ async def honeytoken_export(token_id: int, context: Literal["env_file", "aws_cre
     val = token.token_value
 
     if context == "json":
-        return json.dumps({"label": token.label, "type": token.type.value, "value": val, "metadata": meta}, indent=2)
+        return json.dumps(
+            {"label": token.label, "type": token.type.value, "value": val, "metadata": meta},
+            indent=2,
+        )
 
     if token.type == HoneytokenType.API_KEY and meta.get("service") == "aws":
         key_id = meta.get("access_key_id", val[:20])

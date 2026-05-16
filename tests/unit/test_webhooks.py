@@ -8,9 +8,7 @@ SOC consumer needs.
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
-
-import pytest
+from datetime import UTC, datetime
 
 
 def test_sign_body_produces_verifiable_signature():
@@ -62,7 +60,7 @@ def test_serialise_emits_consumer_fields():
         payload={"username": "root"},
         severity=AlertSeverity.HIGH,
         source_port=1234,
-        timestamp=datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc),
+        timestamp=datetime(2024, 6, 1, 12, 0, tzinfo=UTC),
     )
     body = _serialise(ev)
     # Round-trip JSON to confirm everything is serialisable.

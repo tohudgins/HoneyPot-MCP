@@ -1,11 +1,11 @@
 """Unit tests for the attack campaign correlator."""
 
-import pytest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
+import pytest
+
 from honeypot_mcp.analysis.correlator import detect_campaigns
-from honeypot_mcp.storage.models import AlertSeverity
 
 
 def _make_alert(ip: str, event_type: str, minutes_offset: int) -> MagicMock:
@@ -13,7 +13,7 @@ def _make_alert(ip: str, event_type: str, minutes_offset: int) -> MagicMock:
     a.source_ip = ip
     a.event_type = event_type
     a.honeypot_id = 1
-    a.timestamp = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc) + timedelta(minutes=minutes_offset)
+    a.timestamp = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC) + timedelta(minutes=minutes_offset)
     return a
 
 

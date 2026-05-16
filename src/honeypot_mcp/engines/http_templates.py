@@ -13,7 +13,6 @@ The persona module owns headers and 404s; this module owns body content.
 
 from __future__ import annotations
 
-
 _TEMPLATES: dict[str, str] = {
     # ── Admin panel variants ──────────────────────────────────────────────────
     "admin_panel": """<!DOCTYPE html><html><head><title>Admin Login</title>
@@ -25,7 +24,6 @@ _TEMPLATES: dict[str, str] = {
 <p>Password<br><input type="password" name="password" style="width:100%"></p>
 <p><button type="submit">Login</button></p>
 </form></div></body></html>""",
-
     "cpanel_login": """<!DOCTYPE html><html><head><title>cPanel Login</title>
 <meta charset="utf-8"></head><body style="background:#001f3f;color:#fff;font-family:Arial">
 <div style="max-width:380px;margin:6rem auto;background:#fff;color:#000;padding:1.5rem;border-radius:8px">
@@ -35,7 +33,6 @@ _TEMPLATES: dict[str, str] = {
 <input type="password" name="pass" placeholder="Password" style="width:100%;margin-bottom:1rem;padding:.5rem"><br>
 <button type="submit" style="width:100%;background:#FF4136;color:#fff;border:0;padding:.7rem">Log in</button>
 </form></div></body></html>""",
-
     "webmin_login": """<!DOCTYPE html><html><head><title>Login to Webmin</title></head>
 <body bgcolor="#9999cc"><center>
 <h1>Login to Webmin</h1>
@@ -44,7 +41,6 @@ _TEMPLATES: dict[str, str] = {
 <tr><td>Password</td><td><input type="password" name="pass"></td></tr>
 <tr><td colspan="2"><center><input type="submit" value="Login"></center></td></tr></table>
 </form></center></body></html>""",
-
     # ── Database admin variants ───────────────────────────────────────────────
     "phpmyadmin_5": """<!DOCTYPE html><html><head><title>phpMyAdmin</title>
 <meta charset="utf-8"></head><body>
@@ -58,7 +54,6 @@ _TEMPLATES: dict[str, str] = {
 <p>Database: <input name="db" value=""></p>
 <button type="submit">Go</button>
 </form></div></body></html>""",
-
     "phpmyadmin_4": """<!DOCTYPE html><html><head><title>phpMyAdmin</title></head>
 <body><div style="max-width:420px;margin:4rem auto;text-align:center">
 <h1>phpMyAdmin 4.9.5</h1>
@@ -67,7 +62,6 @@ Username <input name="pma_username" value="root"><br>
 Password <input type="password" name="pma_password"><br>
 <button type="submit">Go</button>
 </form></div></body></html>""",
-
     # ── CMS admin variants ────────────────────────────────────────────────────
     "wordpress_admin": """<!DOCTYPE html><html><head><title>Log In &lsaquo; WordPress</title>
 <meta charset="utf-8"></head><body class="login">
@@ -81,7 +75,6 @@ Password <input type="password" name="pma_password"><br>
 <p><input type="checkbox" name="rememberme"> Remember Me</p>
 <p><input type="submit" value="Log In" style="width:100%"></p>
 </form></div></body></html>""",
-
     "joomla_admin": """<!DOCTYPE html><html><head><title>Joomla! Administration Login</title></head>
 <body><div style="max-width:340px;margin:5rem auto;font-family:Arial">
 <h2>Joomla! Administrator</h2>
@@ -90,7 +83,6 @@ Password <input type="password" name="pma_password"><br>
 <p>Password <input type="password" name="passwd"></p>
 <button type="submit">Log in</button>
 </form></div></body></html>""",
-
     # ── Fake env files ────────────────────────────────────────────────────────
     "env_laravel": """APP_NAME=Laravel
 APP_ENV=production
@@ -117,7 +109,6 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 AWS_DEFAULT_REGION=us-east-1
 AWS_BUCKET=production-uploads
 """,
-
     "env_rails": """RAILS_ENV=production
 SECRET_KEY_BASE=8f7c6b5a4d3c2b1a0f9e8d7c6b5a4d3c2b1a0f9e8d7c6b5a4d3c2b1a
 DATABASE_URL=postgres://railsapp:HunteRailsPwd_99@db.internal:5432/rails_prod
@@ -133,7 +124,6 @@ AWS_S3_BUCKET=rails-prod-assets
 STRIPE_SECRET_KEY=sk_live_51HxxXxXxXxXxXxXxXxXxXxXxX
 SENDGRID_API_KEY=SG.fakeSendGridKey1234567890.aBcDeFgHiJkLmNoPqRsTu
 """,
-
     "env_node": """NODE_ENV=production
 PORT=3000
 JWT_SECRET=production_jwt_secret_KEEP_PRIVATE_2024
@@ -150,7 +140,6 @@ GITHUB_CLIENT_SECRET=fakeGitHubSecret9876543210abcdef
 STRIPE_SECRET_KEY=sk_live_51HxxX_fakeStripeKey_X
 SENDGRID_API_KEY=SG.fakeNodeSendGridKey.RandomString
 """,
-
     # ── Generic ───────────────────────────────────────────────────────────────
     "generic_login": """<!DOCTYPE html><html><head><title>Login</title></head><body>
 <div style="max-width:340px;margin:5rem auto;font-family:Arial">

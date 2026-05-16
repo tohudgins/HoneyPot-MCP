@@ -50,17 +50,21 @@ async def detect_campaigns(
             if len(unique_ips) >= min_sources:
                 start_ts = sorted_alerts[i].timestamp
                 end_ts = window_alerts[-1].timestamp
-                campaigns.append({
-                    "event_type": event_type,
-                    "start_time": start_ts.isoformat(),
-                    "end_time": end_ts.isoformat(),
-                    "duration_minutes": int((end_ts - start_ts).total_seconds() / 60),
-                    "unique_source_ips": len(unique_ips),
-                    "total_events": len(window_alerts),
-                    "source_ips": sorted(unique_ips),
-                    "targeted_honeypots": list({a.honeypot_id for a in window_alerts if a.honeypot_id}),
-                    "campaign_id": _make_campaign_id(event_type, start_ts),
-                })
+                campaigns.append(
+                    {
+                        "event_type": event_type,
+                        "start_time": start_ts.isoformat(),
+                        "end_time": end_ts.isoformat(),
+                        "duration_minutes": int((end_ts - start_ts).total_seconds() / 60),
+                        "unique_source_ips": len(unique_ips),
+                        "total_events": len(window_alerts),
+                        "source_ips": sorted(unique_ips),
+                        "targeted_honeypots": list(
+                            {a.honeypot_id for a in window_alerts if a.honeypot_id}
+                        ),
+                        "campaign_id": _make_campaign_id(event_type, start_ts),
+                    }
+                )
 
             i = j if j > i else i + 1
 
@@ -80,6 +84,8 @@ def _deduplicate(campaigns: list[dict]) -> list[dict]:
     seen: list[dict] = []
     for c in campaigns:
         ips = set(c["source_ips"])
-        if not any(ips.issubset(set(s["source_ips"])) and c["event_type"] == s["event_type"] for s in seen):
+        if not any(
+            ips.issubset(set(s["source_ips"])) and c["event_type"] == s["event_type"] for s in seen
+        ):
             seen.append(c)
     return seen

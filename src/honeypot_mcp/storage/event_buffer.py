@@ -16,7 +16,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from honeypot_mcp.storage.database import get_session
@@ -34,7 +34,7 @@ class PendingEvent:
     severity: AlertSeverity
     source_port: int | None = None
     honeytoken_id: int | None = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class EventBuffer:
@@ -71,7 +71,7 @@ class EventBuffer:
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("Event buffer flusher did not exit cleanly.")
             self._task = None
 
@@ -84,7 +84,7 @@ class EventBuffer:
             try:
                 first = await asyncio.wait_for(self._queue.get(), timeout=self._flush_interval)
                 batch.append(first)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if self._stop.is_set() and self._queue.empty():
                     return
                 continue
@@ -110,22 +110,26 @@ class EventBuffer:
     async def _flush(self, batch: list[PendingEvent]) -> None:
         async with get_session() as session:
             for ev in batch:
-                session.add(Alert(
-                    honeypot_id=ev.honeypot_id,
-                    source_ip=ev.source_ip,
-                    source_port=ev.source_port,
-                    event_type=ev.event_type,
-                    payload=ev.payload,
-                    severity=ev.severity,
-                    timestamp=ev.timestamp,
-                ))
-                session.add(AttackerEvent(
-                    ip=ev.source_ip,
-                    event_type=ev.event_type,
-                    extra=ev.payload,
-                    honeytoken_id=ev.honeytoken_id,
-                    timestamp=ev.timestamp,
-                ))
+                session.add(
+                    Alert(
+                        honeypot_id=ev.honeypot_id,
+                        source_ip=ev.source_ip,
+                        source_port=ev.source_port,
+                        event_type=ev.event_type,
+                        payload=ev.payload,
+                        severity=ev.severity,
+                        timestamp=ev.timestamp,
+                    )
+                )
+                session.add(
+                    AttackerEvent(
+                        ip=ev.source_ip,
+                        event_type=ev.event_type,
+                        extra=ev.payload,
+                        honeytoken_id=ev.honeytoken_id,
+                        timestamp=ev.timestamp,
+                    )
+                )
 
 
 _buffer: EventBuffer | None = None
@@ -170,7 +174,9 @@ async def _bump_suppression_count(rule_id: int) -> None:
     swallowed — a missed counter is not worth back-pressuring honeypot ingest."""
     try:
         from sqlalchemy import update
+
         from honeypot_mcp.storage.models import SuppressionRule
+
         async with get_session() as session:
             await session.execute(
                 update(SuppressionRule)

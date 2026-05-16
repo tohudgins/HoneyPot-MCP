@@ -76,16 +76,18 @@ async def _load_rules() -> None:
     for r in live:
         if r.expires_at is not None and r.expires_at.timestamp() < wall_now:
             continue
-        new_rules.append(_Rule(
-            id=r.id,
-            label=r.label,
-            ip_pattern=r.ip_pattern or None,
-            event_type_pattern=r.event_type_pattern or None,
-            action=r.action,
-            rate_limit_count=r.rate_limit_count,
-            rate_limit_window_seconds=r.rate_limit_window_seconds,
-            expires_at=r.expires_at.timestamp() if r.expires_at else None,
-        ))
+        new_rules.append(
+            _Rule(
+                id=r.id,
+                label=r.label,
+                ip_pattern=r.ip_pattern or None,
+                event_type_pattern=r.event_type_pattern or None,
+                action=r.action,
+                rate_limit_count=r.rate_limit_count,
+                rate_limit_window_seconds=r.rate_limit_window_seconds,
+                expires_at=r.expires_at.timestamp() if r.expires_at else None,
+            )
+        )
     _rules = new_rules
     _rules_loaded_at = now
 
@@ -105,9 +107,10 @@ def _event_type_matches(pattern: str, event_type: str) -> bool:
 def _rule_matches(rule: _Rule, event: PendingEvent) -> bool:
     if rule.ip_pattern and not _ip_matches(rule.ip_pattern, event.source_ip):
         return False
-    if rule.event_type_pattern and not _event_type_matches(rule.event_type_pattern, event.event_type):
-        return False
-    return True
+    return not (
+        rule.event_type_pattern
+        and not _event_type_matches(rule.event_type_pattern, event.event_type)
+    )
 
 
 def _rate_limited(rule: _Rule, event: PendingEvent) -> bool:

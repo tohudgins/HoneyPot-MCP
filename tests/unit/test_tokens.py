@@ -1,6 +1,7 @@
 """Unit tests for honeytoken providers."""
 
 import pytest
+
 from honeypot_mcp.tokens.api_key import APIKeyProvider
 from honeypot_mcp.tokens.canary_url import CanaryURLProvider
 from honeypot_mcp.tokens.credential import CredentialProvider

@@ -98,9 +98,7 @@ async def test_watchdog_marks_dead_honeypot_and_emits_alert():
     await buf.stop()
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Honeypot).where(Honeypot.id == hp_id)
-        )
+        result = await session.execute(select(Honeypot).where(Honeypot.id == hp_id))
         updated = result.scalar_one()
         assert updated.status == HoneypotStatus.ERROR
 

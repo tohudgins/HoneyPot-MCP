@@ -23,6 +23,7 @@ def tmp_db_url(tmp_path: Path):
     prev = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = url
     import honeypot_mcp.config as cfg_mod
+
     cfg_mod._settings = None
     yield url, sync_url
     if prev is None:
@@ -36,6 +37,7 @@ def tmp_db_url(tmp_path: Path):
 async def test_init_db_runs_alembic_on_fresh_persistent_db(tmp_db_url):
     url, sync_url = tmp_db_url
     from honeypot_mcp.storage import database
+
     # Reset module-level engine cache so it picks up the tmp URL
     database._engine = None
     database._session_factory = None
@@ -62,6 +64,7 @@ async def test_init_db_runs_alembic_on_fresh_persistent_db(tmp_db_url):
 async def test_init_db_is_idempotent(tmp_db_url):
     url, sync_url = tmp_db_url
     from honeypot_mcp.storage import database
+
     database._engine = None
     database._session_factory = None
 
@@ -93,6 +96,7 @@ async def test_baseline_migration_is_idempotent_against_pre_alembic_db(tmp_path)
 
     # Simulate the pre-Alembic state: tables exist, no alembic_version.
     from honeypot_mcp.storage.models import Base
+
     sync_engine = create_engine(sync_url)
     Base.metadata.create_all(sync_engine)
     pre_tables = set(inspect(sync_engine).get_table_names())
@@ -104,8 +108,10 @@ async def test_baseline_migration_is_idempotent_against_pre_alembic_db(tmp_path)
     prev = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = async_url
     import honeypot_mcp.config as cfg_mod
+
     cfg_mod._settings = None
     from honeypot_mcp.storage import database
+
     database._engine = None
     database._session_factory = None
     try:

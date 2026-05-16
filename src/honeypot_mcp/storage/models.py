@@ -54,16 +54,16 @@ class Honeypot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    type: Mapped[HoneypotType] = mapped_column(Enum(HoneypotType, values_callable=_ev), nullable=False)
+    type: Mapped[HoneypotType] = mapped_column(
+        Enum(HoneypotType, values_callable=_ev), nullable=False
+    )
     port: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[HoneypotStatus] = mapped_column(
         Enum(HoneypotStatus, values_callable=_ev), default=HoneypotStatus.STOPPED, nullable=False
     )
     container_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     config: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -97,16 +97,16 @@ class Honeytoken(Base):
     __tablename__ = "honeytokens"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    type: Mapped[HoneytokenType] = mapped_column(Enum(HoneytokenType, values_callable=_ev), nullable=False)
+    type: Mapped[HoneytokenType] = mapped_column(
+        Enum(HoneytokenType, values_callable=_ev), nullable=False
+    )
     label: Mapped[str] = mapped_column(String(256), nullable=False)
     token_value: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
     status: Mapped[HoneytokenStatus] = mapped_column(
         Enum(HoneytokenStatus, values_callable=_ev), default=HoneytokenStatus.ACTIVE, nullable=False
     )
     token_meta: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
 
@@ -159,9 +159,7 @@ class Subscription(Base):
         DateTime(timezone=True), nullable=True
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SuppressionRule(Base):
@@ -184,9 +182,7 @@ class SuppressionRule(Base):
     active: Mapped[bool] = mapped_column(default=True)
     suppressed_count: Mapped[int] = mapped_column(Integer, default=0)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class AttackerProfile(Base):

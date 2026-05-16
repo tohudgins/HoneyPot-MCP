@@ -5,11 +5,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+from datetime import UTC
 from typing import Any, Literal
 
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertSeverity
 
 
@@ -75,6 +76,7 @@ async def alerts_get(alert_id: int) -> dict[str, Any]:
         alert_id: The numeric alert ID.
     """
     from sqlalchemy import select
+
     from honeypot_mcp.storage.models import Alert
 
     async with get_session() as session:
@@ -148,12 +150,12 @@ async def alerts_prune(older_than_days: int = 90) -> dict[str, Any]:
     Args:
         older_than_days: Cutoff age in days (default 90).
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     if older_than_days < 1:
         return {"error": "older_than_days must be at least 1 to avoid deleting current data."}
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
     async with get_session() as session:
         result = await queries.prune_alerts_before(session, cutoff)
     return {

@@ -5,7 +5,6 @@ different deploys can pick different personas, and end-to-end that a real
 HTTP engine actually serves the chosen persona's Server header and 404 page.
 """
 
-import asyncio
 import os
 from collections import Counter
 
@@ -91,6 +90,7 @@ def test_render_not_found_embeds_persona_identity():
 
 async def _free_port() -> int:
     import socket
+
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     p = s.getsockname()[1]
@@ -105,8 +105,11 @@ async def _register_honeypot(name: str, port: int, persona_id: str | None = None
     config = {"persona": persona_id} if persona_id else {}
     async with get_session() as session:
         hp = Honeypot(
-            name=name, type=HoneypotType.HTTP, port=port,
-            status=HoneypotStatus.RUNNING, config=config,
+            name=name,
+            type=HoneypotType.HTTP,
+            port=port,
+            status=HoneypotStatus.RUNNING,
+            config=config,
         )
         session.add(hp)
         await session.flush()
@@ -118,6 +121,7 @@ async def test_engine_serves_pinned_persona_headers():
     """If the config has a persona, start() must use it (no random pick).
     The Server header on a real request matches that persona."""
     import httpx
+
     from honeypot_mcp.engines.http import HTTPEngine
 
     port = await _free_port()
@@ -140,6 +144,7 @@ async def test_engine_persists_persona_when_unset():
     """If config has no persona, start() picks one and writes it back to the
     Honeypot row so subsequent restarts reuse it (stability across reboots)."""
     from sqlalchemy import select
+
     from honeypot_mcp.engines.http import HTTPEngine
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot
@@ -151,9 +156,7 @@ async def test_engine_persists_persona_when_unset():
     container_id = await engine.start("auto-test", port, {})
     try:
         async with get_session() as session:
-            result = await session.execute(
-                select(Honeypot).where(Honeypot.name == "auto-test")
-            )
+            result = await session.execute(select(Honeypot).where(Honeypot.name == "auto-test"))
             hp = result.scalar_one()
         assert "persona" in (hp.config or {})
         assert hp.config["persona"]  # non-empty string
@@ -165,6 +168,7 @@ async def test_engine_persists_persona_when_unset():
 async def test_engine_serves_persona_specific_404():
     """Unknown path → persona's 404 (not the old 'generic_login' fallback)."""
     import httpx
+
     from honeypot_mcp.engines.http import HTTPEngine
 
     port = await _free_port()

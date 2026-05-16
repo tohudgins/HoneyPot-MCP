@@ -59,7 +59,9 @@ async def build_profile(
             "detection_ratio": vt.get("detection_ratio"),
             "tags": vt.get("tags", []),
             "as_owner": vt.get("as_owner"),
-        } if vt.get("available") else {"available": False},
+        }
+        if vt.get("available")
+        else {"available": False},
         "abuseipdb": {
             "abuse_confidence_score": abuse.get("abuse_confidence_score", 0),
             "total_reports": abuse.get("total_reports", 0),
@@ -68,7 +70,9 @@ async def build_profile(
             "usage_type": abuse.get("usage_type", ""),
             "last_reported_at": abuse.get("last_reported_at"),
             "report_categories": abuse.get("report_categories", {}),
-        } if abuse.get("available") else {"available": False},
+        }
+        if abuse.get("available")
+        else {"available": False},
         "recommendations": _recommendations(ttps, risk_score, sev_counts, abuse),
     }
 
@@ -142,9 +146,13 @@ def _recommendations(
     # AbuseIPDB score
     abuse_score = abuse.get("abuse_confidence_score", 0) or 0
     if abuse_score >= 80:
-        recs.append(f"AbuseIPDB confidence score {abuse_score}% — strongly confirmed malicious. Report and block.")
+        recs.append(
+            f"AbuseIPDB confidence score {abuse_score}% — strongly confirmed malicious. Report and block."
+        )
     elif abuse_score >= 50:
-        recs.append(f"AbuseIPDB confidence score {abuse_score}% — likely malicious. Consider reporting via report_ip_abuse tool.")
+        recs.append(
+            f"AbuseIPDB confidence score {abuse_score}% — likely malicious. Consider reporting via report_ip_abuse tool."
+        )
     elif abuse_score == 0 and abuse.get("available"):
         recs.append("No prior AbuseIPDB reports — this may be a new or VPN-masked attacker.")
 

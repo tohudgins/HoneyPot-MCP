@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import secrets
 from typing import Any
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
@@ -51,10 +50,13 @@ class _FTPProtocol(asyncio.Protocol):
             self._pending_user = arg
             self._transport.write(b"331 Password required\r\n")
         elif verb == "PASS":
-            asyncio.create_task(self._record(
-                "ftp_login_attempt", AlertSeverity.HIGH,
-                {"username": self._pending_user, "password": arg}
-            ))
+            asyncio.create_task(
+                self._record(
+                    "ftp_login_attempt",
+                    AlertSeverity.HIGH,
+                    {"username": self._pending_user, "password": arg},
+                )
+            )
             self._transport.write(b"530 Login incorrect\r\n")
             self._pending_user = None
         elif verb == "QUIT":
@@ -66,20 +68,20 @@ class _FTPProtocol(asyncio.Protocol):
             self._transport.write(b"211-Features:\r\n PASV\r\n211 End\r\n")
         else:
             self._transport.write(b"502 Command not implemented\r\n")
-            asyncio.create_task(self._record(
-                "ftp_command", AlertSeverity.LOW, {"command": cmd}
-            ))
+            asyncio.create_task(self._record("ftp_command", AlertSeverity.LOW, {"command": cmd}))
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
         src_ip, src_port = self._peer
-        await submit_event(PendingEvent(
-            honeypot_id=self._hp_id,
-            source_ip=src_ip,
-            source_port=src_port,
-            event_type=event_type,
-            payload=payload,
-            severity=severity,
-        ))
+        await submit_event(
+            PendingEvent(
+                honeypot_id=self._hp_id,
+                source_ip=src_ip,
+                source_port=src_port,
+                event_type=event_type,
+                payload=payload,
+                severity=severity,
+            )
+        )
 
     def connection_lost(self, exc: Exception | None) -> None:
         pass

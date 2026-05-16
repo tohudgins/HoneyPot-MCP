@@ -67,4 +67,6 @@ class APIKeyProvider(HoneytokenProvider):
                 f"Alert triggers when anyone attempts to use these credentials.\n"
                 f"Configure AWS CloudTrail or use the MCP alert webhook."
             )
-        return f"Plant API key '{token_value}' in configuration files, source code, or documentation."
+        return (
+            f"Plant API key '{token_value}' in configuration files, source code, or documentation."
+        )

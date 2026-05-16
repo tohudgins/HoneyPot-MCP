@@ -10,14 +10,31 @@ from typing import Any
 from honeypot_mcp.tokens.base import HoneytokenProvider
 
 _USERNAMES = [
-    "admin", "administrator", "root", "sysadmin", "devops", "deploy",
-    "ftpuser", "backup", "webmaster", "dbadmin", "mysql", "postgres",
-    "ubuntu", "ec2-user", "ansible", "jenkins", "gitlab", "docker",
+    "admin",
+    "administrator",
+    "root",
+    "sysadmin",
+    "devops",
+    "deploy",
+    "ftpuser",
+    "backup",
+    "webmaster",
+    "dbadmin",
+    "mysql",
+    "postgres",
+    "ubuntu",
+    "ec2-user",
+    "ansible",
+    "jenkins",
+    "gitlab",
+    "docker",
 ]
 
 _PASSWORD_PATTERNS = [
     lambda: f"{''.join(random.choices(string.ascii_letters + string.digits, k=12))}!",
-    lambda: f"{''.join(random.choices(string.ascii_lowercase, k=8))}{''.join(random.choices(string.digits, k=4))}",
+    lambda: (
+        f"{''.join(random.choices(string.ascii_lowercase, k=8))}{''.join(random.choices(string.digits, k=4))}"
+    ),
     lambda: f"P@ssw0rd{random.randint(100, 999)}",
     lambda: f"{''.join(random.choices(string.ascii_letters, k=6))}_{random.randint(10, 99)}!",
     lambda: f"{''.join(random.choices(string.ascii_lowercase + string.digits + '!@#$', k=16))}",
@@ -54,11 +71,11 @@ class CredentialProvider(HoneytokenProvider):
             lines.append(f"  {c['username']} : {c['password']}")
 
         lines.append(
-            f"\nIdeas:\n"
-            f"  - Add to /etc/shadow or a fake passwd file on a honeypot\n"
-            f"  - Place in a 'passwords.txt' file in a shared drive\n"
-            f"  - Embed in a config file on a web honeypot\n"
-            f"  - Plant in a Git repository's commit history\n\n"
-            f"Alerts fire when these credentials are used on any honeypot."
+            "\nIdeas:\n"
+            "  - Add to /etc/shadow or a fake passwd file on a honeypot\n"
+            "  - Place in a 'passwords.txt' file in a shared drive\n"
+            "  - Embed in a config file on a web honeypot\n"
+            "  - Plant in a Git repository's commit history\n\n"
+            "Alerts fire when these credentials are used on any honeypot."
         )
         return "\n".join(lines)

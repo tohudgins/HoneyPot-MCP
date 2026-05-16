@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 
 
 @mcp.tool
@@ -19,9 +19,10 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
         ip: IPv4 or IPv6 address to look up.
     """
     import asyncio
+
+    from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
     from honeypot_mcp.intel.geoip import lookup_geoip
     from honeypot_mcp.intel.virustotal import lookup_virustotal
-    from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
 
     geo, vt, abuse = await asyncio.gather(
         lookup_geoip(ip),
@@ -68,10 +69,11 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
         ip: The attacker's IP address.
     """
     import asyncio
+
+    from honeypot_mcp.analysis.profiler import build_profile
+    from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
     from honeypot_mcp.intel.geoip import lookup_geoip
     from honeypot_mcp.intel.virustotal import lookup_virustotal
-    from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
-    from honeypot_mcp.analysis.profiler import build_profile
 
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=200, source_ip=ip)
@@ -247,8 +249,10 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         ip: The attacker's IP address.
         hours: Look-back window in hours (default 168 = 7 days).
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
+
     from sqlalchemy import select
+
     from honeypot_mcp.intel.mitre import map_to_attack
     from honeypot_mcp.storage.models import (
         Alert,
@@ -257,7 +261,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         Honeytoken,
     )
 
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = datetime.now(UTC) - timedelta(hours=hours)
 
     async with get_session() as session:
         alerts_result = await session.execute(
@@ -289,12 +293,14 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
                 select(Honeytoken).where(Honeytoken.id.in_(token_ids))
             )
             for t in tok_result.scalars().all():
-                tokens_triggered.append({
-                    "id": t.id,
-                    "type": t.type.value,
-                    "label": t.label,
-                    "triggered_at": t.triggered_at.isoformat() if t.triggered_at else None,
-                })
+                tokens_triggered.append(
+                    {
+                        "id": t.id,
+                        "type": t.type.value,
+                        "label": t.label,
+                        "triggered_at": t.triggered_at.isoformat() if t.triggered_at else None,
+                    }
+                )
 
     if not alerts and not events:
         return {
@@ -311,16 +317,18 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
             if isinstance(v, str):
                 terms.append(v)
         ttps = await map_to_attack(terms)
-        chronological.append({
-            "_ts": a.timestamp,
-            "timestamp": a.timestamp.isoformat(),
-            "event_type": a.event_type,
-            "severity": a.severity.value,
-            "honeypot": honeypot_names.get(a.honeypot_id, "—"),
-            "summary": _summarize_payload(a.payload),
-            "techniques": ttps,
-            "primary_tactic": _primary_tactic(ttps),
-        })
+        chronological.append(
+            {
+                "_ts": a.timestamp,
+                "timestamp": a.timestamp.isoformat(),
+                "event_type": a.event_type,
+                "severity": a.severity.value,
+                "honeypot": honeypot_names.get(a.honeypot_id, "—"),
+                "summary": _summarize_payload(a.payload),
+                "techniques": ttps,
+                "primary_tactic": _primary_tactic(ttps),
+            }
+        )
     chronological.sort(key=lambda x: x["_ts"])
 
     # Group by primary tactic. Each phase aggregates the events and the
@@ -330,25 +338,29 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         pt = e["primary_tactic"]
         if pt not in phases:
             phases[pt] = {"phase": pt, "events": [], "_tech_ids": set(), "techniques": []}
-        phases[pt]["events"].append({
-            "timestamp": e["timestamp"],
-            "event_type": e["event_type"],
-            "severity": e["severity"],
-            "honeypot": e["honeypot"],
-            "summary": e["summary"],
-        })
+        phases[pt]["events"].append(
+            {
+                "timestamp": e["timestamp"],
+                "event_type": e["event_type"],
+                "severity": e["severity"],
+                "honeypot": e["honeypot"],
+                "summary": e["summary"],
+            }
+        )
         for t in e["techniques"]:
             tid = t["technique_id"]
             if tid not in phases[pt]["_tech_ids"]:
                 phases[pt]["_tech_ids"].add(tid)
-                phases[pt]["techniques"].append({
-                    "technique_id": tid,
-                    "technique_name": t["technique_name"],
-                })
+                phases[pt]["techniques"].append(
+                    {
+                        "technique_id": tid,
+                        "technique_name": t["technique_name"],
+                    }
+                )
 
     # Order phases by kill-chain progression.
     phases_list = []
-    for phase_name, data in phases.items():
+    for _phase_name, data in phases.items():
         data.pop("_tech_ids", None)
         data["event_count"] = len(data["events"])
         phases_list.append(data)
@@ -361,12 +373,14 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
     last_phase: str | None = None
     for e in chronological:
         if last_phase is not None and e["primary_tactic"] != last_phase:
-            transitions.append({
-                "at": e["timestamp"],
-                "from": last_phase,
-                "to": e["primary_tactic"],
-                "via": e["event_type"],
-            })
+            transitions.append(
+                {
+                    "at": e["timestamp"],
+                    "from": last_phase,
+                    "to": e["primary_tactic"],
+                    "via": e["event_type"],
+                }
+            )
         last_phase = e["primary_tactic"]
 
     first_seen = chronological[0]["_ts"]
@@ -415,6 +429,7 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
         session_id: The Cowrie session ID (found in any SSH alert's payload.session field).
     """
     from sqlalchemy import String, cast, select
+
     from honeypot_mcp.storage.models import Alert
 
     needle = f'"session": "{session_id}"'
@@ -497,7 +512,7 @@ async def export_blocklist(
         return f"# No attackers met the threshold (>= {min_hits} hits in {hours}h)."
 
     header = (
-        f"# HoneyPot MCP blocklist — generated {datetime.now(timezone.utc).isoformat()}\n"
+        f"# HoneyPot MCP blocklist — generated {datetime.now(UTC).isoformat()}\n"
         f"# {len(offenders)} IPs with >= {min_hits} alerts in the last {hours}h.\n"
     )
     if format == "iptables":
@@ -524,12 +539,12 @@ async def export_stix(hours: int = 24, min_hits: int = 1) -> str:
     """
     import json
     import uuid
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     async with get_session() as session:
         offenders = await queries.get_top_offenders(session, hours, min_hits)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     objects = [
         {
             "type": "indicator",
@@ -567,11 +582,13 @@ async def threat_timeline(
         hours: How many hours back to look (default 24).
         limit: Maximum events to return.
     """
-    from datetime import datetime, timedelta, timezone
-    from sqlalchemy import select, desc
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import select
+
     from honeypot_mcp.storage.models import Alert
 
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = datetime.now(UTC) - timedelta(hours=hours)
 
     async with get_session() as session:
         q = select(Alert).where(Alert.timestamp >= since)

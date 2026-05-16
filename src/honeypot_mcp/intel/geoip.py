@@ -29,12 +29,13 @@ async def lookup_geoip(ip: str) -> dict[str, Any]:
         return {
             "available": False,
             "note": f"GeoIP database not found at {db_path}. "
-                    f"Download GeoLite2-City.mmdb from maxmind.com and place it there.",
+            f"Download GeoLite2-City.mmdb from maxmind.com and place it there.",
         }
 
     try:
-        import geoip2.database
         import asyncio
+
+        import geoip2.database
 
         loop = asyncio.get_event_loop()
 

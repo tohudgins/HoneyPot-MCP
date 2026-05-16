@@ -18,8 +18,8 @@ from aiohttp import web
 from sqlalchemy import select
 
 from honeypot_mcp.config import get_settings
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
     AlertSeverity,
     AttackerEvent,
@@ -32,8 +32,7 @@ log = logging.getLogger(__name__)
 
 # 1x1 transparent PNG, base64-encoded (decoded at import).
 _PIXEL = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIA"
-    "AAoAAv/lxKUAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII="
 )
 
 
@@ -86,15 +85,21 @@ async def _trigger(token: Honeytoken, request: web.Request) -> None:
             },
             severity=AlertSeverity.CRITICAL,
         )
-        session.add(AttackerEvent(
-            ip=src_ip,
-            event_type=f"honeytoken_triggered_{live.type.value}",
-            honeytoken_id=live.id,
-            extra=trigger_meta,
-        ))
+        session.add(
+            AttackerEvent(
+                ip=src_ip,
+                event_type=f"honeytoken_triggered_{live.type.value}",
+                honeytoken_id=live.id,
+                extra=trigger_meta,
+            )
+        )
     log.warning(
         "Honeytoken TRIGGERED — id=%s type=%s label=%r src=%s ua=%r",
-        live.id, live.type.value, live.label, src_ip, user_agent,
+        live.id,
+        live.type.value,
+        live.label,
+        src_ip,
+        user_agent,
     )
 
 
@@ -138,6 +143,11 @@ async def start_canary_server() -> web.AppRunner | None:
         log.info("Canary callback server listening on %s:%d", host, port)
         return runner
     except OSError as e:
-        log.warning("Canary callback server could not bind %s:%d (%s) — canary tokens will not trigger.", host, port, e)
+        log.warning(
+            "Canary callback server could not bind %s:%d (%s) — canary tokens will not trigger.",
+            host,
+            port,
+            e,
+        )
         await runner.cleanup()
         return None

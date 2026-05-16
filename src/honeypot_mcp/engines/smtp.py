@@ -8,8 +8,8 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
@@ -48,19 +48,19 @@ class _SMTPProtocol(asyncio.Protocol):
             self._transport.write(b"250-localhost Hello\r\n250 OK\r\n")
         elif upper.startswith("AUTH"):
             self._transport.write(b"334 VXNlcm5hbWU6\r\n")  # "Username:" base64
-            asyncio.create_task(self._record_event(
-                "smtp_auth_attempt", AlertSeverity.HIGH, {"command": line}
-            ))
+            asyncio.create_task(
+                self._record_event("smtp_auth_attempt", AlertSeverity.HIGH, {"command": line})
+            )
         elif upper.startswith("MAIL FROM"):
             self._transport.write(b"250 OK\r\n")
-            asyncio.create_task(self._record_event(
-                "smtp_mail_from", AlertSeverity.MEDIUM, {"command": line}
-            ))
+            asyncio.create_task(
+                self._record_event("smtp_mail_from", AlertSeverity.MEDIUM, {"command": line})
+            )
         elif upper.startswith("RCPT TO"):
             self._transport.write(b"250 OK\r\n")
-            asyncio.create_task(self._record_event(
-                "smtp_rcpt_to", AlertSeverity.MEDIUM, {"command": line}
-            ))
+            asyncio.create_task(
+                self._record_event("smtp_rcpt_to", AlertSeverity.MEDIUM, {"command": line})
+            )
         elif upper == "DATA":
             self._transport.write(b"354 Start mail input\r\n")
         elif upper == "QUIT":
@@ -72,14 +72,16 @@ class _SMTPProtocol(asyncio.Protocol):
 
     async def _record_event(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
         src_ip, src_port = self._peer
-        await submit_event(PendingEvent(
-            honeypot_id=self._hp_id,
-            source_ip=src_ip,
-            source_port=src_port,
-            event_type=event_type,
-            payload=payload,
-            severity=severity,
-        ))
+        await submit_event(
+            PendingEvent(
+                honeypot_id=self._hp_id,
+                source_ip=src_ip,
+                source_port=src_port,
+                event_type=event_type,
+                payload=payload,
+                severity=severity,
+            )
+        )
 
     def connection_lost(self, exc: Exception | None) -> None:
         pass

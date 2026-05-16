@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastmcp import FastMCP
 
 from honeypot_mcp.canary import start_canary_server
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import close_db, get_session, init_db
 from honeypot_mcp.storage.event_buffer import get_buffer
 from honeypot_mcp.storage.models import HoneypotStatus, HoneytokenStatus
-from honeypot_mcp.storage import queries
 from honeypot_mcp.watchdog import get_watchdog
 from honeypot_mcp.webhooks import get_delivery
 
@@ -64,29 +64,31 @@ mcp = FastMCP(
 
 # ── Register tool modules ─────────────────────────────────────────────────────
 # Import here so the @mcp.tool decorators execute at module load time.
-import honeypot_mcp.tools.honeypot      # noqa: E402, F401
-import honeypot_mcp.tools.honeytoken    # noqa: E402, F401
-import honeypot_mcp.tools.alerts        # noqa: E402, F401
-import honeypot_mcp.tools.analysis      # noqa: E402, F401
+import honeypot_mcp.tools.alerts  # noqa: E402, F401
+import honeypot_mcp.tools.analysis  # noqa: E402, F401
+import honeypot_mcp.tools.honeypot  # noqa: E402, F401
+import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
 import honeypot_mcp.tools.integrations  # noqa: E402, F401
 
-
 # ── Built-in diagnostic tools ─────────────────────────────────────────────────
+
 
 @mcp.tool
 async def ping() -> dict[str, Any]:
     """Verify the MCP server is running and the database is reachable."""
     async with get_session() as session:
         from sqlalchemy import text
+
         await session.execute(text("SELECT 1"))
     return {
         "status": "ok",
         "server": "HoneyPot MCP",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
 # ── MCP Resources ─────────────────────────────────────────────────────────────
+
 
 @mcp.resource("honeypot://active")
 async def resource_active_honeypots() -> str:
@@ -98,8 +100,7 @@ async def resource_active_honeypots() -> str:
     if not honeypots:
         return "No honeypots currently running."
     rows = [
-        f"  [{hp.type.value}] {hp.name} :{hp.port}  hits={counts.get(hp.id, 0)}"
-        for hp in honeypots
+        f"  [{hp.type.value}] {hp.name} :{hp.port}  hits={counts.get(hp.id, 0)}" for hp in honeypots
     ]
     return "Active honeypots:\n" + "\n".join(rows)
 
@@ -126,10 +127,7 @@ async def resource_triggered_tokens() -> str:
         tokens = await queries.list_honeytokens(session, status=HoneytokenStatus.TRIGGERED)
     if not tokens:
         return "No honeytokens have been triggered yet."
-    lines = [
-        f"[{t.type.value}] {t.label} — triggered at {t.triggered_at}"
-        for t in tokens
-    ]
+    lines = [f"[{t.type.value}] {t.label} — triggered at {t.triggered_at}" for t in tokens]
     return "\n".join(lines)
 
 
@@ -140,16 +138,12 @@ async def resource_stats_dashboard() -> str:
         stats = await queries.get_alert_stats(session)
         all_honeypots = await queries.list_honeypots(session)
         running = sum(1 for h in all_honeypots if h.status == HoneypotStatus.RUNNING)
-        triggered_tokens = await queries.list_honeytokens(session, status=HoneytokenStatus.TRIGGERED)
+        triggered_tokens = await queries.list_honeytokens(
+            session, status=HoneytokenStatus.TRIGGERED
+        )
 
-    top_ips = "\n".join(
-        f"  {r['ip']:20s} {r['count']} hits"
-        for r in stats["top_source_ips"][:5]
-    )
-    top_types = "\n".join(
-        f"  {r['type']:30s} {r['count']}"
-        for r in stats["top_event_types"][:5]
-    )
+    top_ips = "\n".join(f"  {r['ip']:20s} {r['count']} hits" for r in stats["top_source_ips"][:5])
+    top_types = "\n".join(f"  {r['type']:30s} {r['count']}" for r in stats["top_event_types"][:5])
     return (
         f"=== HoneyPot MCP Dashboard ===\n"
         f"Honeypots:        {len(all_honeypots)} total  ({running} running)\n"

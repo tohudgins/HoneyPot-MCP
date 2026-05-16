@@ -77,7 +77,10 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
-            return {"available": False, "error": "AbuseIPDB rate limit hit — 1,000/day on free tier."}
+            return {
+                "available": False,
+                "error": "AbuseIPDB rate limit hit — 1,000/day on free tier.",
+            }
         if e.response.status_code == 422:
             return {"available": False, "error": f"Invalid IP address: {ip}"}
         log.warning("AbuseIPDB error for %s: %s", ip, e)
@@ -109,7 +112,7 @@ async def report_ip(ip: str, categories: list[int], comment: str = "") -> dict[s
     payload = {
         "ip": ip,
         "categories": ",".join(str(c) for c in categories),
-        "comment": comment or f"Detected by HoneyPot MCP honeypot system.",
+        "comment": comment or "Detected by HoneyPot MCP honeypot system.",
     }
 
     try:
@@ -124,12 +127,27 @@ async def report_ip(ip: str, categories: list[int], comment: str = "") -> dict[s
 
 # AbuseIPDB category code → human-readable label
 _CATEGORY_NAMES: dict[int, str] = {
-    1: "DNS Compromise", 2: "DNS Poisoning", 3: "Fraud Orders",
-    4: "DDoS Attack", 5: "FTP Brute-Force", 6: "Ping of Death",
-    7: "Phishing", 8: "Fraud VoIP", 9: "Open Proxy",
-    10: "Web Spam", 11: "Email Spam", 12: "Blog Spam",
-    13: "VPN IP", 14: "Port Scan", 15: "Hacking",
-    16: "SQL Injection", 17: "Spoofing", 18: "Brute-Force",
-    19: "Bad Web Bot", 20: "Exploited Host", 21: "Web App Attack",
-    22: "SSH", 23: "IoT Targeted",
+    1: "DNS Compromise",
+    2: "DNS Poisoning",
+    3: "Fraud Orders",
+    4: "DDoS Attack",
+    5: "FTP Brute-Force",
+    6: "Ping of Death",
+    7: "Phishing",
+    8: "Fraud VoIP",
+    9: "Open Proxy",
+    10: "Web Spam",
+    11: "Email Spam",
+    12: "Blog Spam",
+    13: "VPN IP",
+    14: "Port Scan",
+    15: "Hacking",
+    16: "SQL Injection",
+    17: "Spoofing",
+    18: "Brute-Force",
+    19: "Bad Web Bot",
+    20: "Exploited Host",
+    21: "Web App Attack",
+    22: "SSH",
+    23: "IoT Targeted",
 }

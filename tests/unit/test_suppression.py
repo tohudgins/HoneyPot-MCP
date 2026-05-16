@@ -5,7 +5,6 @@ rate-limit rules pass the first N events and drop the rest within the window;
 empty patterns mean 'match anything'.
 """
 
-import asyncio
 import os
 
 import pytest
@@ -15,8 +14,9 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
 @pytest.fixture(autouse=True)
 async def setup_db():
-    from honeypot_mcp.storage.database import close_db, init_db
     from honeypot_mcp import suppression
+    from honeypot_mcp.storage.database import close_db, init_db
+
     await init_db()
     suppression.invalidate_rule_cache()
     suppression._rate_state.clear()
@@ -27,6 +27,7 @@ async def setup_db():
 def _event(ip="1.2.3.4", event_type="ssh_login_failed"):
     from honeypot_mcp.storage.event_buffer import PendingEvent
     from honeypot_mcp.storage.models import AlertSeverity
+
     return PendingEvent(
         honeypot_id=None,
         source_ip=ip,
@@ -39,6 +40,7 @@ def _event(ip="1.2.3.4", event_type="ssh_login_failed"):
 async def _add_rule(**kw):
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import SuppressionRule
+
     async with get_session() as session:
         r = SuppressionRule(**kw)
         session.add(r)
@@ -49,6 +51,7 @@ async def _add_rule(**kw):
 @pytest.mark.asyncio
 async def test_drop_by_exact_ip():
     from honeypot_mcp import suppression
+
     await _add_rule(label="block-1", ip_pattern="1.2.3.4", action="drop")
     suppression.invalidate_rule_cache()
 
@@ -62,6 +65,7 @@ async def test_drop_by_exact_ip():
 @pytest.mark.asyncio
 async def test_drop_by_cidr():
     from honeypot_mcp import suppression
+
     await _add_rule(label="block-net", ip_pattern="10.0.0.0/8", action="drop")
     suppression.invalidate_rule_cache()
 
@@ -75,6 +79,7 @@ async def test_drop_by_cidr():
 @pytest.mark.asyncio
 async def test_drop_by_event_type_glob():
     from honeypot_mcp import suppression
+
     await _add_rule(label="block-ssh", event_type_pattern="ssh_*", action="drop")
     suppression.invalidate_rule_cache()
 
@@ -88,6 +93,7 @@ async def test_drop_by_event_type_glob():
 @pytest.mark.asyncio
 async def test_rate_limit_allows_first_n_then_drops():
     from honeypot_mcp import suppression
+
     await _add_rule(
         label="rate",
         ip_pattern="5.5.5.5",
@@ -112,6 +118,7 @@ async def test_rate_limit_allows_first_n_then_drops():
 @pytest.mark.asyncio
 async def test_inactive_rule_does_not_match():
     from honeypot_mcp import suppression
+
     await _add_rule(label="off", ip_pattern="1.1.1.1", action="drop", active=False)
     suppression.invalidate_rule_cache()
 

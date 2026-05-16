@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -17,12 +18,10 @@ async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) ->
             asyncio.open_connection(host, port), timeout=timeout
         )
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
         return {"alive": True, "detail": "TCP port responsive", "method": "tcp"}
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"alive": False, "detail": f"TCP probe timed out after {timeout}s", "method": "tcp"}
     except (ConnectionRefusedError, OSError) as e:
         return {"alive": False, "detail": f"TCP probe failed: {e}", "method": "tcp"}

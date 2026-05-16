@@ -8,7 +8,7 @@ Markdown rendering escapes pipe and backslash characters in cell values.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from jinja2 import BaseLoader, Environment, select_autoescape
@@ -35,7 +35,7 @@ async def generate(
     ip_counts = Counter(a.source_ip for a in alerts)
     sev_counts = Counter(a.severity.value for a in alerts)
 
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     timeline = sorted(
         [
@@ -173,19 +173,19 @@ def _render_markdown(ctx: dict) -> str:
 
     target_line = f"**Target IP:** `{_md_cell(ctx['target_ip'])}`" if ctx["target_ip"] else ""
 
-    return f"""# {_md_cell(ctx['title'])}
+    return f"""# {_md_cell(ctx["title"])}
 
-**Generated:** {ctx['generated_at']}
+**Generated:** {ctx["generated_at"]}
 {target_line}
 
 ## Summary
 
 | Metric | Value |
 |---|---|
-| Total Alerts | {ctx['total_alerts']} |
-| Unique Attacker IPs | {ctx['total_unique_ips']} |
-| Critical Events | {ctx['severity_counts'].get('critical', 0)} |
-| MITRE Techniques Observed | {len(ctx['ttps'])} |
+| Total Alerts | {ctx["total_alerts"]} |
+| Unique Attacker IPs | {ctx["total_unique_ips"]} |
+| Critical Events | {ctx["severity_counts"].get("critical", 0)} |
+| MITRE Techniques Observed | {len(ctx["ttps"])} |
 
 ## MITRE ATT&CK Techniques
 

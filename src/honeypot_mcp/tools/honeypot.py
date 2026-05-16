@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
+from honeypot_mcp.engines import get_engine
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
-from honeypot_mcp.engines import get_engine, list_engine_types
 
 
 @mcp.tool
@@ -332,14 +333,18 @@ async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict
             "status": hp.status.value,
         }
         if hp.container_id is None:
-            entry.update({"alive": False, "detail": "No container_id — never started?", "method": "none"})
+            entry.update(
+                {"alive": False, "detail": "No container_id — never started?", "method": "none"}
+            )
         else:
             try:
                 engine = get_engine(hp.type)
                 health = await engine.health_check(hp.container_id, hp.port)
                 entry.update(health)
             except Exception as e:
-                entry.update({"alive": False, "detail": f"Health check error: {e}", "method": "error"})
+                entry.update(
+                    {"alive": False, "detail": f"Health check error: {e}", "method": "error"}
+                )
         results.append(entry)
 
     if name and len(results) == 1:
@@ -379,7 +384,7 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
         hp_port = hp.port
 
     marker = f"selftest_{secrets.token_hex(6)}"
-    probe_start = datetime.now(timezone.utc)
+    probe_start = datetime.now(UTC)
 
     sent_ok, send_detail = await _send_probe(hp_type, hp_port, marker)
     if not sent_ok:
@@ -406,7 +411,7 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
             )
             match = result.scalar_one_or_none()
             if match:
-                duration = (datetime.now(timezone.utc) - probe_start).total_seconds()
+                duration = (datetime.now(UTC) - probe_start).total_seconds()
                 return {
                     "name": name,
                     "type": hp_type,
@@ -467,10 +472,8 @@ async def _ssh_probe(port: int, marker: str) -> tuple[bool, str]:
         await asyncio.sleep(0.5)
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
     return True, "SSH banner sent"
 
 
@@ -499,10 +502,8 @@ async def _smtp_probe(port: int, marker: str) -> tuple[bool, str]:
         await asyncio.sleep(0.3)
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
     return True, "SMTP AUTH sent"
 
 
@@ -519,10 +520,8 @@ async def _ftp_probe(port: int, marker: str) -> tuple[bool, str]:
         await asyncio.sleep(0.3)
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
     return True, "FTP USER+PASS sent"
 
 
@@ -548,17 +547,17 @@ async def _dns_probe(port: int, marker: str) -> tuple[bool, str]:
     try:
         query = dnslib.DNSRecord.question(f"{marker}.selftest").pack()
         transport.sendto(query)
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(proto.received.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
     finally:
         transport.close()
     return True, "DNS query sent"
 
 
 @mcp.tool
-async def honeypot_clone(source_name: str, new_port: int, new_name: str | None = None) -> dict[str, Any]:
+async def honeypot_clone(
+    source_name: str, new_port: int, new_name: str | None = None
+) -> dict[str, Any]:
     """Clone an existing honeypot with a new port (and optionally a new name).
 
     Args:

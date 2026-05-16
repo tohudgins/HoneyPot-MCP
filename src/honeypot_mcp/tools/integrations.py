@@ -10,7 +10,7 @@ Subscriptions and rules are stored in the DB and survive restarts.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import select, update
@@ -18,7 +18,6 @@ from sqlalchemy import select, update
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertSeverity, Subscription, SuppressionRule
-
 
 # ── Subscriptions ─────────────────────────────────────────────────────────────
 
@@ -79,9 +78,7 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
     """
     async with get_session() as session:
         result = await session.execute(
-            update(Subscription)
-            .where(Subscription.id == subscription_id)
-            .values(active=False)
+            update(Subscription).where(Subscription.id == subscription_id).values(active=False)
         )
         if result.rowcount == 0:
             return {"error": f"No subscription with id={subscription_id}."}
@@ -152,14 +149,18 @@ async def suppression_add(
         expires_in_hours: Auto-deactivate the rule after this many hours.
     """
     if action == "rate_limit" and (rate_limit_count is None or rate_limit_window_seconds is None):
-        return {"error": "rate_limit action requires rate_limit_count and rate_limit_window_seconds."}
+        return {
+            "error": "rate_limit action requires rate_limit_count and rate_limit_window_seconds."
+        }
 
     if not ip_pattern and not event_type_pattern:
-        return {"error": "Specify ip_pattern, event_type_pattern, or both — empty rules would match every event."}
+        return {
+            "error": "Specify ip_pattern, event_type_pattern, or both — empty rules would match every event."
+        }
 
     expires_at = None
     if expires_in_hours is not None:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
+        expires_at = datetime.now(UTC) + timedelta(hours=expires_in_hours)
 
     async with get_session() as session:
         rule = SuppressionRule(
@@ -178,6 +179,7 @@ async def suppression_add(
 
     # Force the suppression engine to pick up the new rule on its next event.
     from honeypot_mcp.suppression import invalidate_rule_cache
+
     invalidate_rule_cache()
 
     return {
@@ -202,14 +204,13 @@ async def suppression_remove(rule_id: int) -> dict[str, Any]:
     """
     async with get_session() as session:
         result = await session.execute(
-            update(SuppressionRule)
-            .where(SuppressionRule.id == rule_id)
-            .values(active=False)
+            update(SuppressionRule).where(SuppressionRule.id == rule_id).values(active=False)
         )
         if result.rowcount == 0:
             return {"error": f"No suppression rule with id={rule_id}."}
 
     from honeypot_mcp.suppression import invalidate_rule_cache
+
     invalidate_rule_cache()
     return {"id": rule_id, "active": False}
 

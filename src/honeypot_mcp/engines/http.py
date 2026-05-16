@@ -14,6 +14,7 @@ so users can map their own paths to templates the same way they always have.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import secrets
@@ -29,8 +30,8 @@ from honeypot_mcp.engines.http_personas import (
     pick_random_persona_id,
 )
 from honeypot_mcp.engines.http_templates import get_template
-from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage import queries
+from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity, Honeypot
 
@@ -77,9 +78,7 @@ class HTTPEngine(HoneypotEngine):
             if hp_id is not None:
                 async with get_session() as session:
                     await session.execute(
-                        update(Honeypot)
-                        .where(Honeypot.id == hp_id)
-                        .values(config=config)
+                        update(Honeypot).where(Honeypot.id == hp_id).values(config=config)
                     )
 
         persona = get_persona(config.get("persona"))
@@ -95,7 +94,10 @@ class HTTPEngine(HoneypotEngine):
         self._runners[container_id] = (runner, name)
         log.info(
             "HTTP honeypot '%s' listening on port %d (id=%s, persona=%s)",
-            name, port, container_id[:12], persona.id,
+            name,
+            port,
+            container_id[:12],
+            persona.id,
         )
         return container_id
 
@@ -123,9 +125,7 @@ class HTTPEngine(HoneypotEngine):
         # Map path → template name, built once at start so the per-request
         # handler is just a dict lookup.
         path_to_template: dict[str, str] = {
-            ep["path"]: ep.get("template", "generic_login")
-            for ep in endpoints
-            if "path" in ep
+            ep["path"]: ep.get("template", "generic_login") for ep in endpoints if "path" in ep
         }
 
         app = web.Application()
@@ -139,10 +139,8 @@ class HTTPEngine(HoneypotEngine):
 
             post_data: dict = {}
             if method == "POST":
-                try:
+                with contextlib.suppress(Exception):
                     post_data = dict(await request.post())
-                except Exception:
-                    pass
 
             matched_template = path_to_template.get(path)
             severity = _PATH_SEVERITY.get(path, AlertSeverity.LOW)
@@ -161,13 +159,15 @@ class HTTPEngine(HoneypotEngine):
                 "persona": persona.id,
             }
 
-            await submit_event(PendingEvent(
-                honeypot_id=hp_id,
-                source_ip=src_ip,
-                event_type=event_type,
-                payload=payload,
-                severity=severity,
-            ))
+            await submit_event(
+                PendingEvent(
+                    honeypot_id=hp_id,
+                    source_ip=src_ip,
+                    event_type=event_type,
+                    payload=payload,
+                    severity=severity,
+                )
+            )
 
             # Per-persona response timing jitter — uniform sub-ms responses
             # are themselves a fingerprint.

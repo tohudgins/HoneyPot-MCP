@@ -1,6 +1,7 @@
 """Unit tests for MITRE ATT&CK mapper."""
 
 import pytest
+
 from honeypot_mcp.intel.mitre import map_to_attack
 
 
