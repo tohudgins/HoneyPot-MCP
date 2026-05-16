@@ -53,6 +53,10 @@ config/mitre_attack.json
 reports/*.html
 reports/*.md
 
+# Self-signed TLS certs generated per-honeypot at deploy time (engines/tls.py).
+# Keys are private; certs are deployment-specific.
+tls/
+
 # Generated honeytoken artifacts — contain unique tracker UIDs that would let
 # attackers fingerprint your callbacks if the repo were public.
 reports/generated/

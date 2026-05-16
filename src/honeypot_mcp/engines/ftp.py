@@ -1,4 +1,25 @@
-"""FTP honeypot engine — minimal asyncio FTP server."""
+"""FTP honeypot engine — ProFTPD-flavoured asyncio FTP server.
+
+Fidelity notes
+--------------
+Real FTP servers handle a richer command set than just USER / PASS / QUIT.
+Scanner-grade honeypots also need:
+
+* Anonymous-login flow (`USER anonymous` → `331` → any `PASS` → `230`). Many
+  scanners test for anonymous read access before they brute-force, so failing
+  it correctly is itself a signal source.
+* Realistic `FEAT` list (PASV, EPSV, SIZE, MDTM, REST STREAM, LANG en-US, UTF8).
+* `PASV` / `PORT` responses — even without a real data connection, real
+  attackers parse the `227 Entering Passive Mode (h,h,h,h,p1,p2)` tuple. We
+  return a closed local port so subsequent data-connection attempts fail
+  cleanly, which still records the attempt.
+* Basic post-login verbs (`PWD`, `CWD`, `TYPE`, `NOOP`, `SYST`) so anonymous
+  sessions don't immediately die at the first `LIST`.
+
+It is still low-fidelity FTP — no real file system, no working data
+connections — but significantly harder to fingerprint at the first-probe
+level than the previous `502 Command not implemented` skeleton.
+"""
 
 from __future__ import annotations
 
@@ -15,9 +36,26 @@ from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
 
+# ProFTPD-style FEAT listing.
+_FEAT_RESPONSE = (
+    b"211-Features:\r\n"
+    b" PASV\r\n"
+    b" EPSV\r\n"
+    b" SIZE\r\n"
+    b" MDTM\r\n"
+    b" REST STREAM\r\n"
+    b" LANG en-US\r\n"
+    b" UTF8\r\n"
+    b"211 End\r\n"
+)
+
+# Anonymous login usernames that real FTP servers accept under the anonymous
+# pseudo-account.
+_ANONYMOUS_USERS = {"anonymous", "ftp"}
+
 
 class _FTPProtocol(asyncio.Protocol):
-    """Minimal FTP server that captures login attempts."""
+    """ProFTPD-flavoured FTP control-channel handler."""
 
     def __init__(self, honeypot_name: str, honeypot_id: int | None, banner: str) -> None:
         self._name = honeypot_name
@@ -26,10 +64,14 @@ class _FTPProtocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._pending_user: str | None = None
+        self._authed: bool = False
+        self._anonymous: bool = False
+        self._cwd: str = "/"
         self._buf = b""
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self._transport = transport  # type: ignore[assignment]
+        assert isinstance(transport, asyncio.Transport)
+        self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         transport.write(f"220 {self._banner}\r\n".encode())
         asyncio.create_task(self._record("ftp_connection", AlertSeverity.LOW, {}))
@@ -39,36 +81,149 @@ class _FTPProtocol(asyncio.Protocol):
         while b"\r\n" in self._buf:
             line, self._buf = self._buf.split(b"\r\n", 1)
             cmd = line.decode("utf-8", errors="replace").strip()
-            self._handle_command(cmd)
+            if cmd:
+                self._handle_command(cmd)
 
     def _handle_command(self, cmd: str) -> None:
         parts = cmd.split(" ", 1)
         verb = parts[0].upper()
         arg = parts[1] if len(parts) > 1 else ""
+        t = self._transport
+        if t is None:
+            return
 
         if verb == "USER":
             self._pending_user = arg
-            self._transport.write(b"331 Password required\r\n")
+            if arg.lower() in _ANONYMOUS_USERS:
+                t.write(b"331 Anonymous login ok, send your email as password\r\n")
+            else:
+                t.write(b"331 Password required for " + arg.encode() + b"\r\n")
+
         elif verb == "PASS":
+            self._handle_pass(arg)
+
+        elif verb == "QUIT":
+            t.write(b"221 Goodbye.\r\n")
+            t.close()
+
+        elif verb == "SYST":
+            t.write(b"215 UNIX Type: L8\r\n")
+
+        elif verb == "FEAT":
+            t.write(_FEAT_RESPONSE)
+
+        elif verb == "NOOP":
+            t.write(b"200 NOOP command successful\r\n")
+
+        elif verb == "TYPE":
+            # Most clients send TYPE I (binary). Accept any single-letter type.
+            if arg and arg[0].upper() in ("I", "A", "L", "E"):
+                t.write(f"200 Type set to {arg.upper()}.\r\n".encode())
+            else:
+                t.write(b"501 Unrecognised TYPE.\r\n")
+
+        elif verb == "PWD" or verb == "XPWD":
+            self._require_auth_or(t)
+            if self._authed:
+                t.write(f'257 "{self._cwd}" is the current directory.\r\n'.encode())
+
+        elif verb == "CWD":
+            self._require_auth_or(t)
+            if self._authed:
+                target = arg if arg.startswith("/") else f"{self._cwd.rstrip('/')}/{arg}"
+                # Pretend the directory exists for shallow paths; deny anything
+                # that looks like a brute-force traversal beyond a few levels.
+                if target.count("/") > 8:
+                    t.write(b"550 Failed to change directory.\r\n")
+                else:
+                    self._cwd = target.rstrip("/") or "/"
+                    t.write(b"250 Directory successfully changed.\r\n")
+
+        elif verb == "LIST" or verb == "NLST":
+            self._require_auth_or(t)
+            if self._authed:
+                # We don't actually open a data connection. Most scanners
+                # interpret 425 as "data connection refused" — believable.
+                t.write(b"425 Use PORT or PASV first.\r\n")
+
+        elif verb == "PASV":
+            self._require_auth_or(t)
+            if self._authed:
+                self._handle_pasv(t)
+
+        elif verb == "PORT":
+            self._require_auth_or(t)
+            if self._authed:
+                t.write(b"200 PORT command successful.\r\n")
+                asyncio.create_task(
+                    self._record("ftp_port_command", AlertSeverity.MEDIUM, {"argument": arg})
+                )
+
+        elif verb == "STOR" or verb == "RETR" or verb == "APPE" or verb == "DELE":
+            self._require_auth_or(t)
+            if self._authed:
+                # Anonymous shouldn't be writing/reading files in a believable
+                # anonymous FTP. Real anonymous FTP usually allows RETR on
+                # /pub but we don't model that; return 550 and log.
+                t.write(b"550 Permission denied.\r\n")
+                asyncio.create_task(
+                    self._record(
+                        "ftp_file_op_blocked",
+                        AlertSeverity.HIGH,
+                        {"verb": verb, "argument": arg},
+                    )
+                )
+
+        else:
+            t.write(b"502 Command not implemented.\r\n")
+            asyncio.create_task(self._record("ftp_command", AlertSeverity.LOW, {"command": cmd}))
+
+    def _handle_pass(self, password: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        user = self._pending_user or ""
+        self._pending_user = None
+
+        if user.lower() in _ANONYMOUS_USERS:
+            # Anonymous accepts any password (conventionally an email).
+            self._authed = True
+            self._anonymous = True
+            t.write(b"230 Anonymous access granted, restrictions apply.\r\n")
             asyncio.create_task(
                 self._record(
-                    "ftp_login_attempt",
-                    AlertSeverity.HIGH,
-                    {"username": self._pending_user, "password": arg},
+                    "ftp_anonymous_login",
+                    AlertSeverity.MEDIUM,
+                    {"username": user, "password": password},
                 )
             )
-            self._transport.write(b"530 Login incorrect\r\n")
-            self._pending_user = None
-        elif verb == "QUIT":
-            self._transport.write(b"221 Goodbye\r\n")
-            self._transport.close()
-        elif verb == "SYST":
-            self._transport.write(b"215 UNIX Type: L8\r\n")
-        elif verb == "FEAT":
-            self._transport.write(b"211-Features:\r\n PASV\r\n211 End\r\n")
-        else:
-            self._transport.write(b"502 Command not implemented\r\n")
-            asyncio.create_task(self._record("ftp_command", AlertSeverity.LOW, {"command": cmd}))
+            return
+
+        # Authenticated login attempt — record the credential pair and reject.
+        asyncio.create_task(
+            self._record(
+                "ftp_login_attempt",
+                AlertSeverity.HIGH,
+                {"username": user, "password": password},
+            )
+        )
+        t.write(b"530 Login incorrect.\r\n")
+
+    def _handle_pasv(self, t: asyncio.Transport) -> None:
+        # Pick a high port that's almost certainly not listening. The 227
+        # response format encodes the address as h1,h2,h3,h4,p1,p2 where the
+        # port = p1 * 256 + p2. Real attackers parse this; we want them to
+        # connect, fail, and emit a `ftp_passive_attempt` we can log.
+        p = secrets.randbelow(64511) + 1024
+        p1, p2 = divmod(p, 256)
+        t.write(f"227 Entering Passive Mode (127,0,0,1,{p1},{p2}).\r\n".encode())
+        asyncio.create_task(self._record("ftp_passive_attempt", AlertSeverity.MEDIUM, {"port": p}))
+
+    def _require_auth_or(self, t: asyncio.Transport) -> None:
+        """Emit `530 Please login with USER and PASS` for unauthenticated calls.
+        Callers branch on `self._authed` after this."""
+        if not self._authed:
+            t.write(b"530 Please login with USER and PASS.\r\n")
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
         src_ip, src_port = self._peer

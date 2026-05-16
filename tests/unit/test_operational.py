@@ -1,0 +1,211 @@
+"""Operational-hygiene tests: suppression presets, canary rate limiting,
+Prometheus /metrics endpoint."""
+
+import asyncio
+import os
+import socket
+from collections import deque
+
+import pytest
+
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.fixture(autouse=True)
+async def setup_db():
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
+
+    event_buffer.reset_for_tests()
+    await init_db()
+    yield
+    await asyncio.sleep(0.05)
+    event_buffer.reset_for_tests()
+    await close_db()
+
+
+# ── Suppression presets ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_suppression_load_preset_shodan_installs_rules():
+    """Loading the shodan preset installs all its rules and they're active."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import SuppressionRule
+    from honeypot_mcp.tools.integrations import suppression_load_preset
+
+    result = await suppression_load_preset("shodan")
+    assert "error" not in result, result
+    assert result["preset"] == "shodan"
+    assert len(result["applied"]) >= 3
+
+    async with get_session() as session:
+        rules = list(
+            (await session.execute(select(SuppressionRule).where(SuppressionRule.active.is_(True))))
+            .scalars()
+            .all()
+        )
+    labels = [r.label for r in rules]
+    assert any(label.startswith("shodan-scanner-") for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_suppression_load_preset_unknown_returns_error():
+    from honeypot_mcp.tools.integrations import suppression_load_preset
+
+    result = await suppression_load_preset("does-not-exist")
+    assert "error" in result
+    assert "not found" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_suppression_load_preset_idempotent():
+    """Loading the same preset twice should skip duplicates rather than
+    create them — protects against accidental double-runs."""
+    from honeypot_mcp.tools.integrations import suppression_load_preset
+
+    r1 = await suppression_load_preset("censys")
+    r2 = await suppression_load_preset("censys")
+    assert len(r1["applied"]) > 0
+    # Second run should mostly skip
+    assert len(r2["skipped"]) >= len(r1["applied"])
+
+
+@pytest.mark.asyncio
+async def test_suppression_list_presets_finds_bundled():
+    from honeypot_mcp.tools.integrations import suppression_list_presets
+
+    presets = await suppression_list_presets()
+    assert "shodan" in presets
+    assert "censys" in presets
+    assert "internal-rfc1918" in presets
+
+
+# ── Canary rate limiting ────────────────────────────────────────────────
+
+
+def test_canary_rate_limit_under_threshold_passes():
+    """A handful of hits from one IP shouldn't trip the limit."""
+    from honeypot_mcp import canary
+
+    canary._rate_state.clear()
+    for _ in range(5):
+        assert canary._rate_limit_check("1.2.3.4") is False
+
+
+def test_canary_rate_limit_over_threshold_blocks():
+    """After 30 hits in the same window, additional hits are blocked."""
+    from honeypot_mcp import canary
+
+    canary._rate_state.clear()
+    for _ in range(canary._RATE_MAX_PER_WINDOW):
+        assert canary._rate_limit_check("9.9.9.9") is False
+    # The next hit should be blocked
+    assert canary._rate_limit_check("9.9.9.9") is True
+
+
+def test_canary_rate_limit_isolates_per_ip():
+    """One noisy IP can't suppress another's traffic."""
+    from honeypot_mcp import canary
+
+    canary._rate_state.clear()
+    # Burn through the limit for one IP
+    for _ in range(canary._RATE_MAX_PER_WINDOW):
+        canary._rate_limit_check("8.8.8.8")
+    assert canary._rate_limit_check("8.8.8.8") is True
+    # A different IP still passes
+    assert canary._rate_limit_check("1.1.1.1") is False
+
+
+def test_canary_rate_limit_window_expiry():
+    """Old timestamps drop off the window. Manually simulate by injecting
+    timestamps older than the window."""
+    import time
+
+    from honeypot_mcp import canary
+
+    canary._rate_state.clear()
+    src = "5.5.5.5"
+    # Inject 30 old timestamps (well outside the window)
+    canary._rate_state[src] = deque(
+        [time.monotonic() - canary._RATE_WINDOW_SECONDS - 10] * canary._RATE_MAX_PER_WINDOW
+    )
+    # A new hit should clean them up and pass
+    assert canary._rate_limit_check(src) is False
+
+
+# ── Prometheus /metrics ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_returns_text_format():
+    """Bring up the metrics server and confirm `/metrics` returns Prometheus
+    text-format exposition."""
+    import httpx
+
+    from honeypot_mcp.metrics import start_metrics_server
+
+    port = _free_port()
+    runner = await start_metrics_server("127.0.0.1", port)
+    assert runner is not None
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"http://127.0.0.1:{port}/metrics")
+    finally:
+        await runner.cleanup()
+
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["Content-Type"]
+    body = r.text
+    # Required metric names appear (zero-value counters are fine)
+    assert "honeypot_active_honeypots" in body
+    # Must contain HELP/TYPE comments for at least one metric
+    assert "# HELP" in body
+    assert "# TYPE" in body
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_counts_alerts_by_severity():
+    """Seed a few alerts then scrape /metrics; the severity counters reflect
+    what was written."""
+    import httpx
+
+    from honeypot_mcp.metrics import start_metrics_server
+    from honeypot_mcp.storage import queries
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    async with get_session() as session:
+        for severity in (AlertSeverity.HIGH, AlertSeverity.HIGH, AlertSeverity.CRITICAL):
+            await queries.create_alert(
+                session,
+                honeypot_id=None,
+                source_ip="1.2.3.4",
+                source_port=None,
+                event_type="metric_test",
+                payload={},
+                severity=severity,
+            )
+
+    port = _free_port()
+    runner = await start_metrics_server("127.0.0.1", port)
+    assert runner is not None
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"http://127.0.0.1:{port}/metrics")
+    finally:
+        await runner.cleanup()
+
+    body = r.text
+    assert 'honeypot_alerts_total{severity="high"} 2' in body
+    assert 'honeypot_alerts_total{severity="critical"} 1' in body

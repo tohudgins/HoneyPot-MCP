@@ -1,0 +1,34 @@
+# Shodan scanner suppression preset.
+#
+# Shodan crawlers probe every IPv4 on the public internet — running a
+# honeypot on a public IP guarantees Shodan traffic. Suppressing it keeps
+# the alert stream focused on actually-interesting attackers.
+#
+# Source: https://www.shodan.io/page/network — Shodan publishes its
+# scanner CIDR blocks. List below is sampled from their public list; refresh
+# periodically.
+#
+# Verify before loading:  https://www.shodan.io/host/<ip>  (any Shodan IP
+# returns a Shodan-themed host page).
+#
+# To revert: list rules via `suppression_list`, then `suppression_remove`
+# each one by id.
+
+name: shodan
+description: Suppress known Shodan scanner CIDR ranges
+rules:
+  - label: shodan-scanner-66.240
+    ip_pattern: 66.240.192.0/18
+    action: drop
+  - label: shodan-scanner-71.6
+    ip_pattern: 71.6.128.0/17
+    action: drop
+  - label: shodan-scanner-198.20
+    ip_pattern: 198.20.64.0/18
+    action: drop
+  - label: shodan-scanner-208.180
+    ip_pattern: 208.180.20.0/22
+    action: drop
+  - label: shodan-scanner-209.126
+    ip_pattern: 209.126.110.0/24
+    action: drop

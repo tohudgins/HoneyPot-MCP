@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     canary_callback_port: int = 8888
     canary_public_url: str = "http://localhost:8888"
 
+    # Prometheus /metrics endpoint — separate port from honeypot listeners
+    # so scrapers can be locked down independently. Set port to 0 to disable.
+    metrics_host: str = "0.0.0.0"
+    metrics_port: int = 9090
+
     # Docker
     docker_socket: str = Field(default="", description="Docker socket URI")
 
@@ -51,6 +56,9 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+    # `text` (human-readable) or `json` (one JSON object per line — pipes
+    # cleanly into Loki / Splunk / Cloudwatch Logs Insights).
+    log_format: str = "text"
 
     # YAML config overlay (loaded separately)
     _yaml_config: dict[str, Any] = {}

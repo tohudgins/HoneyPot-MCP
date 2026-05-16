@@ -66,10 +66,10 @@ async def honeypot_deploy(
     container_id = await engine.start(resolved_name, resolved_port, resolved_config)
 
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_id(session, hp_id)
-        if hp:
-            hp.status = HoneypotStatus.RUNNING
-            hp.container_id = container_id
+        hp_refresh = await queries.get_honeypot_by_id(session, hp_id)
+        if hp_refresh:
+            hp_refresh.status = HoneypotStatus.RUNNING
+            hp_refresh.container_id = container_id
 
     return {
         "id": hp_id,

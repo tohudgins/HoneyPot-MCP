@@ -1,0 +1,25 @@
+# Internal RFC1918 traffic suppression preset.
+#
+# If you deploy the honeypot inside a corporate network as a trip-wire,
+# you probably DON'T want every health check from your monitoring system
+# generating CRITICAL alerts. This preset drops all RFC1918 + link-local
+# noise.
+#
+# Don't load this preset if the honeypot is the trip-wire FOR internal
+# attackers — internal IPs are exactly what you want to alert on then.
+
+name: internal-rfc1918
+description: Drop all RFC1918 and link-local source traffic
+rules:
+  - label: internal-10.0.0.0/8
+    ip_pattern: 10.0.0.0/8
+    action: drop
+  - label: internal-172.16.0.0/12
+    ip_pattern: 172.16.0.0/12
+    action: drop
+  - label: internal-192.168.0.0/16
+    ip_pattern: 192.168.0.0/16
+    action: drop
+  - label: internal-169.254.0.0/16
+    ip_pattern: 169.254.0.0/16
+    action: drop

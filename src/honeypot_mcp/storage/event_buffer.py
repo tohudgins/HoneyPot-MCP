@@ -108,19 +108,24 @@ class EventBuffer:
                     log.warning("Event buffer on_flush hook failed: %s", e)
 
     async def _flush(self, batch: list[PendingEvent]) -> None:
+        # (Alert object, source_ip) for any CRITICAL event we'll auto-enrich
+        # after the session commits. We can't gather inside the session because
+        # alert.id isn't populated until session.flush(), and we don't want the
+        # external API calls inside the DB transaction.
+        to_enrich: list[tuple[Alert, str]] = []
+
         async with get_session() as session:
             for ev in batch:
-                session.add(
-                    Alert(
-                        honeypot_id=ev.honeypot_id,
-                        source_ip=ev.source_ip,
-                        source_port=ev.source_port,
-                        event_type=ev.event_type,
-                        payload=ev.payload,
-                        severity=ev.severity,
-                        timestamp=ev.timestamp,
-                    )
+                alert = Alert(
+                    honeypot_id=ev.honeypot_id,
+                    source_ip=ev.source_ip,
+                    source_port=ev.source_port,
+                    event_type=ev.event_type,
+                    payload=ev.payload,
+                    severity=ev.severity,
+                    timestamp=ev.timestamp,
                 )
+                session.add(alert)
                 session.add(
                     AttackerEvent(
                         ip=ev.source_ip,
@@ -130,6 +135,28 @@ class EventBuffer:
                         timestamp=ev.timestamp,
                     )
                 )
+                if ev.severity == AlertSeverity.CRITICAL and _is_enrichable_ip(ev.source_ip):
+                    to_enrich.append((alert, ev.source_ip))
+                if ev.honeytoken_id is not None and ev.event_type.startswith(
+                    "honeytoken_triggered_"
+                ):
+                    # Lazy import — queries pulls models which is fine, but keeps
+                    # the import surface of this module minimal.
+                    from honeypot_mcp.storage import queries
+
+                    trigger_meta = {
+                        "trigger_ip": ev.source_ip,
+                        "trigger_event_type": ev.event_type,
+                        "payload": ev.payload,
+                    }
+                    await queries.mark_honeytoken_triggered(session, ev.honeytoken_id, trigger_meta)
+            await session.flush()  # populate alert.id for the enrichment hook
+            enrich_targets = [(alert.id, ip) for alert, ip in to_enrich]
+
+        # Outside the session: kick off background enrichment. Failures here
+        # must never affect ingest — log and move on.
+        for alert_id, ip in enrich_targets:
+            asyncio.create_task(_enrich_alert_async(alert_id, ip))
 
 
 _buffer: EventBuffer | None = None
@@ -157,15 +184,37 @@ async def submit_event(event: PendingEvent) -> None:
     """Module-level convenience for engines.
 
     Suppression rules are evaluated here — events that match an active drop or
-    rate-limit rule are dropped before they enter the buffer. We import lazily
-    to avoid an import cycle between event_buffer ⇄ suppression."""
-    from honeypot_mcp import suppression
+    rate-limit rule are dropped before they enter the buffer. Credential
+    honeytoken matching runs next: when planted creds appear in a login
+    attempt payload, severity is escalated to CRITICAL and the event is tagged
+    with `honeytoken_id` so the flusher can mark the token as triggered.
+
+    Imports are lazy to avoid a cycle (event_buffer ⇄ suppression ⇄
+    credential_match)."""
+    from honeypot_mcp import credential_match, suppression, token_matchers
 
     suppress, rule_id = await suppression.should_suppress(event)
     if suppress:
         if rule_id is not None:
             await _bump_suppression_count(rule_id)
         return
+
+    # Credentials matcher first — most events that match a planted credential
+    # token also look like normal failed logins, so we re-tag them as the
+    # first stop.
+    token_id = await credential_match.match(event)
+    if token_id is not None:
+        event.honeytoken_id = token_id
+        event.severity = AlertSeverity.CRITICAL
+        event.event_type = f"honeytoken_triggered_credential_via_{event.event_type}"
+    else:
+        # SSH key / JWT / DB row matchers — payload-pattern based.
+        token_id, match_type = await token_matchers.match(event)
+        if token_id is not None:
+            event.honeytoken_id = token_id
+            event.severity = AlertSeverity.CRITICAL
+            event.event_type = f"honeytoken_triggered_{match_type}_via_{event.event_type}"
+
     await get_buffer().submit(event)
 
 
@@ -185,3 +234,62 @@ async def _bump_suppression_count(rule_id: int) -> None:
             )
     except Exception as e:
         log.debug("Could not bump suppression count for rule %d: %s", rule_id, e)
+
+
+# IPs we never enrich — internal/loopback/placeholder addresses don't have
+# meaningful VirusTotal or AbuseIPDB records and burning rate-limit on them
+# is wasteful.
+_NON_ENRICHABLE = frozenset({"0.0.0.0", "127.0.0.1", "::1", "localhost", ""})
+
+
+def _is_enrichable_ip(ip: str) -> bool:
+    if ip in _NON_ENRICHABLE:
+        return False
+    # Private RFC1918 / link-local space — same logic as suppression module
+    # uses ipaddress.ip_network. Keeping the dependency local.
+    try:
+        import ipaddress
+
+        addr = ipaddress.ip_address(ip)
+        return not (addr.is_private or addr.is_loopback or addr.is_link_local)
+    except (ValueError, TypeError):
+        return False
+
+
+async def _enrich_alert_async(alert_id: int, ip: str) -> None:
+    """Background task: enrich one alert with VT + AbuseIPDB + GeoIP and merge
+    the result into the stored Alert.payload. Errors are swallowed — auto-
+    enrichment is a UX improvement, not a guarantee, and a failing external
+    API must not break ingest.
+
+    Cached via intel/_cache.py — repeat CRITICALs from the same IP within the
+    TTL window cost zero external calls."""
+    try:
+        from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
+        from honeypot_mcp.intel.geoip import lookup_geoip
+        from honeypot_mcp.intel.virustotal import lookup_virustotal
+
+        results: list[Any] = await asyncio.gather(
+            lookup_geoip(ip),
+            lookup_virustotal(ip),
+            lookup_abuseipdb(ip),
+            return_exceptions=True,
+        )
+        geo, vt, abuse = results[0], results[1], results[2]
+        enrichment = {
+            "geoip": geo if not isinstance(geo, Exception) else {"error": str(geo)},
+            "virustotal": vt if not isinstance(vt, Exception) else {"error": str(vt)},
+            "abuseipdb": abuse if not isinstance(abuse, Exception) else {"error": str(abuse)},
+        }
+
+        async with get_session() as session:
+            alert = await session.get(Alert, alert_id)
+            if alert is None:
+                return
+            # Re-assign the dict so SQLAlchemy's change-detection picks it up.
+            # JSON columns don't track in-place mutation by default.
+            new_payload = dict(alert.payload or {})
+            new_payload["enrichment"] = enrichment
+            alert.payload = new_payload
+    except Exception as e:
+        log.warning("Auto-enrichment failed for alert %d (ip=%s): %s", alert_id, ip, e)

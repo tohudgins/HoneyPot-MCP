@@ -39,7 +39,11 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
         }
 
     headers = {"Key": api_key, "Accept": "application/json"}
-    params = {"ipAddress": ip, "maxAgeInDays": max_age_days, "verbose": "true"}
+    params: dict[str, str | int] = {
+        "ipAddress": ip,
+        "maxAgeInDays": max_age_days,
+        "verbose": "true",
+    }
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:

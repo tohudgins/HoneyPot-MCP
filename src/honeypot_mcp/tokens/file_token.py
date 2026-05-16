@@ -124,6 +124,19 @@ async def _create_pdf(
 async def _create_docx(
     path: str, title: str, dns_canary: str, token_uid: str, settings: Any
 ) -> Path:
+    """Generate a DOCX with an External-mode image relationship pointing at
+    the canary URL. Word fetches external images when opening — that fetch
+    is the trigger.
+
+    This replaces the previous (inert) approach of writing the URL as
+    null-prefixed text in a footer paragraph, which Word never resolved.
+
+    Word's Protected View settings can block external image loading on first
+    open — the user is prompted to "Enable Editing". Many enterprise
+    deployments have Protected View disabled or auto-enable for trusted
+    locations, so the planted document still fires there. Documented in
+    KNOWN_LIMITATIONS.md.
+    """
     try:
         from docx import Document
 
@@ -134,15 +147,80 @@ async def _create_docx(
         )
         doc.add_heading("CLASSIFICATION: CONFIDENTIAL", level=1)
         doc.add_paragraph("Please refer to the appendix for technical details.")
-
-        # Add tracking URL as a 1x1 invisible image reference in footer
-        section = doc.sections[0]
-        footer = section.footer
-        tracking_url = f"http://{dns_canary}/t/{token_uid}"
-        footer.paragraphs[0].text = f"\x00{tracking_url}"  # Zero-width, not visible
-
         doc.save(path)
+
+        tracking_url = f"http://{dns_canary}/t/{token_uid}.png"
+        _inject_external_image_rel(path, tracking_url)
     except ImportError:
         Path(path).write_bytes(b"PK\x03\x04")  # Minimal ZIP stub
 
     return Path(path)
+
+
+def _inject_external_image_rel(path: str, image_url: str) -> None:
+    """Hand-edit the OOXML zip to add an External-mode image relationship
+    and a `<w:drawing>` element in the body that references it.
+
+    python-docx doesn't expose External-mode rels directly so we manipulate
+    the zip directly. Adds:
+      1. A new relationship in `word/_rels/document.xml.rels` of type
+         `.../image` with `Target="<url>"` and `TargetMode="External"`.
+      2. A run with `<w:drawing>...<a:blip r:link="rIdN"/>...</w:drawing>`
+         in the document body. The `r:link` (not `r:embed`) is what makes
+         Word treat it as an external resource and fetch it on open.
+    """
+    import re
+    import shutil
+    import tempfile
+    import zipfile
+
+    # Build the rel id — pick something unlikely to collide with python-docx output.
+    rel_id = "rIdHpCanary"
+
+    # New relationship XML to inject into document.xml.rels.
+    new_rel = (
+        f'<Relationship Id="{rel_id}" '
+        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        f'Target="{image_url}" TargetMode="External"/>'
+    )
+
+    # The drawing block — 1x1 EMU is too small; Word uses 9525 EMU per pixel.
+    # We use a 1-px (9525x9525 EMU) image so it's effectively invisible but
+    # still requested by Word's rendering pipeline.
+    drawing_xml = f"""<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0"><wp:extent cx="9525" cy="9525"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="1" name="canary"/><wp:cNvGraphicFramePr/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="canary"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:link="{rel_id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="9525" cy="9525"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"""
+
+    tmp_dir = tempfile.mkdtemp(prefix="docx-canary-")
+    try:
+        # Copy the docx contents into the tempdir.
+        with zipfile.ZipFile(path, "r") as z:
+            z.extractall(tmp_dir)
+
+        # 1. Patch document.xml.rels to include the external image relationship.
+        rels_path = Path(tmp_dir) / "word" / "_rels" / "document.xml.rels"
+        rels = rels_path.read_text(encoding="utf-8")
+        # Splice the new relationship just before the closing </Relationships>.
+        rels_patched = rels.replace("</Relationships>", f"{new_rel}</Relationships>")
+        rels_path.write_text(rels_patched, encoding="utf-8")
+
+        # 2. Patch document.xml to add the drawing inside the body.
+        doc_path = Path(tmp_dir) / "word" / "document.xml"
+        body_xml = doc_path.read_text(encoding="utf-8")
+        # Insert the drawing paragraph just before the body's section properties
+        # or before the closing </w:body>. The latter is more robust across
+        # python-docx versions.
+        body_patched = re.sub(
+            r"</w:body>",
+            f"{drawing_xml}</w:body>",
+            body_xml,
+            count=1,
+        )
+        doc_path.write_text(body_patched, encoding="utf-8")
+
+        # 3. Re-zip back into the docx.
+        Path(path).unlink()
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in Path(tmp_dir).rglob("*"):
+                if item.is_file():
+                    zout.write(item, item.relative_to(tmp_dir).as_posix())
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

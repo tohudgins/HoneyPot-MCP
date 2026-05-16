@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
+from collections import defaultdict, deque
 from typing import Any
 
 from aiohttp import web
@@ -34,6 +36,30 @@ log = logging.getLogger(__name__)
 _PIXEL = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII="
 )
+
+# Per-IP sliding-window rate limit. The callback server is a public-facing
+# HTTP endpoint that returns 200 OK to anyone — without a limit, an attacker
+# who guesses a canary URL can hammer it 10k req/sec, stressing the buffer
+# flusher and potentially DOSing real alert delivery.
+_RATE_WINDOW_SECONDS = 60.0
+_RATE_MAX_PER_WINDOW = 30  # 30 hits/IP/min is generous for legitimate canary use
+_rate_state: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _rate_limit_check(src_ip: str) -> bool:
+    """Return True if this IP is over the rate limit and should be dropped.
+
+    Sliding-window count via a deque of monotonic timestamps per IP.
+    """
+    now = time.monotonic()
+    window = _rate_state[src_ip]
+    cutoff = now - _RATE_WINDOW_SECONDS
+    while window and window[0] < cutoff:
+        window.popleft()
+    if len(window) >= _RATE_MAX_PER_WINDOW:
+        return True
+    window.append(now)
+    return False
 
 
 async def _find_token_by_id(token_id: str) -> Honeytoken | None:
@@ -104,6 +130,15 @@ async def _trigger(token: Honeytoken, request: web.Request) -> None:
 
 
 async def _handle_token(request: web.Request) -> web.Response:
+    src_ip = request.remote or "0.0.0.0"
+    if _rate_limit_check(src_ip):
+        # Still return 200 OK — surfacing 429 to the attacker would
+        # fingerprint the limit. We just skip the trigger logic.
+        log.debug("Rate-limited canary hit from %s", src_ip)
+        if request.match_info.get("token_id", "").endswith(".png"):
+            return web.Response(body=_PIXEL, content_type="image/png")
+        return web.Response(text="OK", content_type="text/plain")
+
     raw = request.match_info.get("token_id", "")
     # PDF tracker uses /t/<uid>.png — strip extension for matching.
     token_id = raw.split(".", 1)[0]

@@ -1,0 +1,24 @@
+# Censys scanner suppression preset.
+#
+# Censys runs internet-wide scans similar to Shodan. Their crawler IPs
+# rotate but the main ranges have been stable for years. List below is
+# sampled from publicly published Censys scanner CIDRs.
+#
+# Source: https://support.censys.io/hc/en-us/articles/360043177092-Opt-Out-of-Data-Collection
+# (Censys publishes the active CIDR list there.)
+
+name: censys
+description: Suppress known Censys scanner CIDR ranges
+rules:
+  - label: censys-scanner-162.142
+    ip_pattern: 162.142.125.0/24
+    action: drop
+  - label: censys-scanner-167.94
+    ip_pattern: 167.94.138.0/24
+    action: drop
+  - label: censys-scanner-167.94.146
+    ip_pattern: 167.94.146.0/24
+    action: drop
+  - label: censys-scanner-167.248
+    ip_pattern: 167.248.133.0/24
+    action: drop

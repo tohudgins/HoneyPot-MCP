@@ -113,7 +113,10 @@ async def acknowledge_alert(session: AsyncSession, alert_id: int) -> bool:
     result = await session.execute(
         update(Alert).where(Alert.id == alert_id).values(acknowledged=True)
     )
-    return result.rowcount > 0
+    # SQLAlchemy's stubs declare execute() → Result, but UPDATE/DELETE results
+    # are actually CursorResult which exposes rowcount. The runtime call is
+    # correct; mypy needs the hint.
+    return result.rowcount > 0  # type: ignore[attr-defined]
 
 
 async def get_alert_stats(session: AsyncSession) -> dict:
@@ -208,8 +211,8 @@ async def prune_alerts_before(session: AsyncSession, cutoff) -> dict[str, int]:
         delete(AttackerEvent).where(AttackerEvent.timestamp < cutoff)
     )
     return {
-        "alerts_deleted": alert_result.rowcount or 0,
-        "attacker_events_deleted": event_result.rowcount or 0,
+        "alerts_deleted": alert_result.rowcount or 0,  # type: ignore[attr-defined]
+        "attacker_events_deleted": event_result.rowcount or 0,  # type: ignore[attr-defined]
     }
 
 

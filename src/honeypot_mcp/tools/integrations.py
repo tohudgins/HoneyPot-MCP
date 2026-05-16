@@ -80,7 +80,7 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
         result = await session.execute(
             update(Subscription).where(Subscription.id == subscription_id).values(active=False)
         )
-        if result.rowcount == 0:
+        if result.rowcount == 0:  # type: ignore[attr-defined]
             return {"error": f"No subscription with id={subscription_id}."}
     return {"id": subscription_id, "active": False}
 
@@ -206,7 +206,7 @@ async def suppression_remove(rule_id: int) -> dict[str, Any]:
         result = await session.execute(
             update(SuppressionRule).where(SuppressionRule.id == rule_id).values(active=False)
         )
-        if result.rowcount == 0:
+        if result.rowcount == 0:  # type: ignore[attr-defined]
             return {"error": f"No suppression rule with id={rule_id}."}
 
     from honeypot_mcp.suppression import invalidate_rule_cache
@@ -245,3 +245,111 @@ async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
         }
         for r in rules
     ]
+
+
+@mcp.tool
+async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
+    """Apply a bundled suppression preset (e.g. 'shodan', 'censys',
+    'internal-rfc1918').
+
+    Presets live in `config/suppression_presets/<name>.yaml` and bundle a set
+    of suppression rules for known-noise sources so the operator doesn't have
+    to build the same `suppression_add` chain on every deployment.
+
+    Args:
+        preset_name: Filename stem of the preset (without `.yaml`).
+    """
+    from pathlib import Path
+
+    import yaml
+
+    preset_path = Path("config") / "suppression_presets" / f"{preset_name}.yaml"
+    if not preset_path.exists():
+        # Look in the package install dir too, for pip-installed scenarios
+        # where cwd isn't the repo root.
+        alt = (
+            Path(__file__).resolve().parent.parent.parent.parent
+            / "config"
+            / "suppression_presets"
+            / f"{preset_name}.yaml"
+        )
+        if alt.exists():
+            preset_path = alt
+        else:
+            return {
+                "error": (
+                    f"Preset '{preset_name}' not found. Looked at: "
+                    f"{preset_path.absolute()} and {alt.absolute()}. "
+                    f"Available: {_list_available_presets()}"
+                )
+            }
+
+    raw = yaml.safe_load(preset_path.read_text())
+    preset_rules = raw.get("rules") or []
+    if not preset_rules:
+        return {"error": f"Preset '{preset_name}' contains no rules."}
+
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    async with get_session() as session:
+        for entry in preset_rules:
+            label = entry.get("label")
+            if not label:
+                skipped.append({"entry": entry, "reason": "missing label"})
+                continue
+            # Avoid duplicate: if a rule with this label already exists and is
+            # active, skip rather than re-creating.
+            existing = (
+                await session.execute(select(SuppressionRule).where(SuppressionRule.label == label))
+            ).scalar_one_or_none()
+            if existing is not None:
+                skipped.append({"label": label, "reason": "already exists"})
+                continue
+
+            rule = SuppressionRule(
+                label=label,
+                ip_pattern=entry.get("ip_pattern") or None,
+                event_type_pattern=entry.get("event_type_pattern") or None,
+                action=entry.get("action", "drop"),
+                rate_limit_count=entry.get("rate_limit_count"),
+                rate_limit_window_seconds=entry.get("rate_limit_window_seconds"),
+                active=True,
+            )
+            session.add(rule)
+            await session.flush()
+            applied.append({"id": rule.id, "label": label, "ip_pattern": rule.ip_pattern})
+
+    if applied:
+        from honeypot_mcp.suppression import invalidate_rule_cache
+
+        invalidate_rule_cache()
+
+    return {
+        "preset": preset_name,
+        "description": raw.get("description", ""),
+        "applied": applied,
+        "skipped": skipped,
+        "summary": f"{len(applied)} applied, {len(skipped)} skipped",
+    }
+
+
+def _list_available_presets() -> list[str]:
+    from pathlib import Path
+
+    presets: list[str] = []
+    for d in (
+        Path("config") / "suppression_presets",
+        Path(__file__).resolve().parent.parent.parent.parent / "config" / "suppression_presets",
+    ):
+        if d.is_dir():
+            for f in d.glob("*.yaml"):
+                presets.append(f.stem)
+    return sorted(set(presets))
+
+
+@mcp.tool
+async def suppression_list_presets() -> list[str]:
+    """List available bundled suppression presets that can be applied via
+    `suppression_load_preset`."""
+    return _list_available_presets()

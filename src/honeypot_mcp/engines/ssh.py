@@ -38,7 +38,7 @@ _EVENT_MAP = {
 class SSHEngine(HoneypotEngine):
     def __init__(self) -> None:
         try:
-            self._client = docker.from_env()
+            self._client = docker.from_env()  # type: ignore[attr-defined]
         except docker.errors.DockerException as e:
             log.warning("Docker not available: %s — SSH engine will be non-functional.", e)
             self._client = None
@@ -89,6 +89,17 @@ class SSHEngine(HoneypotEngine):
             hostname,
         )
 
+        # Opt-in Telnet: setting `telnet_enabled=True` (or `telnet_port=<int>`)
+        # in config exposes Cowrie's Telnet listener too. Telnet on 23 catches
+        # the Mirai-class population that ignores SSH entirely — very high
+        # volume on a public IP.
+        telnet_enabled = bool(config.get("telnet_enabled")) or "telnet_port" in config
+        telnet_port = int(config.get("telnet_port", 23))
+        port_map: dict[str, int] = {"2222/tcp": port}
+        if telnet_enabled:
+            port_map["2223/tcp"] = telnet_port
+            env["COWRIE_TELNET_ENABLED"] = "yes"
+
         loop = asyncio.get_event_loop()
 
         def _run() -> str:
@@ -102,12 +113,13 @@ class SSHEngine(HoneypotEngine):
                 COWRIE_IMAGE,
                 detach=True,
                 name=f"honeypot-{name}",
-                ports={"2222/tcp": port},
+                ports=port_map,
                 environment=env,
                 labels={
                     "honeypot-mcp": "true",
                     "honeypot-name": name,
                     "honeypot-persona": persona.id,
+                    "honeypot-telnet": "yes" if telnet_enabled else "no",
                 },
                 restart_policy={"Name": "unless-stopped"},
             )
@@ -270,12 +282,11 @@ class SSHEngine(HoneypotEngine):
 
             now = datetime.now(UTC)
             try:
-                raw_logs = await loop.run_in_executor(
-                    None,
-                    lambda c=container, s=last_check: c.logs(since=s, timestamps=False).decode(
-                        "utf-8", errors="replace"
-                    ),
-                )
+
+                def _fetch_logs(c: Any = container, s: Any = last_check) -> str:
+                    return c.logs(since=s, timestamps=False).decode("utf-8", errors="replace")
+
+                raw_logs = await loop.run_in_executor(None, _fetch_logs)
             except Exception as e:
                 log.debug("Log fetch error for %s: %s", honeypot_name, e)
                 continue

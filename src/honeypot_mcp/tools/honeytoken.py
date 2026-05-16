@@ -14,15 +14,21 @@ from honeypot_mcp.tokens import get_provider
 
 @mcp.tool
 async def honeytoken_create(
-    type: Literal["api_key", "canary_url", "credential", "file"],
+    type: Literal["api_key", "canary_url", "credential", "file", "ssh_key", "jwt", "db_row"],
     label: str,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new honeytoken.
 
     Args:
-        type: Token type — api_key (fake AWS credentials), canary_url (tracking URL),
-              credential (fake username/password), or file (document with embedded tracker).
+        type: Token type. Options:
+              - api_key: fake AWS credentials (decoy-only, see KNOWN_LIMITATIONS.md)
+              - canary_url: unique URL that fires on HTTP GET
+              - credential: fake username/password pair (auto-matched on any honeypot)
+              - file: PDF/DOCX with embedded tracker
+              - ssh_key: planted SSH private key (fingerprint match on SSH auth)
+              - jwt: signed JWT (jti match on HTTP Authorization header)
+              - db_row: canary database row with unique email (match on SMTP RCPT TO)
         label: Human-readable label to identify this token (e.g. 'prod-server .env backup').
         metadata: Optional type-specific settings (e.g. {'service': 'aws', 'region': 'us-east-1'}).
     """
@@ -40,6 +46,20 @@ async def honeytoken_create(
         session.add(token)
         await session.flush()
         token_id = token.id
+
+    # Invalidate cross-reference caches for any token type that has a matcher.
+    if HoneytokenType(type) == HoneytokenType.CREDENTIAL:
+        from honeypot_mcp.credential_match import invalidate_cache
+
+        invalidate_cache()
+    if HoneytokenType(type) in (
+        HoneytokenType.SSH_KEY,
+        HoneytokenType.JWT,
+        HoneytokenType.DB_ROW,
+    ):
+        from honeypot_mcp.token_matchers import invalidate_cache as invalidate_token_match
+
+        invalidate_token_match()
 
     return {
         "id": token_id,
@@ -146,8 +166,17 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
             .where(Honeytoken.id == token_id)
             .values(status=HoneytokenStatus.REVOKED)
         )
-        if result.rowcount == 0:
+        if result.rowcount == 0:  # type: ignore[attr-defined]
             return {"error": f"No honeytoken with id={token_id}."}
+
+    # Cheap: invalidate all match caches regardless of token type — they only
+    # rebuild when something asks them to match, and we'd rather over-invalidate
+    # than miss a revoke.
+    from honeypot_mcp.credential_match import invalidate_cache as invalidate_creds
+    from honeypot_mcp.token_matchers import invalidate_cache as invalidate_token_match
+
+    invalidate_creds()
+    invalidate_token_match()
 
     return {"token_id": token_id, "status": "revoked"}
 

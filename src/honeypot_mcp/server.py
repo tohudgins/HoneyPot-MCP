@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 
 from honeypot_mcp.canary import start_canary_server
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.metrics import start_metrics_server
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import close_db, get_session, init_db
 from honeypot_mcp.storage.event_buffer import get_buffer
@@ -24,10 +25,9 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastMCP):
     settings = get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    )
+    from honeypot_mcp.logging_config import configure_logging
+
+    configure_logging(level=settings.log_level, format_style=settings.log_format)
     log.info("HoneyPot MCP starting — initialising database…")
     await init_db()
     log.info("Database ready.")
@@ -38,6 +38,9 @@ async def lifespan(app: FastMCP):
     buffer.set_on_flush(delivery.enqueue_batch)
     await buffer.start()
     canary_runner = await start_canary_server()
+    metrics_runner = None
+    if settings.metrics_port > 0:
+        metrics_runner = await start_metrics_server(settings.metrics_host, settings.metrics_port)
     await watchdog.start()
     try:
         yield
@@ -46,6 +49,8 @@ async def lifespan(app: FastMCP):
         await watchdog.stop()
         if canary_runner is not None:
             await canary_runner.cleanup()
+        if metrics_runner is not None:
+            await metrics_runner.cleanup()
         await buffer.stop()
         await delivery.stop()
         await close_db()

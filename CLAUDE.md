@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (67 unit tests covering security-critical paths)
+# Tests (160 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -42,12 +42,17 @@ uv run mypy src/
 Engines do NOT write to the DB directly. The path is:
 
 ```
-Engine (SSH/HTTP/SMTP/FTP/DNS)
+Engine (SSH/HTTP/SMTP/FTP/DNS/RDP)
   → submit_event(PendingEvent)             # storage/event_buffer.py
   → suppression.should_suppress(event)     # in-memory rules, dropped here are gone
+  → credential_match.match(event)          # planted creds → CRITICAL + honeytoken_id tag
   → EventBuffer queue
   → flusher task (single async task, batches up to 50, max 1s wait)
-  → DB transaction (Alert + AttackerEvent rows)
+  → DB transaction (Alert + AttackerEvent rows); credential-trigger events
+    also mark the matched Honeytoken row as TRIGGERED
+  → CRITICAL events fire a background _enrich_alert_async() that merges
+    VT + AbuseIPDB + GeoIP into Alert.payload (cached via intel/_cache.py
+    so repeat CRITICALs cost zero external calls)
   → on_flush hook
   → WebhookDelivery queue (separate worker, slow consumers don't back-pressure)
   → POST to subscribers (HMAC-signed if configured), 3 retries with backoff
@@ -151,6 +156,91 @@ because real Nginx setups rarely do, and inconsistency is itself a fingerprint.
 - `action="rate_limit"`: monotonic-clock sliding window; passes the first N within `rate_limit_window_seconds`, drops the rest.
 
 A rule must specify at least one of `ip_pattern` / `event_type_pattern` — empty rules are rejected at the tool layer (would otherwise drop every event).
+
+### Credential honeytoken cross-reference
+
+`credential_match.py` runs after suppression in `submit_event`. It loads all
+active CREDENTIAL honeytokens into an in-memory dict keyed by
+`(service, username_lower, password)`, refreshed every 30s and invalidated
+explicitly on `honeytoken_create` / `honeytoken_revoke`.
+
+When a login-attempt event payload contains a planted pair, the event is
+mutated in place: `severity` → `CRITICAL`, `honeytoken_id` → the matched
+token's id, `event_type` → `honeytoken_triggered_credential_via_<original>`.
+The flusher then calls `mark_honeytoken_triggered()` for any flushed event
+with that event_type prefix.
+
+Payload extraction handles:
+- SSH/FTP/HTTP form `{"username": ..., "password": ...}` keys directly.
+- HTTP `post_data` nested dicts — checks common field aliases
+  (`username|user|email|login`, `password|pass|passwd|pwd`).
+- SMTP `AUTH PLAIN <b64>` — base64-decodes and splits on `\0` per RFC 4616.
+
+Service is inferred from `event_type` prefix (`ssh_*`, `http_*`, `ftp_*`,
+`smtp_*`). Tokens planted with `service="any"` match across all services.
+
+Limitation: the matcher only fires when the planted creds hit one of our own
+honeypots. It doesn't observe production-system logins — that needs an IdP
+audit-log feed which this project doesn't ship. Documented in
+`KNOWN_LIMITATIONS.md`.
+
+### Auto-enrichment of CRITICAL alerts
+
+`event_buffer._enrich_alert_async` is scheduled as a fire-and-forget task
+for every CRITICAL event that lands with a globally-routable source IP
+(filtered via `_is_enrichable_ip` — drops loopback, RFC1918, link-local,
+TEST-NET, and any address Python's `ipaddress` module marks as non-global).
+The task fans out parallel VT + AbuseIPDB + GeoIP lookups, then re-opens a
+session and merges the result into the alert's `payload.enrichment` dict.
+
+Failures here are swallowed — auto-enrichment is a UX improvement, not a
+guarantee. The `intel/_cache.py` TTL dict means repeat CRITICALs from the
+same IP within the cache window cost zero external API calls.
+
+### TLS / HTTPS / STARTTLS
+
+`engines/tls.py:ensure_cert` generates a self-signed RSA-2048 cert per
+honeypot, persisted to `tls/<honeypot_name>/server.{crt,key}` so a scanner
+pinning the cert SHA sees a stable identity across restarts. `cryptography`
+is a direct dep.
+
+HTTP: deploy with `config["tls"] = True` to serve HTTPS on the configured
+port. The engine wires the cert via aiohttp's `web.TCPSite(ssl_context=...)`.
+
+SMTP: STARTTLS uses `asyncio.start_tls()` to actually complete the TLS
+handshake (the previous behaviour announced STARTTLS but dropped on the
+ClientHello — itself a fingerprint). After upgrade, the engine clears
+protocol state per RFC 3207 and requires the client to re-issue EHLO.
+
+`tls/` is gitignored — keys are private, certs are deployment-specific.
+
+### RDP engine
+
+`engines/rdp.py` is banner-only: parses the X.224 Connection Request,
+extracts the leaked `Cookie: mstshash=user[@DOMAIN]` field (almost every
+RDP client and brute-force tool sends this in the clear), and returns a
+TPKT + X.224 Connection Confirm with a believable NLA-required
+negotiation-failure response. No real RDP protocol stack — that's NOT the
+goal here; the goal is to catch RDP brute-force traffic, which is one of
+the largest internet attack categories.
+
+Logs `rdp_handshake` at HIGH severity when the X.224 parses, `rdp_invalid_probe`
+at LOW for port-scan garbage.
+
+### HTTP realistic endpoints + sessions
+
+`engines/http_endpoints.py` serves `/robots.txt`, `/favicon.ico`,
+`/sitemap.xml`, `/.well-known/security.txt` with persona-aware content.
+A 404 on any of these is a single-curl tell for a honeypot. The
+`robots.txt` deliberately advertises `/admin/`, `/.env`, etc. — pointing
+attackers at exactly the bait.
+
+The engine maintains a per-honeypot in-memory session table keyed by
+cookie value (persona's `cookie_name`: `PHPSESSID` / `ASP.NET_SessionId`).
+Sessions track hit count; after `_RECON_THRESHOLD` (5) hits, severity
+escalates from LOW to MEDIUM and the event type becomes
+`http_active_recon`. Sessions older than `_SESSION_TTL_SECONDS` (1h) are
+pruned opportunistically on each lookup — no separate sweeper task.
 
 ### Webhook delivery
 

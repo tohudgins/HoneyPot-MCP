@@ -64,8 +64,13 @@ class APIKeyProvider(HoneytokenProvider):
                 f"Or in a .env file:\n"
                 f"  AWS_ACCESS_KEY_ID={key_id}\n"
                 f"  AWS_SECRET_ACCESS_KEY={secret}\n\n"
-                f"Alert triggers when anyone attempts to use these credentials.\n"
-                f"Configure AWS CloudTrail or use the MCP alert webhook."
+                f"NOTE: this is a believable-looking decoy. Detection requires external\n"
+                f"infrastructure that HoneyPot MCP does not ship:\n"
+                f"  - Register the key with your own AWS account and route CloudTrail\n"
+                f"    AccessDenied / ConsoleLogin events to the MCP alert webhook, OR\n"
+                f"  - Use Thinkst's Canarytokens (https://canarytokens.org) for AWS keys\n"
+                f"    with built-in detection.\n"
+                f"By itself, this token will NOT phone home."
             )
         return (
             f"Plant API key '{token_value}' in configuration files, source code, or documentation."

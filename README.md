@@ -6,6 +6,10 @@
 
 A Model Context Protocol server for deploying, monitoring, and analysing honeypots and honeytokens — built on [FastMCP](https://github.com/jlowin/fastmcp) and Python 3.11+.
 
+> **Read first:** [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — a frank rundown of what works (Cowrie SSH, HTTP personas, canary URLs, credential cross-reference) and what doesn't (DOCX/PDF file tokens, AWS-key callback path, HTTP TLS). Acknowledging the gaps is the point.
+>
+> **Ready to deploy?** [docs/DEPLOY.md](docs/DEPLOY.md) walks through "rent a $5 VPS → catch real attack traffic in under 30 minutes" plus ongoing-operations guidance.
+
 Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct an attacker's session, map their TTPs to MITRE ATT&CK, push alerts to Slack, or export a STIX 2.1 IOC bundle — all through natural language.
 
 ---
@@ -20,7 +24,7 @@ Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct
 - **SOC tradecraft** — MITRE ATT&CK technique mapping (built-in regex + optional STIX bundle), cross-honeypot kill-chain reconstruction grouped by tactic, STIX 2.1 IOC bundle export, fail2ban / iptables / CIDR blocklist export.
 - **Operational signals** — periodic health watchdog probes each running honeypot and emits CRITICAL alerts on failure; `honeypot_self_test` confirms the full pipeline end-to-end.
 - **Modern dev tooling** — `uv` for env management, `ruff` for lint, `mypy` for types, `pytest-asyncio` for async tests, `alembic` for migrations.
-- **85 unit tests** covering security-critical paths: XSS escape, HMAC correctness, suppression matching (CIDR + glob + rate limit), event-buffer timestamp preservation, persona consistency, Alembic idempotency.
+- **160 unit tests** covering security-critical paths: XSS escape, HMAC correctness, suppression matching (CIDR + glob + rate limit), all 7 honeytoken types' cross-reference matching, SMTP/FTP/HTTP fidelity, HTTPS + STARTTLS, RDP X.224 parsing, DNS realistic responses, GraphQL/OIDC/Swagger probe detection, auto-enrichment of CRITICAL alerts, Prometheus metrics exposition, suppression presets, canary-callback rate limiting, JSON-structured logging, event-buffer timestamp preservation, persona consistency, Alembic idempotency. **Strict mypy passes** — no `Any` leaks, no untyped corners.
 
 ---
 
@@ -28,14 +32,14 @@ Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct
 
 | Category | Capabilities |
 |---|---|
-| **Honeypots** | SSH (Cowrie/Docker, persona-based identity), HTTP (with persona-based fingerprint resistance), SMTP, FTP, DNS — plug-in architecture, full payload capture |
-| **Honeytokens** | Fake AWS credentials, canary URLs, fake credential pairs, PDF/DOCX file tokens |
+| **Honeypots** | SSH + Telnet (Cowrie/Docker, persona-based identity, Telnet via `telnet_enabled` flag), HTTP / HTTPS (persona-based fingerprint resistance, self-signed TLS, session cookies, realistic well-known endpoints, GraphQL/OIDC/Swagger API attack-surface), SMTP (Postfix-style EHLO + real STARTTLS upgrade), FTP (ProFTPD-style anonymous flow + PASV), DNS (realistic A/AAAA/MX/NS/TXT/SOA responses), RDP (X.224 handshake parsing) — plug-in architecture, full payload capture |
+| **Honeytokens** | Fake AWS credentials, canary URLs, fake credential pairs (auto-matched), PDF/DOCX file tokens (DOCX with real external-image relationship), SSH keys (fingerprint-matched), JWTs (jti-matched on Authorization headers), DB rows (canary email matched on SMTP RCPT TO) |
 | **Canary callback** | Built-in HTTP server receives canary URL hits and PDF pixel-tracker pings |
 | **Threat Intel** | VirusTotal v3, AbuseIPDB (with auto-report), MaxMind GeoIP — all with TTL caching |
 | **Analysis** | MITRE ATT&CK TTP mapping, attacker profiling, SSH session reconstruction, cross-honeypot attacker journey, campaign correlation |
 | **Reporting** | XSS-safe HTML (Jinja2 autoescape) and Markdown attack reports |
-| **Platform** | Webhook subscriptions (HMAC-signed), suppression rules + rate limiting, blocklist + STIX exports |
-| **Operations** | Periodic health watchdog, end-to-end self-test, Alembic-managed schema migrations |
+| **Platform** | Webhook subscriptions (HMAC-signed), suppression rules + rate limiting + bundled presets (Shodan / Censys / RFC1918), blocklist + STIX exports |
+| **Operations** | Periodic health watchdog, end-to-end self-test, Alembic-managed schema migrations, Prometheus `/metrics` endpoint, JSON-structured logging (`LOG_FORMAT=json`), canary-callback rate limiting |
 | **MCP Resources** | Live feeds: active honeypots, alert stream, triggered tokens, stats dashboard |
 
 ---
@@ -288,7 +292,7 @@ Starts Cowrie on 2222, the HTTP honeypot on 8080, and the MCP server with canary
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v                                  # 85 tests
+uv run pytest tests/unit/ -v                                  # 160 tests
 uv run pytest tests/unit/ --cov=src/honeypot_mcp              # with coverage
 uv run ruff check src/ tests/
 uv run mypy src/

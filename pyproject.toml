@@ -39,6 +39,8 @@ dependencies = [
     # Honeypot protocols
     "pyftpdlib>=1.5.9",
     "dnslib>=0.9.24",
+    # TLS (self-signed cert generation for HTTPS + SMTP STARTTLS)
+    "cryptography>=42.0.0",
     # Honeytoken file embedding
     "reportlab>=4.2.0",
     "python-docx>=1.1.0",

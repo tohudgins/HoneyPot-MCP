@@ -26,6 +26,18 @@ def get_provider(token_type: HoneytokenType) -> HoneytokenProvider:
             from honeypot_mcp.tokens.file_token import FileTokenProvider
 
             _providers[token_type] = FileTokenProvider()
+        elif token_type == HoneytokenType.SSH_KEY:
+            from honeypot_mcp.tokens.ssh_key import SSHKeyProvider
+
+            _providers[token_type] = SSHKeyProvider()
+        elif token_type == HoneytokenType.JWT:
+            from honeypot_mcp.tokens.jwt import JWTProvider
+
+            _providers[token_type] = JWTProvider()
+        elif token_type == HoneytokenType.DB_ROW:
+            from honeypot_mcp.tokens.db_row import DBRowProvider
+
+            _providers[token_type] = DBRowProvider()
         else:
             raise ValueError(f"No provider registered for token type: {token_type}")
     return _providers[token_type]

@@ -24,12 +24,15 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
     from honeypot_mcp.intel.geoip import lookup_geoip
     from honeypot_mcp.intel.virustotal import lookup_virustotal
 
-    geo, vt, abuse = await asyncio.gather(
+    # gather() with return_exceptions=True has an inscrutable union return
+    # type that confuses mypy at the tuple-unpack site. Annotate explicitly.
+    results: list[Any] = await asyncio.gather(
         lookup_geoip(ip),
         lookup_virustotal(ip),
         lookup_abuseipdb(ip),
         return_exceptions=True,
     )
+    geo, vt, abuse = results[0], results[1], results[2]
 
     return {
         "ip": ip,
@@ -79,12 +82,13 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
         alerts = await queries.get_recent_alerts(session, limit=200, source_ip=ip)
         events = await queries.get_events_for_ip(session, ip, limit=200)
 
-    geo, vt, abuse = await asyncio.gather(
+    results: list[Any] = await asyncio.gather(
         lookup_geoip(ip),
         lookup_virustotal(ip),
         lookup_abuseipdb(ip),
         return_exceptions=True,
     )
+    geo, vt, abuse = results[0], results[1], results[2]
 
     profile = await build_profile(
         ip=ip,
@@ -323,7 +327,9 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
                 "timestamp": a.timestamp.isoformat(),
                 "event_type": a.event_type,
                 "severity": a.severity.value,
-                "honeypot": honeypot_names.get(a.honeypot_id, "—"),
+                "honeypot": honeypot_names.get(a.honeypot_id, "—")
+                if a.honeypot_id is not None
+                else "—",
                 "summary": _summarize_payload(a.payload),
                 "techniques": ttps,
                 "primary_tactic": _primary_tactic(ttps),

@@ -30,6 +30,10 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.dns import DNSEngine
 
             _engines[hp_type] = DNSEngine()
+        elif hp_type == HoneypotType.RDP:
+            from honeypot_mcp.engines.rdp import RDPEngine
+
+            _engines[hp_type] = RDPEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

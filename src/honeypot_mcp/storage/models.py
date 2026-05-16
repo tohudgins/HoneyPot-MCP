@@ -20,6 +20,7 @@ class HoneypotType(str, enum.Enum):
     SMTP = "smtp"
     FTP = "ftp"
     DNS = "dns"
+    RDP = "rdp"
 
 
 class HoneypotStatus(str, enum.Enum):
@@ -41,6 +42,9 @@ class HoneytokenType(str, enum.Enum):
     CANARY_URL = "canary_url"
     CREDENTIAL = "credential"
     FILE = "file"
+    SSH_KEY = "ssh_key"  # planted private key — fingerprint match on SSH auth
+    JWT = "jwt"  # planted bearer token — jti match on HTTP Authorization header
+    DB_ROW = "db_row"  # planted database row with canary email — match on SMTP RCPT TO
 
 
 class HoneytokenStatus(str, enum.Enum):
