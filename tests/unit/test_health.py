@@ -30,7 +30,18 @@ async def setup_db():
 async def test_tcp_probe_detects_open_port():
     from honeypot_mcp.engines.base import tcp_probe
 
-    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Close immediately so server.wait_closed() can drain.
+        # Python 3.12+ made wait_closed() block until every active connection
+        # finishes — a sync no-op handler leaves the connection dangling and
+        # the teardown hangs forever.
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(_handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
         result = await tcp_probe(port, timeout=1.0)
