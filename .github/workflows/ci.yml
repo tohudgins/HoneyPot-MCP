@@ -102,8 +102,9 @@ jobs:
           pip install -e "."
           pip install pip-audit
       - name: pip-audit
-        # --strict treats vulnerability resolution failures as errors so we
-        # see them in the log; the job is non-blocking via continue-on-error.
-        # --skip-editable skips the local honeypot-mcp editable install,
-        # which isn't on PyPI and would otherwise fail resolution under --strict.
-        run: pip-audit --strict --skip-editable
+        # --skip-editable ignores the local honeypot-mcp install (not on PyPI).
+        # We deliberately do NOT pass --strict: it would treat the editable skip
+        # itself as a fatal resolution error, defeating the point of --skip-editable.
+        # CVEs in real deps are still reported in the log; the job is non-blocking
+        # via continue-on-error anyway.
+        run: pip-audit --skip-editable

@@ -6,6 +6,7 @@ alert exactly once (no flood).
 """
 
 import asyncio
+import contextlib
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -36,10 +37,8 @@ async def test_tcp_probe_detects_open_port():
         # finishes — a sync no-op handler leaves the connection dangling and
         # the teardown hangs forever.
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
 
     server = await asyncio.start_server(_handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
