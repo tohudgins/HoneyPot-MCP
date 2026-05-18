@@ -345,3 +345,88 @@ async def test_docx_token_injects_external_image_relationship():
     assert "r:link=" in body_xml
     # And the relationship type must be image (not hyperlink etc).
     assert "/relationships/image" in rels_xml
+
+
+# ── Cloud-era honeytoken providers ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_kubeconfig_provider_generates_valid_yaml():
+    """KubeconfigProvider returns a YAML kubeconfig pointing at the canary
+    URL. kubectl will resolve that URL on first use."""
+    from honeypot_mcp.tokens.kubeconfig import KubeconfigProvider
+
+    provider = KubeconfigProvider()
+    token_value, meta = await provider.create({"cluster_name": "prod"})
+
+    # YAML structure
+    assert "apiVersion: v1" in token_value
+    assert "kind: Config" in token_value
+    assert "clusters:" in token_value
+    assert "current-context: prod" in token_value
+    # Server URL points at the canary callback
+    assert meta["server_url"].endswith(f"/t/{meta['token_id']}")
+    assert meta["server_url"] in token_value
+
+
+@pytest.mark.asyncio
+async def test_slack_webhook_provider_url_matches_slack_shape():
+    """SlackWebhookProvider returns a URL with /services/T.../B.../<token_id>
+    so it looks like a real Slack incoming-webhook URL."""
+    import re
+
+    from honeypot_mcp.tokens.slack_webhook import SlackWebhookProvider
+
+    provider = SlackWebhookProvider()
+    token_value, meta = await provider.create({})
+
+    assert "/services/" in token_value
+    # Real Slack: /services/T<id>/B<id>/<secret>
+    m = re.search(r"/services/(T[0-9A-F]+)/(B[0-9A-F]+)/([0-9a-f-]+)$", token_value)
+    assert m is not None, f"unexpected webhook shape: {token_value!r}"
+    assert m.group(3) == meta["token_id"]
+
+
+@pytest.mark.asyncio
+async def test_azure_credential_provider_generates_uuids():
+    """Azure credentials are all UUIDs + a base64-ish secret."""
+    import re
+    from uuid import UUID
+
+    from honeypot_mcp.tokens.azure_credential import AzureCredentialProvider
+
+    provider = AzureCredentialProvider()
+    token_value, meta = await provider.create({})
+
+    # Must parse as UUIDs without raising
+    UUID(meta["client_id"])
+    UUID(meta["tenant_id"])
+    UUID(meta["subscription_id"])
+    # Secret should be URL-safe base64-ish, no spaces
+    assert re.fullmatch(r"[A-Za-z0-9_\-]+", meta["client_secret"])
+    # token_value is a .env-style multi-line string
+    assert f"AZURE_CLIENT_ID={meta['client_id']}" in token_value
+    assert f"AZURE_TENANT_ID={meta['tenant_id']}" in token_value
+
+
+@pytest.mark.asyncio
+async def test_gcp_service_account_provider_contains_real_rsa_key():
+    """GCP service-account JSON must contain a parseable RSA private key
+    so any tool that loads the JSON (gcloud, google-auth library) accepts
+    it without raising before sending an authenticated request."""
+    from cryptography.hazmat.primitives import serialization
+
+    from honeypot_mcp.tokens.gcp_service_account import GCPServiceAccountProvider
+
+    provider = GCPServiceAccountProvider()
+    token_value, meta = await provider.create({})
+
+    parsed = json.loads(token_value)
+    assert parsed["type"] == "service_account"
+    assert parsed["project_id"] == meta["project_id"]
+    assert parsed["client_email"].endswith(".iam.gserviceaccount.com")
+
+    # Private key must load as a real RSA key (the throwaway generator
+    # uses cryptography so the structure is real).
+    key = serialization.load_pem_private_key(parsed["private_key"].encode(), password=None)
+    assert key.key_size == 2048

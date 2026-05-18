@@ -17,7 +17,18 @@ from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
 
 @mcp.tool
 async def honeypot_deploy(
-    type: Literal["ssh", "http", "smtp", "ftp", "dns"],
+    type: Literal[
+        "ssh",
+        "http",
+        "smtp",
+        "ftp",
+        "dns",
+        "rdp",
+        "vnc",
+        "redis",
+        "mysql",
+        "elasticsearch",
+    ],
     port: int | None = None,
     name: str | None = None,
     config: dict[str, Any] | None = None,
@@ -25,7 +36,8 @@ async def honeypot_deploy(
     """Deploy a new honeypot container.
 
     Args:
-        type: Protocol type — ssh, http, smtp, ftp, or dns.
+        type: Protocol type — ssh, http, smtp, ftp, dns, rdp, vnc, redis,
+              mysql, or elasticsearch.
         port: Host port to bind (defaults to the configured default for each type).
         name: Unique name for this honeypot (auto-generated if omitted).
         config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
@@ -39,6 +51,11 @@ async def honeypot_deploy(
         "ftp": settings.default_ftp_port,
         "smtp": settings.default_smtp_port,
         "dns": settings.default_dns_port,
+        "rdp": settings.default_rdp_port,
+        "vnc": settings.default_vnc_port,
+        "redis": settings.default_redis_port,
+        "mysql": settings.default_mysql_port,
+        "elasticsearch": settings.default_elasticsearch_port,
     }
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"

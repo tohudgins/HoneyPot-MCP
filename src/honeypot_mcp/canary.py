@@ -11,6 +11,9 @@ from settings: `canary_callback_host`, `canary_callback_port`.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import json
 import logging
 import time
 from collections import defaultdict, deque
@@ -62,14 +65,30 @@ def _rate_limit_check(src_ip: str) -> bool:
     return False
 
 
-async def _find_token_by_id(token_id: str) -> Honeytoken | None:
-    """Match a request token_id against either canary_url tokens (token_meta.token_id)
-    or file tokens (token_meta.token_uid). Iterates active tokens — fine at SOC scale."""
+async def _find_token_by_id(
+    token_id: str, types: tuple[HoneytokenType, ...] | None = None
+) -> Honeytoken | None:
+    """Match a request token_id against active honeytokens of the given types.
+
+    By default matches CANARY_URL, FILE, KUBECONFIG, and SLACK_WEBHOOK — all
+    of which store the lookup identifier in `token_meta.token_id` (or
+    `token_meta.token_uid` for FILE).
+
+    Pass an explicit `types` tuple to restrict the match (e.g. the Slack
+    webhook handler only wants SLACK_WEBHOOK matches so a token_id collision
+    with a CANARY_URL doesn't fire the wrong alert type).
+    """
+    search_types = types or (
+        HoneytokenType.CANARY_URL,
+        HoneytokenType.FILE,
+        HoneytokenType.KUBECONFIG,
+        HoneytokenType.SLACK_WEBHOOK,
+    )
     async with get_session() as session:
         result = await session.execute(
             select(Honeytoken).where(
                 Honeytoken.status == HoneytokenStatus.ACTIVE,
-                Honeytoken.type.in_([HoneytokenType.CANARY_URL, HoneytokenType.FILE]),
+                Honeytoken.type.in_(search_types),
             )
         )
         for t in result.scalars().all():
@@ -156,10 +175,156 @@ async def _handle_root(_request: web.Request) -> web.Response:
     return web.Response(text="OK", content_type="text/plain")
 
 
+async def _handle_slack_webhook(request: web.Request) -> web.Response:
+    """Slack-shaped webhook URL `/services/T<id>/B<id>/<token_id>`.
+
+    SlackWebhookProvider tokens point at this path. We route the trailing
+    token_id through the same trigger machinery as `/t/<token_id>`. Returns
+    a Slack-flavoured `ok` response on match so attackers think their test
+    POST succeeded — keeps them engaged for follow-up exfiltration.
+    """
+    token_id = request.match_info.get("token_id", "")
+    src_ip = request.remote or "0.0.0.0"
+    if _rate_limit_check(src_ip):
+        return web.Response(text="ok", content_type="text/plain")
+
+    token = await _find_token_by_id(token_id, types=(HoneytokenType.SLACK_WEBHOOK,))
+    if token:
+        await _trigger(token, request)
+    # Real Slack webhooks reply `200 OK` with body `ok` on accepted posts.
+    return web.Response(text="ok", content_type="text/plain")
+
+
+async def _handle_cloud_event(request: web.Request) -> web.Response:
+    """Ingest endpoint for forwarded cloud audit-log events.
+
+    Forwarder workflow:
+      1. CloudTrail / Azure Activity Log / GCP Audit Log → Cloud
+         function / Lambda / Pub/Sub trigger.
+      2. The trigger HMAC-SHA256-signs the raw JSON body with the shared
+         `cloud_event_hmac_secret` and POSTs it here.
+      3. We compare-secure the signature, then `match_cloud_event`s the
+         payload against active cloud-credential tokens. On match we fire
+         the same CRITICAL alert + AttackerEvent trail as a canary URL hit.
+
+    Returns 202 Accepted regardless of match (don't leak match state to
+    a potentially attacker-controlled forwarder). 401 on signature
+    mismatch, 503 if the operator hasn't configured a secret yet.
+    """
+    settings = get_settings()
+    secret = settings.cloud_event_hmac_secret
+    if not secret:
+        # Refuse to operate without an opt-in shared secret. An unsigned
+        # ingest endpoint is an open trigger relay for arbitrary alert spam.
+        return web.json_response({"error": "cloud_event_hmac_secret not configured"}, status=503)
+
+    raw = await request.read()
+    provided_sig = request.headers.get("X-HoneyPot-Signature", "")
+    expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not provided_sig or not hmac.compare_digest(provided_sig, expected):
+        return web.json_response({"error": "invalid signature"}, status=401)
+
+    try:
+        event = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    if not isinstance(event, dict):
+        return web.json_response({"error": "expected JSON object"}, status=400)
+
+    # Match against active cloud-credential tokens via the central index.
+    from honeypot_mcp.token_matchers import match_cloud_event
+
+    token_id, source = await match_cloud_event(event)
+    if token_id is not None:
+        # Resolve to a full Honeytoken row, then reuse the existing
+        # `_trigger()` so the mark-triggered + create-alert + AttackerEvent
+        # path is identical to canary-URL triggers.
+        async with get_session() as session:
+            token = await session.get(Honeytoken, token_id)
+        if token is not None and token.status == HoneytokenStatus.ACTIVE:
+            # Build a pseudo-request carrying the event for downstream
+            # logging context. We can't reuse the inbound request object
+            # because _trigger() reads `.remote` / `.headers` / `.path`.
+            await _trigger_cloud(token, request, event, source or "unknown")
+
+    # Always 202 — don't leak whether the event matched.
+    return web.json_response({"accepted": True}, status=202)
+
+
+async def _trigger_cloud(token: Honeytoken, request: web.Request, event: dict, source: str) -> None:
+    """Mark-triggered + alert path for cloud-event matches. Mirrors
+    `_trigger()` but the trigger_meta captures the forwarded event itself
+    rather than HTTP request headers, since the actual attacker is on the
+    cloud side, not directly hitting our endpoint."""
+    forwarder_ip = request.remote or "0.0.0.0"
+    # Pull out the attacker IP from the cloud event if present — CloudTrail
+    # has `sourceIPAddress`, Azure has `callerIpAddress`, GCP has
+    # `requestMetadata.callerIp`.
+    cloud_ip = (
+        event.get("sourceIPAddress")
+        or event.get("callerIpAddress")
+        or (event.get("requestMetadata") or {}).get("callerIp")
+    )
+    attacker_ip = cloud_ip if isinstance(cloud_ip, str) else forwarder_ip
+
+    trigger_meta: dict[str, Any] = {
+        "trigger_ip": attacker_ip,
+        "forwarder_ip": forwarder_ip,
+        "source_cloud": source,
+        "raw_event": event,
+    }
+    async with get_session() as session:
+        live = await session.get(Honeytoken, token.id)
+        if not live or live.status != HoneytokenStatus.ACTIVE:
+            return
+        await queries.mark_honeytoken_triggered(session, live.id, trigger_meta)
+        await queries.create_alert(
+            session,
+            honeypot_id=None,
+            source_ip=attacker_ip,
+            source_port=None,
+            event_type=f"honeytoken_triggered_{live.type.value}_via_{source}",
+            payload={
+                "token_id": live.id,
+                "token_label": live.label,
+                "token_type": live.type.value,
+                **trigger_meta,
+            },
+            severity=AlertSeverity.CRITICAL,
+        )
+        session.add(
+            AttackerEvent(
+                ip=attacker_ip,
+                event_type=f"honeytoken_triggered_{live.type.value}_via_{source}",
+                honeytoken_id=live.id,
+                extra=trigger_meta,
+            )
+        )
+    log.warning(
+        "Cloud honeytoken TRIGGERED — id=%s type=%s label=%r source=%s attacker=%s",
+        live.id,
+        live.type.value,
+        live.label,
+        source,
+        attacker_ip,
+    )
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", _handle_root)
     app.router.add_get("/t/{token_id}", _handle_token)
+    # Slack-shaped webhook path. Real Slack uses
+    # `hooks.slack.com/services/T.../B.../<secret>` and attackers expect
+    # the same path shape; route the trailing component through the
+    # Slack-webhook trigger handler.
+    app.router.add_route("*", "/services/{team_id}/{bot_id}/{token_id}", _handle_slack_webhook)
+    # HMAC-signed cloud audit log ingest. The operator configures their
+    # CloudTrail / Azure Activity / GCP Audit forwarder to POST signed
+    # events here; events matching a planted credential token fire a
+    # CRITICAL alert.
+    app.router.add_post("/cloud-event", _handle_cloud_event)
     return app
 
 

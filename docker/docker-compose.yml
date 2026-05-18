@@ -1,30 +1,99 @@
-version: "3.9"
-
 services:
+  # ── Docker socket proxy ─────────────────────────────────────────────────────
+  # The MCP server uses Docker to manage Cowrie containers. Giving the MCP
+  # container direct access to /var/run/docker.sock is container-escape-equivalent
+  # root — if the MCP process is ever exploited (and it processes untrusted
+  # attacker payloads all day), the attacker walks straight to root-on-host.
+  #
+  # Instead, the proxy mounts the host socket read-only and re-exposes it over
+  # TCP on an internal Docker network with a restricted API surface:
+  #   CONTAINERS=1  list / inspect / run / stop / remove / pause / unpause / logs
+  #   IMAGES=1      get / pull (needed for first-run Cowrie image pull)
+  #   POST=1        allow POST verbs (create/start/stop)
+  # Everything else (networks, volumes, secrets, system, exec, swarm) stays off.
+  # This is the same pattern used by Traefik / Watchtower / Portainer-agent
+  # deployments that need controlled Docker API access.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    container_name: honeypot-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      POST: 1
+      # Defensive defaults: deny every endpoint the SSH engine doesn't touch.
+      # tecnativa/docker-socket-proxy defaults these off, but listing them
+      # explicitly makes the threat model legible to future maintainers.
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EVENTS: 0
+      EXEC: 0
+      GRPC: 0
+      NETWORKS: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - honeypot-net
+    read_only: true
+    tmpfs:
+      - /run
+    security_opt:
+      - no-new-privileges:true
+
   # ── MCP Server ───────────────────────────────────────────────────────────────
   honeypot-mcp:
     build:
       context: ..
       dockerfile: docker/Dockerfile.mcp
+    image: honeypot-mcp:local
     container_name: honeypot-mcp-server
     restart: unless-stopped
+    depends_on:
+      - socket-proxy
     volumes:
-      - ../honeypot_mcp.db:/app/honeypot_mcp.db
-      - ../config:/app/config:ro
-      - ../reports:/app/reports
-      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker for managing honeypots
+      - mcp-data:/app/data
+      - mcp-reports:/app/reports
+      - mcp-tls:/app/tls
+      # Optional: drop a GeoLite2-City.mmdb into ./geoip on the host (sibling of
+      # this compose file) and `GEOIP_DB_PATH=/app/geoip/GeoLite2-City.mmdb` will
+      # pick it up. MaxMind's license forbids redistribution, so the DB is NOT
+      # baked into the image — download it yourself with a free MaxMind account.
+      - ./geoip:/app/geoip:ro
     environment:
-      - DATABASE_URL=sqlite+aiosqlite:////app/honeypot_mcp.db
-      - CANARY_PUBLIC_URL=${CANARY_PUBLIC_URL:-http://localhost:8888}
-      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
-      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Talk to Docker via the proxy, not /var/run/docker.sock directly.
+      DOCKER_HOST: tcp://socket-proxy:2375
+      DATABASE_URL: sqlite+aiosqlite:////app/data/honeypot_mcp.db
+      CANARY_PUBLIC_URL: ${CANARY_PUBLIC_URL:-http://localhost:8888}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      METRICS_HOST: 0.0.0.0
+      METRICS_PORT: "9090"
+      CANARY_CALLBACK_HOST: 0.0.0.0
+      CANARY_CALLBACK_PORT: "8888"
+      GEOIP_DB_PATH: /app/geoip/GeoLite2-City.mmdb
     ports:
-      - "8888:8888"   # Canary callback server
+      - "8888:8888"   # Canary callback server (publicly reachable)
+      - "127.0.0.1:9090:9090"   # Prometheus /metrics — bound to localhost only
     networks:
       - honeypot-net
     labels:
       - "honeypot-mcp=server"
+    security_opt:
+      - no-new-privileges:true
 
   # ── SSH Honeypot (Cowrie) ─────────────────────────────────────────────────
   cowrie-ssh:
@@ -57,8 +126,73 @@ services:
       - "honeypot-mcp=true"
       - "honeypot-name=http-honeypot"
 
+  # ── Prometheus (scrapes /metrics) ──────────────────────────────────────────
+  # Bound to localhost only — same as the MCP /metrics endpoint. SSH-tunnel
+  # to reach it from another host. Prometheus itself doesn't need to be
+  # internet-reachable for the dashboards to work.
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: honeypot-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:9091:9090"
+    networks:
+      - honeypot-net
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Grafana (provisioned dashboards) ───────────────────────────────────────
+  # The visual front door. Provisions Prometheus + SQLite datasources and
+  # auto-loads dashboards from grafana/dashboards/. Mounts the MCP data
+  # volume read-only so SQLite-backed panels (geo map, top attackers) can
+  # query the live alerts table. WAL mode (database.py) means these reads
+  # don't lock the MCP writer.
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: honeypot-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      # Anonymous read access so a recruiter opening the screenshot-link URL
+      # doesn't hit a login wall. Admin is still required to edit.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-honeypot}
+      # Auto-install SQLite plugin so dashboards can query alerts directly.
+      GF_INSTALL_PLUGINS: frser-sqlite-datasource
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: frser-sqlite-datasource
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      # Read-only access to the MCP SQLite DB. WAL mode lets us read while
+      # MCP writes; mount is :ro because dashboards should never mutate.
+      - mcp-data:/mcp-data:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    networks:
+      - honeypot-net
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   cowrie-logs:
+  mcp-data:
+  mcp-reports:
+  mcp-tls:
+  prometheus-data:
+  grafana-data:
 
 networks:
   honeypot-net:

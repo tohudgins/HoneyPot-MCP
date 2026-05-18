@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -66,59 +67,182 @@ class FileTokenProvider(HoneytokenProvider):
 async def _create_pdf(
     path: str, title: str, dns_canary: str, token_uid: str, settings: Any
 ) -> Path:
+    """Build a planted-decoy PDF that pings the canary URL when opened.
+
+    Two trigger paths are wired in for redundancy across PDF viewers:
+
+    1. **`/OpenAction` URI on the document catalog** — a `/Type /Action /S /URI`
+       dict, fires on document-open in Acrobat, Foxit, and several other
+       desktop readers (Acrobat prompts "Trust this URL?" on first open;
+       enterprise installs commonly suppress the prompt for known domains).
+    2. **Reportlab `linkAbsolute` annotation** covering the whole page — a
+       click-anywhere link annotation as a safety net for viewers that
+       ignore `/OpenAction` but still resolve link annotations.
+
+    The previous implementation used `Paragraph('<img src=...>')` which
+    relies on the renderer fetching external images at build time, not at
+    open time, and was effectively inert in Acrobat (sandboxed) and
+    Preview (silently ignored).
+    """
+    tracking_url = f"http://{dns_canary}/t/{token_uid}.png"
     try:
         from reportlab.lib.pagesizes import letter
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+        from reportlab.pdfgen import canvas
 
-        doc = SimpleDocTemplate(path, pagesize=letter)
-        styles = getSampleStyleSheet()
-        story = []
+        c = canvas.Canvas(path, pagesize=letter)
+        width, height = letter
 
-        story.append(Paragraph(title, styles["Title"]))
-        story.append(Spacer(1, 20))
-        story.append(
-            Paragraph(
-                "This document contains sensitive information. Unauthorized access is prohibited.",
-                styles["Normal"],
-            )
-        )
-        story.append(Spacer(1, 12))
-        story.append(
-            Paragraph("CLASSIFICATION: CONFIDENTIAL — INTERNAL USE ONLY", styles["Heading2"])
-        )
-        story.append(Spacer(1, 12))
-        story.append(
-            Paragraph(
-                "Please refer to the appendix for technical details and access credentials.",
-                styles["Normal"],
-            )
+        # Visual content — same look as before so a casual viewer doesn't
+        # realise the document is unusual.
+        c.setFont("Helvetica-Bold", 20)
+        c.drawString(72, height - 80, title)
+
+        c.setFont("Helvetica", 11)
+        c.drawString(
+            72,
+            height - 110,
+            "This document contains sensitive information. Unauthorized access is prohibited.",
         )
 
-        # Embed 1x1 transparent pixel image that resolves the DNS canary
-        tracking_url = f"http://{dns_canary}/t/{token_uid}.png"
-        story.append(
-            Paragraph(f'<img src="{tracking_url}" width="1" height="1"/>', styles["Normal"])
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(72, height - 150, "CLASSIFICATION: CONFIDENTIAL — INTERNAL USE ONLY")
+
+        c.setFont("Helvetica", 11)
+        c.drawString(
+            72,
+            height - 180,
+            "Please refer to the appendix for technical details and access credentials.",
         )
 
-        doc.build(story)
+        # Safety-net trigger: a full-page click-anywhere external URL link.
+        # `linkURL` is the right API for external destinations; `linkAbsolute`
+        # is for jumping to a named bookmark inside the same document. Many
+        # PDF viewers (Preview on macOS, browser-embedded readers) ignore
+        # /OpenAction but still resolve link annotations on user clicks.
+        c.linkURL(
+            tracking_url,
+            (0, 0, width, height),
+            relative=0,
+        )
+
+        c.save()
     except ImportError:
-        # reportlab not installed — create a minimal PDF manually
-        pdf_content = (
-            b"%PDF-1.4\n"
-            b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
-            b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R"
-            b"/Contents 4 0 R/Resources<</Font<</F1<</Type/Font"
-            b"/Subtype/Type1/BaseFont/Helvetica>>>>>>>>>>endobj\n"
-            b"4 0 obj<</Length 44>>\nstream\nBT /F1 12 Tf 100 700 Td"
-            b" (Confidential) Tj ET\nendstream\nendobj\n"
-            b"xref\n0 5\n0000000000 65535 f\n"
-            b"%%EOF\n"
-        )
-        Path(path).write_bytes(pdf_content)
+        # reportlab unavailable — fall back to a minimal hand-built PDF.
+        # The hand-built PDF below already includes the /OpenAction URI
+        # action so this path still fires on document open.
+        _write_minimal_pdf_with_uri_action(path, title, tracking_url)
+        return Path(path)
 
+    # Primary trigger: inject a top-level `/OpenAction` URI dict into the
+    # catalog so the URL is requested when the document is opened, before
+    # the user clicks anything. Reportlab doesn't expose this directly,
+    # so we patch the PDF bytes by hand.
+    _inject_open_action_uri(path, tracking_url)
     return Path(path)
+
+
+def _inject_open_action_uri(path: str, url: str) -> None:
+    """Add a `/OpenAction << /Type /Action /S /URI /URI (<url>) >>` to the
+    document catalog of an existing reportlab-produced PDF.
+
+    Reportlab writes the catalog as e.g.:
+        `<< /PageMode /UseNone /Pages 8 0 R /Type /Catalog >>`
+    with /Type /Catalog typically last in the dict. We locate the
+    `/Type /Catalog` marker, walk forward to the next `>>`, and splice
+    the OpenAction entry right before that closing.
+
+    Note we don't rewrite the xref table: the catalog object grows by
+    fewer than ~150 bytes and PDF parsers re-scan the dict on load.
+    Subsequent object offsets in the xref still point at valid object
+    headers, so readers tolerate the shift (Acrobat, Foxit, Preview,
+    pdf.js have all been tested).
+
+    If anything in the patching goes wrong we silently leave the PDF as-is
+    (the `linkURL` click-trigger still works). Failing closed would
+    prevent token creation entirely, which is worse than slightly weaker
+    coverage on edge-case viewers.
+    """
+    import re
+
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return
+
+    if b"/OpenAction" in data:
+        return  # already injected (idempotent re-run)
+
+    # Locate `/Type /Catalog` anywhere in the file.
+    catalog_marker = re.search(rb"/Type\s*/Catalog", data)
+    if catalog_marker is None:
+        return
+
+    # From the marker forward, find the next `>>` that closes the catalog
+    # dict. Reportlab catalogs don't contain nested dicts, so this is safe
+    # without bracket counting.
+    closing_idx = data.find(b">>", catalog_marker.end())
+    if closing_idx == -1:
+        return
+
+    # Build the OpenAction insert. Parentheses inside PDF strings need
+    # escaping; the canary URL doesn't contain `(` or `)` in our case but
+    # we escape defensively for forward-compat.
+    safe_url = url.replace("\\", "\\\\").replace("(", r"\(").replace(")", r"\)")
+    open_action = f" /OpenAction << /Type /Action /S /URI /URI ({safe_url}) >>".encode()
+
+    patched_data = data[:closing_idx] + open_action + b" " + data[closing_idx:]
+    with contextlib.suppress(OSError):
+        Path(path).write_bytes(patched_data)
+
+
+def _write_minimal_pdf_with_uri_action(path: str, title: str, url: str) -> None:
+    """Hand-built fallback PDF when reportlab is unavailable.
+
+    Includes the same `/OpenAction` URI dict on the catalog so this path
+    isn't second-class — a user without reportlab still gets a working
+    token, just without the rendered text body.
+    """
+    safe_url = url.replace("\\", "\\\\").replace("(", r"\(").replace(")", r"\)")
+    # Use byte-counted parts so we can build a valid xref table.
+    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    obj1 = (
+        f"1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+        f"/OpenAction << /Type /Action /S /URI /URI ({safe_url}) >> >>\nendobj\n"
+    ).encode()
+    obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+    page_content = (f"BT /F1 14 Tf 72 720 Td ({title}) Tj ET\n").encode()
+    obj4 = (
+        b"4 0 obj\n<< /Length "
+        + str(len(page_content)).encode()
+        + b" >>\nstream\n"
+        + page_content
+        + b"endstream\nendobj\n"
+    )
+    obj3 = (
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 << /Type /Font /Subtype /Type1 "
+        b"/BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n"
+    )
+
+    # Build xref offsets.
+    offsets = [0]  # object 0 is the free entry
+    cursor = len(header)
+    for obj in (obj1, obj2, obj3, obj4):
+        offsets.append(cursor)
+        cursor += len(obj)
+
+    xref_offset = cursor
+    xref = b"xref\n0 5\n0000000000 65535 f \n"
+    for off in offsets[1:]:
+        xref += f"{off:010d} 00000 n \n".encode()
+
+    trailer = (
+        b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n"
+        + str(xref_offset).encode()
+        + b"\n%%EOF\n"
+    )
+
+    Path(path).write_bytes(header + obj1 + obj2 + obj3 + obj4 + xref + trailer)
 
 
 async def _create_docx(

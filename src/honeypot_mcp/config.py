@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     canary_callback_port: int = 8888
     canary_public_url: str = "http://localhost:8888"
 
+    # Shared secret for the /cloud-event ingest endpoint. Empty means the
+    # endpoint refuses all requests with 503 — the safe default. Set to a
+    # cryptographically random string (32+ bytes) on a public deployment
+    # and configure your CloudTrail / Azure Activity / GCP Audit log
+    # forwarder to sign POST bodies with HMAC-SHA256 over the raw body.
+    cloud_event_hmac_secret: str = ""
+
     # Prometheus /metrics endpoint — separate port from honeypot listeners
     # so scrapers can be locked down independently. Set port to 0 to disable.
     metrics_host: str = "0.0.0.0"
@@ -50,6 +57,11 @@ class Settings(BaseSettings):
     default_ftp_port: int = 2121
     default_smtp_port: int = 2525
     default_dns_port: int = 5353
+    default_rdp_port: int = 3389
+    default_vnc_port: int = 5900
+    default_redis_port: int = 6379
+    default_mysql_port: int = 3306
+    default_elasticsearch_port: int = 9200
 
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"

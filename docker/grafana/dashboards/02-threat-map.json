@@ -1,0 +1,96 @@
+{
+  "uid": "honeypot-threat-map",
+  "title": "HoneyPot MCP — Threat Map",
+  "tags": ["honeypot", "geo", "soc"],
+  "timezone": "browser",
+  "schemaVersion": 40,
+  "version": 1,
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "geomap",
+      "title": "Attacker origins",
+      "description": "Each marker is one source IP, sized by hit count. Lat/lng come from GeoIP enrichment on CRITICAL alerts (and any other alert that was manually enriched via `enrich_ip`).",
+      "gridPos": {"h": 14, "w": 24, "x": 0, "y": 0},
+      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT source_ip AS ip, CAST(json_extract(payload, '$.enrichment.geoip.latitude') AS REAL) AS latitude, CAST(json_extract(payload, '$.enrichment.geoip.longitude') AS REAL) AS longitude, json_extract(payload, '$.enrichment.geoip.country') AS country, COUNT(*) AS hits FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') AND json_extract(payload, '$.enrichment.geoip.latitude') IS NOT NULL GROUP BY source_ip ORDER BY hits DESC",
+          "queryType": "table",
+          "timeColumns": []
+        }
+      ],
+      "options": {
+        "view": {"id": "zero", "lat": 20, "lon": 0, "zoom": 2},
+        "basemap": {"type": "default", "name": "Layer 0", "config": {}},
+        "controls": {"showZoom": true, "showAttribution": true, "showScale": false, "showDebug": false, "mouseWheelZoom": true},
+        "layers": [
+          {
+            "type": "markers",
+            "name": "Attackers",
+            "config": {
+              "style": {
+                "size": {"fixed": 5, "min": 4, "max": 25, "field": "hits"},
+                "color": {"fixed": "red"},
+                "opacity": 0.6,
+                "symbol": {"fixed": "img/icons/marker/circle.svg", "mode": "fixed"},
+                "textConfig": {"fontSize": 12, "textAlign": "center", "textBaseline": "middle"}
+              },
+              "showLegend": true
+            },
+            "location": {"mode": "coords", "latitude": "latitude", "longitude": "longitude"}
+          }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Top countries (window)",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT json_extract(payload, '$.enrichment.geoip.country') AS country, COUNT(*) AS hits, COUNT(DISTINCT source_ip) AS unique_ips FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') AND json_extract(payload, '$.enrichment.geoip.country') IS NOT NULL GROUP BY country ORDER BY hits DESC LIMIT 25",
+          "queryType": "table",
+          "timeColumns": []
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "left", "displayMode": "auto"}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "hits"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "continuous-reds"}}]}
+        ]
+      },
+      "options": {"showHeader": true}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Unique attacker IPs per hour",
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS time, COUNT(DISTINCT source_ip) AS unique_ips FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H', timestamp) ORDER BY time",
+          "queryType": "time series",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineInterpolation": "smooth", "lineWidth": 2},
+          "color": {"mode": "fixed", "fixedColor": "purple"},
+          "unit": "short"
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    }
+  ]
+}

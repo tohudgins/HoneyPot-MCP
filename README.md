@@ -9,6 +9,8 @@ A Model Context Protocol server for deploying, monitoring, and analysing honeypo
 > **Read first:** [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — a frank rundown of what works (Cowrie SSH, HTTP personas, canary URLs, credential cross-reference) and what doesn't (DOCX/PDF file tokens, AWS-key callback path, HTTP TLS). Acknowledging the gaps is the point.
 >
 > **Ready to deploy?** [docs/DEPLOY.md](docs/DEPLOY.md) walks through "rent a $5 VPS → catch real attack traffic in under 30 minutes" plus ongoing-operations guidance.
+>
+> **Want to see it work in 5 minutes?** Jump to [Quick demo with Grafana](#quick-demo-with-grafana-dashboards) — `docker compose up` plus a seed script gives you pre-populated dashboards including a geo-mapped threat map and MITRE ATT&CK coverage view.
 
 Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct an attacker's session, map their TTPs to MITRE ATT&CK, push alerts to Slack, or export a STIX 2.1 IOC bundle — all through natural language.
 
@@ -282,10 +284,76 @@ Subscription failure stats are tracked per subscription so you can see which int
 ```bash
 cd docker
 cp ../.env .env
-docker compose up -d
+docker compose up -d --build
 ```
 
-Starts Cowrie on 2222, the HTTP honeypot on 8080, and the MCP server with canary callback on 8888.
+Starts six services on an internal Docker network:
+
+| Service | Purpose | Port |
+|---|---|---|
+| `honeypot-mcp` | MCP server, canary callback, `/metrics` exporter | 8888 (canary), 9090 (metrics, localhost-only) |
+| `socket-proxy` | Restricted Docker API access for the MCP container — replaces the dangerous `/var/run/docker.sock` mount | internal only |
+| `cowrie-ssh` | Cowrie SSH/Telnet honeypot | 2222 |
+| `http-honeypot` | HTTP honeypot | 8080 |
+| `prometheus` | Scrapes `/metrics` from the MCP server | 9091 (localhost-only) |
+| `grafana` | Pre-provisioned dashboards (overview, threat map, MITRE coverage) | 3000 |
+
+The socket-proxy sidecar means the MCP container can manage Cowrie via the Docker API without sharing the host socket — so MCP process compromise can't escalate to root-on-host.
+
+---
+
+## Quick demo with Grafana dashboards
+
+The fastest way to see what this project actually does:
+
+```bash
+# 1. Bring the stack up
+cd docker
+docker compose up -d --build
+
+# 2. Seed ~5,000 realistic demo attack events across 24h
+docker compose exec honeypot-mcp python scripts/seed_demo_data.py
+
+# 3. Open Grafana (admin / honeypot)
+#    Three dashboards are pre-loaded:
+#    - HoneyPot MCP — Overview
+#    - HoneyPot MCP — Threat Map
+#    - HoneyPot MCP — MITRE ATT&CK Coverage
+open http://localhost:3000
+```
+
+The seed script generates events with realistic source IPs and geo coordinates spread across the top attacker countries (CN, RU, US, BR, IN, …) so the threat map lights up immediately — no waiting for real traffic to arrive.
+
+### Screenshots
+
+> _Drop captured screenshots into `docs/screenshots/` and reference them here. Suggested:_
+> - `overview.png` — top-level dashboard with severity stack, top attackers
+> - `threat-map.png` — geomap with attacker origins
+> - `mitre.png` — ATT&CK tactic coverage
+
+### Architecture of the observability stack
+
+```
+                                       ┌──────────────┐
+                                       │   Grafana    │  :3000
+                                       │ (dashboards) │
+                                       └──────┬───────┘
+                                              │
+                       ┌──────────────────────┼──────────────────────┐
+                       │ Prometheus DS (time-series)  SQLite DS (JOIN/JSON)
+                       ▼                                              ▼
+                 ┌───────────┐                                ┌──────────────┐
+                 │Prometheus │ :9091 ←── scrape /metrics ──── │ honeypot_mcp │
+                 │  (TSDB)   │                                │   server     │
+                 └───────────┘                                │              │
+                                                              │   SQLite     │
+                                                              │ (WAL mode    │
+                                                              │  → readable  │
+                                                              │   while live)│
+                                                              └──────────────┘
+```
+
+The SQLite WAL mode (`database.py`) is what makes the SQLite datasource panels (geo map, top attackers) safe to run against the live alerts DB while the MCP server is still writing events. Grafana reads the file `read-only`; the MCP server writes via the same volume.
 
 ---
 

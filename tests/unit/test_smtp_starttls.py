@@ -126,6 +126,66 @@ async def test_starttls_handshake_completes(smtp_server):
 
 
 @pytest.mark.asyncio
+async def test_starttls_allows_post_tls_ehlo(smtp_server):
+    """After STARTTLS completes, the engine must keep speaking SMTP over the
+    upgraded TLS transport. Real Postfix requires a fresh EHLO per RFC 3207
+    and serves the same extension list; closing the connection right after
+    the handshake is itself a fingerprint.
+
+    The previous test (`test_starttls_handshake_completes`) only asserts the
+    handshake completes — this one drives the protocol forward over TLS so
+    we catch regressions where the engine drops the connection or fails to
+    reattach the protocol on the new transport.
+    """
+    port = smtp_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        banner = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert banner.startswith(b"220 mail.test.local")
+
+        writer.write(b"EHLO probe.test\r\n")
+        await writer.drain()
+        await _read_until_terminator(reader)
+
+        writer.write(b"STARTTLS\r\n")
+        await writer.drain()
+        starttls_resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert starttls_resp.startswith(b"220")
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        await writer.start_tls(ctx)
+        # writer.start_tls() returns once the CLIENT-side handshake completes;
+        # the server may still be assigning the new transport on its end. A
+        # short settle prevents a race where our EHLO write hits the wire
+        # before the server's post-handshake protocol state is bound.
+        await asyncio.sleep(0.2)
+
+        # Fresh EHLO over the upgraded TLS connection — this is the proof
+        # point. If the engine closed after the handshake (the old broken
+        # behaviour), this write fails or the read returns empty.
+        writer.write(b"EHLO probe-over-tls.test\r\n")
+        await writer.drain()
+        post_tls_resp = await _read_until_terminator(reader)
+        # Multi-line 250- ... 250 <last>, terminator on the last line.
+        assert "250" in post_tls_resp, f"no 250 after post-TLS EHLO: {post_tls_resp!r}"
+        # Should advertise the same extensions as plaintext EHLO did.
+        assert "PIPELINING" in post_tls_resp
+        assert "AUTH" in post_tls_resp
+
+        # And the engine should accept QUIT over TLS too — verifies the
+        # dispatcher is fully functional.
+        writer.write(b"QUIT\r\n")
+        await writer.drain()
+        bye = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert bye.startswith(b"221")
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+
+
+@pytest.mark.asyncio
 async def test_starttls_handshake_logged_as_event(smtp_server):
     """A successful TLS upgrade should emit an `smtp_starttls_handshake`
     event in the alert stream — useful for distinguishing "scanner that did

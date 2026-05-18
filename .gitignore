@@ -48,6 +48,9 @@ ENV/
 # Large user-downloaded data files
 config/GeoLite2-City.mmdb
 config/mitre_attack.json
+# GeoIP MMDB dropped into the Docker mount point at deploy time —
+# MaxMind license forbids redistribution.
+docker/geoip/*.mmdb
 
 # Generated attack reports
 reports/*.html

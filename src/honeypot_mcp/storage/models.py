@@ -21,6 +21,10 @@ class HoneypotType(str, enum.Enum):
     FTP = "ftp"
     DNS = "dns"
     RDP = "rdp"
+    VNC = "vnc"
+    REDIS = "redis"
+    MYSQL = "mysql"
+    ELASTICSEARCH = "elasticsearch"
 
 
 class HoneypotStatus(str, enum.Enum):
@@ -45,6 +49,13 @@ class HoneytokenType(str, enum.Enum):
     SSH_KEY = "ssh_key"  # planted private key — fingerprint match on SSH auth
     JWT = "jwt"  # planted bearer token — jti match on HTTP Authorization header
     DB_ROW = "db_row"  # planted database row with canary email — match on SMTP RCPT TO
+    # Cloud-era tokens. Kubeconfig + Slack webhook trigger via the existing
+    # canary callback. Azure + GCP credentials are decoy-only unless the
+    # operator wires their cloud audit log forwarding to /cloud-event.
+    KUBECONFIG = "kubeconfig"
+    SLACK_WEBHOOK = "slack_webhook"
+    AZURE_CREDENTIAL = "azure_credential"
+    GCP_SERVICE_ACCOUNT = "gcp_service_account"
 
 
 class HoneytokenStatus(str, enum.Enum):

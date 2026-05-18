@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1.7
+#
+# HoneyPot MCP server image.
+#
+# Two-stage build:
+#   1) `builder` resolves and installs the project into an isolated venv.
+#   2) `runtime` is a slim image carrying only the venv + source — no build
+#      toolchain, no apt caches, no pip cache.
+#
+# Runs as a non-root user. Talks to Docker over TCP to a socket-proxy
+# sidecar (see docker-compose.yml) rather than mounting /var/run/docker.sock
+# directly — so MCP server compromise can't escalate to root-on-host.
+
+# ── Stage 1: build venv ────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Build deps for cryptography / reportlab native bits. Removed from runtime.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        libffi-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Non-editable install — the runtime image is shipped as a wheel-installed
+# project, not a working copy mounted from the host.
+RUN pip install --upgrade pip \
+ && pip install .
+
+# ── Stage 2: runtime ───────────────────────────────────────────────────────
+FROM python:3.12-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    LOG_FORMAT=json
+
+# `curl` is needed only for the HEALTHCHECK. ~4 MB; keep it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 honeypot \
+ && useradd  --system --uid 10001 --gid honeypot --home /app --shell /sbin/nologin honeypot
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+# Suppression presets + settings.yaml are read relative to cwd at runtime
+# (tools/integrations.py looks for `config/suppression_presets/*.yaml`).
+# Migrations live inside the installed package, so no separate copy needed.
+COPY --chown=honeypot:honeypot config ./config
+# Ops scripts (seed demo data, fingerprint audit) live alongside config so
+# they're accessible via `docker compose exec honeypot-mcp python -m scripts.<name>`.
+COPY --chown=honeypot:honeypot scripts ./scripts
+# Pre-create the directories that named volumes mount on top of, so Docker
+# initializes them with the honeypot user's ownership rather than root.
+RUN mkdir -p /app/reports /app/tls /app/data /app/geoip \
+ && chown -R honeypot:honeypot /app
+
+USER honeypot
+
+EXPOSE 8888 9090
+
+# Metrics endpoint is the cheapest liveness signal — DB session + counter scan
+# round-trip. Returns text 200 if the server is healthy. 30s start period
+# absorbs DB init + Alembic migration on cold start.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl --silent --fail http://127.0.0.1:9090/metrics > /dev/null || exit 1
+
+ENTRYPOINT ["honeypot-mcp"]

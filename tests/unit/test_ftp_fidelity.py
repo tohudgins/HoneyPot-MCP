@@ -200,3 +200,84 @@ async def test_pwd_requires_auth(ftp_server):
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_list_serves_fake_directory_over_pasv(ftp_server):
+    """PASV + LIST must actually open a real data socket, accept the
+    client's data connection, and serve a ProFTPD-flavoured `ls -l`. The
+    previous engine returned `425 Use PORT or PASV first.` regardless of
+    PASV state, which a single LIST probe confirmed as a honeypot tell.
+
+    End-to-end:
+      USER anonymous → PASS x → PASV → connect to advertised port → LIST
+      → expect 150 (data starting) → read bytes → expect 226 (done).
+    """
+    port = ftp_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await _read_line(reader)  # banner
+
+        writer.write(b"USER anonymous\r\nPASS x@y.com\r\n")
+        await writer.drain()
+        await _read_line(reader)  # 331
+        await _read_line(reader)  # 230
+
+        writer.write(b"PASV\r\n")
+        await writer.drain()
+        pasv_resp = await _read_line(reader)
+        m = re.search(rb"\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", pasv_resp)
+        assert m, f"PASV response not parseable: {pasv_resp!r}"
+        p1, p2 = int(m.group(5)), int(m.group(6))
+        data_port = p1 * 256 + p2
+
+        # Connect the data channel BEFORE issuing LIST — real ftp clients
+        # establish the data connection then send LIST on the control channel.
+        data_reader, data_writer = await asyncio.open_connection("127.0.0.1", data_port)
+
+        writer.write(b"LIST\r\n")
+        await writer.drain()
+
+        # 150 Opening data connection
+        opening = await _read_line(reader)
+        assert opening.startswith(b"150"), f"expected 150 marker, got {opening!r}"
+
+        # Read the directory listing off the data channel until close.
+        listing = await asyncio.wait_for(data_reader.read(), timeout=2.0)
+        data_writer.close()
+        with contextlib.suppress(Exception):
+            await data_writer.wait_closed()
+
+        # Realistic ls -l output: at least one entry, file mode column, and
+        # the names baked into _FAKE_LISTING.
+        assert b"-rw-r--r--" in listing or b"drwxr-xr-x" in listing
+        assert b"backup.tar.gz" in listing or b"passwords.txt" in listing
+
+        # 226 Transfer complete on the control channel.
+        done = await _read_line(reader)
+        assert done.startswith(b"226"), f"expected 226 transfer-complete, got {done!r}"
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_list_without_pasv_returns_425(ftp_server):
+    """A LIST issued without a preceding PASV must still return 425 — the
+    new fake-listing behaviour kicks in only when PASV established a data
+    listener. This is the regression check for the old fallback path."""
+    port = ftp_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await _read_line(reader)  # banner
+        writer.write(b"USER anonymous\r\nPASS x@y.com\r\nLIST\r\n")
+        await writer.drain()
+        await _read_line(reader)  # 331
+        await _read_line(reader)  # 230
+        resp = await _read_line(reader)
+        assert resp.startswith(b"425")
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()

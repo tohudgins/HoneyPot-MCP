@@ -1,0 +1,87 @@
+{
+  "uid": "honeypot-mitre",
+  "title": "HoneyPot MCP — MITRE ATT&CK Coverage",
+  "tags": ["honeypot", "mitre", "soc"],
+  "timezone": "browser",
+  "schemaVersion": 40,
+  "version": 1,
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "bargauge",
+      "title": "Observed tactics (ATT&CK)",
+      "description": "Each event_type is mapped to its primary ATT&CK tactic. Same mapping logic as intel/mitre.py — replicated in SQL for live querying.",
+      "gridPos": {"h": 11, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT tactic, COUNT(*) AS count FROM (SELECT CASE WHEN event_type LIKE 'ssh_login%' OR event_type LIKE 'ftp_login%' OR event_type LIKE 'rdp_%' OR event_type LIKE 'http_credential%' THEN 'Initial Access (TA0001)' WHEN event_type LIKE 'ssh_command%' OR event_type LIKE 'shell_%' THEN 'Execution (TA0002)' WHEN event_type LIKE 'ssh_session%' THEN 'Persistence (TA0003)' WHEN event_type LIKE '%scan%' OR event_type LIKE 'http_active_recon' OR event_type LIKE 'dns_query%' THEN 'Discovery (TA0007)' WHEN event_type LIKE '%credential%' OR event_type LIKE 'honeytoken_triggered_credential%' THEN 'Credential Access (TA0006)' WHEN event_type LIKE 'ssh_port_forward' OR event_type LIKE 'http_canary%' OR event_type LIKE '%callback%' THEN 'Command and Control (TA0011)' WHEN event_type LIKE 'ssh_file_download' OR event_type LIKE '%exfil%' THEN 'Exfiltration (TA0010)' ELSE 'Uncategorised' END AS tactic FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')) GROUP BY tactic ORDER BY count DESC",
+          "queryType": "table",
+          "timeColumns": []
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "continuous-RdYlGr"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "valueMode": "color",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^count$/", "values": false}
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Top event types (raw)",
+      "description": "Unmapped event types — useful for finding new attack patterns to extend the MITRE mapping with.",
+      "gridPos": {"h": 11, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT event_type, COUNT(*) AS hits, COUNT(DISTINCT source_ip) AS unique_ips, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY event_type ORDER BY hits DESC LIMIT 20",
+          "queryType": "table",
+          "timeColumns": []
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "left", "displayMode": "auto"}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "hits"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "continuous-BlPu"}}]},
+          {"matcher": {"id": "byName", "options": "critical"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "continuous-reds"}}]}
+        ]
+      },
+      "options": {"showHeader": true}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Tactic timeline",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 11},
+      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS time, SUM(CASE WHEN event_type LIKE 'ssh_login%' OR event_type LIKE 'ftp_login%' OR event_type LIKE 'rdp_%' THEN 1 ELSE 0 END) AS initial_access, SUM(CASE WHEN event_type LIKE 'ssh_command%' THEN 1 ELSE 0 END) AS execution, SUM(CASE WHEN event_type LIKE '%scan%' OR event_type LIKE 'http_active_recon' THEN 1 ELSE 0 END) AS discovery, SUM(CASE WHEN event_type LIKE '%credential%' OR event_type LIKE 'honeytoken_triggered%' THEN 1 ELSE 0 END) AS credential_access, SUM(CASE WHEN event_type LIKE 'ssh_port_forward' OR event_type LIKE '%canary%' OR event_type LIKE '%callback%' THEN 1 ELSE 0 END) AS c2 FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H', timestamp) ORDER BY time",
+          "queryType": "time series",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 30, "lineInterpolation": "smooth", "lineWidth": 2, "stacking": {"mode": "normal", "group": "A"}},
+          "unit": "short"
+        }
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "right", "values": ["sum"]}, "tooltip": {"mode": "multi"}}
+    }
+  ]
+}

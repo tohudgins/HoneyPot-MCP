@@ -31,10 +31,12 @@ scanner pinning the cert SHA sees stability.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import random
 import secrets
+import string
 import time
 from typing import Any
 
@@ -81,6 +83,161 @@ _RECON_THRESHOLD = 5
 # Session inactivity timeout — drop sessions inactive for this long so the
 # in-memory map doesn't grow unbounded under sustained scanning.
 _SESSION_TTL_SECONDS = 3600
+
+# Cap raw bodies at 64 KB so a single 10 MB upload from a scanner can't
+# bloat the alert payload. Real exploit payloads (webshells, RCE chains)
+# almost always fit well under this.
+_MAX_RAW_BODY_BYTES = 65_536
+
+# Auth-failed response variants. The previous engine returned the SAME
+# byte sequence on every failed login, which is itself a fingerprint —
+# a scanner can submit two requests, diff the responses, and confirm
+# there's no real auth backend. Real login pages return slightly
+# different wording across versions / locales / WAFs, so we rotate.
+_LOGIN_FAILURE_VARIANTS: tuple[str, ...] = (
+    "Invalid username or password.",
+    "Authentication failed. Please try again.",
+    "Login failed: bad credentials.",
+    "The username or password you entered is incorrect.",
+    "We could not log you in with those details.",
+    "Sign-in unsuccessful. Check your credentials and retry.",
+)
+
+# Paths that warrant serving plausible decoy content instead of a 404 or a
+# fixed template. Scanners that probe these are looking for exfil-grade
+# data; returning believable bait gets them to stick around longer and
+# captures their full TTPs. Tokens embedded in the bait are throwaway —
+# not persisted, not matched — so they cost nothing if leaked.
+_DECOY_PATHS: frozenset[str] = frozenset(
+    {
+        "/.env",
+        "/config.json",
+        "/wp-config.php",
+        "/.aws/credentials",
+        "/.kube/config",
+    }
+)
+
+
+def _rand_alnum(n: int, upper: bool = False) -> str:
+    """Fixed-length random alphanumeric string for token-shape decoys."""
+    alphabet = (string.ascii_uppercase if upper else string.ascii_letters) + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def _generate_decoy(path: str) -> tuple[str, str]:
+    """Return `(body, content_type)` for a decoy response.
+
+    Each call mints fresh throwaway token-shaped strings. Nothing here is
+    a real honeytoken — they're decorative bait so the response *looks*
+    like what an attacker hopes to find. Real honeytokens fire via the
+    proper providers; mixing the two would risk leaking real tracker URLs
+    in scrape data.
+    """
+    aws_key_id = "AKIA" + _rand_alnum(16, upper=True)
+    aws_secret = _rand_alnum(40)
+    db_password = _rand_alnum(20)
+    jwt_payload = (
+        base64.urlsafe_b64encode(b'{"sub":"admin","role":"superuser","iat":1700000000}')
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    fake_jwt = f"eyJhbGciOiJIUzI1NiJ9.{jwt_payload}.{_rand_alnum(43)}"
+
+    if path == "/.env":
+        body = (
+            f"APP_NAME=Laravel\n"
+            f"APP_ENV=production\n"
+            f"APP_KEY=base64:{_rand_alnum(32)}=\n"
+            f"APP_DEBUG=false\n"
+            f"DB_CONNECTION=mysql\n"
+            f"DB_HOST=127.0.0.1\n"
+            f"DB_PORT=3306\n"
+            f"DB_DATABASE=production\n"
+            f"DB_USERNAME=appuser\n"
+            f"DB_PASSWORD={db_password}\n"
+            f"AWS_ACCESS_KEY_ID={aws_key_id}\n"
+            f"AWS_SECRET_ACCESS_KEY={aws_secret}\n"
+            f"AWS_DEFAULT_REGION=us-east-1\n"
+            f"JWT_SECRET={_rand_alnum(48)}\n"
+            f"STRIPE_SECRET=sk_live_{_rand_alnum(24)}\n"
+        )
+        return body, "text/plain"
+
+    if path == "/config.json":
+        body = (
+            "{\n"
+            '  "version": "1.2.4",\n'
+            '  "environment": "production",\n'
+            f'  "api_token": "{fake_jwt}",\n'
+            f'  "database": {{\n'
+            f'    "host": "db.internal",\n'
+            f'    "user": "appuser",\n'
+            f'    "password": "{db_password}"\n'
+            "  },\n"
+            f'  "aws": {{\n'
+            f'    "access_key_id": "{aws_key_id}",\n'
+            f'    "secret_access_key": "{aws_secret}"\n'
+            "  }\n"
+            "}\n"
+        )
+        return body, "application/json"
+
+    if path == "/wp-config.php":
+        body = (
+            "<?php\n"
+            "define( 'DB_NAME', 'wordpress' );\n"
+            "define( 'DB_USER', 'wpuser' );\n"
+            f"define( 'DB_PASSWORD', '{db_password}' );\n"
+            "define( 'DB_HOST', 'localhost' );\n"
+            "define( 'DB_CHARSET', 'utf8mb4' );\n"
+            f"define( 'AUTH_KEY',         '{_rand_alnum(64)}' );\n"
+            f"define( 'SECURE_AUTH_KEY',  '{_rand_alnum(64)}' );\n"
+            f"define( 'LOGGED_IN_KEY',    '{_rand_alnum(64)}' );\n"
+            "$table_prefix = 'wp_';\n"
+            "define( 'WP_DEBUG', false );\n"
+            "require_once ABSPATH . 'wp-settings.php';\n"
+        )
+        return body, "application/x-httpd-php"
+
+    if path == "/.aws/credentials":
+        body = (
+            "[default]\n"
+            f"aws_access_key_id = {aws_key_id}\n"
+            f"aws_secret_access_key = {aws_secret}\n"
+            "region = us-east-1\n"
+            "\n"
+            "[deploy]\n"
+            f"aws_access_key_id = AKIA{_rand_alnum(16, upper=True)}\n"
+            f"aws_secret_access_key = {_rand_alnum(40)}\n"
+            "region = us-west-2\n"
+        )
+        return body, "text/plain"
+
+    if path == "/.kube/config":
+        body = (
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- cluster:\n"
+            f"    server: https://k8s.internal:6443\n"
+            f"    certificate-authority-data: {_rand_alnum(80)}\n"
+            "  name: production\n"
+            "contexts:\n"
+            "- context:\n"
+            "    cluster: production\n"
+            "    user: admin\n"
+            "  name: production\n"
+            "current-context: production\n"
+            "users:\n"
+            "- name: admin\n"
+            "  user:\n"
+            f"    token: {fake_jwt}\n"
+        )
+        return body, "application/yaml"
+
+    # Should never hit — caller checks the path against _DECOY_PATHS first.
+    return "", "text/plain"
 
 
 class HTTPEngine(HoneypotEngine):
@@ -337,10 +494,28 @@ class HTTPEngine(HoneypotEngine):
             user_agent = request.headers.get("User-Agent", "")
             host_header = request.headers.get("Host", "localhost")
 
+            # Body parsing — content-type dispatch. Form/multipart goes through
+            # request.post() so credential_match keeps seeing the parsed
+            # `post_data` dict; non-form bodies (JSON, binary, raw exploit
+            # payloads) get captured as base64-encoded raw bytes, capped, so
+            # webshell uploads + RCE chains aren't silently lost.
             post_data: dict = {}
-            if method == "POST":
-                with contextlib.suppress(Exception):
-                    post_data = dict(await request.post())
+            raw_body_b64: str | None = None
+            raw_content_type: str | None = None
+            if method in ("POST", "PUT", "PATCH"):
+                ct = (request.headers.get("Content-Type") or "").lower()
+                is_form = "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct
+                if is_form:
+                    with contextlib.suppress(Exception):
+                        post_data = dict(await request.post())
+                else:
+                    with contextlib.suppress(Exception):
+                        raw = await request.read()
+                        if raw:
+                            raw_body_b64 = base64.b64encode(raw[:_MAX_RAW_BODY_BYTES]).decode(
+                                "ascii"
+                            )
+                            raw_content_type = ct or "application/octet-stream"
 
             matched_template = path_to_template.get(path)
             severity = _PATH_SEVERITY.get(path, AlertSeverity.LOW)
@@ -352,6 +527,16 @@ class HTTPEngine(HoneypotEngine):
             if sess["hits"] >= _RECON_THRESHOLD and severity == AlertSeverity.LOW:
                 severity = AlertSeverity.MEDIUM
                 event_type = "http_active_recon"
+
+            # Recon-path interception: serve plausible bait instead of the
+            # usual template/404 fallback. Severity escalates to MEDIUM because
+            # a probe for `/.env` or `/.aws/credentials` is unambiguously
+            # malicious — no real user hits these paths.
+            serve_decoy = path in _DECOY_PATHS
+            if serve_decoy:
+                event_type = "http_decoy_served"
+                if severity == AlertSeverity.LOW:
+                    severity = AlertSeverity.MEDIUM
 
             payload = {
                 "method": method,
@@ -366,6 +551,11 @@ class HTTPEngine(HoneypotEngine):
                 "session_hits": sess["hits"],
                 "tls": bool(config.get("tls")),
             }
+            if raw_body_b64 is not None:
+                payload["raw_body_b64"] = raw_body_b64
+                payload["raw_content_type"] = raw_content_type
+            if serve_decoy:
+                payload["decoy_target"] = path
 
             await submit_event(
                 PendingEvent(
@@ -383,7 +573,43 @@ class HTTPEngine(HoneypotEngine):
 
             response_headers = _persona_headers()
 
-            if matched_template is not None:
+            # POST /login: rotate the auth-failed wording AND add extra
+            # variable timing on top of the persona jitter. A real login
+            # endpoint does a password hash compare (100-500ms); a fixed
+            # sub-ms uniform response is itself a single-probe tell.
+            if method == "POST" and path == "/login":
+                await asyncio.sleep(random.uniform(0.18, 0.65))
+                variant = random.choice(_LOGIN_FAILURE_VARIANTS)
+                login_html = (
+                    "<!DOCTYPE html><html><head><title>Sign in</title></head><body>"
+                    "<h1>Sign in</h1>"
+                    '<form method="POST" action="/login">'
+                    '<label>Username <input name="username" /></label>'
+                    '<label>Password <input name="password" type="password" /></label>'
+                    '<button type="submit">Log in</button>'
+                    "</form>"
+                    f'<p class="error" style="color:#c00">{variant}</p>'
+                    "</body></html>"
+                )
+                resp = web.Response(
+                    text=login_html,
+                    content_type="text/html",
+                    status=401,
+                    headers=response_headers,
+                )
+                if is_new:
+                    _set_session_cookie(resp, sid)
+                return resp
+
+            if serve_decoy:
+                decoy_body, decoy_ct = _generate_decoy(path)
+                resp = web.Response(
+                    text=decoy_body,
+                    content_type=decoy_ct,
+                    status=200,
+                    headers=response_headers,
+                )
+            elif matched_template is not None:
                 content_type = "text/plain" if path.endswith(".env") else "text/html"
                 resp = web.Response(
                     text=get_template(matched_template),

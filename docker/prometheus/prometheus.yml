@@ -1,0 +1,20 @@
+# Prometheus config for HoneyPot MCP.
+#
+# Single scrape target: the MCP /metrics endpoint on the internal
+# honeypot-net. 15s interval is plenty — the metrics are aggregates over the
+# whole alerts table, not high-frequency counters.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    deployment: honeypot-mcp
+
+scrape_configs:
+  - job_name: honeypot-mcp
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - honeypot-mcp:9090
+        labels:
+          service: honeypot-mcp

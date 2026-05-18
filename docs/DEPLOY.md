@@ -121,20 +121,30 @@ GEOIP_DB_PATH=config/GeoLite2-City.mmdb
 
 If you want geographic data in alerts, register at
 [maxmind.com](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data),
-download `GeoLite2-City.mmdb`, scp it to `config/` on the VPS.
+download `GeoLite2-City.mmdb`, and scp it to `docker/geoip/` on the VPS
+(the compose file bind-mounts that directory read-only into the container).
+MaxMind's license forbids redistribution, so the DB is intentionally not in
+the repo.
 
 ### 5. Start the SSH honeypot via Docker Compose (1 min)
 
 ```bash
 cd /opt/honeypot-mcp/docker
-docker compose up -d
+docker compose up -d --build
 ```
 
-This boots:
+`--build` is required on the first run because the MCP image is built from
+the local `docker/Dockerfile.mcp` — there's no published image yet.
 
-- Cowrie SSH/Telnet honeypot on **port 22** (and 23 if Telnet enabled)
-- HTTP honeypot on **port 80** (and 443 if you opt into TLS)
-- MCP server with the canary callback on **port 8888**
+This boots four services:
+
+- **socket-proxy** — internal-only sidecar that exposes a restricted Docker
+  API to the MCP container. The MCP server can manage Cowrie containers but
+  cannot escape to root-on-host even if the MCP process is exploited.
+- **honeypot-mcp** — server + canary callback (port 8888) + Prometheus
+  `/metrics` (port 9090, bound to localhost only).
+- **cowrie-ssh** — Cowrie SSH/Telnet honeypot.
+- **http-honeypot** — HTTP honeypot.
 
 Confirm everything is alive:
 
@@ -142,7 +152,8 @@ Confirm everything is alive:
 docker compose ps
 ```
 
-All services should be `Up`.
+All four services should be `Up`. The MCP container has a HEALTHCHECK; give
+it ~30s on first start (DB migration runs once).
 
 ### 6. Open the firewall (1 min)
 
@@ -288,6 +299,9 @@ non-fatal).
 | Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on consumer side | `alert_subscriptions_list` shows `last_error` |
 | Out of disk space | Alert payloads accumulating | Run `alerts_prune` more aggressively, or set up a cron job |
 | Host SSH down (locked out) | You forgot to move admin SSH off 22 before starting the honeypot | Use provider web console; edit `/etc/ssh/sshd_config`; restart sshd |
+| `honeypot-mcp` container can't deploy SSH honeypots dynamically | The socket-proxy sidecar is down or unreachable | `docker compose logs socket-proxy`. The MCP container talks to it on `tcp://socket-proxy:2375` over the internal `honeypot-net`. |
+| MCP container HEALTHCHECK reporting unhealthy | `/metrics` is failing — usually a DB init problem on first start | `docker compose logs honeypot-mcp`. Allow 30s on cold start for Alembic to run. |
+| Need to read Prometheus metrics from another host | Port 9090 is intentionally bound to `127.0.0.1` for security | SSH-tunnel it: `ssh -L 9090:127.0.0.1:9090 root@<vps>` |
 
 ---
 

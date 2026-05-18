@@ -38,6 +38,22 @@ def get_provider(token_type: HoneytokenType) -> HoneytokenProvider:
             from honeypot_mcp.tokens.db_row import DBRowProvider
 
             _providers[token_type] = DBRowProvider()
+        elif token_type == HoneytokenType.KUBECONFIG:
+            from honeypot_mcp.tokens.kubeconfig import KubeconfigProvider
+
+            _providers[token_type] = KubeconfigProvider()
+        elif token_type == HoneytokenType.SLACK_WEBHOOK:
+            from honeypot_mcp.tokens.slack_webhook import SlackWebhookProvider
+
+            _providers[token_type] = SlackWebhookProvider()
+        elif token_type == HoneytokenType.AZURE_CREDENTIAL:
+            from honeypot_mcp.tokens.azure_credential import AzureCredentialProvider
+
+            _providers[token_type] = AzureCredentialProvider()
+        elif token_type == HoneytokenType.GCP_SERVICE_ACCOUNT:
+            from honeypot_mcp.tokens.gcp_service_account import GCPServiceAccountProvider
+
+            _providers[token_type] = GCPServiceAccountProvider()
         else:
             raise ValueError(f"No provider registered for token type: {token_type}")
     return _providers[token_type]

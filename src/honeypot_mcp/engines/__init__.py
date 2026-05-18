@@ -34,6 +34,22 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.rdp import RDPEngine
 
             _engines[hp_type] = RDPEngine()
+        elif hp_type == HoneypotType.VNC:
+            from honeypot_mcp.engines.vnc import VNCEngine
+
+            _engines[hp_type] = VNCEngine()
+        elif hp_type == HoneypotType.REDIS:
+            from honeypot_mcp.engines.redis import RedisEngine
+
+            _engines[hp_type] = RedisEngine()
+        elif hp_type == HoneypotType.MYSQL:
+            from honeypot_mcp.engines.mysql import MySQLEngine
+
+            _engines[hp_type] = MySQLEngine()
+        elif hp_type == HoneypotType.ELASTICSEARCH:
+            from honeypot_mcp.engines.elasticsearch import ElasticsearchEngine
+
+            _engines[hp_type] = ElasticsearchEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

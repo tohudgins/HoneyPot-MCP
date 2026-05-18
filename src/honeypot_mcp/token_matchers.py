@@ -47,6 +47,13 @@ CACHE_REFRESH_SECONDS = 30
 _ssh_key_index: dict[str, int] = {}  # fingerprint → token_id
 _jwt_index: dict[str, int] = {}  # jti → token_id
 _dbrow_index: dict[str, int] = {}  # canary_email → token_id
+# Cloud-credential index — keyed on whatever identifying field a cloud
+# audit log emits for the credential. AWS uses `accessKeyId`, Azure uses
+# `appid` / `client_id`, GCP uses `principalEmail` (the service account
+# email). Each ID is stored verbatim; ambiguous prefixes are not
+# coalesced (e.g. "AKIA" prefix is left intact so it doesn't collide
+# with Azure GUIDs).
+_cloud_cred_index: dict[str, int] = {}
 _loaded_at: float = 0.0
 
 # OpenSSH fingerprint pattern: SHA256:<43 base64url chars>
@@ -68,7 +75,7 @@ def invalidate_cache() -> None:
 
 
 async def _load_indices() -> None:
-    global _ssh_key_index, _jwt_index, _dbrow_index, _loaded_at
+    global _ssh_key_index, _jwt_index, _dbrow_index, _cloud_cred_index, _loaded_at
     now = time.monotonic()
     if now - _loaded_at < CACHE_REFRESH_SECONDS:
         return
@@ -78,7 +85,14 @@ async def _load_indices() -> None:
             select(Honeytoken).where(
                 Honeytoken.status == HoneytokenStatus.ACTIVE,
                 Honeytoken.type.in_(
-                    [HoneytokenType.SSH_KEY, HoneytokenType.JWT, HoneytokenType.DB_ROW]
+                    [
+                        HoneytokenType.SSH_KEY,
+                        HoneytokenType.JWT,
+                        HoneytokenType.DB_ROW,
+                        HoneytokenType.API_KEY,
+                        HoneytokenType.AZURE_CREDENTIAL,
+                        HoneytokenType.GCP_SERVICE_ACCOUNT,
+                    ]
                 ),
             )
         )
@@ -87,6 +101,7 @@ async def _load_indices() -> None:
     ssh: dict[str, int] = {}
     jwt: dict[str, int] = {}
     dbr: dict[str, int] = {}
+    cloud: dict[str, int] = {}
     for t in tokens:
         meta = t.token_meta or {}
         if t.type == HoneytokenType.SSH_KEY:
@@ -101,11 +116,85 @@ async def _load_indices() -> None:
             email = meta.get("canary_email")
             if isinstance(email, str) and email:
                 dbr[email.lower()] = t.id
+        elif t.type == HoneytokenType.API_KEY:
+            # AWS access_key_id is the identifying field in CloudTrail.
+            akid = meta.get("access_key_id")
+            if isinstance(akid, str) and akid:
+                cloud[akid] = t.id
+        elif t.type == HoneytokenType.AZURE_CREDENTIAL:
+            cid = meta.get("client_id")
+            if isinstance(cid, str) and cid:
+                cloud[cid] = t.id
+        elif t.type == HoneytokenType.GCP_SERVICE_ACCOUNT:
+            # GCP audit logs surface the principalEmail (the service-account
+            # email). The private_key_id is also distinctive but rarely
+            # appears in audit logs.
+            email = meta.get("client_email")
+            if isinstance(email, str) and email:
+                cloud[email.lower()] = t.id
+            pkid = meta.get("private_key_id")
+            if isinstance(pkid, str) and pkid:
+                cloud[pkid] = t.id
 
     _ssh_key_index = ssh
     _jwt_index = jwt
     _dbrow_index = dbr
+    _cloud_cred_index = cloud
     _loaded_at = now
+
+
+async def match_cloud_event(event: dict) -> tuple[int | None, str | None]:
+    """Match an inbound cloud-audit-log event against active cloud-credential
+    tokens. Returns `(token_id, source)` where `source` is one of `"aws"`,
+    `"azure"`, `"gcp"`, or `None`.
+
+    Supports three shapes:
+    * AWS CloudTrail: `userIdentity.accessKeyId` (or top-level `accessKeyId`).
+    * Azure Activity Log: `claims.appid` or `identity.claims.appid` or
+      top-level `client_id`.
+    * GCP Audit Log: `protoPayload.authenticationInfo.principalEmail` or
+      top-level `principalEmail`. Case-insensitive on the email.
+
+    We probe all three shapes regardless of source so a forwarder that
+    flattens nested fields still matches. Returns the first hit by shape
+    priority (AWS, then Azure, then GCP).
+    """
+    await _load_indices()
+    if not _cloud_cred_index:
+        return None, None
+
+    # AWS shapes
+    aws_key = (event.get("userIdentity") or {}).get("accessKeyId") or event.get("accessKeyId")
+    if isinstance(aws_key, str) and aws_key in _cloud_cred_index:
+        return _cloud_cred_index[aws_key], "aws"
+
+    # Azure shapes
+    claims = event.get("claims") or {}
+    azure_appid = (
+        claims.get("appid")
+        or (event.get("identity") or {}).get("claims", {}).get("appid")
+        or event.get("appId")
+        or event.get("client_id")
+    )
+    if isinstance(azure_appid, str) and azure_appid in _cloud_cred_index:
+        return _cloud_cred_index[azure_appid], "azure"
+
+    # GCP shapes
+    proto = event.get("protoPayload") or {}
+    auth = proto.get("authenticationInfo") or {}
+    gcp_email = (
+        auth.get("principalEmail")
+        or event.get("principalEmail")
+        or (event.get("authenticationInfo") or {}).get("principalEmail")
+    )
+    if isinstance(gcp_email, str):
+        # Case-insensitive lookup since email local-parts are case-insensitive
+        # in practice and audit logs occasionally re-case.
+        lower = gcp_email.lower()
+        if lower in _cloud_cred_index:
+            return _cloud_cred_index[lower], "gcp"
+
+    return None, None
 
 
 def _decode_jwt_jti(jwt: str) -> str | None:

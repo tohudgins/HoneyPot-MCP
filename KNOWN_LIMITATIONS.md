@@ -47,6 +47,28 @@ the URL triggers a CRITICAL alert with full request metadata. Set
 `CANARY_PUBLIC_URL` to a publicly reachable address (ngrok, Cloudflare Tunnel,
 or a real domain) and these fire from the internet.
 
+**DOCX file tokens.** `tokens/file_token.py` injects an External-mode image
+relationship into `word/_rels/document.xml.rels` and references it from a
+`<w:drawing>` in the document body. When Word opens the file it fetches the
+external image — that fetch hits the canary callback and triggers an alert.
+Word's Protected View can block the first fetch (user must click "Enable
+Editing"); enterprise deployments with Protected View disabled or auto-trust
+on certain locations skip the prompt entirely.
+
+**HTTP recon endpoint decoys.** Probes for `/.env`, `/config.json`,
+`/wp-config.php`, `/.aws/credentials`, `/.kube/config` get plausible bait
+responses seeded with fresh throwaway tokens (random AWS-shaped keys, JWTs,
+DB passwords). These tokens are decorative — not persisted, not matched —
+purely to look like real exfil targets. A scanner that picks up "an AWS
+key" from `/.env` and starts trying it elsewhere is now visibly an
+attacker, not a misconfigured tool.
+
+**HTTP login response variation.** `POST /login` rotates across six
+plausible auth-failed strings and adds 180–650ms of random per-request
+delay on top of the persona's existing jitter. A scanner that submits the
+same creds twice and diffs the responses can no longer confirm "no real
+auth backend present" from response bytes or response time.
+
 **DNS as canary infrastructure.** The DNS honeypot isn't designed to look
 discoverable — it's the callback path for file-token DNS lookups. Returning
 NXDOMAIN for everything is correct behaviour for that role.
@@ -72,12 +94,16 @@ provider's audit log.
 **SMTP / FTP engines.** They catch automated traffic — open-relay scanners,
 FTP credential brute force, port-scanner banner grabs. Post-fidelity-upgrade,
 they advertise realistic feature sets (Postfix-style EHLO, ProFTPD-style FEAT,
-anonymous FTP flow). SMTP STARTTLS actually completes a real TLS handshake
-using the per-honeypot self-signed cert. A skilled human probing manually
-will still identify them eventually because we don't implement the full
-state machines (no actual data connections for FTP transfers, no SMTP mail
-queuing or DSN delivery). Comparable to OpenCanary fidelity, not Mailoney
-or a real Postfix deployment.
+anonymous FTP flow). SMTP STARTTLS completes a real TLS handshake using the
+per-honeypot self-signed cert **and continues the protocol over TLS** —
+scanners that EHLO-after-STARTTLS see the same extension list and can
+follow through to AUTH or DATA. FTP `LIST` over PASV actually opens a
+listening data port, accepts the client's connection, and serves a
+believable ProFTPD-flavoured `ls -l` listing — scanners that hammer LIST
+get fed real directory bytes. A skilled human probing manually will still
+identify the SMTP engine because we don't implement a real mail queue or
+DSN delivery, and FTP because RETR / STOR still return 550. Comparable to
+OpenCanary fidelity, not a real Postfix or ProFTPD deployment.
 
 **RDP banner honeypot.** Parses the X.224 Connection Request (TPKT layer),
 extracts the leaked `Cookie: mstshash=user@DOMAIN` field that virtually
@@ -93,25 +119,19 @@ server rejecting an insecure protocol negotiation.
 
 ## What does not work today
 
-**DOCX file tokens.** Don't use these for adversarial detection right now.
-The current implementation in `tokens/file_token.py` writes the tracking URL
-as null-prefixed text in a footer paragraph. Word will never make a network
-request from that — it's display text, not a document relationship. To
-actually fire on open you need to inject an `External`-mode relationship
-into `word/_rels/document.xml.rels` and reference it from the document body
-(`<v:imagedata>` or a modern equivalent). That's planned as a follow-up but
-not in the current code; treat DOCX tokens as a planted-decoy lookalike, not
-a live tripwire.
-
-**PDF file tokens.** Uncertain. The current implementation uses ReportLab's
-`Paragraph("<img src=...>")` HTML mode. Whether the resulting PDF actually
-fetches the image when opened depends entirely on the reader: Adobe Acrobat
-sandboxes external resources by default, Preview (macOS) usually ignores them
-silently, browser-based viewers prompt the user, and most enterprise environments
-strip external references at the gateway. The Canarytokens-style approach
-uses a `/URI` open-action or `app.launchURL` JavaScript — both more reliable
-than embedded HTML, both not yet implemented here. Don't rely on PDF tokens
-to fire in the wild; use canary URLs as the trip-wire path instead.
+**PDF file tokens — fires on open but Acrobat prompts on first use.** The
+current implementation (`tokens/file_token.py:_create_pdf`) injects an
+`/OpenAction` URI dict on the document catalog plus a full-page `linkAbsolute`
+click annotation as a safety net. The `/OpenAction` is what fires on document
+open in Acrobat, Foxit, and most desktop readers — but Acrobat shows a "Trust
+this URL?" prompt on first open from an unknown domain, and the user has to
+click Allow. Enterprise installs with the domain whitelisted skip the prompt;
+default home-user installs prompt every time. Preview on macOS and most
+browser-embedded viewers ignore `/OpenAction` entirely but still resolve
+link annotations (the safety-net path), so the click trigger fires there
+once the user clicks anywhere in the document. Treat PDF tokens as a
+high-confidence-but-not-guaranteed trigger — the canary URL token is still
+the most reliable wire for adversarial detection.
 
 **AWS API key tokens — no built-in detection.** The generated keys look real
 (correct AKIA/ASIA prefix, correct character set, correct length) and will sit
@@ -124,15 +144,16 @@ the real detection backend. By itself, the generated key is a believable
 decoy and nothing more. The token's `plant_instructions` text now says this
 explicitly.
 
-**HTTP — no authenticated session flow.** Sessions are now issued and
-tracked (cookie persistence + repeat-visit escalation), but the engine
-doesn't model a real authentication state machine — every `POST /login`
-gets the same "invalid credentials" response regardless of input, because
-"accepts any password" is itself a fingerprint. A scanner that submits
-the same creds twice and notices identical responses can infer no real
-auth backend is present. Adding randomized "credential check" timing or
-selective acceptance is possible but increases the risk of the honeypot
-itself becoming a useful login surface for attackers.
+**HTTP — no authenticated session flow.** Sessions are issued and tracked
+(cookie persistence + repeat-visit escalation), and `POST /login` now
+rotates across six plausible auth-failed wordings with variable per-
+request timing (see above), so a single diff-the-responses probe no
+longer confirms the absence of an auth backend. But we still never
+accept a login — every credential is rejected. A determined attacker
+who tries enough username/password combinations and observes that none
+ever succeed will eventually infer there's no real backend. Accepting
+some logins (selective acceptance) is possible but increases the risk
+of the honeypot itself becoming a useful login surface for attackers.
 
 **Cowrie known fingerprints.** Cowrie itself has well-known tells in `df` /
 `uname` / filesystem layout output that experienced attackers check. The

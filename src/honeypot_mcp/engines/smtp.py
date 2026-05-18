@@ -134,10 +134,15 @@ class _SMTPProtocol(asyncio.Protocol):
                 t.write(b"503 5.5.1 TLS already active\r\n")
             else:
                 t.write(b"220 2.0.0 Ready to start TLS\r\n")
-                # asyncio.start_tls() handles its own pause/resume_reading
-                # and swaps the transport's protocol to the internal SSL
-                # handler, which consumes the next bytes (the TLS
-                # ClientHello) as part of the handshake.
+                # Pause reading IMMEDIATELY so the TLS ClientHello bytes
+                # can't reach our plaintext data_received() between this
+                # 220 reply and the moment loop.start_tls() takes over
+                # the read path. Without this, a fast client's first TLS
+                # record arrives at _dispatch() as garbage, gets answered
+                # with `502 Command not recognised`, and the handshake
+                # poisons the wire — post-TLS EHLO then fails with
+                # WRONG_VERSION_NUMBER on the client side.
+                t.pause_reading()
                 asyncio.create_task(self._upgrade_to_tls())
         elif upper.startswith("AUTH"):
             t.write(b"334 VXNlcm5hbWU6\r\n")  # base64("Username:")
@@ -246,6 +251,9 @@ class _SMTPProtocol(asyncio.Protocol):
         except Exception as e:
             log.warning("STARTTLS handshake failed for %s: %s", self._peer[0], e)
             if self._transport is not None:
+                # Reading was paused before the handshake started — if we
+                # don't close, we'd leak a paused transport. Closing is
+                # also a believable failure mode (broken cert config).
                 self._transport.close()
 
     async def _record_event(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:

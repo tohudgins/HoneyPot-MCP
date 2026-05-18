@@ -1,0 +1,64 @@
+# Keep the Docker build context small and avoid leaking host state into the image.
+
+# VCS + IDE
+.git/
+.github/
+.idea/
+.vscode/
+.claude/
+
+# Python build artefacts / caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+pytest-results.xml
+
+# Virtual envs / lockfiles we don't want copied into the image
+.venv/
+venv/
+env/
+.uv/
+node_modules/
+
+# Secrets / local data — these MUST NOT bake into the image
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+honeypot_mcp.db*
+tls/
+
+# Documentation + tests — the runtime image doesn't need them
+docs/
+tests/
+KNOWN_LIMITATIONS.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Docker — don't recurse the build context into itself
+docker/
+!docker/Dockerfile.mcp
+
+# Large data files that should be downloaded at deploy time, not baked in.
+# (MaxMind's GeoLite2 license forbids redistribution.)
+config/GeoLite2-City.mmdb
+config/mitre_attack.json
+
+# Scratch / reports — scripts/ is intentionally NOT excluded so the demo
+# seed script and ops helpers are available via `docker compose exec`.
+reports/

@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from honeypot_mcp.config import get_settings
@@ -25,7 +26,38 @@ def _get_engine():
             echo=False,
             future=True,
         )
+        _apply_sqlite_pragmas(_engine, settings.database_url)
     return _engine
+
+
+def _apply_sqlite_pragmas(engine, url: str) -> None:
+    """Enable WAL mode + sane defaults for file-backed SQLite.
+
+    WAL is what lets Grafana (and any other observer) read the alerts table
+    concurrently with the MCP writer. Without it, SQLite's default `delete`
+    journal-mode serialises readers behind writers, and a dashboard refresh
+    can briefly stall event ingestion. WAL also dramatically improves write
+    throughput under burst load.
+
+    In-memory and Postgres URLs short-circuit. SQLite-only PRAGMAs would error
+    against other backends, so we feature-detect by URL scheme.
+    """
+    if not url.startswith("sqlite") or ":memory:" in url:
+        return
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _conn_record) -> None:  # type: ignore[no-untyped-def]
+        cursor = dbapi_conn.cursor()
+        # WAL: readers don't block writers and vice versa.
+        cursor.execute("PRAGMA journal_mode=WAL")
+        # NORMAL: durability slightly relaxed vs FULL, ~2x write speed, still
+        # crash-safe for our use case (lost transactions on power loss are
+        # acceptable for honeypot telemetry).
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        # 5s busy timeout — if a concurrent reader is mid-checkpoint, wait
+        # instead of immediately erroring with SQLITE_BUSY.
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
 
 
 def _get_session_factory():

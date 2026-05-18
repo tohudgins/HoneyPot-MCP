@@ -217,5 +217,136 @@ async def test_session_cookie_persists_across_requests(http_server):
         assert client.cookies.get("PHPSESSID") == first_cookie
 
 
+@pytest.mark.asyncio
+async def test_raw_body_capture_for_json_post(http_server):
+    """POST with a JSON body should land in payload.raw_body_b64 (base64-
+    encoded) plus raw_content_type. Form bodies still flow through post_data
+    so credential_match keeps working — verified by the parallel test below.
+    """
+    import base64
+    import json
+
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = http_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        body = {"cmd": "id", "shell": "<?php system($_GET['c']); ?>"}
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"http://127.0.0.1:{port}/api/exec",
+                content=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type.in_(("http_probe", "http_credential_submit")))
+        )
+        alerts = list(result.scalars().all())
+    assert alerts, "expected at least one alert for the POST"
+    # Find the alert with the raw body — JSON POSTs land as http_probe
+    # because there's no form-parsed post_data.
+    matching = [a for a in alerts if a.payload.get("raw_body_b64")]
+    assert matching, "expected raw_body_b64 to be captured on JSON POST"
+    decoded = base64.b64decode(matching[0].payload["raw_body_b64"])
+    assert b"<?php system" in decoded, "raw body should preserve exploit payload verbatim"
+    assert "application/json" in matching[0].payload["raw_content_type"]
+
+
+@pytest.mark.asyncio
+async def test_form_post_still_parses_into_post_data(http_server):
+    """credential_match.py reads payload.post_data — verify the form path
+    still produces that field. Regression test for the raw-body change."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = http_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"http://127.0.0.1:{port}/wp-admin",
+                data={"log": "admin", "pwd": "hunter2"},
+            )
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type == "http_credential_submit")
+        )
+        alerts = list(result.scalars().all())
+    assert alerts, "expected http_credential_submit for the form POST"
+    pd = alerts[0].payload.get("post_data") or {}
+    assert pd.get("log") == "admin"
+    assert pd.get("pwd") == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_login_response_varies_across_attempts(http_server):
+    """POST /login must rotate across multiple failure-string variants so
+    a scanner can't byte-diff two consecutive responses to confirm the
+    absence of a real auth backend."""
+    port = http_server
+    bodies: set[str] = set()
+    async with httpx.AsyncClient() as client:
+        for _ in range(12):
+            r = await client.post(
+                f"http://127.0.0.1:{port}/login",
+                data={"username": "admin", "password": "wrong"},
+            )
+            assert r.status_code == 401
+            bodies.add(r.text)
+    # 6 variants in the engine; 12 samples should hit at least 3 distinct
+    # bodies with probability close to 1.0. If this flakes the engine
+    # regressed to a fixed response.
+    assert len(bodies) >= 3, f"expected ≥3 distinct login-failed bodies, got {len(bodies)}"
+
+
+@pytest.mark.asyncio
+async def test_env_decoy_contains_aws_key_shape(http_server):
+    """GET /.env must serve a decoy `.env` file containing an `AKIA…` shaped
+    string (a fake AWS access-key-id). Catches both the path-interception
+    wiring and the token-shape filler."""
+    import re
+
+    port = http_server
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"http://127.0.0.1:{port}/.env")
+    assert r.status_code == 200
+    assert "AWS_ACCESS_KEY_ID" in r.text
+    assert re.search(r"AKIA[A-Z0-9]{16}", r.text), (
+        f"expected AKIA<16> token shape in /.env, got: {r.text[:300]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kube_decoy_returns_kubeconfig_shape(http_server):
+    """GET /.kube/config must serve a YAML kubeconfig with the expected
+    top-level keys. Scanners that pivot off `kind: Config` will engage."""
+    port = http_server
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"http://127.0.0.1:{port}/.kube/config")
+    assert r.status_code == 200
+    text = r.text
+    assert "apiVersion: v1" in text
+    assert "kind: Config" in text
+    assert "clusters:" in text
+
+
 # Avoid lint complaints about unused imports
 _ = contextlib

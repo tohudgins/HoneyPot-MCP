@@ -1,0 +1,19 @@
+# Grafana dashboard provisioning.
+#
+# Auto-loads every JSON file in /etc/grafana/dashboards on startup, and
+# polls for changes every 30s — drop a new JSON into docker/grafana/dashboards/
+# and it appears in Grafana without a restart.
+
+apiVersion: 1
+
+providers:
+  - name: HoneyPot MCP
+    orgId: 1
+    folder: HoneyPot MCP
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

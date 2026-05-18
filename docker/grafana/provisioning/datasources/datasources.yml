@@ -1,0 +1,36 @@
+# Grafana datasource provisioning.
+#
+# Two datasources are auto-created on Grafana startup:
+#
+#   1. Prometheus  — counters/gauges from the MCP /metrics endpoint.
+#                    Used for time-series panels (alerts/sec, severity stack,
+#                    engine breakdown).
+#
+#   2. HoneyPot DB — read-only SQLite handle over the MCP alerts table.
+#                    Used for high-cardinality data Prometheus can't hold
+#                    (per-IP attacker tables, geo coordinates from payload
+#                    enrichment, MITRE technique counts).
+#
+# The SQLite plugin is `frser-sqlite-datasource` — auto-installed by the
+# Grafana container via GF_INSTALL_PLUGINS in docker-compose.yml.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "15s"
+
+  - name: HoneyPot DB
+    uid: honeypot-db
+    type: frser-sqlite-datasource
+    access: proxy
+    editable: false
+    jsonData:
+      path: /mcp-data/honeypot_mcp.db
