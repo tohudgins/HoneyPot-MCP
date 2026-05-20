@@ -153,8 +153,8 @@ class AttackerEvent(Base):
 
 
 class Subscription(Base):
-    """Outbound webhook subscription. Delivers JSON-serialised alerts that
-    meet the severity threshold to the configured URL with optional HMAC sig."""
+    """Outbound webhook subscription. Delivers alerts that meet the severity
+    threshold to the configured URL in one of several SIEM-native formats."""
 
     __tablename__ = "subscriptions"
 
@@ -165,6 +165,15 @@ class Subscription(Base):
         Enum(AlertSeverity, values_callable=_ev),
         default=AlertSeverity.MEDIUM,
         nullable=False,
+    )
+    # Output format. Determines both the body shape and the auth scheme:
+    #   json         — raw JSON envelope (HMAC-signed via X-HoneyPot-Signature)
+    #   splunk_hec   — Splunk HTTP Event Collector envelope + Splunk token auth
+    #   elastic_ecs  — Elastic Common Schema field re-mapping (Bulk-input ready)
+    #   cef          — ArcSight CEF text format (works against QRadar too)
+    #   syslog       — RFC 5424 framed message over UDP/TCP (URL scheme picks transport)
+    format: Mapped[str] = mapped_column(
+        String(32), default="json", nullable=False, server_default="json"
     )
     hmac_secret: Mapped[str | None] = mapped_column(String(256), nullable=True)
     active: Mapped[bool] = mapped_column(default=True)

@@ -40,7 +40,8 @@ Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct
 | **Threat Intel** | VirusTotal v3, AbuseIPDB (with auto-report), MaxMind GeoIP — all with TTL caching |
 | **Analysis** | MITRE ATT&CK TTP mapping, attacker profiling, SSH session reconstruction, cross-honeypot attacker journey, campaign correlation |
 | **Reporting** | XSS-safe HTML (Jinja2 autoescape) and Markdown attack reports |
-| **Platform** | Webhook subscriptions (HMAC-signed), suppression rules + rate limiting + bundled presets (Shodan / Censys / RFC1918), blocklist + STIX exports |
+| **SIEM integration** | Native delivery formats: JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, Syslog RFC 5424 over UDP/TCP. Per-subscription severity threshold and delivery health stats. |
+| **Platform** | Webhook subscriptions, suppression rules + rate limiting + bundled presets (Shodan / Censys / RFC1918), blocklist + STIX exports |
 | **Operations** | Periodic health watchdog, end-to-end self-test, Alembic-managed schema migrations, Prometheus `/metrics` endpoint, JSON-structured logging (`LOG_FORMAT=json`), canary-callback rate limiting |
 | **MCP Resources** | Live feeds: active honeypots, alert stream, triggered tokens, stats dashboard |
 
@@ -228,7 +229,7 @@ Expected: the deploy returns `{status: "running", ...}`, and the self-test repor
 ### Platform integration
 | Tool | Description |
 |---|---|
-| `alert_subscribe` | Register a URL for real-time alert webhooks (HMAC signed, severity filter) |
+| `alert_subscribe` | Register a URL for real-time alert delivery in your SIEM's native format (json, splunk_hec, elastic_ecs, cef, syslog) |
 | `alert_unsubscribe` | Deactivate a subscription |
 | `alert_subscriptions_list` | List subscriptions with delivery health stats |
 | `suppression_add` | Add a drop or rate-limit rule (exact IP / CIDR / event-type glob) |
@@ -245,23 +246,233 @@ Expected: the deploy returns `{status: "running", ...}`, and the self-test repor
 
 ---
 
-## Platform integration: pushing alerts to other tools
+## SIEM integration
 
-Webhook subscriptions let you fan alerts out to any HTTP endpoint — Slack, PagerDuty, SIEM, n8n, custom tooling.
+`alert_subscribe` takes a `format` argument that picks the body shape and auth scheme. Five formats are supported out of the box — every common SIEM landing zone has a native option.
 
-```
+| Format | Body shape | Auth | Transport |
+|---|---|---|---|
+| `json` (default) | raw JSON envelope | HMAC-SHA256 via `X-HoneyPot-Signature` | HTTPS POST |
+| `splunk_hec` | Splunk HEC `{time, host, sourcetype, event}` | `Authorization: Splunk <token>` | HTTPS POST |
+| `elastic_ecs` | Elastic Common Schema (`source.ip`, `event.action`, `@timestamp`) | `Authorization: ApiKey <key>` | HTTPS POST |
+| `cef` | ArcSight CEF pipe-delimited text | — | HTTPS POST (works with QRadar Universal CEF Connector too) |
+| `syslog` | RFC 5424 framed message | — | UDP or TCP — URL scheme picks the transport |
+
+Subscription failure stats (`delivery_count`, `failure_count`, `last_error`) are tracked per subscription so you see which integrations are dead at a glance.
+
+### Splunk HEC
+
+```text
 # Through Claude:
-> Subscribe https://hooks.slack.com/services/... to receive HIGH+ severity alerts.
-> Add a suppression rule for 10.0.0.0/8 — that's our internal scanner.
-> Show me which subscriptions are failing.
+> alert_subscribe(
+    url="https://splunk.example.com:8088/services/collector/event",
+    label="splunk-prod",
+    severity_threshold="medium",
+    hmac_secret="<your-Splunk-HEC-token>",
+    format="splunk_hec"
+  )
 ```
 
-Each delivery includes:
-- The full alert JSON in the body
-- `X-HoneyPot-Signature: sha256=<hex>` if `hmac_secret` is set (verify like a GitHub webhook)
-- 3 retries with exponential backoff (1s, 5s, 30s) on failure
+Each delivery POSTs the HEC envelope with `Authorization: Splunk <token>`. Index `honeypot:alert` shows up in Splunk under `sourcetype=honeypot:alert` immediately.
 
-Subscription failure stats are tracked per subscription so you can see which integrations are dead.
+### Elastic / OpenSearch (ECS)
+
+```text
+> alert_subscribe(
+    url="https://elastic.example.com:9200/honeypot-alerts/_doc",
+    label="elastic-soc",
+    severity_threshold="medium",
+    hmac_secret="<your-api-key>",
+    format="elastic_ecs"
+  )
+```
+
+Body is a single ECS-shaped document. Fields land under `source.ip`, `source.port`, `event.action`, `event.category` (taxonomy-classified: authentication / network / process / file / intrusion_detection), `event.severity` (numeric 0-9), `@timestamp`, plus the full native payload preserved under `event.original`. Compatible with Filebeat HTTP input, Logstash `http` input, and the Elasticsearch Bulk API.
+
+### ArcSight / QRadar (CEF)
+
+```text
+> alert_subscribe(
+    url="https://cef-receiver.example.com/cef",
+    label="qradar-cef",
+    severity_threshold="high",
+    format="cef"
+  )
+```
+
+Body is a single CEF line: `CEF:0|HoneyPotMCP|server|1.0|<event_type>|<event_type>|<severity>|src=<ip> spt=<port> cs1=<honeypot_id> cs1Label=honeypot_id …`. QRadar's Universal CEF Connector ingests this directly; ArcSight Smart Connectors with CEF input do the same.
+
+### Syslog (RFC 5424)
+
+```text
+# UDP
+> alert_subscribe(
+    url="udp://syslog.example.com:514",
+    label="rsyslog",
+    severity_threshold="medium",
+    format="syslog"
+  )
+
+# TCP (RFC 6587 octet-counted framing)
+> alert_subscribe(
+    url="tcp://syslog.example.com:514",
+    label="rsyslog-tcp",
+    severity_threshold="medium",
+    format="syslog"
+  )
+```
+
+Messages use facility 16 (`local0`) so you can grep for honeypot traffic separately from system logs at the ingest tier. Severity maps to syslog's inverted scale (CRITICAL → 2, HIGH → 3, MEDIUM → 4, LOW → 6). The MSG body is JSON-encoded so the SIEM still has structured fields to parse out of the syslog message.
+
+### Slack / Discord / PagerDuty / generic webhooks
+
+Use the default `json` format. The body is the raw native event shape (`source_ip`, `event_type`, `severity`, `payload`, `timestamp`) suitable for direct ingestion by SOAR platforms (Tines, n8n, Splunk SOAR, FortiSOAR), incident management (PagerDuty, Opsgenie), and chat (Slack, Discord, MS Teams via incoming webhooks).
+
+```text
+> alert_subscribe(
+    url="https://hooks.slack.com/services/T.../B.../...",
+    label="soc-slack",
+    severity_threshold="high",
+    hmac_secret="",  # auto-generates a 32-byte secret and returns it
+    format="json"
+  )
+```
+
+---
+
+## Launching and using the project
+
+> First-time SIEM operator? Read this whole section once before deploying — the order matters (move admin SSH off port 22 BEFORE the honeypot binds it).
+
+### 1. Decide where to run it
+
+Two reasonable paths:
+
+| Path | Best for | Setup time |
+|---|---|---|
+| **Local Docker stack** | Demos, dashboards, screenshots, learning the tool | ~5 min |
+| **Cheap VPS (Hetzner / DigitalOcean / Linode)** | Catching real internet attack traffic | ~30 min |
+
+For the VPS path, see [`docs/DEPLOY.md`](docs/DEPLOY.md) which walks through "rent a $5 VPS → catch real attack traffic" end-to-end with safety guard-rails.
+
+### 2. Stand up the stack
+
+```bash
+git clone https://github.com/tohudgins/HoneyPot-MCP.git
+cd HoneyPot-MCP
+cp .env.example .env       # then edit; the file is well-commented
+
+cd docker
+docker compose up -d --build
+```
+
+This starts six services on an internal Docker network: the MCP server (canary callback + `/metrics` exporter), a Docker socket proxy, Cowrie SSH, the HTTP honeypot, Prometheus, and Grafana. Confirm everything is healthy:
+
+```bash
+docker compose ps
+# All services should be Up. Allow ~30s on first start for the MCP
+# container's Alembic migration to run.
+```
+
+### 3. See it work in 5 minutes
+
+```bash
+# Seed ~5,000 realistic demo attack events spread across 24h.
+docker compose exec honeypot-mcp python scripts/seed_demo_data.py
+
+# Open Grafana — admin / honeypot (override with GRAFANA_ADMIN_PASSWORD).
+open http://localhost:3000
+```
+
+Three dashboards are pre-loaded: **Overview** (severity stack, top attackers, engine pie), **Threat Map** (geo-located attacker IPs from the GeoIP enrichment), **MITRE ATT&CK Coverage** (tactic distribution, top techniques observed).
+
+### 4. Drive it through Claude
+
+Configure your MCP client to talk to the server (Claude Desktop config snippet is in `README.md` § Deployment; for Claude Code the repo's `.claude/settings.json` is already wired up). Then in a chat:
+
+```text
+> Deploy a Redis honeypot on port 6379.
+> Deploy a Cowrie SSH honeypot on port 2222.
+> Run honeypot_self_test on both — confirm the alert pipeline lands events.
+> Show me the alert stream.
+```
+
+### 5. Plant a honeytoken
+
+```text
+> Generate a fake AWS credential token labelled "planted-aws-key".
+> Generate a kubeconfig honeytoken named "prod-cluster-config".
+> Generate a Slack-webhook honeytoken named "fake-deploy-webhook".
+> Show me the plant instructions for each.
+```
+
+Claude returns:
+- The token artefact (key pair / YAML / URL)
+- A specific "drop this file at …" instruction
+- For cloud tokens: the field to forward to `/cloud-event` for real detection
+
+### 6. Wire up your SIEM
+
+Pick the section above that matches your SIEM. For example, Elastic:
+
+```text
+> alert_subscribe(
+    url="https://elastic.mysoc.io:9200/honeypot-alerts/_doc",
+    label="elastic-soc",
+    severity_threshold="medium",
+    hmac_secret="<my-api-key>",
+    format="elastic_ecs"
+  )
+```
+
+Within seconds of the next alert, a document shows up in your Elastic index with ECS-conformant field names. From there, Kibana / Grafana / Opensearch Dashboards can visualise it without any field mapping.
+
+Confirm deliveries are landing:
+
+```text
+> alert_subscriptions_list
+# Shows delivery_count, failure_count, last_error for every subscription.
+```
+
+### 7. Day-to-day operations
+
+```text
+> alerts_recent severity=high              # quick triage
+> analyze_attacker_journey ip=1.2.3.4      # cross-honeypot timeline
+> enrich_ip 1.2.3.4                        # VT + AbuseIPDB + GeoIP
+> generate_report format=markdown          # weekly write-up
+> export_blocklist format=iptables hits=10 # firewall rules for top attackers
+> alerts_prune older_than_days=30          # retention sweep — schedule weekly
+```
+
+### 8. Forward cloud audit logs (optional — closes AWS / Azure / GCP token detection)
+
+If you generated `api_key` / `azure_credential` / `gcp_service_account` tokens and want them to actually trigger on use, your cloud provider's audit log forwarder needs to POST to the canary server's `/cloud-event` endpoint with an HMAC signature:
+
+```bash
+# In .env, set the shared secret (cryptographically random, 32+ bytes):
+CLOUD_EVENT_HMAC_SECRET=$(openssl rand -hex 32)
+docker compose restart honeypot-mcp
+```
+
+Then in your AWS Lambda / Azure Function / GCP Pub/Sub trigger, do something like:
+
+```python
+# AWS CloudTrail → honeypot-mcp/cloud-event
+import hashlib, hmac, json, urllib.request
+
+def lambda_handler(event, _ctx):
+    body = json.dumps(event).encode()
+    sig = "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(
+        "https://canary.your-domain.com/cloud-event",
+        data=body,
+        headers={"Content-Type": "application/json", "X-HoneyPot-Signature": sig},
+    )
+    urllib.request.urlopen(req)
+```
+
+When an attacker tries the planted credentials against AWS/Azure/GCP and triggers a CloudTrail/Activity/Audit event with the matching `accessKeyId` / `client_id` / `principalEmail`, your forwarder routes the event into `/cloud-event`, which fires a CRITICAL alert through the normal pipeline.
 
 ---
 

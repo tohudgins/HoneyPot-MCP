@@ -1,27 +1,46 @@
-"""Outbound webhook delivery.
+"""Outbound webhook + SIEM delivery.
 
-Every flushed alert that meets a subscription's severity threshold is POSTed
-to the subscription URL as JSON. If `hmac_secret` is set, the request carries
-an `X-HoneyPot-Signature: sha256=<hex>` header (HMAC-SHA256 of the raw body)
-so the consumer can verify authenticity.
+Every flushed alert that meets a subscription's severity threshold is
+serialised into the subscription's chosen `format` and delivered via the
+appropriate transport. Five formats are supported:
 
-Delivery runs in a background asyncio task drained from a queue so that slow
-webhook endpoints can never back-pressure the honeypot data path. Failed
-deliveries retry with exponential backoff (1s, 5s, 30s); after that, the
-failure_count column tracks consecutive failures and an admin can deactivate
-or repair the subscription.
+* `json` — raw JSON envelope, optionally HMAC-signed via
+  `X-HoneyPot-Signature: sha256=<hex>` (consumer verifies with the same
+  secret, same convention as GitHub webhooks).
+* `splunk_hec` — Splunk HTTP Event Collector. Body is
+  `{"time": ..., "host": ..., "sourcetype": "honeypot:alert", "event": {...}}`
+  and the HEC token rides in `Authorization: Splunk <token>` (stored in
+  `subscription.hmac_secret`).
+* `elastic_ecs` — Elastic Common Schema. Fields are re-mapped to the
+  ECS namespace (`source.ip`, `event.action`, `event.severity`, `@timestamp`).
+  Compatible with Elastic Bulk API receivers and Filebeat HTTP input.
+* `cef` — ArcSight Common Event Format. Pipe-delimited text body that
+  QRadar's Universal CEF Connector also ingests.
+* `syslog` — RFC 5424 framed message. The subscription URL scheme picks
+  the transport — `udp://host:514` for UDP datagrams,
+  `tcp://host:514` for TCP-framed delivery.
+
+Delivery runs in a background asyncio task drained from a queue so slow
+webhook endpoints can never back-pressure the honeypot data path. HTTP
+deliveries retry with exponential backoff (1s, 5s, 30s); UDP syslog is
+fire-and-forget (UDP has no retry semantics) but failures are still
+recorded against `failure_count`. The `last_error` column gives operators
+a one-line failure reason without needing log access.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import select, update
@@ -39,7 +58,35 @@ _SEVERITY_RANK = {
     AlertSeverity.CRITICAL: 3,
 }
 
+# Severity mappings into each format's native scale.
+# ECS uses 0-9 (RFC equivalent). CEF uses 0-10. Syslog uses 0-7 inverted
+# (0=Emergency, 7=Debug) where lower = more severe.
+_ECS_SEVERITY = {
+    AlertSeverity.LOW: 3,
+    AlertSeverity.MEDIUM: 5,
+    AlertSeverity.HIGH: 7,
+    AlertSeverity.CRITICAL: 9,
+}
+_CEF_SEVERITY = {
+    AlertSeverity.LOW: 3,
+    AlertSeverity.MEDIUM: 6,
+    AlertSeverity.HIGH: 8,
+    AlertSeverity.CRITICAL: 10,
+}
+# Syslog severities per RFC 5424 §6.2.1. We never use 0 (Emergency) /
+# 1 (Alert) — those imply system-wide outages, not honeypot events.
+_SYSLOG_SEVERITY = {
+    AlertSeverity.CRITICAL: 2,  # Critical
+    AlertSeverity.HIGH: 3,  # Error
+    AlertSeverity.MEDIUM: 4,  # Warning
+    AlertSeverity.LOW: 6,  # Informational
+}
+# Syslog facility 16 = local0. Operators can grep on this to bucket
+# honeypot traffic separately from system logs at the SIEM input.
+_SYSLOG_FACILITY = 16
+
 _RETRY_DELAYS = (1.0, 5.0, 30.0)
+_HOSTNAME = "honeypot-mcp"
 
 
 def sign_body(secret: str, body: bytes) -> str:
@@ -48,7 +95,15 @@ def sign_body(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
-def _serialise(event: PendingEvent) -> dict[str, Any]:
+def _meets_threshold(event_severity: AlertSeverity, threshold: AlertSeverity) -> bool:
+    return _SEVERITY_RANK[event_severity] >= _SEVERITY_RANK[threshold]
+
+
+# ── Format renderers ────────────────────────────────────────────────────────
+
+
+def _base_event_dict(event: PendingEvent) -> dict[str, Any]:
+    """The canonical native shape — used as input by every renderer."""
     return {
         "source_ip": event.source_ip,
         "source_port": event.source_port,
@@ -61,20 +116,214 @@ def _serialise(event: PendingEvent) -> dict[str, Any]:
     }
 
 
-def _meets_threshold(event_severity: AlertSeverity, threshold: AlertSeverity) -> bool:
-    return _SEVERITY_RANK[event_severity] >= _SEVERITY_RANK[threshold]
+# Backwards-compat alias — the old delivery worker called this `_serialise`,
+# and the existing webhook test still imports it. Keep both names working
+# so the test surface doesn't churn.
+_serialise = _base_event_dict
+
+
+def render_json(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Default JSON envelope. HMAC-signed if `sub.hmac_secret` is set."""
+    body = json.dumps(_base_event_dict(event), default=str).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "HoneyPot-MCP/1.0"}
+    if sub.hmac_secret:
+        headers["X-HoneyPot-Signature"] = sign_body(sub.hmac_secret, body)
+    return body, headers
+
+
+def render_splunk_hec(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Splunk HTTP Event Collector envelope.
+
+    The HEC schema is documented at
+    https://docs.splunk.com/Documentation/Splunk/latest/Data/FormateventsforHTTPEventCollector
+    `event` can be any JSON value; we hand it the canonical native dict.
+    Time is unix-epoch seconds with millisecond precision (Splunk accepts
+    floats here)."""
+    envelope = {
+        "time": event.timestamp.timestamp(),
+        "host": _HOSTNAME,
+        "source": "honeypot-mcp",
+        "sourcetype": "honeypot:alert",
+        "event": _base_event_dict(event),
+    }
+    body = json.dumps(envelope, default=str).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "HoneyPot-MCP/1.0",
+    }
+    if sub.hmac_secret:
+        # Splunk HEC authenticates via `Authorization: Splunk <token>`. We
+        # reuse the `hmac_secret` column to store the token — it's
+        # conceptually the same thing (a per-subscription auth secret).
+        headers["Authorization"] = f"Splunk {sub.hmac_secret}"
+    return body, headers
+
+
+def _ecs_event_category(event_type: str, honeytoken_id: int | None) -> list[str]:
+    """Map honeypot event types into ECS `event.category` taxonomy.
+
+    Empty list is valid ECS but reduces searchability — we prefer to assign
+    the closest match. ECS categories are a closed set documented at
+    https://www.elastic.co/guide/en/ecs/current/ecs-allowed-values-event-category.html.
+    """
+    et = event_type.lower()
+    if honeytoken_id is not None or "honeytoken" in et:
+        return ["intrusion_detection"]
+    if "login" in et or "auth" in et or "credential" in et:
+        return ["authentication", "intrusion_detection"]
+    if "scan" in et or "probe" in et or "recon" in et:
+        return ["network", "intrusion_detection"]
+    if "command" in et or "exec" in et or "eval" in et:
+        return ["process", "intrusion_detection"]
+    if "file" in et or "download" in et:
+        return ["file", "intrusion_detection"]
+    return ["intrusion_detection"]
+
+
+def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Elastic Common Schema field-renamed JSON.
+
+    Compatible with Filebeat HTTP input, Logstash http input, and the
+    Elasticsearch Bulk API (each line is a self-contained ECS document).
+    """
+    doc: dict[str, Any] = {
+        "@timestamp": event.timestamp.isoformat(),
+        "event": {
+            "action": event.event_type,
+            "category": _ecs_event_category(event.event_type, event.honeytoken_id),
+            "kind": "alert",
+            "severity": _ECS_SEVERITY[event.severity],
+            "dataset": "honeypot.mcp",
+            "module": "honeypot-mcp",
+            "outcome": "success",
+        },
+        "host": {"name": _HOSTNAME, "type": "honeypot"},
+        "message": f"{event.event_type} from {event.source_ip}",
+        "labels": {"severity_name": event.severity.value},
+        "honeypot": {
+            "id": event.honeypot_id,
+            "token_id": event.honeytoken_id,
+        },
+        # Stash the full native payload under event.original — ECS-blessed
+        # field for the raw event so SIEM analysts can dig into details.
+        "event.original": json.dumps(_base_event_dict(event), default=str),
+    }
+    if event.source_ip:
+        doc["source"] = {"ip": event.source_ip}
+        if event.source_port is not None:
+            doc["source"]["port"] = event.source_port
+
+    body = json.dumps(doc, default=str).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "HoneyPot-MCP/1.0",
+    }
+    if sub.hmac_secret:
+        # Elastic-stack receivers typically accept an `Authorization`
+        # header — basic-auth-or-token style. Treat hmac_secret as a
+        # bearer token here (ApiKey style).
+        headers["Authorization"] = f"ApiKey {sub.hmac_secret}"
+    return body, headers
+
+
+def _cef_escape(value: str) -> str:
+    """CEF header values escape `|` and `\\`; extension values escape `=`."""
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "\\n")
+
+
+def _cef_ext_escape(value: str) -> str:
+    """CEF extension values escape `=`, `\\`, and newlines."""
+    return value.replace("\\", "\\\\").replace("=", "\\=").replace("\n", "\\n")
+
+
+def render_cef(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """ArcSight Common Event Format (CEF 0).
+
+    Spec: https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.4/cef-implementation-standard/
+    Layout:
+        CEF:0|Vendor|Product|Version|EventID|EventName|Severity|extension
+
+    The `extension` part is `key=value key=value …`. Quoting is per
+    `_cef_ext_escape`. Custom fields use the `cs1` / `cs2` / `cn1` slots
+    with matching `*Label` keys.
+    """
+    event_type_safe = _cef_escape(event.event_type)
+    parts = [
+        "CEF:0",
+        "HoneyPotMCP",  # device vendor
+        "server",  # device product
+        "1.0",  # device version
+        event_type_safe,  # signature/event ID
+        event_type_safe,  # event name (humanized)
+        str(_CEF_SEVERITY[event.severity]),
+    ]
+    header = "|".join(parts)
+
+    ext_pairs: list[str] = [
+        f"rt={int(event.timestamp.timestamp() * 1000)}",
+        f"src={_cef_ext_escape(event.source_ip or '0.0.0.0')}",
+    ]
+    if event.source_port is not None:
+        ext_pairs.append(f"spt={event.source_port}")
+    if event.honeypot_id is not None:
+        ext_pairs.append(f"cs1={event.honeypot_id}")
+        ext_pairs.append("cs1Label=honeypot_id")
+    if event.honeytoken_id is not None:
+        ext_pairs.append(f"cs2={event.honeytoken_id}")
+        ext_pairs.append("cs2Label=honeytoken_id")
+    ext_pairs.append(f"cs3={_cef_ext_escape(event.severity.value)}")
+    ext_pairs.append("cs3Label=honeypot_severity")
+    ext_pairs.append(f"msg={_cef_ext_escape(event.event_type)}")
+    # Stash the full payload as cs4 so SIEM analysts can grep it.
+    payload_json = json.dumps(event.payload, default=str)
+    ext_pairs.append(f"cs4={_cef_ext_escape(payload_json[:1024])}")
+    ext_pairs.append("cs4Label=honeypot_payload")
+
+    body_text = header + "|" + " ".join(ext_pairs) + "\n"
+    body = body_text.encode("utf-8")
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "User-Agent": "HoneyPot-MCP/1.0",
+    }
+    return body, headers
+
+
+def render_syslog(event: PendingEvent, sub: Subscription) -> bytes:
+    """RFC 5424 framed syslog message.
+
+    Spec: https://tools.ietf.org/html/rfc5424
+    Layout:
+        <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID SD MSG
+
+    PRI = facility * 8 + severity. Timestamp is RFC 3339 (ISO 8601).
+    """
+    severity = _SYSLOG_SEVERITY[event.severity]
+    pri = _SYSLOG_FACILITY * 8 + severity
+    timestamp = event.timestamp.isoformat(timespec="milliseconds")
+    if not timestamp.endswith("Z") and "+" not in timestamp[-6:]:
+        # RFC 5424 timestamps need explicit TZ. ISO format includes it for
+        # tz-aware datetimes already.
+        timestamp += "Z"
+    msgid = event.event_type[:32]
+    # No structured-data block — represent as `-` per spec.
+    msg = json.dumps(_base_event_dict(event), default=str)
+    line = f"<{pri}>1 {timestamp} {_HOSTNAME} honeypot - {msgid} - {msg}"
+    return line.encode("utf-8")
+
+
+# ── Transports ──────────────────────────────────────────────────────────────
 
 
 async def _post_with_retry(
     client: httpx.AsyncClient,
-    sub: Subscription,
+    url: str,
     body_bytes: bytes,
     headers: dict[str, str],
 ) -> tuple[bool, str | None]:
     last_err: str | None = None
     for attempt, delay in enumerate(_RETRY_DELAYS):
         try:
-            resp = await client.post(sub.url, content=body_bytes, headers=headers, timeout=10.0)
+            resp = await client.post(url, content=body_bytes, headers=headers, timeout=10.0)
             if 200 <= resp.status_code < 300:
                 return True, None
             last_err = f"HTTP {resp.status_code}"
@@ -85,10 +334,75 @@ async def _post_with_retry(
     return False, last_err
 
 
+class _SyslogUDPProtocol(asyncio.DatagramProtocol):
+    """Minimal fire-and-forget datagram sender. UDP has no delivery
+    confirmation — we report success once `sendto` returns."""
+
+    def __init__(self) -> None:
+        self.transport: asyncio.DatagramTransport | None = None
+        self.error: Exception | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        assert isinstance(transport, asyncio.DatagramTransport)
+        self.transport = transport
+
+    def error_received(self, exc: Exception) -> None:
+        self.error = exc
+
+
+async def _send_syslog_udp(host: str, port: int, body: bytes) -> tuple[bool, str | None]:
+    loop = asyncio.get_event_loop()
+    try:
+        transport, proto = await loop.create_datagram_endpoint(
+            _SyslogUDPProtocol, remote_addr=(host, port)
+        )
+        try:
+            transport.sendto(body)
+            # Give the kernel a tick to flush + report ICMP unreachables.
+            await asyncio.sleep(0.05)
+        finally:
+            transport.close()
+        if proto.error is not None:
+            return False, str(proto.error)[:200]
+        return True, None
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+async def _send_syslog_tcp(host: str, port: int, body: bytes) -> tuple[bool, str | None]:
+    """TCP-framed syslog. RFC 6587 octet-counting frame:
+    `<MSG-LEN> <MSG>` where MSG-LEN is the ASCII byte count.
+    """
+    framed = f"{len(body)} ".encode() + body
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5.0
+            )
+            try:
+                writer.write(framed)
+                await writer.drain()
+                return True, None
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+        except Exception as e:
+            last_err = str(e)[:200]
+            if attempt < len(_RETRY_DELAYS) - 1:
+                await asyncio.sleep(delay)
+                continue
+            return False, last_err
+    return False, "unreachable"
+
+
+# ── Job + worker ────────────────────────────────────────────────────────────
+
+
 @dataclass
 class _Job:
     event: PendingEvent
-    enqueued_at: float = field(default_factory=lambda: __import__("time").monotonic())
+    enqueued_at: float = field(default_factory=time.monotonic)
 
 
 class WebhookDelivery:
@@ -140,21 +454,58 @@ class WebhookDelivery:
             )
             subs = list(result.scalars().all())
 
-        if not subs or self._client is None:
+        if not subs:
             return
-
-        body = json.dumps(_serialise(event), default=str).encode("utf-8")
 
         for sub in subs:
             if not _meets_threshold(event.severity, sub.severity_threshold):
                 continue
-
-            headers = {"Content-Type": "application/json", "User-Agent": "HoneyPot-MCP/1.0"}
-            if sub.hmac_secret:
-                headers["X-HoneyPot-Signature"] = sign_body(sub.hmac_secret, body)
-
-            ok, err = await _post_with_retry(self._client, sub, body, headers)
+            try:
+                ok, err = await self._dispatch(event, sub)
+            except Exception as e:
+                ok, err = False, f"renderer failure: {e!s}"[:200]
             await self._record_outcome(sub.id, ok, err)
+
+    async def _dispatch(self, event: PendingEvent, sub: Subscription) -> tuple[bool, str | None]:
+        """Pick the renderer + transport for this subscription's format."""
+        fmt = (sub.format or "json").lower()
+
+        if fmt == "syslog":
+            return await self._dispatch_syslog(event, sub)
+
+        # HTTP-shaped formats
+        if fmt == "json":
+            body, headers = render_json(event, sub)
+        elif fmt == "splunk_hec":
+            body, headers = render_splunk_hec(event, sub)
+        elif fmt == "elastic_ecs":
+            body, headers = render_elastic_ecs(event, sub)
+        elif fmt == "cef":
+            body, headers = render_cef(event, sub)
+        else:
+            return False, f"unknown format: {fmt}"
+
+        if self._client is None:
+            return False, "delivery client not started"
+        return await _post_with_retry(self._client, sub.url, body, headers)
+
+    async def _dispatch_syslog(
+        self, event: PendingEvent, sub: Subscription
+    ) -> tuple[bool, str | None]:
+        """Send via UDP or TCP depending on the URL scheme."""
+        parsed = urlparse(sub.url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        port = parsed.port or 514
+        if not host:
+            return False, "syslog URL missing host"
+
+        body = render_syslog(event, sub)
+        if scheme == "udp":
+            return await _send_syslog_udp(host, port, body)
+        if scheme == "tcp":
+            return await _send_syslog_tcp(host, port, body)
+        return False, f"syslog URL must use udp:// or tcp:// (got {scheme!r})"
 
     async def _record_outcome(self, sub_id: int, ok: bool, err: str | None) -> None:
         async with get_session() as session:

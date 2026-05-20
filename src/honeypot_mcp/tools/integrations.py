@@ -28,20 +28,33 @@ async def alert_subscribe(
     label: str,
     severity_threshold: Literal["low", "medium", "high", "critical"] = "medium",
     hmac_secret: str | None = None,
+    format: Literal["json", "splunk_hec", "elastic_ecs", "cef", "syslog"] = "json",
 ) -> dict[str, Any]:
-    """Register a URL to receive real-time alert deliveries.
+    """Register a URL to receive real-time alert deliveries in a SIEM-native format.
 
-    Each new alert at or above the threshold is POSTed as JSON. If `hmac_secret`
-    is provided, the request includes an `X-HoneyPot-Signature: sha256=<hex>`
-    header (HMAC-SHA256 of the raw body). If you pass an empty string for
-    `hmac_secret`, a random 32-byte secret is generated for you and returned.
+    The `format` argument picks the body shape and auth scheme:
+
+    * `json` (default) — raw JSON envelope, optionally HMAC-signed via
+      `X-HoneyPot-Signature: sha256=<hex>` (set `hmac_secret`). Works with
+      Slack/Discord/PagerDuty/generic webhook consumers.
+    * `splunk_hec` — Splunk HTTP Event Collector. URL ends in
+      `/services/collector/event`. Pass your Splunk HEC token via
+      `hmac_secret` — it's sent as `Authorization: Splunk <token>`.
+    * `elastic_ecs` — Elastic Common Schema field re-mapping (source.ip,
+      event.action, event.severity, @timestamp). POST as JSON; works with
+      Elastic Bulk API receivers and Filebeat HTTP input.
+    * `cef` — ArcSight CEF pipe-delimited text. Compatible with QRadar
+      Universal CEF Connector as well.
+    * `syslog` — RFC 5424 framed message. URL scheme picks the transport:
+      `udp://host:514` for UDP datagrams, `tcp://host:514` for TCP.
 
     Args:
-        url: The webhook URL to POST alerts to.
-        label: Human-readable label (e.g. 'soc-slack-channel').
+        url: Webhook URL (or `udp://` / `tcp://` for syslog).
+        label: Human-readable label (e.g. 'splunk-prod', 'qradar-cef').
         severity_threshold: Minimum severity to deliver — events below are skipped.
-        hmac_secret: Shared secret for HMAC signing. None = no signing,
-                     "" = generate a fresh secret and return it.
+        hmac_secret: Auth secret. JSON: HMAC key. Splunk HEC: HEC token. Pass
+                     empty string ("") to generate a random 32-byte secret.
+        format: Output format — see above.
     """
     if hmac_secret == "":
         hmac_secret = secrets.token_urlsafe(32)
@@ -53,6 +66,7 @@ async def alert_subscribe(
             severity_threshold=AlertSeverity(severity_threshold),
             hmac_secret=hmac_secret,
             active=True,
+            format=format,
         )
         session.add(sub)
         await session.flush()
@@ -64,6 +78,7 @@ async def alert_subscribe(
         "url": url,
         "severity_threshold": severity_threshold,
         "hmac_secret": hmac_secret,
+        "format": format,
         "active": True,
     }
 
@@ -105,6 +120,7 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
             "label": s.label,
             "url": s.url,
             "severity_threshold": s.severity_threshold.value,
+            "format": s.format,
             "active": s.active,
             "delivery_count": s.delivery_count,
             "failure_count": s.failure_count,
