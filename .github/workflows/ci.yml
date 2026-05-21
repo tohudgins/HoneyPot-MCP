@@ -107,4 +107,22 @@ jobs:
         # itself as a fatal resolution error, defeating the point of --skip-editable.
         # CVEs in real deps are still reported in the log; the job is non-blocking
         # via continue-on-error anyway.
-        run: pip-audit --skip-editable
+        #
+        # --ignore-vuln PYSEC-2025-183 — pyjwt "weak encryption" advisory.
+        # Reasons:
+        #  1. The advisory's `last_affected` is 2.10.1 (per the OSV record at
+        #     https://osv.dev/vulnerability/PYSEC-2025-183). We pull in pyjwt
+        #     2.12.1 transitively via fastmcp -> mcp; that's already past the
+        #     affected range, so this is a pip-audit version-comparison false
+        #     positive.
+        #  2. The upstream maintainer disputes the underlying claim, arguing
+        #     that key length is the responsibility of the calling application.
+        #     There is no published fix version because the maintainer doesn't
+        #     consider the issue a bug.
+        #  3. We don't sign or verify JWTs with pyjwt — our jwt honeytoken
+        #     provider (tokens/jwt.py) implements its own HS256 path using
+        #     stdlib hmac + base64, so even if the advisory applied to us,
+        #     our attack surface wouldn't be affected.
+        # Re-evaluate this ignore if the advisory is updated to extend the
+        # affected range past 2.10.1 OR if pyjwt publishes a fixed version.
+        run: pip-audit --skip-editable --ignore-vuln PYSEC-2025-183
