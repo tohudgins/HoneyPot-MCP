@@ -242,9 +242,7 @@ def test_loki_renderer_envelope_uses_string_nanoseconds():
     ts_ns, payload_line = stream["values"][0]
     assert isinstance(ts_ns, str), "Loki timestamp MUST be a string of nanoseconds"
     # Reconstruct expected ns from the same datetime to avoid hardcoding wrong epoch
-    expected_ns = str(
-        int(datetime(2026, 5, 20, 12, 0, 0, tzinfo=UTC).timestamp() * 1_000_000_000)
-    )
+    expected_ns = str(int(datetime(2026, 5, 20, 12, 0, 0, tzinfo=UTC).timestamp() * 1_000_000_000))
     assert ts_ns == expected_ns
     # Payload is JSON-encoded native dict
     payload = json.loads(payload_line)

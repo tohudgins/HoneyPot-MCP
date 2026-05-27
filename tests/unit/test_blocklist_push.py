@@ -190,7 +190,13 @@ async def test_cloudflare_push_records_api_failure():
 
 
 class _FakePfClient:
-    def __init__(self, existing_addresses: str, get_status: int = 200, put_status: int = 200, apply_status: int = 200):
+    def __init__(
+        self,
+        existing_addresses: str,
+        get_status: int = 200,
+        put_status: int = 200,
+        apply_status: int = 200,
+    ):
         self.existing_addresses = existing_addresses
         self.get_status = get_status
         self.put_status = put_status

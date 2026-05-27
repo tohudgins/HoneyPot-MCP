@@ -315,9 +315,7 @@ async def _handle_rdp_client(
 
     # Always log the initial connection at LOW severity (matches the previous
     # banner-only engine's behaviour so dashboards don't drift).
-    asyncio.create_task(
-        _record_event(honeypot_id, peer, "rdp_connection", AlertSeverity.LOW, {})
-    )
+    asyncio.create_task(_record_event(honeypot_id, peer, "rdp_connection", AlertSeverity.LOW, {}))
 
     try:
         first = await asyncio.wait_for(reader.read(4096), timeout=10.0)
@@ -416,9 +414,7 @@ class RDPEngine(HoneypotEngine):
 
         async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
-                await _handle_rdp_client(
-                    reader, writer, honeypot_name=name, honeypot_id=hp_id
-                )
+                await _handle_rdp_client(reader, writer, honeypot_name=name, honeypot_id=hp_id)
             except Exception as e:
                 log.warning("RDP handler error: %s", e)
 

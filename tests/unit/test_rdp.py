@@ -195,31 +195,26 @@ def _build_minimal_mcs_pdu(
     # + imeFileName(64) + ... we cap here at clientDigProductId (192 bytes).
     name_utf16 = client_name.encode("utf-16-le").ljust(32, b"\x00")[:32]
     core_body = (
-        (0x00080001).to_bytes(4, "little")            # version
+        (0x00080001).to_bytes(4, "little")  # version
         + desktop_width.to_bytes(2, "little")
         + desktop_height.to_bytes(2, "little")
         + color_depth.to_bytes(2, "little")
-        + (0xAA03).to_bytes(2, "little")              # SASSequence
+        + (0xAA03).to_bytes(2, "little")  # SASSequence
         + keyboard_layout.to_bytes(4, "little")
         + client_build.to_bytes(4, "little")
         + name_utf16
-        + (0x00000004).to_bytes(4, "little")          # keyboardType
-        + (0).to_bytes(4, "little")                   # keyboardSubType
-        + (12).to_bytes(4, "little")                  # keyboardFunctionKey
-        + b"\x00" * 64                                # imeFileName
-        + b"\x00" * 64                                # clientDigProductId
+        + (0x00000004).to_bytes(4, "little")  # keyboardType
+        + (0).to_bytes(4, "little")  # keyboardSubType
+        + (12).to_bytes(4, "little")  # keyboardFunctionKey
+        + b"\x00" * 64  # imeFileName
+        + b"\x00" * 64  # clientDigProductId
     )
     core_len = 4 + len(core_body)
-    core_block = (
-        b"\x01\xc0"
-        + core_len.to_bytes(2, "little")
-        + core_body
-    )
+    core_block = b"\x01\xc0" + core_len.to_bytes(2, "little") + core_body
 
     # TS_UD_CS_SEC body: encryptionMethods(4) + extEncryptionMethods(4).
-    sec_body = (
-        encryption_methods.to_bytes(4, "little")
-        + ext_encryption_methods.to_bytes(4, "little")
+    sec_body = encryption_methods.to_bytes(4, "little") + ext_encryption_methods.to_bytes(
+        4, "little"
     )
     sec_len = 4 + len(sec_body)
     sec_block = b"\x02\xc0" + sec_len.to_bytes(2, "little") + sec_body
@@ -227,7 +222,13 @@ def _build_minimal_mcs_pdu(
     # Frame: anything → GCC magic → core+sec blocks.
     # The parser only needs the magic prefix to anchor — outer BER framing
     # is irrelevant.
-    return b"\x7f\x65\x82\x01\x00" + b"\x00" * 80 + b"\x00\x05\x00\x14\x7c\x00\x01" + core_block + sec_block
+    return (
+        b"\x7f\x65\x82\x01\x00"
+        + b"\x00" * 80
+        + b"\x00\x05\x00\x14\x7c\x00\x01"
+        + core_block
+        + sec_block
+    )
 
 
 def test_mcs_parser_extracts_core_and_sec_fields():

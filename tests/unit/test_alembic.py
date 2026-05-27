@@ -82,8 +82,7 @@ async def test_init_db_does_not_log_alembic_fallback_warning(tmp_db_url, caplog)
     fallback_records = [r for r in caplog.records if "Alembic upgrade failed" in r.message]
     assert not fallback_records, (
         "Alembic chain triggered the fallback path on a fresh DB — migrations "
-        "must be idempotent. Records: "
-        + "; ".join(r.message for r in fallback_records)
+        "must be idempotent. Records: " + "; ".join(r.message for r in fallback_records)
     )
 
 

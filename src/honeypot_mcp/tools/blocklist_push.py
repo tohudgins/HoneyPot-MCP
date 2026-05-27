@@ -196,14 +196,14 @@ async def blocklist_push_pfsense(
         merged = sorted(existing | set(to_add))
         put_body = dict(data)
         put_body["address"] = " ".join(merged)
-        put_resp = await client.put(
-            f"{base}/api/v2/firewall/alias", headers=headers, json=put_body
-        )
+        put_resp = await client.put(f"{base}/api/v2/firewall/alias", headers=headers, json=put_body)
         if not 200 <= put_resp.status_code < 300:
             return {
                 "added": [],
                 "skipped": skipped,
-                "failed": [{"ip": ip, "error": f"PUT HTTP {put_resp.status_code}"} for ip in to_add],
+                "failed": [
+                    {"ip": ip, "error": f"PUT HTTP {put_resp.status_code}"} for ip in to_add
+                ],
                 "dry_run": dry_run,
             }
 
