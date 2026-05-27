@@ -40,7 +40,10 @@ Ask Claude to deploy an SSH honeypot, generate fake AWS credentials, reconstruct
 | **Threat Intel** | VirusTotal v3, AbuseIPDB (with auto-report), MaxMind GeoIP — all with TTL caching |
 | **Analysis** | MITRE ATT&CK TTP mapping, attacker profiling, SSH session reconstruction, cross-honeypot attacker journey, campaign correlation |
 | **Reporting** | XSS-safe HTML (Jinja2 autoescape) and Markdown attack reports |
-| **SIEM integration** | Native delivery formats: JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, Syslog RFC 5424 over UDP/TCP. Per-subscription severity threshold and delivery health stats. |
+| **SIEM integration** | Native delivery formats: JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, Syslog RFC 5424 over UDP/TCP, Grafana Loki, Datadog Logs API v2. Per-subscription severity threshold and delivery health stats. |
+| **Cloud honeytokens** | Cloud audit-log ingest endpoint (`/cloud-event`, HMAC-signed) wired to AWS API keys, Azure service principals, GCP service accounts. Ready-to-deploy forwarders under `examples/cloud-forwarders/{aws,azure,gcp}/` (Lambda + Terraform, Azure Function + Bicep, Cloud Function + gcloud). |
+| **RDP fingerprinting** | Beyond the X.224 banner: when a client requests SSL/HYBRID, the engine upgrades to TLS and captures the MCS Connect Initial — `clientName`, `clientBuild`, keyboard layout, screen resolution, and encryption methods land in an `rdp_mcs_handshake` event. |
+| **Blocklist push** | One-shot tools push offender IPs straight to live appliances: Cloudflare custom lists, pfSense firewall aliases, AWS WAFv2 IPSets. Idempotent + `dry_run` support. |
 | **Platform** | Webhook subscriptions, suppression rules + rate limiting + bundled presets (Shodan / Censys / RFC1918), blocklist + STIX exports |
 | **Operations** | Periodic health watchdog, end-to-end self-test, Alembic-managed schema migrations, Prometheus `/metrics` endpoint, JSON-structured logging (`LOG_FORMAT=json`), canary-callback rate limiting |
 | **MCP Resources** | Live feeds: active honeypots, alert stream, triggered tokens, stats dashboard |
@@ -229,12 +232,15 @@ Expected: the deploy returns `{status: "running", ...}`, and the self-test repor
 ### Platform integration
 | Tool | Description |
 |---|---|
-| `alert_subscribe` | Register a URL for real-time alert delivery in your SIEM's native format (json, splunk_hec, elastic_ecs, cef, syslog) |
+| `alert_subscribe` | Register a URL for real-time alert delivery in your SIEM's native format (json, splunk_hec, elastic_ecs, cef, syslog, loki, datadog) |
 | `alert_unsubscribe` | Deactivate a subscription |
 | `alert_subscriptions_list` | List subscriptions with delivery health stats |
 | `suppression_add` | Add a drop or rate-limit rule (exact IP / CIDR / event-type glob) |
 | `suppression_remove` | Deactivate a suppression rule |
 | `suppression_list` | List rules with hit counts |
+| `blocklist_push_cloudflare` | Push offender IPs to a Cloudflare custom list (idempotent + `dry_run`) |
+| `blocklist_push_pfsense` | Push offender IPs to a pfSense firewall alias via the Netgate REST API |
+| `blocklist_push_aws_waf` | Push offender IPs to an AWS WAFv2 IPSet (uses standard boto3 cred chain) |
 
 ### MCP Resources
 | Resource | Description |
@@ -248,7 +254,7 @@ Expected: the deploy returns `{status: "running", ...}`, and the self-test repor
 
 ## SIEM integration
 
-`alert_subscribe` takes a `format` argument that picks the body shape and auth scheme. Five formats are supported out of the box — every common SIEM landing zone has a native option.
+`alert_subscribe` takes a `format` argument that picks the body shape and auth scheme. Seven formats are supported out of the box — every common SIEM landing zone has a native option.
 
 | Format | Body shape | Auth | Transport |
 |---|---|---|---|
@@ -257,6 +263,8 @@ Expected: the deploy returns `{status: "running", ...}`, and the self-test repor
 | `elastic_ecs` | Elastic Common Schema (`source.ip`, `event.action`, `@timestamp`) | `Authorization: ApiKey <key>` | HTTPS POST |
 | `cef` | ArcSight CEF pipe-delimited text | — | HTTPS POST (works with QRadar Universal CEF Connector too) |
 | `syslog` | RFC 5424 framed message | — | UDP or TCP — URL scheme picks the transport |
+| `loki` | Grafana Loki push API `{streams: [...]}` with stringified-ns timestamps | `Authorization: Basic <pre-encoded userid:token>` (optional) | HTTPS POST to `/loki/api/v1/push` |
+| `datadog` | Datadog Logs API v2 JSON list | `DD-API-KEY: <key>` | HTTPS POST to `/api/v2/logs` |
 
 Subscription failure stats (`delivery_count`, `failure_count`, `last_error`) are tracked per subscription so you see which integrations are dead at a glance.
 
@@ -323,6 +331,34 @@ Body is a single CEF line: `CEF:0|HoneyPotMCP|server|1.0|<event_type>|<event_typ
 ```
 
 Messages use facility 16 (`local0`) so you can grep for honeypot traffic separately from system logs at the ingest tier. Severity maps to syslog's inverted scale (CRITICAL → 2, HIGH → 3, MEDIUM → 4, LOW → 6). The MSG body is JSON-encoded so the SIEM still has structured fields to parse out of the syslog message.
+
+### Grafana Loki
+
+```text
+> alert_subscribe(
+    url="https://logs-prod-us-central1.grafana.net/loki/api/v1/push",
+    label="grafana-cloud-loki",
+    severity_threshold="medium",
+    hmac_secret="<base64 of userid:token>",  # see note below
+    format="loki"
+  )
+```
+
+Body is `{"streams": [...]}` with stringified-nanosecond timestamps (Loki silently 400s on integer timestamps — use the format as-is). Stream labels carry `severity`, `event_type`, `source_ip`, and a fixed `job=honeypot-mcp` so you can pin one panel per honeypot kind without high-cardinality blowups. Self-hosted Loki ignores the auth header; Grafana Cloud expects HTTP basic auth where the credential is `<userid>:<token>` — pre-encode it (`echo -n 'userid:token' | base64`) and pass the result as `hmac_secret`.
+
+### Datadog Logs API
+
+```text
+> alert_subscribe(
+    url="https://http-intake.logs.datadoghq.com/api/v2/logs",
+    label="datadog-soc",
+    severity_threshold="medium",
+    hmac_secret="<your-DD-API-KEY>",
+    format="datadog"
+  )
+```
+
+Body is the Datadog v2 logs JSON list shape — `ddsource=honeypot-mcp`, `service=honeypot`, `ddtags` includes `severity:` and `event_type:` for fast slicing. Severity maps to Datadog's `status` field: `low→info`, `medium→warning`, `high→error`, `critical→critical`. Regional endpoints (EU / AP1) work identically — swap the URL prefix.
 
 ### Slack / Discord / PagerDuty / generic webhooks
 
@@ -474,6 +510,14 @@ def lambda_handler(event, _ctx):
 
 When an attacker tries the planted credentials against AWS/Azure/GCP and triggers a CloudTrail/Activity/Audit event with the matching `accessKeyId` / `client_id` / `principalEmail`, your forwarder routes the event into `/cloud-event`, which fires a CRITICAL alert through the normal pipeline.
 
+**Ready-to-deploy forwarders ship under [`examples/cloud-forwarders/`](./examples/cloud-forwarders/):**
+
+- **AWS** (`aws/`) — Lambda + Terraform module + EventBridge rule on CloudTrail. `terraform apply` deploys end-to-end.
+- **Azure** (`azure/`) — Function App (Python v2) + Bicep template + Activity Log → Event Hub diagnostic setting.
+- **GCP** (`gcp/`) — Cloud Function (Gen2) + Log Sink + Pub/Sub topic provisioned via `deploy.sh`.
+
+Each subdirectory has its own README with deployment steps. The inline snippet above is just the signing primitive every forwarder reuses.
+
 ---
 
 ## SOC analyst workflow example
@@ -616,12 +660,12 @@ src/honeypot_mcp/
 ├── suppression.py       — Drop / rate-limit rule engine (in-memory cache)
 ├── watchdog.py          — Periodic health checks of running honeypots
 ├── config.py            — Pydantic settings (.env + YAML)
-├── engines/             — Honeypot engines (SSH/HTTP/SMTP/FTP/DNS)
-├── tokens/              — Honeytoken providers (api_key/canary_url/credential/file)
+├── engines/             — Honeypot engines (SSH/HTTP/SMTP/FTP/DNS/RDP/MySQL/Redis/Elasticsearch/VNC)
+├── tokens/              — Honeytoken providers (api_key, canary_url, credential, file, ssh_key, jwt, db_row, kubeconfig, slack_webhook, azure_credential, gcp_service_account)
 ├── storage/             — SQLAlchemy models, queries, async DB layer, event buffer
 ├── intel/               — VT, AbuseIPDB, GeoIP, MITRE ATT&CK (all cached)
 ├── analysis/            — Campaign correlator, attacker profiler, Jinja2 reporter
-├── tools/               — MCP-exposed tools (honeypot, honeytoken, alerts, analysis, integrations)
+├── tools/               — MCP-exposed tools (honeypot, honeytoken, alerts, analysis, integrations, blocklist_push)
 └── migrations/          — Alembic schema migrations
 ```
 
@@ -653,7 +697,7 @@ src/honeypot_mcp/
 
 **Less good for, without further work:**
 - Studying advanced persistent threats — Cowrie is high-fidelity but the in-process HTTP/SMTP/FTP/DNS engines are minimal asyncio implementations; sophisticated attackers may fingerprint them quickly.
-- Internet-facing high-volume deployment — needs perimeter hardening, host isolation, log shipping to Elastic/Splunk/Loki (the webhook layer enables this but doesn't ship integrations out of the box).
+- Internet-facing high-volume deployment — needs perimeter hardening, host isolation, and TLS termination in front of the canary callback. Log shipping itself *is* shipped — Splunk HEC, Elastic ECS, Loki, Datadog, ArcSight CEF, and RFC 5424 syslog renderers are built in (see `alert_subscribe format=...`).
 - Comprehensive deception platforms — see [T-Pot](https://github.com/telekom-security/tpotce), OpenCanary, or Conpot for higher fidelity across more protocols.
 
 The honeytoken stack, threat-intel enrichment, MITRE mapping, session reconstruction, and integration layer (webhooks + suppression + exports) are all production-grade.

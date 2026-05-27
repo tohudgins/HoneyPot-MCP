@@ -220,7 +220,6 @@ class AttackerProfile(Base):
     asn: Mapped[str | None] = mapped_column(String(128), nullable=True)
     org: Mapped[str | None] = mapped_column(String(256), nullable=True)
     vt_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    shodan_data: Mapped[dict] = mapped_column(JSON, default=dict)
     mitre_techniques: Mapped[list] = mapped_column(JSON, default=list)
     event_count: Mapped[int] = mapped_column(Integer, default=0)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

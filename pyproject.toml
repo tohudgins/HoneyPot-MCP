@@ -34,6 +34,10 @@ dependencies = [
     "alembic>=1.13.0",
     # Docker
     "docker>=7.1.0",
+    # AWS — used by tools/blocklist_push.py for WAFv2 IPSet updates.
+    # Optional in practice (the WAF tool gates the import), but pinning it
+    # in deps makes the blocklist-push feature work out of the box.
+    "boto3>=1.34.0",
     # Threat intel
     "geoip2>=4.8.0",
     # Honeypot protocols

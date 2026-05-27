@@ -2,7 +2,7 @@
 
 Every flushed alert that meets a subscription's severity threshold is
 serialised into the subscription's chosen `format` and delivered via the
-appropriate transport. Five formats are supported:
+appropriate transport. Seven formats are supported:
 
 * `json` — raw JSON envelope, optionally HMAC-signed via
   `X-HoneyPot-Signature: sha256=<hex>` (consumer verifies with the same
@@ -19,6 +19,12 @@ appropriate transport. Five formats are supported:
 * `syslog` — RFC 5424 framed message. The subscription URL scheme picks
   the transport — `udp://host:514` for UDP datagrams,
   `tcp://host:514` for TCP-framed delivery.
+* `loki` — Grafana Loki push API. Body is `{"streams": [...]}` with
+  nanosecond string timestamps. Stream labels carry severity / event_type /
+  source_ip. Auth via `Authorization: Basic <pre-encoded>` if
+  `hmac_secret` is set (operator pre-encodes `userid:token` for Grafana Cloud).
+* `datadog` — Datadog Logs API. Body is a single-element JSON list per
+  the v2 logs intake. `DD-API-KEY: <hmac_secret>` carries the API key.
 
 Delivery runs in a background asyncio task drained from a queue so slow
 webhook endpoints can never back-pressure the honeypot data path. HTTP
@@ -288,6 +294,74 @@ def render_cef(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str,
     return body, headers
 
 
+# Datadog `status` mapping (info / warning / error / critical) per the
+# v2 logs intake. Anything else is treated as info by the Datadog backend.
+_DD_STATUS = {
+    AlertSeverity.LOW: "info",
+    AlertSeverity.MEDIUM: "warning",
+    AlertSeverity.HIGH: "error",
+    AlertSeverity.CRITICAL: "critical",
+}
+
+
+def render_loki(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Grafana Loki push API envelope.
+
+    Spec: https://grafana.com/docs/loki/latest/reference/api/#push-log-entries-to-loki
+
+    Timestamp **must** be a string of nanoseconds. Loki silently rejects
+    integer timestamps with a 400. Stream labels are bounded to the
+    high-cardinality fields most useful for SOC slicing — source_ip is
+    intentionally label-side because Loki indexes by labels.
+    """
+    ts_ns = str(int(event.timestamp.timestamp() * 1_000_000_000))
+    payload_line = json.dumps(_base_event_dict(event), default=str)
+    stream = {
+        "job": "honeypot-mcp",
+        "severity": event.severity.value,
+        "event_type": event.event_type,
+        "source_ip": event.source_ip or "unknown",
+    }
+    envelope = {"streams": [{"stream": stream, "values": [[ts_ns, payload_line]]}]}
+    body = json.dumps(envelope, default=str).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "HoneyPot-MCP/1.0",
+    }
+    if sub.hmac_secret:
+        # Grafana Cloud Loki uses HTTP basic auth where the credential is
+        # `<userid>:<token>`. Operators pre-encode the whole thing and we
+        # pass it through unchanged so the same column works for self-hosted
+        # Loki behind any basic-auth proxy too.
+        headers["Authorization"] = f"Basic {sub.hmac_secret}"
+    return body, headers
+
+
+def render_datadog(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Datadog Logs API v2 envelope.
+
+    Spec: https://docs.datadoghq.com/api/latest/logs/#send-logs
+    The endpoint accepts a single object or an array; we always send an
+    array so the same path works for batched calls in the future.
+    """
+    log_entry = {
+        "ddsource": "honeypot-mcp",
+        "ddtags": f"env:prod,severity:{event.severity.value},event_type:{event.event_type}",
+        "hostname": _HOSTNAME,
+        "service": "honeypot",
+        "message": json.dumps(_base_event_dict(event), default=str),
+        "status": _DD_STATUS[event.severity],
+    }
+    body = json.dumps([log_entry], default=str).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "HoneyPot-MCP/1.0",
+    }
+    if sub.hmac_secret:
+        headers["DD-API-KEY"] = sub.hmac_secret
+    return body, headers
+
+
 def render_syslog(event: PendingEvent, sub: Subscription) -> bytes:
     """RFC 5424 framed syslog message.
 
@@ -482,6 +556,10 @@ class WebhookDelivery:
             body, headers = render_elastic_ecs(event, sub)
         elif fmt == "cef":
             body, headers = render_cef(event, sub)
+        elif fmt == "loki":
+            body, headers = render_loki(event, sub)
+        elif fmt == "datadog":
+            body, headers = render_datadog(event, sub)
         else:
             return False, f"unknown format: {fmt}"
 

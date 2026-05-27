@@ -105,7 +105,7 @@ uv run alembic revision --autogenerate -m "what changed"
 
 If Alembic fails for any reason (corrupted version table, missing migration file, etc.), `init_db()` falls back to `create_all()` so the server still starts. The warning is logged.
 
-Known schema leftover: `AttackerProfile.shodan_data` JSON column is unused (Shodan was removed). Left in place — when you next touch the model, generate a migration that drops it.
+Migrations that ADD or DROP columns guard themselves with `inspect().get_columns(...)` so the chain stays idempotent against fresh DBs (where `0001_baseline`'s `create_all` already reflects current `models.py`). The regression test `test_init_db_does_not_log_alembic_fallback_warning` asserts no fallback warning fires on boot — keep new migrations idempotent the same way so that signal stays clean.
 
 ### SSH personas
 

@@ -61,6 +61,33 @@ async def test_init_db_runs_alembic_on_fresh_persistent_db(tmp_db_url):
 
 
 @pytest.mark.asyncio
+async def test_init_db_does_not_log_alembic_fallback_warning(tmp_db_url, caplog):
+    """Regression guard: every fresh boot used to trip the `Alembic upgrade
+    failed … falling back to create_all` warning because the baseline
+    `create_all` overlapped with later `ALTER TABLE` migrations. The chain
+    is now idempotent — assert the noisy warning is gone so any real future
+    chain bug stays visible instead of getting buried in the fallback path.
+    """
+    import logging
+
+    from honeypot_mcp.storage import database
+
+    database._engine = None
+    database._session_factory = None
+
+    caplog.set_level(logging.WARNING, logger="honeypot_mcp.storage.database")
+    await database.init_db()
+    await database.close_db()
+
+    fallback_records = [r for r in caplog.records if "Alembic upgrade failed" in r.message]
+    assert not fallback_records, (
+        "Alembic chain triggered the fallback path on a fresh DB — migrations "
+        "must be idempotent. Records: "
+        + "; ".join(r.message for r in fallback_records)
+    )
+
+
+@pytest.mark.asyncio
 async def test_init_db_is_idempotent(tmp_db_url):
     url, sync_url = tmp_db_url
     from honeypot_mcp.storage import database
@@ -82,6 +109,68 @@ async def test_init_db_is_idempotent(tmp_db_url):
     finally:
         engine.dispose()
     assert "alembic_version" in tables
+
+
+def test_drop_shodan_data_migration_roundtrip(tmp_path: Path):
+    """0007 drops attacker_profiles.shodan_data on upgrade and restores it on downgrade.
+
+    Sets DATABASE_URL + clears the settings cache because the project's
+    `migrations/env.py` reads the URL from `get_settings()` regardless of what
+    the alembic Config has set. Hand-builds a minimal attacker_profiles table
+    so the test doesn't depend on the rest of the migration chain (baseline
+    uses create_all and conflicts with later ALTER TABLE migrations — a
+    pre-existing quirk unrelated to this change).
+    """
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import text
+
+    db_path = tmp_path / "migration_roundtrip.db"
+    sync_url = f"sqlite:///{db_path}"
+    async_url = f"sqlite+aiosqlite:///{db_path}"
+
+    prev_db_url = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = async_url
+    import honeypot_mcp.config as cfg_mod
+
+    cfg_mod._settings = None
+    engine = create_engine(sync_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE attacker_profiles ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "ip VARCHAR(45) NOT NULL UNIQUE, "
+                    "shodan_data JSON NOT NULL DEFAULT '{}')"
+                )
+            )
+
+        cfg = Config()
+        cfg.set_main_option(
+            "script_location",
+            str(Path(__file__).resolve().parents[2] / "src/honeypot_mcp/migrations"),
+        )
+        command.stamp(cfg, "0006_add_subscription_format")
+
+        command.upgrade(cfg, "0007_drop_attacker_profile_shodan_data")
+        cols = {c["name"] for c in inspect(engine).get_columns("attacker_profiles")}
+        assert "shodan_data" not in cols, "shodan_data should be gone after upgrade"
+
+        command.downgrade(cfg, "0006_add_subscription_format")
+        cols = {c["name"] for c in inspect(engine).get_columns("attacker_profiles")}
+        assert "shodan_data" in cols, "downgrade should restore shodan_data"
+
+        command.upgrade(cfg, "0007_drop_attacker_profile_shodan_data")
+        cols = {c["name"] for c in inspect(engine).get_columns("attacker_profiles")}
+        assert "shodan_data" not in cols, "re-upgrade should drop again"
+    finally:
+        engine.dispose()
+        if prev_db_url is None:
+            del os.environ["DATABASE_URL"]
+        else:
+            os.environ["DATABASE_URL"] = prev_db_url
+        cfg_mod._settings = None
 
 
 @pytest.mark.asyncio

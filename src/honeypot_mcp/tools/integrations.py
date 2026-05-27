@@ -28,7 +28,9 @@ async def alert_subscribe(
     label: str,
     severity_threshold: Literal["low", "medium", "high", "critical"] = "medium",
     hmac_secret: str | None = None,
-    format: Literal["json", "splunk_hec", "elastic_ecs", "cef", "syslog"] = "json",
+    format: Literal[
+        "json", "splunk_hec", "elastic_ecs", "cef", "syslog", "loki", "datadog"
+    ] = "json",
 ) -> dict[str, Any]:
     """Register a URL to receive real-time alert deliveries in a SIEM-native format.
 
@@ -47,12 +49,21 @@ async def alert_subscribe(
       Universal CEF Connector as well.
     * `syslog` — RFC 5424 framed message. URL scheme picks the transport:
       `udp://host:514` for UDP datagrams, `tcp://host:514` for TCP.
+    * `loki` — Grafana Loki push API. URL ends in `/loki/api/v1/push`. If
+      `hmac_secret` is set, it rides as `Authorization: Basic <secret>`
+      (Grafana Cloud expects `<userid>:<token>` pre-encoded — encode that
+      yourself and pass the result).
+    * `datadog` — Datadog Logs API v2. URL is
+      `https://http-intake.logs.datadoghq.com/api/v2/logs` (or your
+      regional equivalent). Pass your DD API key via `hmac_secret` — it's
+      sent as `DD-API-KEY: <key>`.
 
     Args:
         url: Webhook URL (or `udp://` / `tcp://` for syslog).
         label: Human-readable label (e.g. 'splunk-prod', 'qradar-cef').
         severity_threshold: Minimum severity to deliver — events below are skipped.
-        hmac_secret: Auth secret. JSON: HMAC key. Splunk HEC: HEC token. Pass
+        hmac_secret: Auth secret. JSON: HMAC key. Splunk HEC: HEC token.
+                     Loki: pre-encoded basic-auth. Datadog: API key. Pass
                      empty string ("") to generate a random 32-byte secret.
         format: Output format — see above.
     """

@@ -223,6 +223,159 @@ def test_syslog_renderer_emits_rfc5424_framed_message():
     assert msg_doc["event_type"] == "ssh_login_failed"
 
 
+def test_loki_renderer_envelope_uses_string_nanoseconds():
+    """Loki silently 400s if the timestamp is a number — must be a string of
+    nanoseconds. Stream labels carry severity, event_type, source_ip."""
+    from honeypot_mcp.webhooks import render_loki
+
+    body, headers = render_loki(_make_event(severity="critical"), _make_sub(fmt="loki"))
+    doc = json.loads(body)
+    streams = doc["streams"]
+    assert len(streams) == 1
+    stream = streams[0]
+    assert stream["stream"]["job"] == "honeypot-mcp"
+    assert stream["stream"]["severity"] == "critical"
+    assert stream["stream"]["event_type"] == "ssh_login_failed"
+    assert stream["stream"]["source_ip"] == "203.0.113.7"
+    # Values: [[<ns string>, <payload string>], ...]
+    assert len(stream["values"]) == 1
+    ts_ns, payload_line = stream["values"][0]
+    assert isinstance(ts_ns, str), "Loki timestamp MUST be a string of nanoseconds"
+    # Reconstruct expected ns from the same datetime to avoid hardcoding wrong epoch
+    expected_ns = str(
+        int(datetime(2026, 5, 20, 12, 0, 0, tzinfo=UTC).timestamp() * 1_000_000_000)
+    )
+    assert ts_ns == expected_ns
+    # Payload is JSON-encoded native dict
+    payload = json.loads(payload_line)
+    assert payload["event_type"] == "ssh_login_failed"
+    assert headers["Content-Type"] == "application/json"
+    # No auth header without hmac_secret
+    assert "Authorization" not in headers
+
+
+def test_loki_renderer_basic_auth_header_when_secret_set():
+    """Operators pre-encode `<userid>:<token>` for Grafana Cloud; we pass it
+    through unchanged in the Basic auth header."""
+    from honeypot_mcp.webhooks import render_loki
+
+    pre_encoded = "ZGVtbzpHRkNfc2VjcmV0X3Rva2VuMTIz"
+    _, headers = render_loki(_make_event(), _make_sub(fmt="loki", hmac_secret=pre_encoded))
+    assert headers["Authorization"] == f"Basic {pre_encoded}"
+
+
+def test_datadog_renderer_status_mapping_table_driven():
+    """Datadog status: low→info, medium→warning, high→error, critical→critical."""
+    from honeypot_mcp.webhooks import render_datadog
+
+    expected = {
+        "low": "info",
+        "medium": "warning",
+        "high": "error",
+        "critical": "critical",
+    }
+    for severity, dd_status in expected.items():
+        body, _ = render_datadog(_make_event(severity=severity), _make_sub(fmt="datadog"))
+        entries = json.loads(body)
+        assert isinstance(entries, list), "Datadog v2 logs intake expects a JSON array"
+        assert len(entries) == 1
+        assert entries[0]["status"] == dd_status, f"severity={severity} → status={dd_status}"
+        assert entries[0]["ddsource"] == "honeypot-mcp"
+        assert entries[0]["service"] == "honeypot"
+
+
+def test_datadog_renderer_api_key_header():
+    """DD-API-KEY header carries the API key (stored in hmac_secret)."""
+    from honeypot_mcp.webhooks import render_datadog
+
+    _, headers = render_datadog(_make_event(), _make_sub(fmt="datadog", hmac_secret="dd-api-xyz"))
+    assert headers["DD-API-KEY"] == "dd-api-xyz"
+    assert headers["Content-Type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_dispatches_loki_format():
+    """End-to-end: subscribe a loki format, deliver an event, assert the
+    captured POST has the streams envelope + Basic auth header."""
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import AlertSeverity, Subscription
+    from honeypot_mcp.webhooks import WebhookDelivery
+
+    port = _free_port()
+    runner, captures = await _start_http_capture(port)
+    try:
+        async with get_session() as session:
+            sub = Subscription(
+                label="loki-test",
+                url=f"http://127.0.0.1:{port}/loki/api/v1/push",
+                severity_threshold=AlertSeverity.LOW,
+                format="loki",
+                hmac_secret="dXNlcjpwYXNz",  # base64("user:pass")
+                active=True,
+            )
+            session.add(sub)
+            await session.flush()
+
+        delivery = WebhookDelivery()
+        await delivery.start()
+        try:
+            await delivery.enqueue_batch([_make_event(severity="high")])
+            await asyncio.sleep(1.5)
+        finally:
+            await delivery.stop()
+    finally:
+        await runner.cleanup()
+
+    assert len(captures) == 1
+    cap = captures[0]
+    assert cap["path"] == "/loki/api/v1/push"
+    assert cap["headers"].get("Authorization") == "Basic dXNlcjpwYXNz"
+    doc = json.loads(cap["body"])
+    assert doc["streams"][0]["stream"]["severity"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_dispatches_datadog_format():
+    """End-to-end: subscribe a datadog format, deliver an event, assert the
+    captured POST has the v2 logs envelope + DD-API-KEY header."""
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import AlertSeverity, Subscription
+    from honeypot_mcp.webhooks import WebhookDelivery
+
+    port = _free_port()
+    runner, captures = await _start_http_capture(port)
+    try:
+        async with get_session() as session:
+            sub = Subscription(
+                label="dd-test",
+                url=f"http://127.0.0.1:{port}/api/v2/logs",
+                severity_threshold=AlertSeverity.LOW,
+                format="datadog",
+                hmac_secret="dd-api-test-key",
+                active=True,
+            )
+            session.add(sub)
+            await session.flush()
+
+        delivery = WebhookDelivery()
+        await delivery.start()
+        try:
+            await delivery.enqueue_batch([_make_event(severity="critical")])
+            await asyncio.sleep(1.5)
+        finally:
+            await delivery.stop()
+    finally:
+        await runner.cleanup()
+
+    assert len(captures) == 1
+    cap = captures[0]
+    assert cap["path"] == "/api/v2/logs"
+    assert cap["headers"].get("DD-API-KEY") == "dd-api-test-key"
+    entries = json.loads(cap["body"])
+    assert isinstance(entries, list)
+    assert entries[0]["status"] == "critical"
+
+
 # ── Transport integration tests ────────────────────────────────────────────
 
 

@@ -71,6 +71,7 @@ mcp = FastMCP(
 # Import here so the @mcp.tool decorators execute at module load time.
 import honeypot_mcp.tools.alerts  # noqa: E402, F401
 import honeypot_mcp.tools.analysis  # noqa: E402, F401
+import honeypot_mcp.tools.blocklist_push  # noqa: E402, F401
 import honeypot_mcp.tools.honeypot  # noqa: E402, F401
 import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
 import honeypot_mcp.tools.integrations  # noqa: E402, F401

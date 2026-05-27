@@ -166,8 +166,15 @@ covers ~99% of internet attack traffic regardless.
 ## What is intentionally out of scope
 
 - **Internet-facing high-volume production deployment** — needs perimeter
-  hardening, host isolation, log shipping to Elastic / Splunk / Loki. The
-  webhook layer enables this but doesn't ship integrations out of the box.
+  hardening, host isolation, and TLS termination in front of the canary
+  callback (a reverse proxy like nginx / Caddy / Cloudflare Tunnel does
+  the job). Log shipping is *in scope* and shipped: Splunk HEC, Elastic
+  ECS, Grafana Loki, Datadog, ArcSight CEF, and RFC 5424 syslog renderers
+  are all built into the webhook layer — configure via
+  `alert_subscribe(format=...)`. CloudTrail / Azure Activity Log /
+  GCP Audit Log forwarders ship under `examples/cloud-forwarders/`,
+  and blocklist push integrations for Cloudflare / pfSense / AWS WAFv2
+  ship under `tools/blocklist_push.py`.
 - **APT / targeted-attacker research** — the custom engines are too thin.
 - **Real TLS termination, ICS / SCADA protocols, IoT-specific protocols** —
   see Conpot or T-Pot.
