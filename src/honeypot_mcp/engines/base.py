@@ -53,7 +53,9 @@ class HoneypotEngine(ABC):
     async def get_logs(self, container_id: str, lines: int = 50) -> list[str]:
         """Return the most recent log lines from the instance."""
 
-    async def reattach(self, name: str, port: int, config: dict[str, Any], container_id: str) -> str:
+    async def reattach(
+        self, name: str, port: int, config: dict[str, Any], container_id: str
+    ) -> str:
         """Re-establish a honeypot that the DB says is RUNNING after a server
         restart. In-process engines die with the process, so the default is to
         start fresh. Returns the (possibly new) container/process ID.

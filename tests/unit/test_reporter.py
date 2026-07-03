@@ -131,8 +131,12 @@ async def test_report_intel_reverse_dns_is_escaped():
         "recommendations": [],
     }
     html = await generate(
-        title="T", alerts=[_alert("1.2.3.4", "x")], stats={}, target_ip="1.2.3.4",
-        format="html", intel=intel,
+        title="T",
+        alerts=[_alert("1.2.3.4", "x")],
+        stats={},
+        target_ip="1.2.3.4",
+        format="html",
+        intel=intel,
     )
     assert "<script>alert(1)" not in html
     assert "&lt;script&gt;alert(1)" in html

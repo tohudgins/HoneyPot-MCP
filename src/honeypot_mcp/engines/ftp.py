@@ -71,6 +71,7 @@ def _classify_upload(filename: str, data: bytes) -> str | None:
         return "reverse_shell"
     return None
 
+
 # ProFTPD-style FEAT listing.
 _FEAT_RESPONSE = (
     b"211-Features:\r\n"
@@ -383,9 +384,7 @@ class _FTPProtocol(asyncio.Protocol):
         total = 0
         try:
             while total < _MAX_UPLOAD_BYTES:
-                chunk = await asyncio.wait_for(
-                    reader.read(_MAX_UPLOAD_BYTES - total), timeout=10.0
-                )
+                chunk = await asyncio.wait_for(reader.read(_MAX_UPLOAD_BYTES - total), timeout=10.0)
                 if not chunk:
                     break
                 chunks.append(chunk)

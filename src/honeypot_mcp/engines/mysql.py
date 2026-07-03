@@ -267,8 +267,16 @@ def _classify_query(sql: str) -> tuple[str, AlertSeverity]:
         return "mysql_file_read", AlertSeverity.HIGH
     if any(
         tok in s
-        for tok in ("information_schema", "show databases", "show tables", "@@version",
-                    "user()", "current_user", "@@datadir", "@@version_compile_os")
+        for tok in (
+            "information_schema",
+            "show databases",
+            "show tables",
+            "@@version",
+            "user()",
+            "current_user",
+            "@@datadir",
+            "@@version_compile_os",
+        )
     ):
         return "mysql_recon_query", AlertSeverity.MEDIUM
     return "mysql_query", AlertSeverity.MEDIUM

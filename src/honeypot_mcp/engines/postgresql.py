@@ -73,9 +73,15 @@ def _auth_cleartext_request() -> bytes:
 def _error_response(severity: str, code: str, message: str) -> bytes:
     # 'E' + Int32 len + [field-type byte + string\0]... + \0
     fields = (
-        b"S" + severity.encode() + b"\x00"
-        + b"C" + code.encode() + b"\x00"
-        + b"M" + message.encode() + b"\x00"
+        b"S"
+        + severity.encode()
+        + b"\x00"
+        + b"C"
+        + code.encode()
+        + b"\x00"
+        + b"M"
+        + message.encode()
+        + b"\x00"
         + b"\x00"
     )
     return b"E" + struct.pack("!I", len(fields) + 4) + fields
@@ -120,8 +126,7 @@ def _single_value_result(col: str, value: str) -> bytes:
     # typeOID(4) + typeLen(2) + typeMod(4) + format(2)]
     # tableOID(I) colAttr(H) typeOID(I) typeSize(h, signed) typeMod(i, signed) format(H)
     col_desc = (
-        col.encode() + b"\x00"
-        + struct.pack("!IHIhiH", 0, 0, 25, -1, -1, 0)  # typeOID 25 = text
+        col.encode() + b"\x00" + struct.pack("!IHIhiH", 0, 0, 25, -1, -1, 0)  # typeOID 25 = text
     )
     t_msg = _msg(b"T", struct.pack("!H", 1) + col_desc)
     vb = value.encode()
@@ -145,8 +150,17 @@ def _classify_pg_query(sql: str) -> tuple[str, AlertSeverity]:
         return "postgresql_copy", AlertSeverity.HIGH
     if any(
         tok in s
-        for tok in ("pg_stat", "version()", "current_user", "pg_shadow", "pg_authid",
-                    "information_schema", "pg_database", "current_setting", "pg_ls")
+        for tok in (
+            "pg_stat",
+            "version()",
+            "current_user",
+            "pg_shadow",
+            "pg_authid",
+            "information_schema",
+            "pg_database",
+            "current_setting",
+            "pg_ls",
+        )
     ):
         return "postgresql_recon_query", AlertSeverity.MEDIUM
     return "postgresql_query", AlertSeverity.MEDIUM
@@ -326,9 +340,7 @@ class PostgreSQLEngine(HoneypotEngine):
                 hp_id = hp.id
 
         loop = asyncio.get_event_loop()
-        server = await loop.create_server(
-            lambda: _PGProtocol(hp_id), host="0.0.0.0", port=port
-        )
+        server = await loop.create_server(lambda: _PGProtocol(hp_id), host="0.0.0.0", port=port)
         cid = f"postgresql-{secrets.token_hex(8)}"
         self._servers[cid] = server
         log.info("PostgreSQL honeypot '%s' listening on port %d", name, port)

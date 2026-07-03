@@ -51,9 +51,7 @@ class SSHEngine(HoneypotEngine):
         existing = self._ingest_tasks.get(container_id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(
-            self._ingest_logs(name, container_id), name=f"ssh-ingest-{name}"
-        )
+        task = asyncio.create_task(self._ingest_logs(name, container_id), name=f"ssh-ingest-{name}")
         self._ingest_tasks[container_id] = task
 
         def _cleanup(_task: asyncio.Task, cid: str = container_id) -> None:
@@ -154,7 +152,9 @@ class SSHEngine(HoneypotEngine):
         self._spawn_ingest_task(name, container_id)
         return container_id
 
-    async def reattach(self, name: str, port: int, config: dict[str, Any], container_id: str) -> str:
+    async def reattach(
+        self, name: str, port: int, config: dict[str, Any], container_id: str
+    ) -> str:
         """The Cowrie container survives an MCP server restart
         (restart_policy=unless-stopped), but the log-ingestion task dies with
         the process — without re-attaching it, attacks land in Cowrie's logs
@@ -177,7 +177,11 @@ class SSHEngine(HoneypotEngine):
             # identity + captured state) back rather than deploying a new one.
             await loop.run_in_executor(None, self._client.containers.get(container_id).start)
         self._spawn_ingest_task(name, container_id)
-        log.info("Re-attached log ingestion for SSH honeypot '%s' (container=%s)", name, container_id[:12])
+        log.info(
+            "Re-attached log ingestion for SSH honeypot '%s' (container=%s)",
+            name,
+            container_id[:12],
+        )
         return container_id
 
     async def stop(self, container_id: str, remove: bool = False) -> None:

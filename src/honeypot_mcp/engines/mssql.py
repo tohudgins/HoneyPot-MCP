@@ -239,9 +239,7 @@ class MSSQLEngine(HoneypotEngine):
                 hp_id = hp.id
 
         loop = asyncio.get_event_loop()
-        server = await loop.create_server(
-            lambda: _MSSQLProtocol(hp_id), host="0.0.0.0", port=port
-        )
+        server = await loop.create_server(lambda: _MSSQLProtocol(hp_id), host="0.0.0.0", port=port)
         cid = f"mssql-{secrets.token_hex(8)}"
         self._servers[cid] = server
         log.info("MSSQL honeypot '%s' listening on port %d", name, port)

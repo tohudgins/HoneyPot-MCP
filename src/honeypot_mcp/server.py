@@ -170,9 +170,7 @@ async def resource_stats_dashboard() -> str:
 def main() -> None:
     settings = get_settings()
     # Validated by Settings.validate_mcp_transport to one of these literals.
-    transport = cast(
-        'Literal["stdio", "http", "sse", "streamable-http"]', settings.mcp_transport
-    )
+    transport = cast('Literal["stdio", "http", "sse", "streamable-http"]', settings.mcp_transport)
     if transport == "stdio":
         # Per-chat subprocess launched by Claude Desktop / Claude Code.
         mcp.run()

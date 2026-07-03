@@ -207,9 +207,11 @@ class _SMTPProtocol(asyncio.Protocol):
             # Accepting this is the classic open-relay abuse spammers scan for.
             from_dom = _domain_of(self._mail_from)
             to_dom = _domain_of(rcpt)
-            is_relay = bool(from_dom and to_dom) and not self._is_local_domain(
-                to_dom
-            ) and not self._is_local_domain(from_dom)
+            is_relay = (
+                bool(from_dom and to_dom)
+                and not self._is_local_domain(to_dom)
+                and not self._is_local_domain(from_dom)
+            )
             asyncio.create_task(
                 self._record_event(
                     "smtp_open_relay" if is_relay else "smtp_rcpt_to",

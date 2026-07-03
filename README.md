@@ -21,18 +21,36 @@ You ask in plain English; it deploys real honeypots (14 protocols), captures wha
 
 ---
 
-## Features
+## Honeypots
+
+Fourteen protocols. SSH is Cowrie (industrial-grade); the rest are custom async engines that capture the actual attack, not just the connection. Server identity is randomised per deploy (personas) to resist fingerprinting.
+
+| Protocol (default port) | What it captures |
+|---|---|
+| **SSH + Telnet** (22/23) | Cowrie — full sessions, commands, file uploads, credentials |
+| **HTTP/HTTPS** (80/443) | Exploit signatures (Log4Shell, SQLi, traversal, webshell, RCE…), credentials, recon escalation |
+| **SMB** (445) | EternalBlue / DoublePulsar exploit probes |
+| **RDP** (3389) | X.224 handshake + TLS-upgraded MCS client fingerprint |
+| **FTP** (21) | Credentials + uploaded malware (SHA-256'd + classified) |
+| **SMTP** (25) | Credentials (AUTH LOGIN/PLAIN), message bodies, open-relay probes |
+| **MySQL / PostgreSQL / MSSQL** (3306/5432/1433) | Login creds + post-auth RCE queries (`INTO OUTFILE`, `COPY FROM PROGRAM`) |
+| **Redis** (6379) | Full unauth-RCE dropper chain — the attacker's SSH key + target path |
+| **MongoDB** (27017) | Unauth commands, `dropDatabase`, ransom notes |
+| **Elasticsearch** (9200) | Recon + data-exfil query patterns |
+| **DNS** (53) | Tunneling/exfil + recon (AXFR, `version.bind`, ANY) |
+| **VNC** (5900) | RFB auth challenge/response |
+
+## Platform
 
 | Category | Capabilities |
 |---|---|
-| **Honeypots** | SSH + Telnet (Cowrie/Docker), HTTP/HTTPS (exploit-signature detection — Log4Shell, SQLi, traversal, webshell…), SMTP (real STARTTLS, AUTH capture, open-relay detection), FTP (captures uploaded malware), DNS (tunneling + recon detection), RDP (X.224 + MCS fingerprinting), VNC, Redis (stateful — captures the full RCE dropper chain), MySQL (post-auth query capture), Elasticsearch, SMB (EternalBlue/DoublePulsar), PostgreSQL (COPY-FROM-PROGRAM RCE), MongoDB (ransom-note detection), MSSQL (TDS credential capture). Persona system randomises server identity per deploy to resist fingerprinting. |
 | **Honeytokens** | Fake AWS keys, canary URLs, credential pairs (auto-matched on honeypot logins), PDF/DOCX file tokens, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks, Azure/GCP cloud credentials |
-| **Detection pipeline** | Batched async event ingestion → suppression rules (CIDR/glob + rate limit) → honeytoken cross-reference (auto-escalates to CRITICAL) → auto-enrichment of CRITICAL alerts (VT + AbuseIPDB + GeoIP, TTL-cached) |
-| **Analysis** | MITRE ATT&CK mapping, attacker profiling, SSH session reconstruction, cross-honeypot kill-chain timeline, campaign correlation, XSS-safe HTML/Markdown reports |
-| **SIEM delivery** | Native formats: JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, Syslog RFC 5424 (UDP/TCP), Grafana Loki, Datadog — with per-subscription severity thresholds and delivery health stats |
+| **Detection pipeline** | Batched async ingestion → suppression (CIDR/glob + rate limit) → honeytoken cross-reference (auto-CRITICAL) → auto-enrichment of CRITICAL alerts (VT + AbuseIPDB + GeoIP/ASN/reverse-DNS, TTL-cached) |
+| **Analysis** | MITRE ATT&CK mapping, attacker profiling + risk score, SSH session reconstruction, cross-honeypot kill-chain timeline, campaign correlation, enriched XSS-safe HTML/Markdown reports |
+| **SIEM delivery** | JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, Syslog RFC 5424 (UDP/TCP), Grafana Loki, Datadog — per-subscription severity thresholds + delivery health stats |
 | **Response** | Blocklist push to Cloudflare / pfSense / AWS WAFv2, blocklist + STIX 2.1 export, AbuseIPDB reporting |
-| **Operations** | Health watchdog (CRITICAL alert on honeypot death), end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboard stack |
-| **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest endpoint + ready-to-deploy CloudTrail/Azure/GCP audit-log forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
+| **Operations** | Health watchdog, restart reconciliation, end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboards |
+| **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest + ready-to-deploy CloudTrail/Azure/GCP forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
 291 unit tests cover the security-critical paths; strict mypy passes.
 

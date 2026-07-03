@@ -159,8 +159,6 @@ async def test_subscribe_rejects_bad_scheme():
 async def test_subscribe_accepts_valid_url():
     from honeypot_mcp.tools.integrations import alert_subscribe
 
-    result = await alert_subscribe(
-        url="https://hooks.example.com/x", label="ok", format="json"
-    )
+    result = await alert_subscribe(url="https://hooks.example.com/x", label="ok", format="json")
     assert result.get("active") is True
     assert "error" not in result

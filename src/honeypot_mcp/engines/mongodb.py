@@ -253,7 +253,9 @@ class _MongoProtocol(asyncio.Protocol):
             if cmd_lower in _DESTRUCTIVE:
                 severity = AlertSeverity.HIGH
                 event_type = "mongodb_destructive"
-            if any(h in joined for h in _RANSOM_HINTS) or any(h in cmd_lower for h in _RANSOM_HINTS):
+            if any(h in joined for h in _RANSOM_HINTS) or any(
+                h in cmd_lower for h in _RANSOM_HINTS
+            ):
                 severity = AlertSeverity.CRITICAL
                 event_type = "mongodb_ransom_note"
             asyncio.create_task(
@@ -296,9 +298,7 @@ class MongoDBEngine(HoneypotEngine):
                 hp_id = hp.id
 
         loop = asyncio.get_event_loop()
-        server = await loop.create_server(
-            lambda: _MongoProtocol(hp_id), host="0.0.0.0", port=port
-        )
+        server = await loop.create_server(lambda: _MongoProtocol(hp_id), host="0.0.0.0", port=port)
         cid = f"mongodb-{secrets.token_hex(8)}"
         self._servers[cid] = server
         log.info("MongoDB honeypot '%s' listening on port %d", name, port)

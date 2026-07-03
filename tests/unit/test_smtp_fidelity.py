@@ -194,9 +194,7 @@ async def test_smtp_auth_login_decodes_credentials(smtp_server):
         await buf.stop()
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Alert).where(Alert.event_type == "smtp_auth_attempt")
-        )
+        result = await session.execute(select(Alert).where(Alert.event_type == "smtp_auth_attempt"))
         alerts = list(result.scalars().all())
     assert len(alerts) == 1
     assert alerts[0].payload["username"] == "admin@corp"
@@ -235,9 +233,7 @@ async def test_smtp_open_relay_detected(smtp_server):
         await buf.stop()
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Alert).where(Alert.event_type == "smtp_open_relay")
-        )
+        result = await session.execute(select(Alert).where(Alert.event_type == "smtp_open_relay"))
         alerts = list(result.scalars().all())
     assert len(alerts) == 1
     assert alerts[0].severity.value == "high"

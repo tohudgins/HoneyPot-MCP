@@ -676,8 +676,12 @@ def _enriched_event() -> Any:
             "target_path": "/root/.ssh/authorized_keys",
             "planted_keys": [{"key": "crackit", "payload_kind": "ssh_authorized_key"}],
             "enrichment": {
-                "geoip": {"country": "Germany", "asn": 24940, "as_org": "Hetzner",
-                          "reverse_dns": "static.example.your-server.de"},
+                "geoip": {
+                    "country": "Germany",
+                    "asn": 24940,
+                    "as_org": "Hetzner",
+                    "reverse_dns": "static.example.your-server.de",
+                },
                 "abuseipdb": {"abuse_confidence_score": 100},
             },
         },

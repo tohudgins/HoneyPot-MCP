@@ -327,9 +327,7 @@ async def test_redis_rce_dropper_chain_captured(redis_server):
         await buf.stop()
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Alert).where(Alert.event_type == "redis_rce_dropper")
-        )
+        result = await session.execute(select(Alert).where(Alert.event_type == "redis_rce_dropper"))
         events = list(result.scalars().all())
 
     assert len(events) == 1

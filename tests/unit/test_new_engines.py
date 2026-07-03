@@ -84,7 +84,9 @@ async def test_smb_detects_doublepulsar_ping():
             await writer.drain()
             await asyncio.wait_for(reader.read(256), timeout=3.0)
             # Trans2 (command 0x32) carrying subcommand 0x000e.
-            trans2 = b"\xffSMB" + bytes([0x32]) + b"\x00" * 27 + struct.pack("<H", 0x000E) + b"\x00" * 8
+            trans2 = (
+                b"\xffSMB" + bytes([0x32]) + b"\x00" * 27 + struct.pack("<H", 0x000E) + b"\x00" * 8
+            )
             writer.write(b"\x00" + len(trans2).to_bytes(3, "big") + trans2)
             await writer.drain()
             await asyncio.sleep(0.3)

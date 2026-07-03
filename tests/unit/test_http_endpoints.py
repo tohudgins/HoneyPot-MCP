@@ -382,9 +382,7 @@ async def test_http_exploit_signatures_detected(http_server):
             # Path traversal + LFI in the query string.
             await client.get(f"http://127.0.0.1:{port}/p?f=../../../../etc/passwd")
             # SQL injection in the query string.
-            await client.get(
-                f"http://127.0.0.1:{port}/s?q=1 UNION SELECT user,pass FROM users"
-            )
+            await client.get(f"http://127.0.0.1:{port}/s?q=1 UNION SELECT user,pass FROM users")
             # PHP webshell in a raw body.
             await client.post(
                 f"http://127.0.0.1:{port}/up",
@@ -405,9 +403,7 @@ async def test_http_exploit_signatures_detected(http_server):
     assert {"log4shell", "path_traversal", "sqli", "webshell"}.issubset(cats), cats
     # Log4Shell and webshell are CRITICAL.
     sev_by_cat = {
-        c: a.severity.value
-        for a in alerts
-        for c in a.payload.get("exploit_categories", [])
+        c: a.severity.value for a in alerts for c in a.payload.get("exploit_categories", [])
     }
     assert sev_by_cat["log4shell"] == "critical"
     assert sev_by_cat["webshell"] == "critical"

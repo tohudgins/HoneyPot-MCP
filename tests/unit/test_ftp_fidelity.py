@@ -198,9 +198,7 @@ async def test_stor_captures_uploaded_webshell(ftp_server):
         await buf.stop()
 
     async with get_session() as session:
-        result = await session.execute(
-            select(Alert).where(Alert.event_type == "ftp_file_upload")
-        )
+        result = await session.execute(select(Alert).where(Alert.event_type == "ftp_file_upload"))
         alerts = list(result.scalars().all())
     assert len(alerts) == 1
     p = alerts[0].payload

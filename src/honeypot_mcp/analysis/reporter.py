@@ -216,7 +216,9 @@ def _render_intel_md(intel: dict[str, Any] | None) -> str:
         return ""
     rows = []
     if intel.get("risk_level"):
-        rows.append(f"| Risk | **{_md_cell(intel['risk_level'])}** ({intel.get('risk_score')}/100) |")
+        rows.append(
+            f"| Risk | **{_md_cell(intel['risk_level'])}** ({intel.get('risk_score')}/100) |"
+        )
     if intel.get("location"):
         rows.append(f"| Location | {_md_cell(intel['location'])} |")
     if intel.get("asn"):
@@ -227,15 +229,21 @@ def _render_intel_md(intel: dict[str, Any] | None) -> str:
         usage = f" ({_md_cell(intel['usage_type'])})" if intel.get("usage_type") else ""
         rows.append(f"| ISP / Org | {_md_cell(intel['isp'])}{usage} |")
     if intel.get("vt_detection_ratio"):
-        rows.append(f"| VirusTotal | {_md_cell(intel['vt_detection_ratio'])} malicious (rep {intel.get('vt_reputation')}) |")
+        rows.append(
+            f"| VirusTotal | {_md_cell(intel['vt_detection_ratio'])} malicious (rep {intel.get('vt_reputation')}) |"
+        )
     if intel.get("abuse_score") is not None:
-        rows.append(f"| AbuseIPDB | {intel['abuse_score']}% confidence, {intel.get('abuse_reports')} reports |")
+        rows.append(
+            f"| AbuseIPDB | {intel['abuse_score']}% confidence, {intel.get('abuse_reports')} reports |"
+        )
     if not rows:
         return ""
     table = "\n## IP Intelligence\n\n| Field | Value |\n|---|---|\n" + "\n".join(rows) + "\n"
     recs = intel.get("recommendations") or []
     if recs:
-        table += "\n**Recommended actions:**\n\n" + "\n".join(f"- {_md_cell(r)}" for r in recs) + "\n"
+        table += (
+            "\n**Recommended actions:**\n\n" + "\n".join(f"- {_md_cell(r)}" for r in recs) + "\n"
+        )
     return table
 
 
