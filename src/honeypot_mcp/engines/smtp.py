@@ -17,17 +17,27 @@ This implementation:
   announcing).
 * Accepts the `DATA` body until a bare `.` line; logs the first 4KB.
 * Returns `252` for `VRFY` — Postfix's default "neither confirm nor deny".
+* Decodes `AUTH LOGIN` (base64 username/password challenge exchange) and
+  `AUTH PLAIN` (inline or challenged SASL) into `username`/`password` with
+  `service="smtp"`, so brute-force creds are captured and cross-referenced
+  against planted honeytokens like the other services.
+* Flags open-relay probes: an external `MAIL FROM` + external `RCPT TO` (neither
+  a domain we host) is the abuse spammers scan for — logged as
+  `smtp_open_relay` HIGH instead of a plain `smtp_rcpt_to`.
 
-It is still a low-fidelity SMTP — no real mail queue, no TLS — but
-significantly harder to fingerprint at the first-probe level than the
-previous `250 OK` skeleton.
+It is still a low-fidelity SMTP — no real mail queue — but it captures the
+things that matter (credentials, message bodies, relay attempts) and is
+significantly harder to fingerprint than a `250 OK` skeleton.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import random
+import re
 import secrets
 from typing import Any
 
@@ -38,6 +48,27 @@ from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
+
+
+def _b64_decode(s: str) -> str:
+    try:
+        return base64.b64decode(s, validate=False).decode("utf-8", errors="replace")
+    except (binascii.Error, ValueError):
+        return ""
+
+
+def _extract_addr(command: str) -> str:
+    """Pull the address out of `MAIL FROM:<a@b>` / `RCPT TO:<a@b>` (or the
+    bare form without angle brackets)."""
+    m = re.search(r"<([^>]*)>", command)
+    if m:
+        return m.group(1).strip()
+    _, _, rest = command.partition(":")
+    return rest.strip().split()[0] if rest.strip() else ""
+
+
+def _domain_of(addr: str) -> str:
+    return addr.rsplit("@", 1)[-1].lower() if "@" in addr else ""
 
 
 # Hostname pool used when a honeypot is deployed without an explicit
@@ -96,6 +127,11 @@ class _SMTPProtocol(asyncio.Protocol):
         self._data_lines: list[str] = []
         self._data_size = 0
         self._tls_active = False
+        # AUTH continuation state: None | "login_user" | "login_pass" | "plain".
+        self._auth_state: str | None = None
+        self._auth_username = ""
+        # Envelope tracking for open-relay detection.
+        self._mail_from = ""
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         # asyncio.Protocol's contract narrows this — it's always a stream
@@ -119,10 +155,17 @@ class _SMTPProtocol(asyncio.Protocol):
     def _dispatch(self, line: str) -> None:
         if not line:
             return
-        upper = line.upper()
         t = self._transport
         if t is None:
             return
+
+        # An AUTH exchange in progress consumes the next line(s) as the
+        # base64-encoded credential material, not as a new command.
+        if self._auth_state is not None:
+            self._handle_auth_continuation(line)
+            return
+
+        upper = line.upper()
 
         if upper.startswith("EHLO"):
             t.write(_build_ehlo_response(self._hostname))
@@ -145,19 +188,34 @@ class _SMTPProtocol(asyncio.Protocol):
                 t.pause_reading()
                 asyncio.create_task(self._upgrade_to_tls())
         elif upper.startswith("AUTH"):
-            t.write(b"334 VXNlcm5hbWU6\r\n")  # base64("Username:")
-            asyncio.create_task(
-                self._record_event("smtp_auth_attempt", AlertSeverity.HIGH, {"command": line})
-            )
+            self._handle_auth(line, upper)
         elif upper.startswith("MAIL FROM"):
+            self._mail_from = _extract_addr(line)
             t.write(b"250 2.1.0 Ok\r\n")
             asyncio.create_task(
-                self._record_event("smtp_mail_from", AlertSeverity.MEDIUM, {"command": line})
+                self._record_event(
+                    "smtp_mail_from",
+                    AlertSeverity.MEDIUM,
+                    {"command": line, "address": self._mail_from},
+                )
             )
         elif upper.startswith("RCPT TO"):
+            rcpt = _extract_addr(line)
             t.write(b"250 2.1.5 Ok\r\n")
+            # Open-relay probe: the server is asked to deliver from an external
+            # sender to an external recipient (neither is a domain we host).
+            # Accepting this is the classic open-relay abuse spammers scan for.
+            from_dom = _domain_of(self._mail_from)
+            to_dom = _domain_of(rcpt)
+            is_relay = bool(from_dom and to_dom) and not self._is_local_domain(
+                to_dom
+            ) and not self._is_local_domain(from_dom)
             asyncio.create_task(
-                self._record_event("smtp_rcpt_to", AlertSeverity.MEDIUM, {"command": line})
+                self._record_event(
+                    "smtp_open_relay" if is_relay else "smtp_rcpt_to",
+                    AlertSeverity.HIGH if is_relay else AlertSeverity.MEDIUM,
+                    {"command": line, "mail_from": self._mail_from, "rcpt_to": rcpt},
+                )
             )
         elif upper == "DATA":
             t.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
@@ -178,6 +236,81 @@ class _SMTPProtocol(asyncio.Protocol):
             t.close()
         else:
             t.write(b"502 5.5.2 Error: command not recognized\r\n")
+
+    def _is_local_domain(self, domain: str) -> bool:
+        """True if `domain` is one we'd plausibly host (matches our hostname).
+        Anything else is an external destination — the relay signal."""
+        host = self._hostname.lower()
+        return not domain or domain == host or host.endswith("." + domain) or domain in host
+
+    def _handle_auth(self, line: str, upper: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        # AUTH mechanisms: `AUTH LOGIN`, `AUTH PLAIN [<initial>]`,
+        # `AUTH CRAM-MD5`. We capture creds for LOGIN and PLAIN.
+        parts = line.split()
+        mech = parts[1].upper() if len(parts) > 1 else ""
+        if mech == "PLAIN":
+            if len(parts) >= 3:
+                # Inline initial response: base64(\0user\0pass).
+                self._capture_plain(parts[2])
+                t.write(b"535 5.7.8 Error: authentication failed\r\n")
+            else:
+                self._auth_state = "plain"
+                t.write(b"334 \r\n")
+            return
+        if mech == "LOGIN":
+            self._auth_state = "login_user"
+            t.write(b"334 VXNlcm5hbWU6\r\n")  # base64("Username:")
+            return
+        # Unknown/unsupported mechanism — still record the attempt.
+        t.write(b"504 5.7.4 Unrecognized authentication type\r\n")
+        asyncio.create_task(
+            self._record_event("smtp_auth_attempt", AlertSeverity.HIGH, {"command": line})
+        )
+
+    def _handle_auth_continuation(self, line: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        state = self._auth_state
+        if state == "login_user":
+            self._auth_username = _b64_decode(line)
+            self._auth_state = "login_pass"
+            t.write(b"334 UGFzc3dvcmQ6\r\n")  # base64("Password:")
+            return
+        if state == "login_pass":
+            password = _b64_decode(line)
+            self._auth_state = None
+            self._record_auth(self._auth_username, password)
+            t.write(b"535 5.7.8 Error: authentication failed\r\n")
+            return
+        if state == "plain":
+            self._auth_state = None
+            self._capture_plain(line)
+            t.write(b"535 5.7.8 Error: authentication failed\r\n")
+            return
+        self._auth_state = None
+
+    def _capture_plain(self, b64: str) -> None:
+        # SASL PLAIN: authzid \0 authcid \0 passwd (RFC 4616).
+        decoded = _b64_decode(b64)
+        parts = decoded.split("\x00")
+        if len(parts) >= 3:
+            self._record_auth(parts[1], parts[2])
+        else:
+            self._record_auth("", decoded)
+
+    def _record_auth(self, username: str, password: str) -> None:
+        # service="smtp" so credential_match cross-references planted tokens.
+        asyncio.create_task(
+            self._record_event(
+                "smtp_auth_attempt",
+                AlertSeverity.HIGH,
+                {"username": username, "password": password, "service": "smtp"},
+            )
+        )
 
     def _handle_data_line(self, line: str) -> None:
         """Collect message body until a bare `.` ends DATA."""

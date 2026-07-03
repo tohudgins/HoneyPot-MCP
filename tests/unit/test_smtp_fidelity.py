@@ -152,3 +152,94 @@ async def test_vrfy_returns_252(smtp_server):
 # STARTTLS handshake-completion behaviour moved to test_smtp_starttls.py
 # now that we actually perform the TLS handshake instead of closing on the
 # ClientHello.
+
+
+@pytest.mark.asyncio
+async def test_smtp_auth_login_decodes_credentials(smtp_server):
+    """AUTH LOGIN's base64 username/password challenge exchange must be decoded
+    and captured with service=smtp for credential cross-referencing."""
+    import base64
+
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = smtp_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=2.0)  # banner
+            writer.write(b"EHLO x\r\n")
+            await writer.drain()
+            await _read_until_terminator(reader)
+            writer.write(b"AUTH LOGIN\r\n")
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=2.0)  # 334 Username:
+            writer.write(base64.b64encode(b"admin@corp") + b"\r\n")
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=2.0)  # 334 Password:
+            writer.write(base64.b64encode(b"Hunter2!") + b"\r\n")
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=2.0)  # 535 fail
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type == "smtp_auth_attempt")
+        )
+        alerts = list(result.scalars().all())
+    assert len(alerts) == 1
+    assert alerts[0].payload["username"] == "admin@corp"
+    assert alerts[0].payload["password"] == "Hunter2!"
+    assert alerts[0].payload["service"] == "smtp"
+
+
+@pytest.mark.asyncio
+async def test_smtp_open_relay_detected(smtp_server):
+    """External sender + external recipient = open-relay probe → HIGH."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = smtp_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            await asyncio.wait_for(reader.readline(), timeout=2.0)  # banner
+            writer.write(b"MAIL FROM:<spammer@gmail.com>\r\n")
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=2.0)
+            writer.write(b"RCPT TO:<victim@yahoo.com>\r\n")
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=2.0)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type == "smtp_open_relay")
+        )
+        alerts = list(result.scalars().all())
+    assert len(alerts) == 1
+    assert alerts[0].severity.value == "high"
+    assert alerts[0].payload["mail_from"] == "spammer@gmail.com"
+    assert alerts[0].payload["rcpt_to"] == "victim@yahoo.com"
