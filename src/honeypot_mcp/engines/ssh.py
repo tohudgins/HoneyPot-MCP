@@ -42,6 +42,24 @@ class SSHEngine(HoneypotEngine):
         except docker.errors.DockerException as e:
             log.warning("Docker not available: %s — SSH engine will be non-functional.", e)
             self._client = None
+        # asyncio only holds weak references to tasks — without a strong ref
+        # here, a running ingestion task is eligible for GC and event capture
+        # stops silently. Keyed by container_id so reattach can dedup.
+        self._ingest_tasks: dict[str, asyncio.Task] = {}
+
+    def _spawn_ingest_task(self, name: str, container_id: str) -> None:
+        existing = self._ingest_tasks.get(container_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._ingest_logs(name, container_id), name=f"ssh-ingest-{name}"
+        )
+        self._ingest_tasks[container_id] = task
+
+        def _cleanup(_task: asyncio.Task, cid: str = container_id) -> None:
+            self._ingest_tasks.pop(cid, None)
+
+        task.add_done_callback(_cleanup)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         if not self._client:
@@ -133,7 +151,33 @@ class SSHEngine(HoneypotEngine):
             container_id[:12],
             persona.id,
         )
-        asyncio.create_task(self._ingest_logs(name, container_id))
+        self._spawn_ingest_task(name, container_id)
+        return container_id
+
+    async def reattach(self, name: str, port: int, config: dict[str, Any], container_id: str) -> str:
+        """The Cowrie container survives an MCP server restart
+        (restart_policy=unless-stopped), but the log-ingestion task dies with
+        the process — without re-attaching it, attacks land in Cowrie's logs
+        and never become alerts while every health check still passes."""
+        if not self._client:
+            raise RuntimeError("Docker is not available on this system.")
+        loop = asyncio.get_event_loop()
+
+        def _container_status() -> str:
+            try:
+                return self._client.containers.get(container_id).status
+            except docker.errors.NotFound:
+                return "not_found"
+
+        status = await loop.run_in_executor(None, _container_status)
+        if status == "not_found":
+            raise RuntimeError(f"Container {container_id[:12]} no longer exists.")
+        if status != "running":
+            # exited/created — bring the existing container (and its persona
+            # identity + captured state) back rather than deploying a new one.
+            await loop.run_in_executor(None, self._client.containers.get(container_id).start)
+        self._spawn_ingest_task(name, container_id)
+        log.info("Re-attached log ingestion for SSH honeypot '%s' (container=%s)", name, container_id[:12])
         return container_id
 
     async def stop(self, container_id: str, remove: bool = False) -> None:

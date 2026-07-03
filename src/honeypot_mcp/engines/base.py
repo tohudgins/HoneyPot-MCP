@@ -53,6 +53,17 @@ class HoneypotEngine(ABC):
     async def get_logs(self, container_id: str, lines: int = 50) -> list[str]:
         """Return the most recent log lines from the instance."""
 
+    async def reattach(self, name: str, port: int, config: dict[str, Any], container_id: str) -> str:
+        """Re-establish a honeypot that the DB says is RUNNING after a server
+        restart. In-process engines die with the process, so the default is to
+        start fresh. Returns the (possibly new) container/process ID.
+
+        Docker-backed engines override this: their containers survive the
+        restart, but per-honeypot background work (log ingestion) must be
+        re-attached to the still-running container.
+        """
+        return await self.start(name, port, config)
+
     async def pause(self, container_id: str) -> None:
         """Pause a running instance (default: no-op for non-Docker engines)."""
 

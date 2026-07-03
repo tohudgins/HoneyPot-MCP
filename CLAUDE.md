@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (160 unit tests covering security-critical paths)
+# Tests (253 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -264,6 +264,30 @@ query and waits for any reply.
 The `_reported_dead` set prevents alert spam: a dead honeypot generates exactly
 one alert. If it later recovers (becomes alive again), the entry is cleared, so
 a subsequent failure will alert again.
+
+### Startup reconciliation
+
+`reconcile.py` runs once from `lifespan`, AFTER the event buffer starts and
+BEFORE the watchdog (ordering matters — otherwise the watchdog races it to
+mark restartable honeypots dead). MCP clients relaunch this server per chat
+session, so every start is a process restart, and anything the DB left
+`RUNNING` must be re-established:
+
+- In-process engines (HTTP/SMTP/FTP/DNS/RDP/VNC/Redis/MySQL/Elasticsearch)
+  died with the previous process — they get restarted on their recorded port.
+- Cowrie SSH containers survive (`restart_policy=unless-stopped`), but the
+  log-ingestion task doesn't — without re-attaching it, attacks land in
+  Cowrie's logs and never become alerts while health checks still pass.
+
+Each engine's `reattach(name, port, config, container_id)` encapsulates the
+right behaviour (base default = `start()` fresh; SSH overrides to re-attach
+ingestion to the live container). A honeypot that can't be re-established is
+flipped to ERROR with a CRITICAL `honeypot_restart_failed` alert; startup
+never aborts.
+
+Note: `SSHEngine` holds strong references to ingestion tasks in
+`self._ingest_tasks` — asyncio only weakly references tasks, so an unreferenced
+one can be GC'd mid-run, silently stopping capture.
 
 ### Canary callback server
 

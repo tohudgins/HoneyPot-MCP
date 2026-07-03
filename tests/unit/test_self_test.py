@@ -115,3 +115,60 @@ async def test_self_test_http_end_to_end():
         # Clean up the engine
         for cid in list(engine._runners.keys()):
             await engine.stop(cid)
+
+
+def _free_port() -> int:
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.mark.parametrize(
+    ("engine_path", "engine_cls", "hp_type_name"),
+    [
+        ("honeypot_mcp.engines.redis", "RedisEngine", "REDIS"),
+        ("honeypot_mcp.engines.mysql", "MySQLEngine", "MYSQL"),
+        ("honeypot_mcp.engines.rdp", "RDPEngine", "RDP"),
+        ("honeypot_mcp.engines.vnc", "VNCEngine", "VNC"),
+        ("honeypot_mcp.engines.elasticsearch", "ElasticsearchEngine", "ELASTICSEARCH"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_self_test_in_process_engines_end_to_end(engine_path, engine_cls, hp_type_name):
+    """Every in-process engine must have a working self-test probe: start the
+    real engine, probe it, confirm the marker-bearing alert lands. Guards
+    against a new engine shipping without a matching probe."""
+    import importlib
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
+    from honeypot_mcp.tools.honeypot import honeypot_self_test
+
+    engine = getattr(importlib.import_module(engine_path), engine_cls)()
+    hp_type = getattr(HoneypotType, hp_type_name)
+    port = _free_port()
+    name = f"selftest-{hp_type_name.lower()}"
+
+    async with get_session() as session:
+        hp = Honeypot(name=name, type=hp_type, port=port, status=HoneypotStatus.RUNNING)
+        session.add(hp)
+        await session.flush()
+
+    container_id = await engine.start(name, port, {})
+    try:
+        async with get_session() as session:
+            from sqlalchemy import update
+
+            await session.execute(
+                update(Honeypot).where(Honeypot.name == name).values(container_id=container_id)
+            )
+
+        result = await honeypot_self_test(name, timeout_seconds=10)
+        assert result.get("probe_sent") is True, result
+        assert result.get("alert_received") is True, result
+    finally:
+        await engine.stop(container_id)

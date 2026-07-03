@@ -80,7 +80,19 @@ async def honeypot_deploy(
         await session.flush()
         hp_id = hp.id
 
-    container_id = await engine.start(resolved_name, resolved_port, resolved_config)
+    try:
+        container_id = await engine.start(resolved_name, resolved_port, resolved_config)
+    except Exception as e:
+        # Roll back the reservation — otherwise the name is burned by a row
+        # stuck in STOPPED and every retry gets "already exists".
+        async with get_session() as session:
+            hp_row = await queries.get_honeypot_by_id(session, hp_id)
+            if hp_row:
+                await session.delete(hp_row)
+        return {
+            "error": f"Failed to start {type} honeypot on port {resolved_port}: {e}",
+            "hint": "Common causes: port already in use, or Docker not running (ssh type).",
+        }
 
     async with get_session() as session:
         hp_refresh = await queries.get_honeypot_by_id(session, hp_id)
@@ -318,6 +330,36 @@ async def honeypot_templates() -> list[dict[str, Any]]:
             "default_port": 5353,
             "config_options": ["fake_records"],
         },
+        {
+            "type": "rdp",
+            "description": "RDP honeypot: X.224 handshake parsing (leaks the mstshash username) plus TLS-upgraded MCS client fingerprinting. Catches RDP brute-force scanners.",
+            "default_port": 3389,
+            "config_options": [],
+        },
+        {
+            "type": "vnc",
+            "description": "VNC honeypot speaking the RFB handshake — captures client version and auth challenge/response pairs from brute-force tools.",
+            "default_port": 5900,
+            "config_options": [],
+        },
+        {
+            "type": "redis",
+            "description": "Unauthenticated-looking Redis (RESP) honeypot. Detects the CONFIG SET dropper and SLAVEOF rogue-replica exploit patterns; AUTH attempts are credential-matched.",
+            "default_port": 6379,
+            "config_options": [],
+        },
+        {
+            "type": "mysql",
+            "description": "MySQL honeypot: serves a real handshake, captures login usernames + auth responses, rejects with access-denied.",
+            "default_port": 3306,
+            "config_options": [],
+        },
+        {
+            "type": "elasticsearch",
+            "description": "Elasticsearch honeypot: realistic cluster identity with fake indices — detects recon probes and data-exfil query patterns (_search, _bulk, …).",
+            "default_port": 9200,
+            "config_options": [],
+        },
     ]
 
 
@@ -403,7 +445,7 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
     marker = f"selftest_{secrets.token_hex(6)}"
     probe_start = datetime.now(UTC)
 
-    sent_ok, send_detail = await _send_probe(hp_type, hp_port, marker)
+    sent_ok, send_detail, match_token = await _send_probe(hp_type, hp_port, marker)
     if not sent_ok:
         return {
             "name": name,
@@ -422,7 +464,7 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
                 .where(
                     Alert.honeypot_id == hp_id,
                     Alert.timestamp >= probe_start,
-                    cast(Alert.payload, String).contains(marker),
+                    cast(Alert.payload, String).contains(match_token),
                 )
                 .limit(1)
             )
@@ -457,9 +499,15 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
     }
 
 
-async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str]:
+async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str, str]:
     """Dispatch to the per-protocol probe. Each probe embeds `marker` in a
-    field that the engine writes into the alert payload."""
+    field the engine writes into the alert payload.
+
+    Returns `(sent_ok, detail, match_token)`. `match_token` is the string to
+    search the resulting alert payload for — usually `marker` itself, but a
+    protocol that can only carry raw bytes (VNC) returns the hex form it
+    actually put on the wire.
+    """
     try:
         if hp_type == "ssh":
             return await _ssh_probe(port, marker)
@@ -471,12 +519,22 @@ async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str]:
             return await _ftp_probe(port, marker)
         if hp_type == "dns":
             return await _dns_probe(port, marker)
-        return False, f"No self-test probe defined for honeypot type {hp_type}"
+        if hp_type == "rdp":
+            return await _rdp_probe(port, marker)
+        if hp_type == "vnc":
+            return await _vnc_probe(port, marker)
+        if hp_type == "redis":
+            return await _redis_probe(port, marker)
+        if hp_type == "mysql":
+            return await _mysql_probe(port, marker)
+        if hp_type == "elasticsearch":
+            return await _elasticsearch_probe(port, marker)
+        return False, f"No self-test probe defined for honeypot type {hp_type}", marker
     except Exception as e:
-        return False, f"Probe failed: {e}"
+        return False, f"Probe failed: {e}", marker
 
 
-async def _ssh_probe(port: int, marker: str) -> tuple[bool, str]:
+async def _ssh_probe(port: int, marker: str) -> tuple[bool, str, str]:
     """Open a TCP connection and send an SSH banner containing the marker.
     Cowrie logs `cowrie.client.version` with the banner — the marker lands in
     the version field of the alert payload."""
@@ -491,10 +549,10 @@ async def _ssh_probe(port: int, marker: str) -> tuple[bool, str]:
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
-    return True, "SSH banner sent"
+    return True, "SSH banner sent", marker
 
 
-async def _http_probe(port: int, marker: str) -> tuple[bool, str]:
+async def _http_probe(port: int, marker: str) -> tuple[bool, str, str]:
     """HTTP GET with marker in the User-Agent — lands in payload['user_agent']."""
     import httpx
 
@@ -503,10 +561,10 @@ async def _http_probe(port: int, marker: str) -> tuple[bool, str]:
             f"http://127.0.0.1:{port}/.env",
             headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
         )
-    return True, f"HTTP {resp.status_code}"
+    return True, f"HTTP {resp.status_code}", marker
 
 
-async def _smtp_probe(port: int, marker: str) -> tuple[bool, str]:
+async def _smtp_probe(port: int, marker: str) -> tuple[bool, str, str]:
     """AUTH PLAIN with marker as the credentials blob — lands in payload['command']."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     try:
@@ -521,10 +579,10 @@ async def _smtp_probe(port: int, marker: str) -> tuple[bool, str]:
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
-    return True, "SMTP AUTH sent"
+    return True, "SMTP AUTH sent", marker
 
 
-async def _ftp_probe(port: int, marker: str) -> tuple[bool, str]:
+async def _ftp_probe(port: int, marker: str) -> tuple[bool, str, str]:
     """USER + PASS — marker goes in the username, lands in payload['username']."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     try:
@@ -539,15 +597,15 @@ async def _ftp_probe(port: int, marker: str) -> tuple[bool, str]:
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
-    return True, "FTP USER+PASS sent"
+    return True, "FTP USER+PASS sent", marker
 
 
-async def _dns_probe(port: int, marker: str) -> tuple[bool, str]:
+async def _dns_probe(port: int, marker: str) -> tuple[bool, str, str]:
     """DNS query for `<marker>.selftest` — marker lands in payload['qname']."""
     try:
         import dnslib
     except ImportError:
-        return False, "dnslib not installed — cannot self-test DNS"
+        return False, "dnslib not installed — cannot self-test DNS", marker
 
     class _Probe(asyncio.DatagramProtocol):
         def __init__(self) -> None:
@@ -568,7 +626,109 @@ async def _dns_probe(port: int, marker: str) -> tuple[bool, str]:
             await asyncio.wait_for(proto.received.wait(), timeout=2.0)
     finally:
         transport.close()
-    return True, "DNS query sent"
+    return True, "DNS query sent", marker
+
+
+async def _rdp_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send an X.224 Connection Request carrying `Cookie: mstshash=<marker>`
+    — the RDP engine parses it into payload['mstshash'] / ['username']."""
+    cookie = f"Cookie: mstshash={marker}\r\n".encode()
+    neg_req = bytes([0x01, 0x00]) + (8).to_bytes(2, "little") + (0).to_bytes(4, "little")
+    # X.224 body: code(0xE0) + dst-ref(2) + src-ref(2) + class(1) + variable.
+    x224_body = bytes([0xE0, 0x00, 0x00, 0x00, 0x00, 0x00]) + cookie + neg_req
+    x224 = bytes([len(x224_body)]) + x224_body
+    tpkt = bytes([3, 0]) + (4 + len(x224)).to_bytes(2, "big")
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(tpkt + x224)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "RDP X.224 CR sent", marker
+
+
+async def _vnc_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Drive the RFB handshake through to the auth response. VNC can only
+    carry 16 raw bytes there, so we send the marker's bytes and match on their
+    hex form (what lands in payload['response_hex'])."""
+    response = marker.encode()[:16].ljust(16, b"\x00")
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readexactly(12), timeout=3.0)  # server version
+        writer.write(b"RFB 003.008\n")
+        await writer.drain()
+        await asyncio.wait_for(reader.read(8), timeout=3.0)  # security-types list
+        writer.write(bytes([2]))  # select VNC auth
+        await writer.drain()
+        await asyncio.wait_for(reader.readexactly(16), timeout=3.0)  # challenge
+        writer.write(response)
+        await writer.drain()
+        await asyncio.sleep(0.3)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "VNC auth response sent", response.hex()
+
+
+async def _redis_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """`AUTH default <marker>` — the marker lands in payload['password']."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(f"AUTH default {marker}\r\n".encode())
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(128), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "Redis AUTH sent", marker
+
+
+async def _mysql_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send a HandshakeResponse41 with the marker as username — lands in
+    payload['username']."""
+    import struct
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.read(256), timeout=3.0)  # server handshake
+        body = (
+            struct.pack("<I", 0x0005A685)  # client capability flags
+            + struct.pack("<I", 16_777_216)  # max packet size
+            + bytes([0x21])  # charset
+            + b"\x00" * 23  # reserved
+            + marker.encode()
+            + b"\x00"  # username null terminator
+            + b"\x00"  # auth-response length = 0
+        )
+        header = struct.pack("<I", len(body))[:3] + bytes([1])  # seq id 1
+        writer.write(header + body)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "MySQL handshake response sent", marker
+
+
+async def _elasticsearch_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """HTTP GET with marker in the User-Agent — lands in payload['user_agent']."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(
+            f"http://127.0.0.1:{port}/",
+            headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
+        )
+    return True, f"HTTP {resp.status_code}", marker
 
 
 @mcp.tool

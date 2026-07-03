@@ -12,6 +12,7 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from sqlalchemy import select, update
 
@@ -67,6 +68,21 @@ async def alert_subscribe(
                      empty string ("") to generate a random 32-byte secret.
         format: Output format — see above.
     """
+    # Validate the URL up front — a malformed or wrong-scheme URL otherwise
+    # sits in the DB silently failing every delivery. syslog uses udp://tcp://;
+    # every other format is HTTP(S).
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return {"error": f"URL {url!r} has no host."}
+    allowed_schemes = {"udp", "tcp"} if format == "syslog" else {"http", "https"}
+    if parsed.scheme.lower() not in allowed_schemes:
+        return {
+            "error": (
+                f"format={format} requires a URL scheme in {sorted(allowed_schemes)}, "
+                f"got {parsed.scheme!r}."
+            )
+        }
+
     if hmac_secret == "":
         hmac_secret = secrets.token_urlsafe(32)
 

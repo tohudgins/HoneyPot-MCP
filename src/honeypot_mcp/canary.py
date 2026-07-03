@@ -46,6 +46,8 @@ _PIXEL = base64.b64decode(
 # flusher and potentially DOSing real alert delivery.
 _RATE_WINDOW_SECONDS = 60.0
 _RATE_MAX_PER_WINDOW = 30  # 30 hits/IP/min is generous for legitimate canary use
+# Above this many tracked IPs we sweep out decayed windows on the next hit.
+_RATE_STATE_MAX_IPS = 10_000
 _rate_state: dict[str, deque[float]] = defaultdict(deque)
 
 
@@ -62,7 +64,19 @@ def _rate_limit_check(src_ip: str) -> bool:
     if len(window) >= _RATE_MAX_PER_WINDOW:
         return True
     window.append(now)
+    # Evict fully-decayed windows so the dict doesn't grow unbounded with one
+    # deque per source IP ever seen on a long-lived public deployment.
+    if len(_rate_state) > _RATE_STATE_MAX_IPS:
+        _evict_stale_rate_windows(cutoff)
     return False
+
+
+def _evict_stale_rate_windows(cutoff: float) -> None:
+    """Drop IPs whose entire window has decayed below `cutoff` (no hits in the
+    last `_RATE_WINDOW_SECONDS`). Called only when the table grows large."""
+    stale = [ip for ip, w in _rate_state.items() if not w or w[-1] < cutoff]
+    for ip in stale:
+        del _rate_state[ip]
 
 
 async def _find_token_by_id(
