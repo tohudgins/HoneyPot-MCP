@@ -30,6 +30,14 @@ class Settings(BaseSettings):
 
     # GeoIP
     geoip_db_path: Path = _PROJECT_ROOT / "config" / "GeoLite2-City.mmdb"
+    # Optional separate MaxMind ASN database (GeoLite2-ASN.mmdb, also free).
+    # When present, GeoIP enrichment adds the origin AS number + organisation —
+    # the single most useful pivot for "is this a hosting/VPN/botnet network?".
+    geoip_asn_db_path: Path = _PROJECT_ROOT / "config" / "GeoLite2-ASN.mmdb"
+    # Reverse-DNS (PTR) lookup during enrichment. Cheap and high-signal
+    # (bulletproof-hosting and residential-proxy PTRs are a strong tell), but
+    # it's a network round-trip — set False to disable on an air-gapped host.
+    geoip_reverse_dns: bool = True
 
     # Canary callback server
     canary_callback_host: str = "0.0.0.0"
@@ -119,7 +127,7 @@ class Settings(BaseSettings):
             return v
         return f"{scheme}:///{(_PROJECT_ROOT / path).as_posix()}"
 
-    @field_validator("geoip_db_path", "mitre_data_path", mode="after")
+    @field_validator("geoip_db_path", "geoip_asn_db_path", "mitre_data_path", mode="after")
     @classmethod
     def _anchor_to_project_root(cls, v: Path) -> Path:
         return v if v.is_absolute() else _PROJECT_ROOT / v

@@ -240,3 +240,122 @@ async def test_redis_eval_captures_script_body(redis_server):
     assert len(events) == 1
     assert b"redis.call" in events[0].payload["script_preview"].encode()
     assert events[0].severity.value == "high"
+
+
+async def _cmd(reader, writer, *parts: bytes) -> bytes:
+    writer.write(_resp_array(*parts))
+    await writer.drain()
+    return await asyncio.wait_for(reader.readline(), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_redis_keyspace_is_stateful(redis_server):
+    """SET then GET must reflect the stored value — the statefulness that lets
+    the exploit tool believe its write landed."""
+    port = redis_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        assert await _cmd(reader, writer, b"SET", b"foo", b"bar") == b"+OK\r\n"
+        # GET returns a bulk string: `$3\r\nbar\r\n`
+        writer.write(_resp_array(b"GET", b"foo"))
+        await writer.drain()
+        header = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert header == b"$3\r\n"
+        body = await asyncio.wait_for(reader.readexactly(5), timeout=2.0)
+        assert body == b"bar\r\n"
+        # EXISTS / DBSIZE reflect it; missing GET is a null bulk.
+        assert await _cmd(reader, writer, b"EXISTS", b"foo") == b":1\r\n"
+        assert await _cmd(reader, writer, b"DBSIZE") == b":1\r\n"
+        assert await _cmd(reader, writer, b"GET", b"nope") == b"$-1\r\n"
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_redis_config_get_reflects_config_set(redis_server):
+    """CONFIG GET must echo what the attacker CONFIG SET — they verify the
+    write path took before triggering SAVE."""
+    port = redis_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        assert await _cmd(reader, writer, b"CONFIG", b"SET", b"dir", b"/root/.ssh") == b"+OK\r\n"
+        # CONFIG GET dir → array [dir, /root/.ssh]
+        writer.write(_resp_array(b"CONFIG", b"GET", b"dir"))
+        await writer.drain()
+        # *2\r\n $3\r\ndir\r\n $10\r\n/root/.ssh\r\n
+        assert await asyncio.wait_for(reader.readline(), timeout=2.0) == b"*2\r\n"
+        assert await asyncio.wait_for(reader.readline(), timeout=2.0) == b"$3\r\n"
+        assert await asyncio.wait_for(reader.readline(), timeout=2.0) == b"dir\r\n"
+        assert await asyncio.wait_for(reader.readline(), timeout=2.0) == b"$10\r\n"
+        assert await asyncio.wait_for(reader.readline(), timeout=2.0) == b"/root/.ssh\r\n"
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_redis_rce_dropper_chain_captured(redis_server):
+    """The full unauth-RCE chain (CONFIG SET dir + dbfilename → SET ssh key →
+    SAVE) must be captured as a CRITICAL redis_rce_dropper with the target path
+    and the classified SSH-key payload."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = redis_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    ssh_key = b"\n\nssh-rsa AAAAB3NzaC1yc2EAAAADAQABattacker@evil\n\n"
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            await _cmd(reader, writer, b"CONFIG", b"SET", b"dir", b"/root/.ssh")
+            await _cmd(reader, writer, b"CONFIG", b"SET", b"dbfilename", b"authorized_keys")
+            await _cmd(reader, writer, b"SET", b"crackit", ssh_key)
+            assert await _cmd(reader, writer, b"SAVE") == b"+OK\r\n"
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type == "redis_rce_dropper")
+        )
+        events = list(result.scalars().all())
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.severity.value == "critical"
+    assert ev.payload["target_path"] == "/root/.ssh/authorized_keys"
+    kinds = {k["payload_kind"] for k in ev.payload["planted_keys"]}
+    assert "ssh_authorized_key" in kinds
+
+
+@pytest.mark.asyncio
+async def test_redis_keyspace_bounded(redis_server):
+    """The keyspace is capped so it can't be used to exhaust honeypot memory."""
+    from honeypot_mcp.engines.redis import _MAX_KEYS
+
+    port = redis_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        # Write more keys than the cap; each still returns +OK.
+        for i in range(_MAX_KEYS + 20):
+            assert await _cmd(reader, writer, b"SET", f"k{i}".encode(), b"v") == b"+OK\r\n"
+        # DBSIZE must not exceed the cap.
+        resp = await _cmd(reader, writer, b"DBSIZE")
+        count = int(resp[1:].strip())
+        assert count <= _MAX_KEYS
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()

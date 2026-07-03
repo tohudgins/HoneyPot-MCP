@@ -14,17 +14,32 @@ the attacker tries to actually exfil keys. Specifically:
 * `AUTH` — logs the credential and replies `-WRONGPASS`.
 * `PING` / `SELECT` / `COMMAND` / `QUIT` — terse correct responses.
 * `INFO` — synthesized real-looking server-info block.
-* `CONFIG GET *` — empty array (real configs reveal too much).
-* `CONFIG SET <dir|dbfilename> …` — replies `+OK` but escalates severity:
-  this is the Mirai dropper pattern.
-* `SLAVEOF` / `REPLICAOF` — replies `+OK` and escalates severity: this is
-  the slave-of-evil-master rogue-replica exploit.
-* `EVAL` — captures the Lua script body (the part attackers actually
-  care about for sandbox-escape research) and replies `-ERR`.
+* Keyspace (`SET`/`GET`/`DEL`/`EXISTS`/`TYPE`/`KEYS`/`STRLEN`/`TTL`/`DBSIZE`/
+  `FLUSHALL`) — a real bounded in-memory keyspace, so the attacker's writes
+  read back and the exploit tool believes it succeeded.
+* `CONFIG GET` — reflects the attacker's own `CONFIG SET`s, then falls back to
+  believable defaults. Empty replies were a tell that aborted the exploit.
+* `CONFIG SET <dir|dbfilename>` — persisted and escalated: redirecting the RDB
+  write path is the setup half of the unauth-RCE dropper.
+* `SAVE` / `BGSAVE` — when the write path was redirected, this is where the
+  file drop would land. We capture the full payload — target path + every
+  planted key — as a CRITICAL `redis_rce_dropper` event, and classify the
+  payload (SSH key / cron / webshell / reverse shell).
+* `SLAVEOF` / `REPLICAOF` — replies `+OK` and escalates: the rogue-replica
+  exploit.
+* `EVAL` — captures the Lua script body (sandbox-escape research) and `-ERR`.
 * Anything else — logs the command and replies `-ERR unknown command`.
+
+The full RCE chain therefore plays out end-to-end
+(`CONFIG SET dir /root/.ssh` → `CONFIG SET dbfilename authorized_keys` →
+`SET x "ssh-rsa AAAA…"` → `SAVE`), and we come away with the attacker's actual
+SSH public key and target path instead of just a truncated first command.
 
 Every login-shaped command (`AUTH`) is fed through `credential_match.match`
 so planted CREDENTIAL honeytokens trigger across Redis just like SSH/FTP.
+
+Memory is bounded: at most `_MAX_KEYS` keys and `_MAX_VALUE_BYTES` per value,
+so the keyspace can't be used to exhaust the honeypot.
 """
 
 from __future__ import annotations
@@ -109,6 +124,58 @@ def _empty_array() -> bytes:
     return b"*0\r\n"
 
 
+def _null_bulk() -> bytes:
+    return b"$-1\r\n"
+
+
+def _classify_payload(value: str) -> str | None:
+    """Recognise the payload an attacker plants in a Redis value during the
+    RDB-write RCE. Returns a short label or None. This is the high-value intel:
+    it tells you exactly what they'd have implanted."""
+    v = value.strip()
+    if "ssh-rsa " in v or "ssh-ed25519 " in v or "ssh-dss " in v or "ecdsa-sha2-" in v:
+        return "ssh_authorized_key"
+    lowered = v.lower()
+    # Cron line: has a schedule and a shell fetch/exec.
+    if ("* * * * *" in v or "@reboot" in lowered) and any(
+        tok in lowered for tok in ("curl", "wget", "bash", "sh ", "/bin/")
+    ):
+        return "cron_reverse_shell"
+    if v.startswith("<?php") or "<?=" in v:
+        return "php_webshell"
+    if "/bin/bash -i" in v or "bash -i >&" in v or "/dev/tcp/" in v:
+        return "reverse_shell"
+    return None
+
+
+def _array(items: list[str]) -> bytes:
+    out = f"*{len(items)}\r\n".encode()
+    for item in items:
+        out += _bulk_string(item)
+    return out
+
+
+# Keyspace safety bounds — an attacker could otherwise SET millions of huge
+# keys to exhaust honeypot memory. We accept enough to look real and to capture
+# the dropper payload, and silently cap beyond that.
+_MAX_KEYS = 256
+_MAX_VALUE_BYTES = 65536
+
+# Default CONFIG GET answers for the parameters attackers probe before the
+# dir/dbfilename exploit — believable values for a stock Debian package install.
+_CONFIG_DEFAULTS = {
+    "dir": "/var/lib/redis",
+    "dbfilename": "dump.rdb",
+    "maxmemory": "0",
+    "maxmemory-policy": "noeviction",
+    "save": "3600 1 300 100 60 10000",
+    "appendonly": "no",
+    "requirepass": "",
+    "bind": "127.0.0.1 -::1",
+    "protected-mode": "yes",
+}
+
+
 class _RESPParser:
     """Minimal RESP parser handling both inline (`PING\\r\\n`) and bulk-string
     array (`*N\\r\\n$len\\r\\nfoo\\r\\n…`) command forms.
@@ -171,6 +238,14 @@ class _RedisProtocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
+        # Per-connection state so the full RCE chain plays out: the attacker
+        # SETs a key (usually an SSH pubkey or cron line), CONFIG SETs dir +
+        # dbfilename to redirect the RDB write, then SAVE/BGSAVE. We keep the
+        # keyspace + overridden config so GET/CONFIG GET reflect their writes
+        # (they verify), then capture the whole payload at SAVE time.
+        self._store: dict[str, str] = {}
+        self._config: dict[str, str] = {}
+        self._save_reported = False
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -279,8 +354,65 @@ class _RedisProtocol(asyncio.Protocol):
             )
             return
 
-        if verb in ("DBSIZE",):
-            t.write(_integer(0))
+        if verb in ("SAVE", "BGSAVE", "BGREWRITEAOF"):
+            self._handle_save(verb, t)
+            return
+
+        # ── Keyspace commands ────────────────────────────────────────────────
+        # Modelling these is what lets the RCE dropper chain complete: the
+        # attacker SETs their payload key, and GET/EXISTS/DBSIZE reflect it so
+        # the exploit tool believes it worked and proceeds to SAVE.
+        if verb == "SET":
+            self._handle_set(args, t)
+            return
+
+        if verb == "GET":
+            key = args[1] if len(args) > 1 else ""
+            val = self._store.get(key)
+            t.write(_null_bulk() if val is None else _bulk_string(val))
+            return
+
+        if verb in ("DEL", "UNLINK"):
+            removed = sum(1 for k in args[1:] if self._store.pop(k, None) is not None)
+            t.write(_integer(removed))
+            return
+
+        if verb == "EXISTS":
+            t.write(_integer(sum(1 for k in args[1:] if k in self._store)))
+            return
+
+        if verb == "TYPE":
+            key = args[1] if len(args) > 1 else ""
+            t.write(_simple("string") if key in self._store else _simple("none"))
+            return
+
+        if verb == "STRLEN":
+            key = args[1] if len(args) > 1 else ""
+            t.write(_integer(len(self._store.get(key, ""))))
+            return
+
+        if verb == "KEYS":
+            # Real KEYS honours a glob; scanners almost always send `*`. Matching
+            # exactly is fine — the keys present are the attacker's own.
+            import fnmatch
+
+            pattern = args[1] if len(args) > 1 else "*"
+            matched = [k for k in self._store if fnmatch.fnmatch(k, pattern)]
+            t.write(_array(matched))
+            return
+
+        if verb == "TTL" or verb == "PTTL":
+            key = args[1] if len(args) > 1 else ""
+            t.write(_integer(-1 if key in self._store else -2))
+            return
+
+        if verb in ("FLUSHALL", "FLUSHDB"):
+            self._store.clear()
+            t.write(_simple("OK"))
+            return
+
+        if verb == "DBSIZE":
+            t.write(_integer(len(self._store)))
             return
 
         # Unknown / un-modelled command — log and respond like Redis 7.
@@ -293,30 +425,97 @@ class _RedisProtocol(asyncio.Protocol):
             )
         )
 
+    def _handle_set(self, args: list[str], t: asyncio.Transport) -> None:
+        if len(args) < 3:
+            t.write(_error("ERR wrong number of arguments for 'set' command"))
+            return
+        key, value = args[1], args[2]
+        # Bound memory: cap key count and value size. Beyond the cap we still
+        # reply +OK (looks normal) but don't grow the store.
+        if len(self._store) < _MAX_KEYS or key in self._store:
+            self._store[key] = value[:_MAX_VALUE_BYTES]
+        t.write(_simple("OK"))
+        # An SSH public key or cron line landing in a Redis value is the dropper
+        # payload itself — flag it HIGH even before the SAVE.
+        severity = AlertSeverity.MEDIUM
+        payload_kind = _classify_payload(value)
+        if payload_kind:
+            severity = AlertSeverity.HIGH
+        asyncio.create_task(
+            self._record(
+                "redis_key_set",
+                severity,
+                {"key": key, "value": value[:2048], "payload_kind": payload_kind},
+            )
+        )
+
+    def _handle_save(self, verb: str, t: asyncio.Transport) -> None:
+        # SAVE/BGSAVE writes the keyspace to <dir>/<dbfilename>. When the
+        # attacker has redirected those via CONFIG SET, this is the moment the
+        # RDB-write RCE would have dropped their file. Capture the complete
+        # payload: target path + every key they planted.
+        if verb == "BGSAVE":
+            t.write(_simple("Background saving started"))
+        elif verb == "BGREWRITEAOF":
+            t.write(_simple("Background append only file rewriting started"))
+        else:
+            t.write(_simple("OK"))
+
+        target_dir = self._config.get("dir")
+        target_file = self._config.get("dbfilename")
+        redirected = target_dir is not None or target_file is not None
+        if redirected and self._store and not self._save_reported:
+            self._save_reported = True
+            target_path = f"{target_dir or _CONFIG_DEFAULTS['dir']}/{target_file or 'dump.rdb'}"
+            payloads = [
+                {"key": k, "value": v[:2048], "payload_kind": _classify_payload(v)}
+                for k, v in self._store.items()
+            ]
+            asyncio.create_task(
+                self._record(
+                    "redis_rce_dropper",
+                    AlertSeverity.CRITICAL,
+                    {
+                        "verb": verb,
+                        "target_path": target_path,
+                        "config": dict(self._config),
+                        "planted_keys": payloads,
+                        "technique": "redis RDB-write file drop (CVE-class unauth RCE)",
+                    },
+                )
+            )
+
     def _handle_config(self, args: list[str], t: asyncio.Transport) -> None:
         if len(args) < 2:
             t.write(_error("ERR wrong number of arguments for 'config' command"))
             return
         sub = args[1].upper()
         if sub == "GET":
-            # Empty result for any parameter — real configs reveal too much
-            # context (maxmemory, save policy, dirs) to safely mock.
-            t.write(_empty_array())
+            param = args[2] if len(args) > 2 else "*"
+            # Reflect the attacker's own CONFIG SETs first (they verify their
+            # `dir`/`dbfilename` writes took), then fall back to believable
+            # defaults. A real unauth Redis answers these; empty replies were a
+            # tell that broke the exploit chain we want to observe.
+            key = param.lower()
+            value = self._config.get(key, _CONFIG_DEFAULTS.get(key))
+            t.write(_array([param, value]) if value is not None else _empty_array())
             asyncio.create_task(
                 self._record(
                     "redis_config_get",
                     AlertSeverity.MEDIUM,
-                    {"parameter": args[2] if len(args) > 2 else "*"},
+                    {"parameter": param},
                 )
             )
             return
         if sub == "SET":
             param = args[2] if len(args) > 2 else ""
             value = args[3] if len(args) > 3 else ""
+            # Persist the override so a follow-up CONFIG GET reflects it and the
+            # SAVE handler knows where the drop is aimed.
+            self._config[param.lower()] = value
             severity = AlertSeverity.MEDIUM
-            # The Mirai-classic exploit pattern: writing to `dir` + `dbfilename`
-            # to bend BGSAVE into dropping a file at an attacker-controlled
-            # location. Treat as HIGH.
+            # The classic exploit pattern: redirect `dir` + `dbfilename` to bend
+            # BGSAVE into dropping a file at an attacker-controlled location.
             if param.lower() in ("dir", "dbfilename", "save"):
                 severity = AlertSeverity.HIGH
             t.write(_simple("OK"))
