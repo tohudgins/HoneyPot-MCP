@@ -131,6 +131,37 @@ Expected: deploy returns `{status: "running"}` and the self-test reports `alert_
 
 ---
 
+## Deploy — catching traffic
+
+Pick by what you want to catch:
+
+| Goal | Run it on | Effort |
+|---|---|---|
+| Try it / see the dashboards | Your laptop | ~5 min ([demo stack](#docker-stack--grafana-demo)) |
+| Catch attacks **on your own network** | A spare box/VM on your LAN | ~15 min |
+| Catch **real internet attack traffic** | A cheap throwaway VPS ($5/mo) | ~30 min ([docs/DEPLOY.md](docs/DEPLOY.md)) |
+
+Both "real" paths use the **persistent daemon** so honeypots run 24/7, independent of any chat:
+
+```bash
+# On the host, in .env:  MCP_TRANSPORT=http   MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+sudo cp deploy/honeypot-mcp.service /etc/systemd/system/   # edit paths inside
+sudo systemctl enable --now honeypot-mcp
+
+# From your laptop — tunnel the control port (never firewall-expose it):
+ssh -N -L 8000:127.0.0.1:8000 you@host &
+claude mcp add --transport http honeypot-mcp http://127.0.0.1:8000/mcp \
+  --header "Authorization: Bearer <your-MCP_AUTH_TOKEN>"
+```
+
+Then just ask Claude to deploy honeypots and watch the alerts roll in.
+
+**On your own network (internal tripwire).** Deploy honeypots on ports nothing else uses. Anything on your LAN that connects to them — a compromised laptop scanning for open SSH/SMB/Redis, an insider poking around — is by definition not legitimate, so **every hit is high-signal**. Plant credential honeytokens and canary URLs on real hosts and file shares so lateral movement trips them too. Nothing needs to be internet-exposed.
+
+**On the public internet (catch real attackers).** Run the daemon on a VPS you don't care about and open the honeypot ports (22, 80, 443, 445, 3389…) to the internet — you'll see Mirai/Hydra SSH brute force, RDP/SMB exploit scanners, and web exploit probes within minutes. **Safety: use a dedicated throwaway host, move your admin SSH off port 22 first, and never reuse production keys.** The full guarded walkthrough (firewall, alerting, ongoing ops) is in [docs/DEPLOY.md](docs/DEPLOY.md).
+
+---
+
 ## MCP tools
 
 ### Honeypots
