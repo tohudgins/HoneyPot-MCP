@@ -266,6 +266,16 @@ escalates from LOW to MEDIUM and the event type becomes
 `http_active_recon`. Sessions older than `_SESSION_TTL_SECONDS` (1h) are
 pruned opportunistically on each lookup — no separate sweeper task.
 
+Every request is also scanned for exploit signatures (`_classify_http_attack`
+over `_HTTP_ATTACK_SIGNATURES`) across the full surface — path, query, all
+header values, User-Agent, and body — with the surface additionally URL-decoded
+so `%`-encoded payloads don't slip past. A hit re-tags the event to
+`http_exploit_attempt`, raises severity to at least the matched level, and adds
+`payload.exploit_categories`. Covers Log4Shell, Shellshock, command injection,
+webshell upload, OGNL/Struts, Spring4Shell, SQLi, path traversal, LFI/RFI,
+SSRF, deserialization, and XSS. Broad patterns are fine here — a honeypot has
+no legitimate users, so false positives cost nothing.
+
 ### Webhook delivery
 
 `webhooks.py` runs a single background worker that drains a queue. Decoupled from the buffer's flusher — slow webhook endpoints can't slow honeypot ingestion.

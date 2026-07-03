@@ -35,10 +35,12 @@ import base64
 import contextlib
 import logging
 import random
+import re
 import secrets
 import string
 import time
 from typing import Any
+from urllib.parse import unquote
 
 from aiohttp import web
 from sqlalchemy import update
@@ -88,6 +90,46 @@ _SESSION_TTL_SECONDS = 3600
 # bloat the alert payload. Real exploit payloads (webshells, RCE chains)
 # almost always fit well under this.
 _MAX_RAW_BODY_BYTES = 65_536
+
+
+# Exploit signatures scanned across the whole request surface (path, query,
+# headers, User-Agent, body). Ordered high-to-low so the first hit sets the
+# floor; all matches are recorded. Honeypot traffic has no legit users, so the
+# false-positive cost of broad patterns is near zero.
+_HTTP_ATTACK_SIGNATURES: list[tuple[str, re.Pattern[str], AlertSeverity]] = [
+    ("log4shell", re.compile(r"\$\{jndi:(ldap|ldaps|rmi|dns|iiop|corba|nis|nds)", re.I), AlertSeverity.CRITICAL),
+    ("shellshock", re.compile(r"\(\s*\)\s*\{\s*:?\s*;", re.I), AlertSeverity.CRITICAL),
+    ("command_injection", re.compile(r"(;|\||&&|\|\|)\s*(cat|wget|curl|bash|/bin/sh|/bin/bash|nc|ncat|python|perl|id|whoami|uname)\b|\$\((cat|id|whoami|uname|curl|wget)|`(cat|id|whoami|curl|wget)|nc\s+-e|bash\s+-i", re.I), AlertSeverity.CRITICAL),
+    ("webshell", re.compile(r"<\?php|eval\s*\(\s*\$_(get|post|request|cookie)|system\s*\(\s*\$_|assert\s*\(\s*\$_|base64_decode\s*\(\s*\$_", re.I), AlertSeverity.CRITICAL),
+    ("ognl_struts", re.compile(r"%\{[^}]*(#context|#_memberAccess|ognl|Runtime@getRuntime)", re.I), AlertSeverity.CRITICAL),
+    ("spring4shell", re.compile(r"class\.module\.classLoader", re.I), AlertSeverity.CRITICAL),
+    ("sqli", re.compile(r"union\s+(all\s+)?select|\bor\s+1\s*=\s*1\b|'\s*or\s*'1'\s*=\s*'1|\bsleep\(\s*\d|\bbenchmark\(|\bpg_sleep\(|information_schema\.", re.I), AlertSeverity.HIGH),
+    ("path_traversal", re.compile(r"\.\./|\.\.%2f|%2e%2e[/\\]|\.\.\\|%252e%252e", re.I), AlertSeverity.HIGH),
+    ("lfi_rfi", re.compile(r"/etc/passwd|/proc/self/environ|php://(filter|input)|data://|expect://|file:///", re.I), AlertSeverity.HIGH),
+    ("ssrf", re.compile(r"gopher://|dict://|169\.254\.169\.254|metadata\.google|/latest/meta-data/", re.I), AlertSeverity.HIGH),
+    ("deserialization", re.compile(r"java\.lang\.Runtime|rO0AB[A-Za-z0-9+/]|__proto__|constructor\[.prototype", re.I), AlertSeverity.HIGH),
+    ("xss", re.compile(r"<script\b|onerror\s*=|onload\s*=|javascript:", re.I), AlertSeverity.MEDIUM),
+]
+
+_SEV_RANK = {
+    AlertSeverity.LOW: 0,
+    AlertSeverity.MEDIUM: 1,
+    AlertSeverity.HIGH: 2,
+    AlertSeverity.CRITICAL: 3,
+}
+
+
+def _classify_http_attack(surface: str) -> tuple[list[str], AlertSeverity | None]:
+    """Scan the request surface for exploit signatures. Returns the matched
+    category labels and the highest matched severity (or None if clean)."""
+    matched: list[str] = []
+    top: AlertSeverity | None = None
+    for label, pattern, sev in _HTTP_ATTACK_SIGNATURES:
+        if pattern.search(surface):
+            matched.append(label)
+            if top is None or _SEV_RANK[sev] > _SEV_RANK[top]:
+                top = sev
+    return matched, top
 
 # Auth-failed response variants. The previous engine returned the SAME
 # byte sequence on every failed login, which is itself a fingerprint —
@@ -502,6 +544,7 @@ class HTTPEngine(HoneypotEngine):
             post_data: dict = {}
             raw_body_b64: str | None = None
             raw_content_type: str | None = None
+            raw_body_scan = ""
             if method in ("POST", "PUT", "PATCH"):
                 ct = (request.headers.get("Content-Type") or "").lower()
                 is_form = "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct
@@ -512,9 +555,9 @@ class HTTPEngine(HoneypotEngine):
                     with contextlib.suppress(Exception):
                         raw = await request.read()
                         if raw:
-                            raw_body_b64 = base64.b64encode(raw[:_MAX_RAW_BODY_BYTES]).decode(
-                                "ascii"
-                            )
+                            capped = raw[:_MAX_RAW_BODY_BYTES]
+                            raw_body_b64 = base64.b64encode(capped).decode("ascii")
+                            raw_body_scan = capped.decode("utf-8", errors="replace")
                             raw_content_type = ct or "application/octet-stream"
 
             matched_template = path_to_template.get(path)
@@ -538,6 +581,25 @@ class HTTPEngine(HoneypotEngine):
                 if severity == AlertSeverity.LOW:
                     severity = AlertSeverity.MEDIUM
 
+            # Exploit-signature scan across the whole request surface (path +
+            # query + headers + UA + body), with the surface also URL-decoded so
+            # %-encoded payloads don't slip past. Any hit re-tags the event and
+            # raises severity to at least the matched level — this is the intel
+            # a SOC actually wants (which CVE/technique was thrown at you).
+            surface_parts = [request.path_qs, user_agent]
+            surface_parts.extend(str(v) for v in request.headers.values())
+            surface_parts.extend(f"{k}={v}" for k, v in post_data.items())
+            if raw_body_scan:
+                surface_parts.append(raw_body_scan)
+            surface = " ".join(surface_parts)
+            exploit_categories, exploit_sev = _classify_http_attack(
+                surface + " " + unquote(surface)
+            )
+            if exploit_sev is not None:
+                event_type = "http_exploit_attempt"
+                if _SEV_RANK[exploit_sev] > _SEV_RANK[severity]:
+                    severity = exploit_sev
+
             payload = {
                 "method": method,
                 "path": path,
@@ -556,6 +618,8 @@ class HTTPEngine(HoneypotEngine):
                 payload["raw_content_type"] = raw_content_type
             if serve_decoy:
                 payload["decoy_target"] = path
+            if exploit_categories:
+                payload["exploit_categories"] = exploit_categories
 
             await submit_event(
                 PendingEvent(
