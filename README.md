@@ -6,6 +6,8 @@
 
 A Model Context Protocol server that lets Claude (or any MCP client) deploy honeypots, plant honeytokens, monitor alerts, and analyse attacker behaviour — all through natural language. Built on [FastMCP](https://github.com/jlowin/fastmcp), async Python 3.11+.
 
+You ask in plain English; it deploys real honeypots (13 protocols), captures what attackers actually do, enriches each hit with threat intel, and ships the result to your SIEM or into a report.
+
 ```
 > Deploy an SSH honeypot on port 2222.
 > Generate a fake AWS credential token and show me where to plant it.
@@ -32,7 +34,7 @@ A Model Context Protocol server that lets Claude (or any MCP client) deploy hone
 | **Operations** | Health watchdog (CRITICAL alert on honeypot death), end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboard stack |
 | **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest endpoint + ready-to-deploy CloudTrail/Azure/GCP audit-log forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
-278 unit tests cover the security-critical paths; strict mypy passes.
+279 unit tests cover the security-critical paths; strict mypy passes.
 
 ---
 
@@ -257,7 +259,7 @@ Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), poin
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v          # 278 tests
+uv run pytest tests/unit/ -v          # 279 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
@@ -295,9 +297,9 @@ Architecture details (event pipeline, persona system, plugin patterns) are docum
 
 ## What this is / isn't
 
-**Good fit:** SOC research and training labs, internal trip-wire deception, small-to-medium SOC alert pipelines, catching internet-scale automated attack traffic on a public IP.
+**Good fit:** SOC research and training labs, internal trip-wire deception, small-to-medium SOC alert pipelines, and catching internet-scale automated attack traffic on a public IP. The engines capture real attack artifacts — Redis RCE dropper chains (the attacker's SSH key + target path), FTP malware uploads (hashed + classified), MySQL `INTO OUTFILE` webshell drops, SMB EternalBlue/DoublePulsar probes, MongoDB ransom notes — enriched (geo, ASN, reverse DNS, VT/AbuseIPDB reputation) and shipped to your SIEM.
 
-**Not a fit without further work:** APT research (the in-process HTTP/SMTP/FTP engines are minimal asyncio implementations a skilled human can fingerprint), or comprehensive deception platforms — see [T-Pot](https://github.com/telekom-security/tpotce), [OpenCanary](https://github.com/thinkst/opencanary), or [Thinkst Canary](https://canary.tools/).
+**Not a fit without further work:** fooling a skilled human probing by hand. SSH is Cowrie (high-fidelity); the custom protocol engines are detection-focused rather than full protocol stacks, so a manual expert can eventually fingerprint them. For maximal-fidelity deception across more protocols, see [T-Pot](https://github.com/telekom-security/tpotce), [OpenCanary](https://github.com/thinkst/opencanary), or [Thinkst Canary](https://canary.tools/).
 
 The full honest rundown is in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
 

@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (278 unit tests covering security-critical paths)
+# Tests (279 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -273,6 +273,8 @@ pruned opportunistically on each lookup — no separate sweeper task.
 Signature: `X-HoneyPot-Signature: sha256=<hex>` (HMAC-SHA256 of raw body) — same convention as GitHub webhooks. Consumers verify with the shared secret.
 
 Failure tracking is per subscription: `delivery_count`, `failure_count`, `last_error`. After repeated failures, an admin can deactivate via `alert_unsubscribe` or repair via DB.
+
+Active subscriptions are cached in-process (`_active_subscriptions`, 30s TTL) so delivery doesn't issue a `SELECT … WHERE active` per event on the ingest hot path — the same pattern as the suppression-rule cache. The cache is invalidated on `alert_subscribe`/`alert_unsubscribe` and on worker `start()`. Rows are `expunge_all`'d from the loading session so the per-delivery stat UPDATEs (`_record_outcome`) never interact with the cache. If a test inserts a `Subscription` directly (not via the tool), call `invalidate_subscription_cache()` or start a fresh delivery worker to pick it up.
 
 ### Watchdog
 
