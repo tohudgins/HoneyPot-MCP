@@ -1,0 +1,55 @@
+# systemd unit for the HoneyPot MCP control plane on a public VPS.
+#
+# This runs the server as a PERSISTENT daemon over HTTP transport, so the
+# honeypots you deploy through natural language keep running 24/7 — independent
+# of any chat session. Your MCP client (Claude Code / Claude Desktop) connects
+# to it over the network at http://<vps-ip>:8000/mcp.
+#
+# Install:
+#   sudo cp deploy/honeypot-mcp.service /etc/systemd/system/
+#   # edit paths/User below to match your host, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now honeypot-mcp
+#   sudo systemctl status honeypot-mcp
+#   journalctl -u honeypot-mcp -f      # live logs
+#
+# The service reads configuration from the repo's .env file (EnvironmentFile).
+# Set MCP_TRANSPORT=http there (see .env.example).
+
+[Unit]
+Description=HoneyPot MCP control plane (persistent daemon)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# A dedicated non-login user that is a member of the `docker` group (needed
+# for the SSH/Cowrie engine to manage containers). Create with:
+#   sudo useradd --system --home /opt/honeypot-mcp --shell /usr/sbin/nologin honeypot
+#   sudo usermod -aG docker honeypot
+User=honeypot
+Group=honeypot
+WorkingDirectory=/opt/honeypot-mcp
+EnvironmentFile=/opt/honeypot-mcp/.env
+# `uv run` resolves the project venv. Use an absolute path — systemd has a
+# minimal PATH. Find yours with `which uv` (often /usr/local/bin/uv or
+# /home/<user>/.local/bin/uv). Or point ExecStart at the installed script:
+#   ExecStart=/opt/honeypot-mcp/.venv/bin/honeypot-mcp
+ExecStart=/usr/local/bin/uv run --project /opt/honeypot-mcp honeypot-mcp
+Restart=on-failure
+RestartSec=5
+# The reconcile step re-establishes RUNNING honeypots on every restart, so a
+# crash-restart transparently brings the fleet back.
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+# The daemon processes untrusted attacker payloads all day. Constrain it.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+# Writable paths the server needs: DB, TLS certs, generated reports.
+ReadWritePaths=/opt/honeypot-mcp
+
+[Install]
+WantedBy=multi-user.target

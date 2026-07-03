@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from fastmcp import FastMCP
 
@@ -168,7 +168,19 @@ async def resource_stats_dashboard() -> str:
 
 
 def main() -> None:
-    mcp.run()
+    settings = get_settings()
+    # Validated by Settings.validate_mcp_transport to one of these literals.
+    transport = cast(
+        'Literal["stdio", "http", "sse", "streamable-http"]', settings.mcp_transport
+    )
+    if transport == "stdio":
+        # Per-chat subprocess launched by Claude Desktop / Claude Code.
+        mcp.run()
+    else:
+        # Persistent networked server — the deployment mode for a public host,
+        # where honeypots must outlive any single client session. Clients
+        # connect to http://<mcp_host>:<mcp_port>/mcp.
+        mcp.run(transport=transport, host=settings.mcp_host, port=settings.mcp_port)
 
 
 if __name__ == "__main__":

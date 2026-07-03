@@ -85,19 +85,28 @@ until you've confirmed.
 ### 3. Install Docker + clone the repo (5 min)
 
 ```bash
-# Docker — convenience installer is fine for a disposable honeypot host
+# Docker — the SSH/Cowrie engine manages honeypot containers through it
 curl -fsSL https://get.docker.com | sh
 
-# Python + uv for running the MCP server / management tools
+# Python + uv to run the MCP server
 apt update && apt install -y python3-pip python3-venv git
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 
-# Clone
 git clone https://github.com/tohudgins/HoneyPot-MCP.git /opt/honeypot-mcp
 cd /opt/honeypot-mcp
 uv sync --extra dev
 ```
+
+> **Architecture — read this once.** The MCP server is the *control plane*:
+> you talk to it in natural language and it deploys/monitors honeypots.
+> The in-process engines (HTTP/SMTP/FTP/DNS/RDP/VNC/Redis/MySQL/Elasticsearch)
+> run *inside the server process* and bind host ports directly; the SSH engine
+> launches Cowrie as its own Docker container. Because the honeypots live in
+> the server process, **the server must run persistently** — not spawned per
+> chat. So on a VPS you run it as an HTTP daemon (this section) and connect
+> your MCP client to it over the network. (Locally, Claude Desktop/Code spawn
+> it over stdio per chat — fine for testing, wrong for 24/7 collection.)
 
 ### 4. Configure (2 min)
 
@@ -108,6 +117,11 @@ cp .env.example .env
 Open `.env` and set:
 
 ```bash
+# Run as a persistent HTTP daemon so honeypots survive across chats.
+MCP_TRANSPORT=http
+MCP_HOST=0.0.0.0          # so your MCP client can reach it over the network
+MCP_PORT=8000
+
 # REQUIRED for canary tokens to fire from the internet
 CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
 
@@ -121,87 +135,109 @@ GEOIP_DB_PATH=config/GeoLite2-City.mmdb
 
 If you want geographic data in alerts, register at
 [maxmind.com](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data),
-download `GeoLite2-City.mmdb`, and scp it to `docker/geoip/` on the VPS
-(the compose file bind-mounts that directory read-only into the container).
-MaxMind's license forbids redistribution, so the DB is intentionally not in
-the repo.
+download `GeoLite2-City.mmdb`, and place it at `config/GeoLite2-City.mmdb`.
+MaxMind's license forbids redistribution, so it's intentionally not in the repo.
 
-### 5. Start the SSH honeypot via Docker Compose (1 min)
+> **Secure the control-plane port.** `MCP_PORT` (8000) is an authenticated-by-
+> nothing management interface — anyone who can reach it can deploy honeypots.
+> Do **not** open it in the firewall. Reach it from your laptop over an SSH
+> tunnel instead (step 7), or bind it to `127.0.0.1` and tunnel in.
 
-```bash
-cd /opt/honeypot-mcp/docker
-docker compose up -d --build
-```
+### 5. Run the server as a persistent daemon (2 min)
 
-`--build` is required on the first run because the MCP image is built from
-the local `docker/Dockerfile.mcp` — there's no published image yet.
-
-This boots four services:
-
-- **socket-proxy** — internal-only sidecar that exposes a restricted Docker
-  API to the MCP container. The MCP server can manage Cowrie containers but
-  cannot escape to root-on-host even if the MCP process is exploited.
-- **honeypot-mcp** — server + canary callback (port 8888) + Prometheus
-  `/metrics` (port 9090, bound to localhost only).
-- **cowrie-ssh** — Cowrie SSH/Telnet honeypot.
-- **http-honeypot** — HTTP honeypot.
-
-Confirm everything is alive:
+Install the bundled systemd unit so the control plane runs 24/7 and survives
+reboots and crashes (the startup `reconcile` step re-establishes running
+honeypots automatically):
 
 ```bash
-docker compose ps
+# Dedicated non-login user with Docker access (for the SSH engine)
+sudo useradd --system --home /opt/honeypot-mcp --shell /usr/sbin/nologin honeypot
+sudo usermod -aG docker honeypot
+sudo chown -R honeypot:honeypot /opt/honeypot-mcp
+
+sudo cp deploy/honeypot-mcp.service /etc/systemd/system/
+# Edit ExecStart's uv path if `which uv` differs from /usr/local/bin/uv
+sudo systemctl daemon-reload
+sudo systemctl enable --now honeypot-mcp
+sudo systemctl status honeypot-mcp        # should be active (running)
+journalctl -u honeypot-mcp -f             # live logs
 ```
 
-All four services should be `Up`. The MCP container has a HEALTHCHECK; give
-it ~30s on first start (DB migration runs once).
+The daemon now serves the MCP endpoint at `http://<vps-ip>:8000/mcp`, plus the
+canary callback (`:8888`) and Prometheus `/metrics` (`:9090`).
 
 ### 6. Open the firewall (1 min)
 
-Whatever firewall your provider uses, open inbound TCP for:
+Open **only the honeypot ports and the canary callback** — never the MCP
+control port (8000) or metrics (9090). You choose which honeypots to run in
+step 8; open the ports you plan to use:
 
-- 22 (SSH honeypot)
-- 23 (Telnet honeypot — optional)
+- 22 (SSH honeypot — biggest traffic generator)
+- 23 (Telnet — optional, Mirai-class volume)
 - 80, 443 (HTTP/HTTPS honeypot)
-- 2525 (SMTP honeypot — optional)
-- 21 (FTP honeypot — optional)
-- 3389 (RDP honeypot — optional, biggest traffic generator after SSH)
+- 3389 (RDP — second-biggest after SSH)
+- 21 (FTP), 2525 (SMTP) — optional
 - 8888 (canary callbacks)
-- **2200** (your admin SSH, the port you moved earlier)
-
-Leave UDP 53 open if you want DNS honeypot traffic.
-
-On a vanilla Ubuntu VPS with `ufw`:
+- **2200** (your admin SSH, moved earlier)
+- UDP 53 (DNS honeypot) — optional
 
 ```bash
 ufw allow 2200/tcp comment 'admin SSH'
-ufw allow 22/tcp 23/tcp 80/tcp 443/tcp 3389/tcp 8888/tcp
+ufw allow 22/tcp 23/tcp 80/tcp 443/tcp 3389/tcp 21/tcp 2525/tcp 8888/tcp
 ufw allow 53/udp
 ufw --force enable
+# NB: 8000 (MCP control) and 9090 (metrics) are deliberately NOT opened.
 ```
 
-### 7. Wire up an alert channel (2 min)
+### 7. Connect your MCP client over an SSH tunnel (2 min)
 
-Don't deploy a honeypot you can't see. From your laptop (or from Claude Code
-configured to talk to the MCP server), subscribe a Slack/Discord/Telegram
-webhook:
+From your laptop, tunnel the control port so you can drive the daemon without
+exposing it to the internet:
+
+```bash
+ssh -p 2200 -N -L 8000:127.0.0.1:8000 honeypot@<vps-ip> &
+```
+
+Then register the daemon with Claude Code as a networked MCP server:
+
+```bash
+claude mcp add --transport http honeypot-mcp http://127.0.0.1:8000/mcp
+```
+
+(Claude Desktop: add an `mcpServers` entry with `"url":
+"http://127.0.0.1:8000/mcp"` — a URL, not a spawn command.) Every deploy you
+make now lands in the daemon on the VPS and keeps running after you disconnect.
+
+### 8. Deploy honeypots and wire an alert channel (2 min)
+
+In a chat with the connected client:
 
 ```
+> Deploy an SSH honeypot on port 22.
+> Deploy an HTTP honeypot on port 80.
+> Deploy an RDP honeypot on port 3389.
 > alert_subscribe url=https://hooks.slack.com/services/... severity_threshold=high
+> honeypot_self_test <name>      # confirm the pipeline end-to-end
 ```
 
-Now you'll get a notification on every HIGH+ event.
+`honeypot_self_test` sends a synthetic probe and confirms it lands as an alert
+within ~1s (`alert_received: True`). Because the daemon is persistent, these
+honeypots keep collecting after your chat and your SSH tunnel close.
 
-### 8. Confirm the pipeline works end-to-end
+### 9. (Optional) Bring up the Grafana dashboards
 
+```bash
+cd /opt/honeypot-mcp/docker
+HONEYPOT_DB_DIR=/opt/honeypot-mcp \
+  docker compose -f docker-compose.observability.yml up -d
 ```
-> honeypot_self_test
-```
 
-This sends a probe at each running honeypot and confirms it lands as an alert
-in the DB within ~1 second. If `alert_received: True` for every engine,
-you're done.
+This starts Prometheus + Grafana pointed at the daemon's SQLite DB and
+`/metrics` endpoint (both read-only). Tunnel `-L 3000:127.0.0.1:3000` to view
+it; don't expose 3000 publicly. Dashboards: Overview, Threat Map, MITRE
+Coverage.
 
-### 9. Wait
+### 10. Wait
 
 You'll see your first Mirai-family scanner usually within 5–10 minutes.
 Within an hour you'll have dozens of failed SSH logins. Within 24 hours
@@ -279,10 +315,15 @@ quickly) find your honeypot.
 ```bash
 cd /opt/honeypot-mcp
 git pull
-cd docker && docker compose pull && docker compose up -d
+uv sync --extra dev
+sudo systemctl restart honeypot-mcp        # reconcile re-establishes honeypots
+# If you run the Grafana stack too:
+cd docker && docker compose -f docker-compose.observability.yml pull \
+  && docker compose -f docker-compose.observability.yml up -d
 ```
 
-Schema migrations are idempotent — Alembic upgrades on next server start.
+Schema migrations are idempotent — Alembic upgrades on next server start, and
+the `reconcile` step brings the running honeypots back after the restart.
 If migrations fail, the server falls back to `create_all` (logged but
 non-fatal).
 
@@ -295,13 +336,15 @@ non-fatal).
 | No events after 30 minutes | Firewall not open or port blocked upstream by provider | Test from your laptop: `nc -zv <your-ip> 22` |
 | `honeypot_self_test` returns `alert_received: False` | Engine is up but alert pipeline is broken | Check suppression rules; check DB connectivity; check the buffer flusher is running (it's a single asyncio task — usually fine) |
 | Canary URLs never fire | `CANARY_PUBLIC_URL` wrong or port 8888 not reachable | Test: `curl http://<canary-url>/t/test` — should return 200 OK |
-| Cowrie not catching anything but port is open | Cowrie image not pulled, or the wrong Cowrie image | `docker compose logs cowrie` |
+| Cowrie not catching anything but port is open | Cowrie image not pulled, or the container died | `docker logs honeypot-<name>` (the SSH engine names containers `honeypot-<honeypot-name>`); `honeypot_health <name>` |
 | Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on consumer side | `alert_subscriptions_list` shows `last_error` |
 | Out of disk space | Alert payloads accumulating | Run `alerts_prune` more aggressively, or set up a cron job |
 | Host SSH down (locked out) | You forgot to move admin SSH off 22 before starting the honeypot | Use provider web console; edit `/etc/ssh/sshd_config`; restart sshd |
-| `honeypot-mcp` container can't deploy SSH honeypots dynamically | The socket-proxy sidecar is down or unreachable | `docker compose logs socket-proxy`. The MCP container talks to it on `tcp://socket-proxy:2375` over the internal `honeypot-net`. |
-| MCP container HEALTHCHECK reporting unhealthy | `/metrics` is failing — usually a DB init problem on first start | `docker compose logs honeypot-mcp`. Allow 30s on cold start for Alembic to run. |
-| Need to read Prometheus metrics from another host | Port 9090 is intentionally bound to `127.0.0.1` for security | SSH-tunnel it: `ssh -L 9090:127.0.0.1:9090 root@<vps>` |
+| Client can't connect / tools don't appear | Daemon not running, or the SSH tunnel to port 8000 is down | `systemctl status honeypot-mcp`; re-open `ssh -L 8000:127.0.0.1:8000 …`; confirm `MCP_TRANSPORT=http` in `.env` |
+| SSH honeypots won't deploy | Daemon's user isn't in the `docker` group | `sudo usermod -aG docker honeypot` then `systemctl restart honeypot-mcp` |
+| Daemon won't start / crashes on boot | Config or DB error | `journalctl -u honeypot-mcp -e` — the last lines show the traceback |
+| Honeypots vanished after a reboot | Expected — they're re-established on daemon start | `reconcile` runs on startup; confirm with `honeypot_list`. If any show ERROR, check `journalctl` |
+| Need to read Prometheus metrics from another host | Port 9090 is bound locally for security | SSH-tunnel it: `ssh -L 9090:127.0.0.1:9090 honeypot@<vps>` |
 
 ---
 

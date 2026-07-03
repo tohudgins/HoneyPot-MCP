@@ -32,7 +32,7 @@ A Model Context Protocol server that lets Claude (or any MCP client) deploy hone
 | **Operations** | Health watchdog (CRITICAL alert on honeypot death), end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboard stack |
 | **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest endpoint + ready-to-deploy CloudTrail/Azure/GCP audit-log forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
-253 unit tests cover the security-critical paths; strict mypy passes.
+257 unit tests cover the security-critical paths; strict mypy passes.
 
 ---
 
@@ -64,7 +64,12 @@ uv run python -m honeypot_mcp.server   # or just: honeypot-mcp
 
 ## Connect an MCP client
 
-There's no long-running server to manage — MCP clients launch the server as a stdio subprocess on demand.
+Two modes, and the difference matters:
+
+- **Local (stdio)** — Claude Desktop/Code spawn the server per chat. Simplest for trying it out, but the server (and any honeypot you deploy) lives only as long as the chat. Use this for local testing.
+- **Persistent daemon (HTTP)** — the server runs 24/7 (e.g. via systemd on a VPS) and your MCP client connects over the network. **This is the mode for real deployments**, because honeypots run inside the server process and must outlive any single chat. See [docs/DEPLOY.md](docs/DEPLOY.md) for the full VPS walkthrough (systemd unit, SSH-tunneled control port, observability stack).
+
+The rest of this section covers local stdio setup.
 
 ### Claude Code
 
@@ -191,7 +196,7 @@ Notes:
 
 ## Docker stack + Grafana demo
 
-The fastest way to see the whole thing working:
+The fastest way to see the whole thing working — an all-in-one demo stack (server + static honeypots + Prometheus + Grafana):
 
 ```bash
 cd docker
@@ -205,6 +210,8 @@ open http://localhost:3000
 ```
 
 Three pre-provisioned dashboards: **Overview** (severity stack, top attackers), **Threat Map** (geo-located attacker IPs), **MITRE ATT&CK Coverage**. The seed script spreads events across realistic source countries so the map lights up immediately.
+
+> This all-in-one `docker-compose.yml` is for demos and dashboards. For a **public deployment** driven by natural language, run the server as a persistent daemon on the host and use `docker-compose.observability.yml` for just Grafana + Prometheus against that daemon's data — see [docs/DEPLOY.md](docs/DEPLOY.md).
 
 | Service | Purpose | Port |
 |---|---|---|
@@ -250,7 +257,7 @@ Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), poin
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v          # 253 tests
+uv run pytest tests/unit/ -v          # 257 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
@@ -272,6 +279,7 @@ src/honeypot_mcp/
 ├── suppression.py       — Drop / rate-limit rule engine
 ├── credential_match.py  — Planted-credential cross-reference (auto-CRITICAL)
 ├── watchdog.py          — Periodic health checks of running honeypots
+├── reconcile.py         — Re-establishes RUNNING honeypots on server restart
 ├── engines/             — Honeypot engines (plugin ABC: HoneypotEngine)
 ├── tokens/              — Honeytoken providers (plugin ABC: HoneytokenProvider)
 ├── storage/             — Models, async DB layer, batched event buffer

@@ -144,6 +144,52 @@ def test_canary_rate_limit_window_expiry():
     assert canary._rate_limit_check(src) is False
 
 
+def test_canary_rate_limit_evicts_stale_windows():
+    """Once the table grows past the cap, fully-decayed IP windows are swept
+    so memory stays bounded on a long-lived public deployment."""
+    import time
+
+    from honeypot_mcp import canary
+
+    canary._rate_state.clear()
+    old = time.monotonic() - canary._RATE_WINDOW_SECONDS - 100
+    # Seed the table past the eviction cap with stale (decayed) windows.
+    for i in range(canary._RATE_STATE_MAX_IPS + 5):
+        canary._rate_state[f"10.0.{i // 256}.{i % 256}"] = deque([old])
+    before = len(canary._rate_state)
+    # An active hit crosses the cap and triggers the sweep.
+    canary._rate_limit_check("203.0.113.7")
+    assert len(canary._rate_state) < before
+    # The active IP survives; the stale ones are gone.
+    assert "203.0.113.7" in canary._rate_state
+
+
+# ── MCP transport config ─────────────────────────────────────────────────
+
+
+def test_mcp_transport_defaults_to_stdio():
+    from honeypot_mcp.config import Settings
+
+    assert Settings().mcp_transport == "stdio"
+
+
+def test_mcp_transport_accepts_http_case_insensitive(monkeypatch):
+    from honeypot_mcp.config import Settings
+
+    monkeypatch.setenv("MCP_TRANSPORT", "HTTP")
+    assert Settings().mcp_transport == "http"
+
+
+def test_mcp_transport_rejects_garbage(monkeypatch):
+    import pytest as _pytest
+
+    from honeypot_mcp.config import Settings
+
+    monkeypatch.setenv("MCP_TRANSPORT", "carrier-pigeon")
+    with _pytest.raises(ValueError, match="mcp_transport"):
+        Settings()
+
+
 # ── Prometheus /metrics ─────────────────────────────────────────────────
 
 

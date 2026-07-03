@@ -1,0 +1,66 @@
+# Observability-only stack — Grafana + Prometheus, pointed at a HoneyPot MCP
+# control plane running as a HOST DAEMON (systemd), not in a container.
+#
+# Use this on a public VPS where the MCP server runs persistently on the host
+# (so the honeypots you deploy via natural language keep running and bind real
+# host ports directly). This stack just visualises the data that daemon writes.
+#
+#   # 1. MCP daemon already running on the host (see deploy/honeypot-mcp.service),
+#   #    writing its SQLite DB to the repo root and exposing /metrics on :9090.
+#   # 2. Bring up the dashboards:
+#   HONEYPOT_DB_DIR=/opt/honeypot-mcp \
+#     docker compose -f docker-compose.observability.yml up -d
+#   # 3. Grafana on http://localhost:3000 (admin / ${GRAFANA_ADMIN_PASSWORD:-honeypot})
+#
+# For an all-in-one DEMO on a laptop (no host daemon, no real traffic) use the
+# full docker-compose.yml instead — it bundles the server + static honeypots.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: honeypot-prometheus
+    restart: unless-stopped
+    extra_hosts:
+      # Lets the container reach the host daemon's :9090 as host.docker.internal.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.observability.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    ports:
+      - "127.0.0.1:9091:9090"
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: honeypot-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-honeypot}
+      GF_INSTALL_PLUGINS: frser-sqlite-datasource
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: frser-sqlite-datasource
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      # Read the host daemon's SQLite DB read-only. WAL mode (database.py) makes
+      # concurrent reads safe while the daemon writes. HONEYPOT_DB_DIR is the
+      # directory holding honeypot_mcp.db (the repo root by default).
+      - ${HONEYPOT_DB_DIR:-..}:/mcp-data:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  prometheus-data:
+  grafana-data:

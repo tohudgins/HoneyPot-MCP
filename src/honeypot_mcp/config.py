@@ -48,6 +48,16 @@ class Settings(BaseSettings):
     metrics_host: str = "0.0.0.0"
     metrics_port: int = 9090
 
+    # MCP transport. `stdio` (default) is what Claude Desktop / Claude Code
+    # spawn per chat — the server lives only as long as the client session.
+    # `http` (or `sse`) runs a persistent networked server, required for a
+    # public deployment: honeypots must outlive any single chat, and in-process
+    # engines hold their listeners in the server process. Run it as a daemon
+    # (systemd) and point your MCP client at http://<host>:<port>/mcp.
+    mcp_transport: str = "stdio"
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = 8000
+
     # Docker
     docker_socket: str = Field(default="", description="Docker socket URI")
 
@@ -74,6 +84,15 @@ class Settings(BaseSettings):
 
     # YAML config overlay (loaded separately)
     _yaml_config: dict[str, Any] = {}
+
+    @field_validator("mcp_transport")
+    @classmethod
+    def validate_mcp_transport(cls, v: str) -> str:
+        valid = {"stdio", "http", "sse", "streamable-http"}
+        lower = v.lower()
+        if lower not in valid:
+            raise ValueError(f"mcp_transport must be one of {valid}")
+        return lower
 
     @field_validator("log_level")
     @classmethod

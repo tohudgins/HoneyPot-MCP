@@ -1,3 +1,13 @@
+# All-in-one DEMO / self-contained stack: MCP server + static Cowrie & HTTP
+# honeypots + Prometheus + Grafana, on one internal network. Best for a laptop
+# demo, dashboards, and screenshots (`scripts/seed_demo_data.py`).
+#
+# NOT the path for driving honeypots via natural language on a public host —
+# the honeypot-mcp container here runs the background services but is not a
+# networked MCP endpoint a client can attach to, and dynamically-deployed
+# in-process honeypots wouldn't have their ports published. For that, run the
+# server as a persistent HTTP daemon on the host (deploy/honeypot-mcp.service)
+# and use docker-compose.observability.yml for the dashboards. See docs/DEPLOY.md.
 services:
   # ── Docker socket proxy ─────────────────────────────────────────────────────
   # The MCP server uses Docker to manage Cowrie containers. Giving the MCP

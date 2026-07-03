@@ -1,0 +1,23 @@
+# Prometheus config for the observability-ONLY stack
+# (docker-compose.observability.yml).
+#
+# Here the HoneyPot MCP control plane runs as a host daemon (systemd), not as
+# a container, so Prometheus scrapes the host's /metrics endpoint through the
+# Docker host-gateway alias rather than a container name.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    deployment: honeypot-mcp
+
+scrape_configs:
+  - job_name: honeypot-mcp
+    metrics_path: /metrics
+    static_configs:
+      # host.docker.internal resolves to the host via `extra_hosts:
+      # host-gateway` in the compose file (works on Linux + Docker Desktop).
+      - targets:
+          - host.docker.internal:9090
+        labels:
+          service: honeypot-mcp
