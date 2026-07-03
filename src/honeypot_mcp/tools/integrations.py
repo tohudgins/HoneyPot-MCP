@@ -99,6 +99,10 @@ async def alert_subscribe(
         await session.flush()
         sub_id = sub.id
 
+    from honeypot_mcp.webhooks import invalidate_subscription_cache
+
+    invalidate_subscription_cache()
+
     return {
         "id": sub_id,
         "label": label,
@@ -124,6 +128,10 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
         )
         if result.rowcount == 0:  # type: ignore[attr-defined]
             return {"error": f"No subscription with id={subscription_id}."}
+
+    from honeypot_mcp.webhooks import invalidate_subscription_cache
+
+    invalidate_subscription_cache()
     return {"id": subscription_id, "active": False}
 
 

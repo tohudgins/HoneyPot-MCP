@@ -94,6 +94,39 @@ _SYSLOG_FACILITY = 16
 _RETRY_DELAYS = (1.0, 5.0, 30.0)
 _HOSTNAME = "honeypot-mcp"
 
+# Active-subscription cache. Delivery previously issued one `SELECT … WHERE
+# active` per event — a DB round-trip on the ingest hot path, even in the
+# common case of zero subscribers. Subscriptions change rarely, so we cache
+# them (refreshed on TTL, invalidated explicitly on subscribe/unsubscribe and
+# on worker start), mirroring the suppression-rule cache.
+_SUB_CACHE_TTL = 30.0
+_sub_cache: list[Subscription] | None = None
+_sub_cache_ts: float = 0.0
+
+
+def invalidate_subscription_cache() -> None:
+    """Force the next delivery to re-read subscriptions from the DB."""
+    global _sub_cache
+    _sub_cache = None
+
+
+async def _active_subscriptions() -> list[Subscription]:
+    """Active subscriptions, cached for `_SUB_CACHE_TTL`. Detached from the
+    loading session (`expunge_all`) so `_record_outcome`'s stat updates never
+    interact with the cache and post-commit attribute expiry can't bite."""
+    global _sub_cache, _sub_cache_ts
+    now = time.monotonic()
+    cache = _sub_cache
+    if cache is not None and now - _sub_cache_ts < _SUB_CACHE_TTL:
+        return cache
+    async with get_session() as session:
+        result = await session.execute(select(Subscription).where(Subscription.active.is_(True)))
+        subs = list(result.scalars().all())
+        session.expunge_all()
+    _sub_cache = subs
+    _sub_cache_ts = now
+    return subs
+
 
 def sign_body(secret: str, body: bytes) -> str:
     """`X-HoneyPot-Signature: sha256=<hex>`. Consumers verify with the same
@@ -489,6 +522,9 @@ class WebhookDelivery:
     async def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop.clear()
+            # Drop any cache from a previous run / test so the first delivery
+            # reflects the current DB.
+            invalidate_subscription_cache()
             self._client = httpx.AsyncClient()
             self._task = asyncio.create_task(self._run(), name="webhook-delivery")
 
@@ -522,12 +558,7 @@ class WebhookDelivery:
                 log.warning("Webhook delivery error: %s", e)
 
     async def _deliver(self, event: PendingEvent) -> None:
-        async with get_session() as session:
-            result = await session.execute(
-                select(Subscription).where(Subscription.active.is_(True))
-            )
-            subs = list(result.scalars().all())
-
+        subs = await _active_subscriptions()
         if not subs:
             return
 

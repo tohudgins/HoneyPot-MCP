@@ -721,3 +721,38 @@ def test_capture_survives_cef_payload_field():
     # CEF stows the payload JSON in cs4 — the target path must be present.
     assert "authorized_keys" in text
     assert "redis_rce_dropper" in text
+
+
+@pytest.mark.asyncio
+async def test_subscription_cache_avoids_requery_and_honours_invalidation():
+    """The active-subscription cache serves repeat reads without a DB round-trip
+    and only reflects new rows after invalidation — the contract that keeps
+    delivery off the DB on the ingest hot path."""
+    from honeypot_mcp import webhooks
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import AlertSeverity, Subscription
+
+    webhooks.invalidate_subscription_cache()
+
+    # Empty to start — cached.
+    assert await webhooks._active_subscriptions() == []
+
+    # Insert directly (not via the tool, so no invalidation) — the cache still
+    # returns the stale empty list within the TTL.
+    async with get_session() as session:
+        session.add(
+            Subscription(
+                label="siem",
+                url="http://x/y",
+                severity_threshold=AlertSeverity.LOW,
+                format="json",
+                active=True,
+            )
+        )
+    assert await webhooks._active_subscriptions() == []
+
+    # After explicit invalidation the new subscription is visible.
+    webhooks.invalidate_subscription_cache()
+    subs = await webhooks._active_subscriptions()
+    assert len(subs) == 1
+    assert subs[0].url == "http://x/y"
