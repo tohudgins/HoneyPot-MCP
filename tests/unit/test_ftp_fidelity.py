@@ -142,9 +142,12 @@ async def test_feat_lists_realistic_features(ftp_server):
 
 
 @pytest.mark.asyncio
-async def test_stor_after_anonymous_login_blocked(ftp_server):
-    """Anonymous shouldn't be writing. 550 + an ftp_file_op_blocked event."""
+async def test_stor_captures_uploaded_webshell(ftp_server):
+    """A STOR upload over PASV is now accepted and captured — the dropped
+    artefact (here a PHP webshell) lands as a CRITICAL ftp_file_upload with the
+    payload classified and hashed."""
     import asyncio as _asyncio
+    import re as _re
 
     from sqlalchemy import select
 
@@ -155,6 +158,7 @@ async def test_stor_after_anonymous_login_blocked(ftp_server):
     port = ftp_server
     buf = event_buffer.get_buffer()
     await buf.start()
+    payload = b"<?php system($_GET['c']); ?>\n"
     try:
         reader, writer = await _asyncio.open_connection("127.0.0.1", port)
         try:
@@ -164,25 +168,47 @@ async def test_stor_after_anonymous_login_blocked(ftp_server):
             await _read_line(reader)  # 331
             await _read_line(reader)  # 230
 
-            writer.write(b"STOR /etc/passwd\r\n")
+            # PASV to open the data channel.
+            writer.write(b"PASV\r\n")
             await writer.drain()
-            resp = await _read_line(reader)
-            assert resp.startswith(b"550")
+            pasv = await _read_line(reader)
+            m = _re.search(rb"\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", pasv)
+            assert m, pasv
+            data_port = int(m.group(5)) * 256 + int(m.group(6))
+
+            # STOR, connect the data socket, send the webshell.
+            writer.write(b"STOR shell.php\r\n")
+            await writer.drain()
+            resp150 = await _read_line(reader)
+            assert resp150.startswith(b"150"), resp150
+            dr, dw = await _asyncio.open_connection("127.0.0.1", data_port)
+            dw.write(payload)
+            await dw.drain()
+            dw.close()
+            with contextlib.suppress(Exception):
+                await dw.wait_closed()
+            resp226 = await _read_line(reader)
+            assert resp226.startswith(b"226"), resp226
         finally:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
-        await _asyncio.sleep(1.0)  # let the flusher drain
+        await _asyncio.sleep(1.2)  # let the flusher drain
     finally:
         await buf.stop()
 
     async with get_session() as session:
         result = await session.execute(
-            select(Alert).where(Alert.event_type == "ftp_file_op_blocked")
+            select(Alert).where(Alert.event_type == "ftp_file_upload")
         )
         alerts = list(result.scalars().all())
-    assert len(alerts) >= 1
-    assert alerts[0].payload.get("verb") == "STOR"
+    assert len(alerts) == 1
+    p = alerts[0].payload
+    assert p["filename"] == "shell.php"
+    assert p["size_bytes"] == len(payload)
+    assert p["payload_kind"] == "php_webshell"
+    assert alerts[0].severity.value == "critical"
+    assert len(p["sha256"]) == 64
 
 
 @pytest.mark.asyncio

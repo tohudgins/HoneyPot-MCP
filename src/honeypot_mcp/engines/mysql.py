@@ -1,12 +1,20 @@
-"""MySQL banner honeypot — handshake exchange + access-denied response.
+"""MySQL honeypot — handshake, credential capture, and post-auth query capture.
 
 MySQL on port 3306 is a constant brute-force target on the internet:
 default-credential sweepers, exposed-DB scrapers, ransomware actors.
-We don't implement the full protocol (no query execution, no SSL upgrade,
-no auth_plugin negotiation beyond the default) — but we do the Initial
-Handshake + HandshakeResponse41 + Error Packet exchange faithfully enough
-that scanners harvest a believable username + password attempt before we
-close the connection.
+We do the Initial Handshake + HandshakeResponse41 faithfully to harvest a
+believable username + password attempt, then ACCEPT the login and enter the
+command phase — because a fake datastore with no real data loses nothing by
+granting access, and the post-auth SQL is where the attacker's real objective
+shows: recon (`@@version`, `information_schema`, `SHOW DATABASES`), file read
+(`LOAD_FILE`, `LOAD DATA`), and the RCE patterns that matter most —
+`INTO OUTFILE`/`INTO DUMPFILE` webshell drops and `CREATE FUNCTION … SONAME`
+UDF loads. Those are flagged HIGH/CRITICAL via `_classify_query`.
+
+We reply to `SELECT @@version` / `user()` / `@@datadir` with believable
+single-value result sets and OK-packet everything else — enough to keep a
+scanner running its whole playbook so we capture it, without implementing a
+real query engine (no data is ever stored or returned from a real table).
 
 Wire format reference:
 * https://dev.mysql.com/doc/internals/en/connection-phase.html
@@ -187,6 +195,85 @@ def _parse_handshake_response(payload: bytes) -> dict[str, Any]:
     return out
 
 
+def _lenenc_int(n: int) -> bytes:
+    if n < 251:
+        return bytes([n])
+    if n < 65536:
+        return b"\xfc" + struct.pack("<H", n)
+    if n < 16777216:
+        return b"\xfd" + struct.pack("<I", n)[:3]
+    return b"\xfe" + struct.pack("<Q", n)
+
+
+def _lenenc_str(s: str) -> bytes:
+    b = s.encode("utf-8", errors="replace")
+    return _lenenc_int(len(b)) + b
+
+
+def _packet(seq: int, payload: bytes) -> bytes:
+    return struct.pack("<I", len(payload))[:3] + bytes([seq]) + payload
+
+
+def _ok_packet(seq: int) -> bytes:
+    payload = bytes([0x00]) + b"\x00" + b"\x00" + struct.pack("<HH", _STATUS_FLAGS, 0)
+    return _packet(seq, payload)
+
+
+def _eof_packet(seq: int) -> bytes:
+    return _packet(seq, bytes([0xFE]) + struct.pack("<HH", 0, _STATUS_FLAGS))
+
+
+def _column_def(seq: int, name: str) -> bytes:
+    payload = (
+        _lenenc_str("def")  # catalog
+        + _lenenc_str("")  # schema
+        + _lenenc_str("")  # table
+        + _lenenc_str("")  # org_table
+        + _lenenc_str(name)  # name
+        + _lenenc_str(name)  # org_name
+        + bytes([0x0C])  # length of fixed fields
+        + struct.pack("<H", 0x21)  # charset utf8_general_ci
+        + struct.pack("<I", 255)  # column length
+        + bytes([0xFD])  # type = VAR_STRING
+        + struct.pack("<H", 0)  # flags
+        + bytes([0x00])  # decimals
+        + b"\x00\x00"  # filler
+    )
+    return _packet(seq, payload)
+
+
+def _single_value_resultset(column_name: str, value: str) -> bytes:
+    """A one-column, one-row text result set — enough for `SELECT @@version`
+    and friends so a scanner that reads results stays engaged."""
+    out = _packet(1, _lenenc_int(1))  # column count = 1
+    out += _column_def(2, column_name)
+    out += _eof_packet(3)
+    out += _packet(4, _lenenc_str(value))  # one row, one value
+    out += _eof_packet(5)
+    return out
+
+
+def _classify_query(sql: str) -> tuple[str, AlertSeverity]:
+    """Map a captured SQL string to (event_type, severity). Recognises the
+    file-write/read and UDF patterns that turn a MySQL login into RCE."""
+    s = sql.lower()
+    if "into outfile" in s or "into dumpfile" in s:
+        return "mysql_outfile_write", AlertSeverity.CRITICAL
+    if "create function" in s and "soname" in s:
+        return "mysql_udf_rce", AlertSeverity.CRITICAL
+    if "sys_exec" in s or "sys_eval" in s:
+        return "mysql_udf_rce", AlertSeverity.CRITICAL
+    if "load_file" in s or "load data" in s:
+        return "mysql_file_read", AlertSeverity.HIGH
+    if any(
+        tok in s
+        for tok in ("information_schema", "show databases", "show tables", "@@version",
+                    "user()", "current_user", "@@datadir", "@@version_compile_os")
+    ):
+        return "mysql_recon_query", AlertSeverity.MEDIUM
+    return "mysql_query", AlertSeverity.MEDIUM
+
+
 class _MySQLProtocol(asyncio.Protocol):
     def __init__(self, honeypot_name: str, honeypot_id: int | None) -> None:
         self._name = honeypot_name
@@ -195,6 +282,7 @@ class _MySQLProtocol(asyncio.Protocol):
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
         self._sent_handshake = False
+        self._authed = False
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -212,39 +300,74 @@ class _MySQLProtocol(asyncio.Protocol):
 
     def data_received(self, data: bytes) -> None:
         self._buf += data
-        # Read one packet: 3-byte LE length + 1-byte sequence id + payload.
-        if len(self._buf) < 4:
-            return
-        payload_len = int.from_bytes(self._buf[0:3], "little")
-        seq = self._buf[3]
-        if len(self._buf) < 4 + payload_len:
-            return
-        payload = self._buf[4 : 4 + payload_len]
-        self._buf = self._buf[4 + payload_len :]
+        # Drain all complete packets: 3-byte LE length + 1-byte seq + payload.
+        while len(self._buf) >= 4:
+            payload_len = int.from_bytes(self._buf[0:3], "little")
+            seq = self._buf[3]
+            if len(self._buf) < 4 + payload_len:
+                return
+            payload = self._buf[4 : 4 + payload_len]
+            self._buf = self._buf[4 + payload_len :]
+            if not self._authed:
+                self._handle_login(seq, payload)
+            else:
+                self._handle_command(seq, payload)
 
+    def _handle_login(self, seq: int, payload: bytes) -> None:
         parsed = _parse_handshake_response(payload)
-        username = parsed.get("username", "")
-
-        # Reply with ER_ACCESS_DENIED_ERROR (1045) — the universal "wrong
-        # creds" response. SQLSTATE 28000 is the matching standard code.
-        host_str = f"{self._peer[0]}:{self._peer[1]}"
-        err = _build_error_packet(
-            seq=seq + 1,
-            errno=1045,
-            sqlstate="28000",
-            message=f"Access denied for user '{username}'@'{host_str}' (using password: YES)",
-        )
-        if self._transport is not None:
-            self._transport.write(err)
-            self._transport.close()
-
         asyncio.create_task(
-            self._record(
-                "mysql_login_attempt",
-                AlertSeverity.HIGH,
-                {**parsed, "service": "mysql"},
-            )
+            self._record("mysql_login_attempt", AlertSeverity.HIGH, {**parsed, "service": "mysql"})
         )
+        # Accept the login and enter the command phase. This is a fake datastore
+        # with no real data, so granting "access" is safe — and it's what lets
+        # us capture the post-auth SQL (recon, INTO OUTFILE / UDF RCE attempts)
+        # that reveals the attacker's actual objective, not just their creds.
+        if self._transport is not None:
+            self._transport.write(_ok_packet(seq + 1))
+        self._authed = True
+
+    def _handle_command(self, seq: int, payload: bytes) -> None:
+        t = self._transport
+        if t is None or not payload:
+            return
+        command = payload[0]
+        # COM_QUERY = 0x03, COM_QUIT = 0x01, COM_INIT_DB = 0x02, COM_PING = 0x0e,
+        # COM_FIELD_LIST = 0x04.
+        if command == 0x01:  # COM_QUIT
+            t.close()
+            return
+        if command == 0x03:  # COM_QUERY
+            sql = payload[1:].decode("utf-8", errors="replace")
+            event_type, severity = _classify_query(sql)
+            asyncio.create_task(
+                self._record(event_type, severity, {"query": sql[:4096], "service": "mysql"})
+            )
+            self._respond_to_query(sql)
+            return
+        if command in (0x02, 0x0E):  # COM_INIT_DB / COM_PING
+            t.write(_ok_packet(seq + 1))
+            return
+        # Anything else — generic OK keeps the client talking.
+        t.write(_ok_packet(seq + 1))
+
+    def _respond_to_query(self, sql: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        s = sql.lower().strip()
+        if "@@version" in s or "version()" in s:
+            t.write(_single_value_resultset("@@version", _SERVER_VERSION.decode()))
+        elif "user()" in s or "current_user" in s:
+            t.write(_single_value_resultset("user()", "root@localhost"))
+        elif "@@datadir" in s:
+            t.write(_single_value_resultset("@@datadir", "/var/lib/mysql/"))
+        elif s.startswith("select"):
+            # Empty single-column result — believable "no rows" for arbitrary
+            # SELECTs without implementing a real query engine.
+            t.write(_single_value_resultset("result", ""))
+        else:
+            # DDL/DML/SET/USE — reply OK (0 rows affected).
+            t.write(_ok_packet(1))
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
         await submit_event(

@@ -16,15 +16,22 @@ Scanner-grade honeypots also need:
 * Basic post-login verbs (`PWD`, `CWD`, `TYPE`, `NOOP`, `SYST`) so anonymous
   sessions don't immediately die at the first `LIST`.
 
-It is still low-fidelity FTP — no real file system, no working data
-connections — but significantly harder to fingerprint at the first-probe
-level than the previous `502 Command not implemented` skeleton.
+* `LIST`/`NLST` over PASV serve a real directory listing over a real data
+  socket, and `STOR`/`APPE` **accept the upload** over the data channel and
+  capture the bytes — a dropped webshell or malware stager is the artefact
+  worth keeping. Uploads are classified (`_classify_upload`), SHA-256'd, and
+  bounded to `_MAX_UPLOAD_BYTES`; `RETR`/`DELE` stay logged-and-refused.
+
+It is still low-fidelity FTP — no persistent file system — but it now captures
+the two things that matter most (credentials and uploaded payloads) and is
+significantly harder to fingerprint than the previous `502` skeleton.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import secrets
 from typing import Any
@@ -36,6 +43,33 @@ from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
+
+# Cap captured uploads so a large STOR can't exhaust honeypot memory. 1 MB is
+# plenty to fingerprint a dropped webshell or malware stager.
+_MAX_UPLOAD_BYTES = 1_048_576
+
+
+def _classify_upload(filename: str, data: bytes) -> str | None:
+    """Recognise the artefact an attacker STORs. Returns a short label or None.
+    This is the high-value intel — what they tried to drop on the box."""
+    name = filename.lower()
+    head = data[:2048]
+    lowered = head.lower()
+    if name.endswith((".php", ".phtml", ".php5")) or b"<?php" in head or b"<?=" in head:
+        return "php_webshell"
+    if name.endswith((".jsp", ".jspx")) or b"<%" in head and b"runtime" in lowered:
+        return "jsp_webshell"
+    if name.endswith((".asp", ".aspx")):
+        return "asp_webshell"
+    if head[:2] == b"MZ":
+        return "windows_executable"
+    if head[:4] == b"\x7fELF":
+        return "linux_executable"
+    if head[:2] == b"#!" and (b"/bin/sh" in head or b"/bin/bash" in head or b"python" in lowered):
+        return "shell_script"
+    if b"/dev/tcp/" in head or b"bash -i" in head or b"nc -e" in head:
+        return "reverse_shell"
+    return None
 
 # ProFTPD-style FEAT listing.
 _FEAT_RESPONSE = (
@@ -189,12 +223,22 @@ class _FTPProtocol(asyncio.Protocol):
                     self._record("ftp_port_command", AlertSeverity.MEDIUM, {"argument": arg})
                 )
 
-        elif verb == "STOR" or verb == "RETR" or verb == "APPE" or verb == "DELE":
+        elif verb == "STOR" or verb == "APPE":
             self._require_auth_or(t)
             if self._authed:
-                # Anonymous shouldn't be writing/reading files in a believable
-                # anonymous FTP. Real anonymous FTP usually allows RETR on
-                # /pub but we don't model that; return 550 and log.
+                # Accept the upload over the data channel and capture the bytes.
+                # A malware sample or webshell an attacker tries to STOR is
+                # exactly the artefact worth keeping — so we take delivery
+                # rather than rejecting with 550 (which learns us nothing).
+                if self._pasv_data_queue is None:
+                    t.write(b"425 Use PORT or PASV first.\r\n")
+                else:
+                    asyncio.create_task(self._receive_upload(verb, arg))
+
+        elif verb == "RETR" or verb == "DELE":
+            self._require_auth_or(t)
+            if self._authed:
+                # We don't serve real files or delete anything; log the intent.
                 t.write(b"550 Permission denied.\r\n")
                 asyncio.create_task(
                     self._record(
@@ -315,6 +359,62 @@ class _FTPProtocol(asyncio.Protocol):
                 "verb": verb,
                 "bytes_sent": len(_FAKE_LISTING),
                 "entry_count": _FAKE_LISTING.count(b"\r\n"),
+            },
+        )
+        await self._teardown_pasv()
+
+    async def _receive_upload(self, verb: str, filename: str) -> None:
+        """Accept the client's data connection for a STOR/APPE and capture the
+        uploaded bytes — a malware sample or webshell drop is the artefact worth
+        keeping. Bounded so a huge upload can't exhaust honeypot memory."""
+        t = self._transport
+        if t is None or self._pasv_data_queue is None:
+            return
+
+        t.write(b"150 Ok to send data.\r\n")
+        try:
+            reader, writer = await asyncio.wait_for(self._pasv_data_queue.get(), timeout=10.0)
+        except TimeoutError:
+            t.write(b"425 No data connection received.\r\n")
+            await self._teardown_pasv()
+            return
+
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            while total < _MAX_UPLOAD_BYTES:
+                chunk = await asyncio.wait_for(
+                    reader.read(_MAX_UPLOAD_BYTES - total), timeout=10.0
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        except Exception as e:
+            # Timeout or client reset ends the transfer — keep what we got.
+            log.debug("STOR data read ended: %s", e)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+        data = b"".join(chunks)
+        t.write(b"226 Transfer complete.\r\n")
+
+        kind = _classify_upload(filename, data)
+        severity = AlertSeverity.CRITICAL if kind else AlertSeverity.HIGH
+        await self._record(
+            "ftp_file_upload",
+            severity,
+            {
+                "verb": verb,
+                "filename": filename,
+                "size_bytes": total,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "payload_kind": kind,
+                # A short printable preview so an analyst sees what it is without
+                # needing to pull the raw sample.
+                "preview": data[:512].decode("utf-8", errors="replace"),
             },
         )
         await self._teardown_pasv()
