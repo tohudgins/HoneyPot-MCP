@@ -17,8 +17,15 @@ The captured (user, database, password) tuple is fed through
 `credential_match` via the event buffer, so a planted CREDENTIAL honeytoken
 tried against Postgres escalates to CRITICAL just like SSH/FTP/Redis.
 
-We do NOT implement the query protocol — auth always fails, so no session is
-ever established. That keeps this a credential trap, not a real database.
+We then ACCEPT the login and open the simple-query phase (AuthenticationOk +
+ParameterStatus + ReadyForQuery). A fake datastore with no real data loses
+nothing by granting access, and the post-auth SQL is where intent shows:
+`COPY … FROM/TO PROGRAM '<cmd>'` (direct superuser RCE), `CREATE FUNCTION …
+LANGUAGE C` UDF loads, `pg_read_file`/`lo_export` file access, and credential-
+table dumps (`pg_shadow`, `pg_authid`) — flagged HIGH/CRITICAL by
+`_classify_pg_query`. `version()`/`current_user` get believable result sets so
+a tool that reads results runs its whole playbook. No real table data is ever
+stored or returned.
 
 Wire reference: PostgreSQL protocol v3
 https://www.postgresql.org/docs/current/protocol-message-formats.html
@@ -74,6 +81,77 @@ def _error_response(severity: str, code: str, message: str) -> bytes:
     return b"E" + struct.pack("!I", len(fields) + 4) + fields
 
 
+def _msg(tag: bytes, payload: bytes) -> bytes:
+    return tag + struct.pack("!I", len(payload) + 4) + payload
+
+
+def _auth_ok() -> bytes:
+    return b"R" + struct.pack("!II", 8, 0)  # AuthenticationOk
+
+
+def _ready_for_query() -> bytes:
+    return b"Z" + struct.pack("!I", 5) + b"I"  # status 'I' = idle
+
+
+def _post_auth_preamble() -> bytes:
+    """What a real server sends after AuthenticationOk: a few ParameterStatus
+    messages, BackendKeyData, then ReadyForQuery. Enough for psql/libpq and
+    exploit tools to consider themselves connected and start issuing queries."""
+    params = {
+        "server_version": "14.10 (Debian 14.10-1.pgdg120+1)",
+        "server_encoding": "UTF8",
+        "client_encoding": "UTF8",
+        "DateStyle": "ISO, MDY",
+        "integer_datetimes": "on",
+        "standard_conforming_strings": "on",
+    }
+    out = _auth_ok()
+    for k, v in params.items():
+        out += _msg(b"S", k.encode() + b"\x00" + v.encode() + b"\x00")
+    out += _msg(b"K", struct.pack("!II", 12345, 67890))  # BackendKeyData
+    out += _ready_for_query()
+    return out
+
+
+def _single_value_result(col: str, value: str) -> bytes:
+    """RowDescription + one DataRow + CommandComplete for a 1-col/1-row SELECT
+    (e.g. version()), so a tool that reads results stays engaged."""
+    # RowDescription 'T': field count(2) + [name\0 + tableOID(4) + colAttr(2) +
+    # typeOID(4) + typeLen(2) + typeMod(4) + format(2)]
+    # tableOID(I) colAttr(H) typeOID(I) typeSize(h, signed) typeMod(i, signed) format(H)
+    col_desc = (
+        col.encode() + b"\x00"
+        + struct.pack("!IHIhiH", 0, 0, 25, -1, -1, 0)  # typeOID 25 = text
+    )
+    t_msg = _msg(b"T", struct.pack("!H", 1) + col_desc)
+    vb = value.encode()
+    d_msg = _msg(b"D", struct.pack("!HI", 1, len(vb)) + vb)  # 1 col, len-prefixed
+    c_msg = _msg(b"C", b"SELECT 1\x00")
+    return t_msg + d_msg + c_msg + _ready_for_query()
+
+
+def _classify_pg_query(sql: str) -> tuple[str, AlertSeverity]:
+    """Map a captured SQL string to (event_type, severity). Recognises the
+    file/command patterns that turn a Postgres login into RCE or file access."""
+    s = sql.lower()
+    if "from program" in s or "to program" in s:
+        # COPY ... FROM/TO PROGRAM '<cmd>' — direct superuser command execution.
+        return "postgresql_copy_program_rce", AlertSeverity.CRITICAL
+    if "create function" in s and ("language c" in s or "as '" in s):
+        return "postgresql_udf_rce", AlertSeverity.CRITICAL
+    if "lo_import" in s or "lo_export" in s or "pg_read_file" in s or "pg_ls_dir" in s:
+        return "postgresql_file_access", AlertSeverity.HIGH
+    if s.strip().startswith("copy "):
+        return "postgresql_copy", AlertSeverity.HIGH
+    if any(
+        tok in s
+        for tok in ("pg_stat", "version()", "current_user", "pg_shadow", "pg_authid",
+                    "information_schema", "pg_database", "current_setting", "pg_ls")
+    ):
+        return "postgresql_recon_query", AlertSeverity.MEDIUM
+    return "postgresql_query", AlertSeverity.MEDIUM
+
+
 class _PGProtocol(asyncio.Protocol):
     def __init__(self, honeypot_id: int | None) -> None:
         self._hp_id = honeypot_id
@@ -81,6 +159,7 @@ class _PGProtocol(asyncio.Protocol):
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
         self._startup_done = False
+        self._authed = False
         self._params: dict[str, str] = {}
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -151,22 +230,49 @@ class _PGProtocol(asyncio.Protocol):
         t = self._transport
         if t is None:
             return
-        if msg_type == b"p":
+        if msg_type == b"p" and not self._authed:
             # PasswordMessage: password is a null-terminated string.
             password = payload.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             user = self._params.get("user", "")
             asyncio.create_task(self._record_login(user, password))
-            t.write(
-                _error_response(
-                    "FATAL",
-                    "28P01",
-                    f'password authentication failed for user "{user}"',
-                )
+            # Accept the login and open the query phase — a fake datastore with
+            # no real data loses nothing by granting access, and the post-auth
+            # SQL is where the objective shows (COPY ... FROM PROGRAM RCE,
+            # pg_read_file, credential-table dumps).
+            self._authed = True
+            t.write(_post_auth_preamble())
+            return
+        if self._authed and msg_type == b"Q":
+            sql = payload.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            event_type, severity = _classify_pg_query(sql)
+            asyncio.create_task(
+                self._record(event_type, severity, {"query": sql[:4096], "service": "postgresql"})
             )
+            self._respond_to_query(sql)
+            return
+        if msg_type == b"X":  # Terminate
             self._close()
             return
-        # Any other post-startup message before auth — terminate.
+        if self._authed:
+            # Unmodelled post-auth message (Parse/Bind/etc.) — stay ready.
+            t.write(_ready_for_query())
+            return
         self._close()
+
+    def _respond_to_query(self, sql: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        s = sql.lower()
+        if "version()" in s:
+            t.write(_single_value_result("version", "PostgreSQL 14.10 on x86_64-pc-linux-gnu"))
+        elif "current_user" in s or s.strip().rstrip(";") == "user":
+            t.write(_single_value_result("current_user", "postgres"))
+        elif s.strip().startswith("select"):
+            t.write(_single_value_result("?column?", ""))
+        else:
+            # DDL/DML/COPY/SET — CommandComplete + ready.
+            t.write(_msg(b"C", b"OK\x00") + _ready_for_query())
 
     def _close(self) -> None:
         if self._transport is not None:
