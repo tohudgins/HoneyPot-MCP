@@ -28,6 +28,9 @@ async def honeypot_deploy(
         "redis",
         "mysql",
         "elasticsearch",
+        "smb",
+        "postgresql",
+        "mongodb",
     ],
     port: int | None = None,
     name: str | None = None,
@@ -37,7 +40,7 @@ async def honeypot_deploy(
 
     Args:
         type: Protocol type — ssh, http, smtp, ftp, dns, rdp, vnc, redis,
-              mysql, or elasticsearch.
+              mysql, elasticsearch, smb, postgresql, or mongodb.
         port: Host port to bind (defaults to the configured default for each type).
         name: Unique name for this honeypot (auto-generated if omitted).
         config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
@@ -56,6 +59,9 @@ async def honeypot_deploy(
         "redis": settings.default_redis_port,
         "mysql": settings.default_mysql_port,
         "elasticsearch": settings.default_elasticsearch_port,
+        "smb": settings.default_smb_port,
+        "postgresql": settings.default_postgresql_port,
+        "mongodb": settings.default_mongodb_port,
     }
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"
@@ -360,6 +366,24 @@ async def honeypot_templates() -> list[dict[str, Any]]:
             "default_port": 9200,
             "config_options": [],
         },
+        {
+            "type": "smb",
+            "description": "SMB/445 honeypot: captures negotiate + session setup and flags EternalBlue / DoublePulsar exploit signatures. The most-scanned Windows attack surface (ransomware initial access).",
+            "default_port": 445,
+            "config_options": [],
+        },
+        {
+            "type": "postgresql",
+            "description": "PostgreSQL honeypot: captures the login username, target database, and password via the v3 auth flow, then rejects. Credentials are cross-referenced against planted honeytokens.",
+            "default_port": 5432,
+            "config_options": [],
+        },
+        {
+            "type": "mongodb",
+            "description": "MongoDB honeypot: speaks the wire protocol, answers isMaster/hello, and captures unauth commands — flags dropDatabase and ransom-note inserts (the classic Mongo data-ransom pattern).",
+            "default_port": 27017,
+            "config_options": [],
+        },
     ]
 
 
@@ -529,6 +553,12 @@ async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str, 
             return await _mysql_probe(port, marker)
         if hp_type == "elasticsearch":
             return await _elasticsearch_probe(port, marker)
+        if hp_type == "smb":
+            return await _smb_probe(port, marker)
+        if hp_type == "postgresql":
+            return await _postgresql_probe(port, marker)
+        if hp_type == "mongodb":
+            return await _mongodb_probe(port, marker)
         return False, f"No self-test probe defined for honeypot type {hp_type}", marker
     except Exception as e:
         return False, f"Probe failed: {e}", marker
@@ -729,6 +759,73 @@ async def _elasticsearch_probe(port: int, marker: str) -> tuple[bool, str, str]:
             headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
         )
     return True, f"HTTP {resp.status_code}", marker
+
+
+async def _smb_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send an SMB1 negotiate whose dialect list contains the marker — lands in
+    payload['dialects']."""
+    # SMB1 header: \xffSMB + command 0x72 (negotiate) + 27 more bytes.
+    smb_header = b"\xffSMB" + bytes([0x72]) + b"\x00" * 27
+    # WordCount(0) + ByteCount + dialect list: 0x02 + <marker>\0
+    dialects = b"\x02" + marker.encode() + b"\x00" + b"\x02NT LM 0.12\x00"
+    body = bytes([0]) + len(dialects).to_bytes(2, "little") + dialects
+    smb = smb_header + body
+    frame = b"\x00" + len(smb).to_bytes(3, "big") + smb
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(frame)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "SMB negotiate sent", marker
+
+
+async def _postgresql_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send a StartupMessage with user=<marker> — lands in payload['user']."""
+    import struct
+
+    params = b"user\x00" + marker.encode() + b"\x00database\x00postgres\x00\x00"
+    body = struct.pack("!I", 196608) + params
+    msg = struct.pack("!I", len(body) + 4) + body
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(msg)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "PostgreSQL startup sent", marker
+
+
+async def _mongodb_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send an OP_QUERY isMaster whose command doc carries the marker as a
+    string field — lands in payload['strings']."""
+    import struct
+
+    from honeypot_mcp.engines.mongodb import _bson_encode
+
+    doc = _bson_encode({"ismaster": 1, "comment": marker})
+    # OP_QUERY body: flags(4) + fullCollectionName + skip(4) + return(4) + doc
+    body = struct.pack("<i", 0) + b"admin.$cmd\x00" + struct.pack("<ii", 0, 1) + doc
+    header = struct.pack("<iiii", 16 + len(body), 1, 0, 2004)  # opcode 2004 = OP_QUERY
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(header + body)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(512), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "MongoDB isMaster sent", marker
 
 
 @mcp.tool

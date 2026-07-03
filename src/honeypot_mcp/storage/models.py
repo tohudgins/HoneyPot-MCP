@@ -25,6 +25,9 @@ class HoneypotType(str, enum.Enum):
     REDIS = "redis"
     MYSQL = "mysql"
     ELASTICSEARCH = "elasticsearch"
+    SMB = "smb"
+    POSTGRESQL = "postgresql"
+    MONGODB = "mongodb"
 
 
 class HoneypotStatus(str, enum.Enum):

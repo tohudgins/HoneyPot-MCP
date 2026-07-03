@@ -227,6 +227,30 @@ the largest internet attack categories.
 Logs `rdp_handshake` at HIGH severity when the X.224 parses, `rdp_invalid_probe`
 at LOW for port-scan garbage.
 
+### SMB / PostgreSQL / MongoDB engines
+
+Three database/file-share engines aimed at the highest-value public-internet
+attack surfaces. All in-process asyncio, same buffer path as the others.
+
+- `engines/smb.py` — tcp/445, the top ransomware initial-access surface.
+  Parses the NetBIOS-framed SMB1/SMB2 negotiate, replies to an SMB1 negotiate
+  to keep the exploit tool talking, then classifies follow-up packets:
+  `smb_exploit_attempt` (CRITICAL) on a DoublePulsar Trans2 SESSION_SETUP
+  (0x000e) or EternalBlue pre-auth Trans2, `smb_session_setup` (HIGH) capturing
+  readable NTLM strings. Detection-focused, no real file server — same tier as
+  RDP.
+- `engines/postgresql.py` — tcp/5432. Declines SSL (`N`) so the client falls
+  back to cleartext, parses the StartupMessage (user + database), requests
+  cleartext auth, and captures the password from the PasswordMessage before
+  rejecting with `28P01`. Emits `postgresql_login_attempt` with
+  `service="postgresql"` so `credential_match` cross-references planted tokens.
+- `engines/mongodb.py` — tcp/27017. Minimal BSON encode/decode + OP_MSG/OP_QUERY
+  framing. Answers `isMaster`/`hello`/`buildInfo`/`listDatabases` believably so
+  the scanner proceeds, captures each command, and flags `mongodb_destructive`
+  (dropDatabase) and `mongodb_ransom_note` (CRITICAL — bitcoin/recover language
+  in an insert) with the note text. Replies `ok:1` so the ransom note lands.
+  Nothing is persisted or dropped.
+
 ### HTTP realistic endpoints + sessions
 
 `engines/http_endpoints.py` serves `/robots.txt`, `/favicon.ico`,

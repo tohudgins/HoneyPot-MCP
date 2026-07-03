@@ -23,7 +23,7 @@ A Model Context Protocol server that lets Claude (or any MCP client) deploy hone
 
 | Category | Capabilities |
 |---|---|
-| **Honeypots** | SSH + Telnet (Cowrie/Docker), HTTP/HTTPS, SMTP (real STARTTLS), FTP, DNS, RDP (X.224 + MCS fingerprinting), VNC, Redis, MySQL, Elasticsearch. Persona system randomises server identity per deploy to resist fingerprinting. |
+| **Honeypots** | SSH + Telnet (Cowrie/Docker), HTTP/HTTPS, SMTP (real STARTTLS), FTP, DNS, RDP (X.224 + MCS fingerprinting), VNC, Redis (stateful — captures the full RCE dropper chain), MySQL, Elasticsearch, SMB (EternalBlue/DoublePulsar detection), PostgreSQL (credential capture), MongoDB (ransom-note detection). Persona system randomises server identity per deploy to resist fingerprinting. |
 | **Honeytokens** | Fake AWS keys, canary URLs, credential pairs (auto-matched on honeypot logins), PDF/DOCX file tokens, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks, Azure/GCP cloud credentials |
 | **Detection pipeline** | Batched async event ingestion → suppression rules (CIDR/glob + rate limit) → honeytoken cross-reference (auto-escalates to CRITICAL) → auto-enrichment of CRITICAL alerts (VT + AbuseIPDB + GeoIP, TTL-cached) |
 | **Analysis** | MITRE ATT&CK mapping, attacker profiling, SSH session reconstruction, cross-honeypot kill-chain timeline, campaign correlation, XSS-safe HTML/Markdown reports |
@@ -116,7 +116,7 @@ Expected: deploy returns `{status: "running"}` and the self-test reports `alert_
 ### Honeypots
 | Tool | Description |
 |---|---|
-| `honeypot_deploy` | Deploy (ssh, http, smtp, ftp, dns, rdp, vnc, redis, mysql, elasticsearch) |
+| `honeypot_deploy` | Deploy (ssh, http, smtp, ftp, dns, rdp, vnc, redis, mysql, elasticsearch, smb, postgresql, mongodb) |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
 | `honeypot_stop` / `honeypot_pause` / `honeypot_resume` | Lifecycle control |
 | `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |

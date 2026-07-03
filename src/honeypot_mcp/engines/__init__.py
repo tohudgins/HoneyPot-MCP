@@ -50,6 +50,18 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.elasticsearch import ElasticsearchEngine
 
             _engines[hp_type] = ElasticsearchEngine()
+        elif hp_type == HoneypotType.SMB:
+            from honeypot_mcp.engines.smb import SMBEngine
+
+            _engines[hp_type] = SMBEngine()
+        elif hp_type == HoneypotType.POSTGRESQL:
+            from honeypot_mcp.engines.postgresql import PostgreSQLEngine
+
+            _engines[hp_type] = PostgreSQLEngine()
+        elif hp_type == HoneypotType.MONGODB:
+            from honeypot_mcp.engines.mongodb import MongoDBEngine
+
+            _engines[hp_type] = MongoDBEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

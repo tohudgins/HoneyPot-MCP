@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     default_redis_port: int = 6379
     default_mysql_port: int = 3306
     default_elasticsearch_port: int = 9200
+    default_smb_port: int = 445
+    default_postgresql_port: int = 5432
+    default_mongodb_port: int = 27017
 
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"
