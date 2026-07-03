@@ -22,8 +22,14 @@ async def generate(
     stats: dict[str, Any],
     target_ip: str | None,
     format: str = "html",
+    intel: dict[str, Any] | None = None,
 ) -> str:
-    """Generate an attack report from alert data."""
+    """Generate an attack report from alert data.
+
+    `intel` is an optional enrichment block (geo/ASN/reverse-DNS + VT/AbuseIPDB
+    reputation + risk score + recommendations) for an IP-scoped report. When
+    present, an "IP Intelligence" section is rendered so the report carries the
+    context a SOC analyst needs to action it, not just raw event counts."""
     from honeypot_mcp.intel.mitre import map_to_attack
 
     event_terms = [a.event_type for a in alerts]
@@ -61,11 +67,40 @@ async def generate(
         "severity_counts": dict(sev_counts),
         "ttps": ttps,
         "timeline": timeline,
+        "intel": _flatten_intel(intel) if intel else None,
     }
 
     if format == "html":
         return _render_html(context)
     return _render_markdown(context)
+
+
+def _flatten_intel(intel: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a `build_profile()` block into the flat fields the report
+    templates render. The profiler's vt/abuse sub-blocks omit an `available`
+    flag when they carry data, so presence is detected by content."""
+    geo = intel.get("geoip") or {}
+    vt = intel.get("virustotal") or {}
+    abuse = intel.get("abuseipdb") or {}
+    loc = ", ".join(p for p in (geo.get("city"), geo.get("country")) if p)
+    asn = geo.get("asn")
+    asn_str = f"AS{asn} {geo.get('as_org', '')}".strip() if asn else ""
+    vt_has_data = "detection_ratio" in vt
+    abuse_has_data = "abuse_confidence_score" in abuse
+    return {
+        "risk_score": intel.get("risk_score"),
+        "risk_level": intel.get("risk_level"),
+        "location": loc,
+        "asn": asn_str,
+        "reverse_dns": geo.get("reverse_dns"),
+        "vt_detection_ratio": vt.get("detection_ratio") if vt_has_data else None,
+        "vt_reputation": vt.get("reputation") if vt_has_data else None,
+        "abuse_score": abuse.get("abuse_confidence_score") if abuse_has_data else None,
+        "abuse_reports": abuse.get("total_reports") if abuse_has_data else None,
+        "isp": abuse.get("isp") or geo.get("as_org") or "",
+        "usage_type": abuse.get("usage_type", ""),
+        "recommendations": intel.get("recommendations", []),
+    }
 
 
 _HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -104,6 +139,23 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="stat-card"><div class="num">{{ severity_counts.get('critical', 0) }}</div>Critical Events</div>
   <div class="stat-card"><div class="num">{{ ttps|length }}</div>MITRE Techniques</div>
 </div>
+
+{% if intel %}
+<h2>IP Intelligence</h2>
+<table>
+  {% if intel.risk_level %}<tr><th>Risk</th><td><span class="badge {{ (intel.risk_level|lower) if intel.risk_level in ['CRITICAL','HIGH','MEDIUM','LOW'] else 'low' }}">{{ intel.risk_level }}</span> &nbsp; {{ intel.risk_score }}/100</td></tr>{% endif %}
+  {% if intel.location %}<tr><th>Location</th><td>{{ intel.location }}</td></tr>{% endif %}
+  {% if intel.asn %}<tr><th>Network (ASN)</th><td>{{ intel.asn }}</td></tr>{% endif %}
+  {% if intel.reverse_dns %}<tr><th>Reverse DNS</th><td><code>{{ intel.reverse_dns }}</code></td></tr>{% endif %}
+  {% if intel.isp %}<tr><th>ISP / Org</th><td>{{ intel.isp }}{% if intel.usage_type %} ({{ intel.usage_type }}){% endif %}</td></tr>{% endif %}
+  {% if intel.vt_detection_ratio %}<tr><th>VirusTotal</th><td>{{ intel.vt_detection_ratio }} engines flag malicious (reputation {{ intel.vt_reputation }})</td></tr>{% endif %}
+  {% if intel.abuse_score is not none %}<tr><th>AbuseIPDB</th><td>{{ intel.abuse_score }}% confidence, {{ intel.abuse_reports }} reports</td></tr>{% endif %}
+</table>
+{% if intel.recommendations %}
+<h3>Recommended actions</h3>
+<ul>{% for r in intel.recommendations %}<li>{{ r }}</li>{% endfor %}</ul>
+{% endif %}
+{% endif %}
 
 <h2>MITRE ATT&amp;CK Techniques Observed</h2>
 {% if ttps %}
@@ -159,6 +211,34 @@ def _md_cell(value: Any) -> str:
     return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
+def _render_intel_md(intel: dict[str, Any] | None) -> str:
+    if not intel:
+        return ""
+    rows = []
+    if intel.get("risk_level"):
+        rows.append(f"| Risk | **{_md_cell(intel['risk_level'])}** ({intel.get('risk_score')}/100) |")
+    if intel.get("location"):
+        rows.append(f"| Location | {_md_cell(intel['location'])} |")
+    if intel.get("asn"):
+        rows.append(f"| Network (ASN) | {_md_cell(intel['asn'])} |")
+    if intel.get("reverse_dns"):
+        rows.append(f"| Reverse DNS | `{_md_cell(intel['reverse_dns'])}` |")
+    if intel.get("isp"):
+        usage = f" ({_md_cell(intel['usage_type'])})" if intel.get("usage_type") else ""
+        rows.append(f"| ISP / Org | {_md_cell(intel['isp'])}{usage} |")
+    if intel.get("vt_detection_ratio"):
+        rows.append(f"| VirusTotal | {_md_cell(intel['vt_detection_ratio'])} malicious (rep {intel.get('vt_reputation')}) |")
+    if intel.get("abuse_score") is not None:
+        rows.append(f"| AbuseIPDB | {intel['abuse_score']}% confidence, {intel.get('abuse_reports')} reports |")
+    if not rows:
+        return ""
+    table = "\n## IP Intelligence\n\n| Field | Value |\n|---|---|\n" + "\n".join(rows) + "\n"
+    recs = intel.get("recommendations") or []
+    if recs:
+        table += "\n**Recommended actions:**\n\n" + "\n".join(f"- {_md_cell(r)}" for r in recs) + "\n"
+    return table
+
+
 def _render_markdown(ctx: dict) -> str:
     ttps_md = "\n".join(
         f"| [{_md_cell(t['technique_id'])}]({t['url']}) | {_md_cell(t['technique_name'])} | {_md_cell(t['tactic'])} |"
@@ -177,7 +257,7 @@ def _render_markdown(ctx: dict) -> str:
 
 **Generated:** {ctx["generated_at"]}
 {target_line}
-
+{_render_intel_md(ctx.get("intel"))}
 ## Summary
 
 | Metric | Value |

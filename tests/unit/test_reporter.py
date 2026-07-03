@@ -64,3 +64,75 @@ async def test_html_report_with_no_alerts_renders():
     html = await generate(title="Empty Report", alerts=[], stats={}, target_ip=None, format="html")
     assert "Empty Report" in html
     assert "Total Alerts" in html
+
+
+@pytest.mark.asyncio
+async def test_report_renders_ip_intelligence_section():
+    """An IP-scoped report with an intel block must surface geo/ASN/reputation/
+    risk and recommendations in both HTML and Markdown."""
+    intel = {
+        "risk_score": 82,
+        "risk_level": "CRITICAL",
+        "geoip": {
+            "available": True,
+            "country": "Germany",
+            "city": "Nuremberg",
+            "asn": 24940,
+            "as_org": "Hetzner Online GmbH",
+            "reverse_dns": "static.example.your-server.de",
+        },
+        "virustotal": {"reputation": -34, "malicious_votes": 8, "detection_ratio": "8/89"},
+        "abuseipdb": {
+            "abuse_confidence_score": 100,
+            "total_reports": 421,
+            "isp": "Hetzner Online GmbH",
+            "usage_type": "Data Center/Web Hosting/Transit",
+        },
+        "recommendations": ["Block this IP at the perimeter firewall immediately."],
+    }
+    alerts = [_alert("1.2.3.4", "ssh_login_failed")]
+    for fmt in ("html", "markdown"):
+        out = await generate(
+            title="Attacker 1.2.3.4",
+            alerts=alerts,
+            stats={},
+            target_ip="1.2.3.4",
+            format=fmt,
+            intel=intel,
+        )
+        assert "IP Intelligence" in out
+        assert "AS24940" in out
+        assert "Hetzner" in out
+        assert "8/89" in out
+        assert "100" in out  # abuse confidence
+        assert "static.example.your-server.de" in out
+        assert "Block this IP at the perimeter" in out
+
+
+@pytest.mark.asyncio
+async def test_report_without_intel_has_no_intel_section():
+    """Reports with no intel block (unscoped, or enrichment unavailable) must
+    not render an empty IP Intelligence section."""
+    alerts = [_alert("1.2.3.4", "ssh_login_failed")]
+    html = await generate(title="T", alerts=alerts, stats={}, target_ip=None, format="html")
+    assert "IP Intelligence" not in html
+
+
+@pytest.mark.asyncio
+async def test_report_intel_reverse_dns_is_escaped():
+    """Reverse-DNS is attacker-influenced (they can set their own PTR), so it
+    must be escaped in HTML like every other untrusted field."""
+    intel = {
+        "risk_score": 10,
+        "risk_level": "LOW",
+        "geoip": {"available": True, "reverse_dns": "<script>alert(1)</script>.evil"},
+        "virustotal": {"available": False},
+        "abuseipdb": {"available": False},
+        "recommendations": [],
+    }
+    html = await generate(
+        title="T", alerts=[_alert("1.2.3.4", "x")], stats={}, target_ip="1.2.3.4",
+        format="html", intel=intel,
+    )
+    assert "<script>alert(1)" not in html
+    assert "&lt;script&gt;alert(1)" in html

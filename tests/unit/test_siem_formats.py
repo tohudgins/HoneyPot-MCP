@@ -659,3 +659,65 @@ async def test_webhook_delivery_records_format_in_subscriptions_list():
     by_label = {s["label"]: s for s in out}
     assert by_label["json-sub"]["format"] == "json"
     assert by_label["cef-sub"]["format"] == "cef"
+
+
+def _enriched_event() -> Any:
+    """An event carrying auto-enrichment + new-engine capture data, exactly as
+    a CRITICAL alert would after the buffer merges enrichment into payload."""
+    from honeypot_mcp.storage.event_buffer import PendingEvent
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    return PendingEvent(
+        honeypot_id=7,
+        source_ip="203.0.113.7",
+        source_port=443,
+        event_type="redis_rce_dropper",
+        payload={
+            "target_path": "/root/.ssh/authorized_keys",
+            "planted_keys": [{"key": "crackit", "payload_kind": "ssh_authorized_key"}],
+            "enrichment": {
+                "geoip": {"country": "Germany", "asn": 24940, "as_org": "Hetzner",
+                          "reverse_dns": "static.example.your-server.de"},
+                "abuseipdb": {"abuse_confidence_score": 100},
+            },
+        },
+        severity=AlertSeverity.CRITICAL,
+        timestamp=datetime(2026, 5, 20, 12, 0, 0, tzinfo=UTC),
+    )
+
+
+def test_enrichment_and_capture_survive_json_renderer():
+    import json
+
+    from honeypot_mcp.webhooks import render_json
+
+    body, _ = render_json(_enriched_event(), _make_sub(fmt="json"))
+    doc = json.loads(body)
+    assert doc["event_type"] == "redis_rce_dropper"
+    assert doc["payload"]["target_path"] == "/root/.ssh/authorized_keys"
+    # Enrichment (ASN, reputation, reverse DNS) rides along in the payload.
+    assert doc["payload"]["enrichment"]["geoip"]["asn"] == 24940
+    assert doc["payload"]["enrichment"]["abuseipdb"]["abuse_confidence_score"] == 100
+
+
+def test_enrichment_survives_ecs_event_original():
+    import json
+
+    from honeypot_mcp.webhooks import render_elastic_ecs
+
+    body, _ = render_elastic_ecs(_enriched_event(), _make_sub(fmt="elastic_ecs"))
+    doc = json.loads(body)
+    # ECS stashes the full native payload (incl. enrichment) under event.original.
+    original = json.loads(doc["event.original"])
+    assert original["payload"]["enrichment"]["geoip"]["as_org"] == "Hetzner"
+    assert doc["event"]["action"] == "redis_rce_dropper"
+
+
+def test_capture_survives_cef_payload_field():
+    from honeypot_mcp.webhooks import render_cef
+
+    body, _ = render_cef(_enriched_event(), _make_sub(fmt="cef"))
+    text = body.decode()
+    # CEF stows the payload JSON in cs4 — the target path must be present.
+    assert "authorized_keys" in text
+    assert "redis_rce_dropper" in text

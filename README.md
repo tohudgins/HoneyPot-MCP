@@ -32,7 +32,7 @@ A Model Context Protocol server that lets Claude (or any MCP client) deploy hone
 | **Operations** | Health watchdog (CRITICAL alert on honeypot death), end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboard stack |
 | **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest endpoint + ready-to-deploy CloudTrail/Azure/GCP audit-log forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
-257 unit tests cover the security-critical paths; strict mypy passes.
+278 unit tests cover the security-critical paths; strict mypy passes.
 
 ---
 
@@ -257,7 +257,7 @@ Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), poin
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v          # 257 tests
+uv run pytest tests/unit/ -v          # 278 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

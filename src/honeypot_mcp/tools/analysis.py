@@ -180,6 +180,30 @@ async def generate_report(
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=limit, source_ip=ip)
         stats = await queries.get_alert_stats(session)
+        events = await queries.get_events_for_ip(session, ip) if ip else []
+
+    # For an IP-scoped report, attach the full intelligence picture (geo/ASN/
+    # reverse-DNS + VT/AbuseIPDB reputation + risk score + recommendations) so
+    # the report is actionable, not just a count of events.
+    intel: dict[str, Any] | None = None
+    if ip:
+        import asyncio
+
+        from honeypot_mcp.analysis.profiler import build_profile
+        from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
+        from honeypot_mcp.intel.geoip import lookup_geoip
+        from honeypot_mcp.intel.virustotal import lookup_virustotal
+
+        results: list[Any] = await asyncio.gather(
+            lookup_geoip(ip),
+            lookup_virustotal(ip),
+            lookup_abuseipdb(ip),
+            return_exceptions=True,
+        )
+        geo, vt, abuse = (r if not isinstance(r, Exception) else {} for r in results)
+        intel = await build_profile(
+            ip=ip, alerts=alerts, events=events, geoip=geo, vt=vt, abuse=abuse
+        )
 
     return await generate(
         title=title,
@@ -187,6 +211,7 @@ async def generate_report(
         stats=stats,
         target_ip=ip,
         format=format,
+        intel=intel,
     )
 
 
