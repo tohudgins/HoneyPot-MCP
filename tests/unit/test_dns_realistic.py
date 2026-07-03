@@ -114,3 +114,51 @@ def test_soa_query_returns_soa_record():
     answers = list(reply.rr)
     assert len(answers) == 1
     assert dnslib.QTYPE[answers[0].rtype] == "SOA"
+
+
+# ── Recon / exfil classification ─────────────────────────────────────────────
+
+
+def test_dns_classifies_zone_transfer_high():
+    from honeypot_mcp.engines.dns import _classify_dns_query
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    et, sev = _classify_dns_query("corp.test", "AXFR", "IN")
+    assert et == "dns_zone_transfer"
+    assert sev == AlertSeverity.HIGH
+
+
+def test_dns_classifies_version_bind_probe():
+    from honeypot_mcp.engines.dns import _classify_dns_query
+
+    # By CHAOS class...
+    assert _classify_dns_query("anything", "TXT", "CH")[0] == "dns_version_probe"
+    # ...or by the well-known name.
+    assert _classify_dns_query("version.bind", "TXT", "IN")[0] == "dns_version_probe"
+
+
+def test_dns_classifies_any_query():
+    from honeypot_mcp.engines.dns import _classify_dns_query
+
+    assert _classify_dns_query("example.test", "ANY", "IN")[0] == "dns_any_query"
+
+
+def test_dns_detects_tunneling_but_not_normal_names():
+    from honeypot_mcp.engines.dns import _classify_dns_query, _looks_like_tunneling
+
+    # Long encoded label = tunneling.
+    tunnel = "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43UOV3HO6DZPIFAKEEXFILDATAABCDEF.evil.test"
+    assert _looks_like_tunneling(tunnel)
+    assert _classify_dns_query(tunnel, "A", "IN")[0] == "dns_tunneling_suspected"
+    # Normal FQDN and the 32-char file-token label must NOT trip it.
+    assert not _looks_like_tunneling("www.example.com")
+    assert not _looks_like_tunneling("a" * 32 + ".canary.test")
+
+
+def test_dns_normal_query_is_low():
+    from honeypot_mcp.engines.dns import _classify_dns_query
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    et, sev = _classify_dns_query("www.example.com", "A", "IN")
+    assert et == "dns_query"
+    assert sev == AlertSeverity.LOW

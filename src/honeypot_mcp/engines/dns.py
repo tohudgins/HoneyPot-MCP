@@ -6,12 +6,23 @@ zone (which is what a wildcard / catch-all real DNS server does), rather
 than uniform NXDOMAIN that signals "honeypot or misconfigured zone" on
 the first probe.
 
+Beyond logging, each query is classified (`_classify_dns_query`) for the
+recon/exfil shapes that make a DNS honeypot worth deploying:
+* `dns_zone_transfer` (HIGH) — AXFR/IXFR full-zone dump attempts.
+* `dns_version_probe` (MEDIUM) — CHAOS-class `version.bind` / `id.server`
+  server fingerprinting.
+* `dns_any_query` (MEDIUM) — ANY queries (amplification reflectors, recon).
+* `dns_tunneling_suspected` (HIGH) — unusually long / high-entropy labels,
+  the signature of base32/base64/hex-encoded data exfil over DNS.
+A file-token canary hit still overrides these with CRITICAL.
+
 Unknown types and parse failures still fall through to NXDOMAIN.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import secrets
@@ -24,6 +35,35 @@ from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
+
+
+def _looks_like_tunneling(qname: str) -> bool:
+    """Heuristic for DNS tunneling / exfiltration: encoded data chunked into
+    labels produces unusually long, high-entropy labels (base32/base64/hex).
+    Normal domain labels are short dictionary-ish words. Thresholds are
+    conservative so ordinary FQDNs and the 32-char file-token label don't trip."""
+    if len(qname) >= 100:
+        return True
+    # A label near the 63-char ceiling is an encoded data chunk, not a word.
+    return any(len(label) >= 45 for label in qname.split("."))
+
+
+def _classify_dns_query(qname: str, qtype: str, qclass: str) -> tuple[str, AlertSeverity]:
+    """Beyond a plain lookup, recognise the recon/exfil query shapes that make
+    a DNS honeypot worth deploying."""
+    low = qname.lower()
+    if qtype in ("AXFR", "IXFR"):
+        # Full-zone dump attempt — a real misconfig leaks every record.
+        return "dns_zone_transfer", AlertSeverity.HIGH
+    if qclass == "CH" or low in ("version.bind", "version.server", "hostname.bind", "id.server"):
+        # CHAOS-class server fingerprinting.
+        return "dns_version_probe", AlertSeverity.MEDIUM
+    if qtype == "ANY":
+        # Amplification-DDoS reflectors and recon tools favour ANY.
+        return "dns_any_query", AlertSeverity.MEDIUM
+    if _looks_like_tunneling(qname):
+        return "dns_tunneling_suspected", AlertSeverity.HIGH
+    return "dns_query", AlertSeverity.LOW
 
 
 class _DNSProtocol(asyncio.DatagramProtocol):
@@ -40,17 +80,20 @@ class _DNSProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         src_ip, src_port = addr
         request = None
+        qclass = "IN"
         try:
             import dnslib
 
             request = dnslib.DNSRecord.parse(data)
             qname = str(request.q.qname).rstrip(".")
             qtype = dnslib.QTYPE[request.q.qtype]
+            with contextlib.suppress(Exception):
+                qclass = dnslib.CLASS[request.q.qclass]
         except Exception:
             qname = data[:64].hex()
             qtype = "UNKNOWN"
 
-        asyncio.create_task(self._record(src_ip, src_port, qname, qtype))
+        asyncio.create_task(self._record(src_ip, src_port, qname, qtype, qclass))
 
         # Return a believable response for common query types — uniform
         # NXDOMAIN against any A query is itself a fingerprint (real
@@ -72,10 +115,13 @@ class _DNSProtocol(asyncio.DatagramProtocol):
             except Exception:
                 pass
 
-    async def _record(self, src_ip: str, src_port: int, qname: str, qtype: str) -> None:
-        severity = AlertSeverity.LOW
-        event_type = "dns_query"
-        payload: dict = {"qname": qname, "qtype": qtype}
+    async def _record(
+        self, src_ip: str, src_port: int, qname: str, qtype: str, qclass: str = "IN"
+    ) -> None:
+        # Classify recon/exfil shape first (version probe, ANY, zone transfer,
+        # tunneling). A canary-token match below overrides with CRITICAL.
+        event_type, severity = _classify_dns_query(qname, qtype, qclass)
+        payload: dict = {"qname": qname, "qtype": qtype, "qclass": qclass}
         matched_token_id: int | None = None
 
         # File honeytokens use a 32-char UUID hex as a subdomain label.
