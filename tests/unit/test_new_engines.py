@@ -1,8 +1,9 @@
-"""High-value capture tests for the SMB / PostgreSQL / MongoDB honeypots.
+"""High-value capture tests for the SMB / PostgreSQL / MongoDB / MSSQL honeypots.
 
 Beyond the generic self-test (probe → alert), these exercise the attack
 scenarios that make each engine worth deploying: EternalBlue/DoublePulsar
-detection, credential capture, and Mongo ransom-note detection.
+detection, credential capture (incl. TDS password de-obfuscation), Postgres
+COPY-FROM-PROGRAM RCE, and Mongo ransom-note detection.
 """
 
 import asyncio
@@ -246,6 +247,90 @@ async def test_mongodb_answers_ismaster():
             resp = await asyncio.wait_for(reader.read(512), timeout=3.0)
             # The reply BSON should contain the "ismaster" field name.
             assert b"ismaster" in resp
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+    finally:
+        await engine.stop(cid)
+
+
+# ── MSSQL ─────────────────────────────────────────────────────────────────────
+
+
+def _tds_encode_password(password: str) -> bytes:
+    """Client-side TDS password obfuscation: swap nibbles then XOR 0xA5, over
+    the UTF-16LE bytes."""
+    out = bytearray()
+    for b in password.encode("utf-16-le"):
+        swapped = ((b & 0x0F) << 4) | ((b & 0xF0) >> 4)
+        out.append(swapped ^ 0xA5)
+    return bytes(out)
+
+
+@pytest.mark.asyncio
+async def test_mssql_captures_and_deobfuscates_credentials():
+    """A TDS Login7 must yield the UTF-16LE username and the de-obfuscated
+    password, with service=mssql."""
+    from honeypot_mcp.engines.mssql import MSSQLEngine, _tds_packet
+    from honeypot_mcp.storage.models import HoneypotType
+
+    port = await _register("mssql-cred", HoneypotType.MSSQL)
+    engine = MSSQLEngine()
+    cid = await engine.start("mssql-cred", port, {})
+    try:
+        user = "sa"
+        password = "P@ssw0rd!"
+        user_u16 = user.encode("utf-16-le")
+        pw_enc = _tds_encode_password(password)
+
+        body = bytearray(72) + user_u16 + pw_enc  # fixed(36)+table(36)+data
+        struct.pack_into("<HH", body, 40, 72, len(user))  # UserName ib/cch
+        struct.pack_into("<HH", body, 44, 72 + len(user_u16), len(password))  # Password
+        struct.pack_into("<I", body, 0, len(body))  # Length
+        packet = _tds_packet(0x10, bytes(body))  # 0x10 = LOGIN7
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(packet)
+            await writer.drain()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(reader.read(256), timeout=2.0)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        await asyncio.sleep(1.2)
+    finally:
+        await engine.stop(cid)
+
+    events = await _alerts_of_type("mssql_login_attempt")
+    assert len(events) == 1
+    p = events[0].payload
+    assert p["username"] == "sa"
+    assert p["password"] == "P@ssw0rd!"
+    assert p["service"] == "mssql"
+
+
+@pytest.mark.asyncio
+async def test_mssql_prelogin_declines_encryption():
+    """The PRELOGIN response must advertise ENCRYPT_NOT_SUP (0x02) so the client
+    sends Login7 in the clear."""
+    from honeypot_mcp.engines.mssql import MSSQLEngine, _tds_packet
+    from honeypot_mcp.storage.models import HoneypotType
+
+    port = await _register("mssql-pre", HoneypotType.MSSQL)
+    engine = MSSQLEngine()
+    cid = await engine.start("mssql-pre", port, {})
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(_tds_packet(0x12, b"\xff"))  # 0x12 = PRELOGIN
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.read(256), timeout=2.0)
+            assert resp[0] == 0x04  # TDS response packet
+            # ENCRYPT_NOT_SUP (0x02) must appear in the option data.
+            assert b"\x02" in resp[8:]
         finally:
             writer.close()
             with contextlib.suppress(Exception):

@@ -62,6 +62,10 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.mongodb import MongoDBEngine
 
             _engines[hp_type] = MongoDBEngine()
+        elif hp_type == HoneypotType.MSSQL:
+            from honeypot_mcp.engines.mssql import MSSQLEngine
+
+            _engines[hp_type] = MSSQLEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

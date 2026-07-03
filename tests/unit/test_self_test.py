@@ -138,6 +138,7 @@ def _free_port() -> int:
         ("honeypot_mcp.engines.smb", "SMBEngine", "SMB"),
         ("honeypot_mcp.engines.postgresql", "PostgreSQLEngine", "POSTGRESQL"),
         ("honeypot_mcp.engines.mongodb", "MongoDBEngine", "MONGODB"),
+        ("honeypot_mcp.engines.mssql", "MSSQLEngine", "MSSQL"),
     ],
 )
 @pytest.mark.asyncio

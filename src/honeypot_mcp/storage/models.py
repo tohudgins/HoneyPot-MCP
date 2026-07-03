@@ -28,6 +28,7 @@ class HoneypotType(str, enum.Enum):
     SMB = "smb"
     POSTGRESQL = "postgresql"
     MONGODB = "mongodb"
+    MSSQL = "mssql"
 
 
 class HoneypotStatus(str, enum.Enum):

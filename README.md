@@ -6,7 +6,7 @@
 
 A Model Context Protocol server that lets Claude (or any MCP client) deploy honeypots, plant honeytokens, monitor alerts, and analyse attacker behaviour — all through natural language. Built on [FastMCP](https://github.com/jlowin/fastmcp), async Python 3.11+.
 
-You ask in plain English; it deploys real honeypots (13 protocols), captures what attackers actually do, enriches each hit with threat intel, and ships the result to your SIEM or into a report.
+You ask in plain English; it deploys real honeypots (14 protocols), captures what attackers actually do, enriches each hit with threat intel, and ships the result to your SIEM or into a report.
 
 ```
 > Deploy an SSH honeypot on port 2222.
@@ -25,7 +25,7 @@ You ask in plain English; it deploys real honeypots (13 protocols), captures wha
 
 | Category | Capabilities |
 |---|---|
-| **Honeypots** | SSH + Telnet (Cowrie/Docker), HTTP/HTTPS, SMTP (real STARTTLS), FTP, DNS, RDP (X.224 + MCS fingerprinting), VNC, Redis (stateful — captures the full RCE dropper chain), MySQL, Elasticsearch, SMB (EternalBlue/DoublePulsar detection), PostgreSQL (credential capture), MongoDB (ransom-note detection). Persona system randomises server identity per deploy to resist fingerprinting. |
+| **Honeypots** | SSH + Telnet (Cowrie/Docker), HTTP/HTTPS (exploit-signature detection — Log4Shell, SQLi, traversal, webshell…), SMTP (real STARTTLS, AUTH capture, open-relay detection), FTP (captures uploaded malware), DNS (tunneling + recon detection), RDP (X.224 + MCS fingerprinting), VNC, Redis (stateful — captures the full RCE dropper chain), MySQL (post-auth query capture), Elasticsearch, SMB (EternalBlue/DoublePulsar), PostgreSQL (COPY-FROM-PROGRAM RCE), MongoDB (ransom-note detection), MSSQL (TDS credential capture). Persona system randomises server identity per deploy to resist fingerprinting. |
 | **Honeytokens** | Fake AWS keys, canary URLs, credential pairs (auto-matched on honeypot logins), PDF/DOCX file tokens, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks, Azure/GCP cloud credentials |
 | **Detection pipeline** | Batched async event ingestion → suppression rules (CIDR/glob + rate limit) → honeytoken cross-reference (auto-escalates to CRITICAL) → auto-enrichment of CRITICAL alerts (VT + AbuseIPDB + GeoIP, TTL-cached) |
 | **Analysis** | MITRE ATT&CK mapping, attacker profiling, SSH session reconstruction, cross-honeypot kill-chain timeline, campaign correlation, XSS-safe HTML/Markdown reports |
@@ -34,7 +34,7 @@ You ask in plain English; it deploys real honeypots (13 protocols), captures wha
 | **Operations** | Health watchdog (CRITICAL alert on honeypot death), end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboard stack |
 | **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest endpoint + ready-to-deploy CloudTrail/Azure/GCP audit-log forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
-279 unit tests cover the security-critical paths; strict mypy passes.
+291 unit tests cover the security-critical paths; strict mypy passes.
 
 ---
 
@@ -118,7 +118,7 @@ Expected: deploy returns `{status: "running"}` and the self-test reports `alert_
 ### Honeypots
 | Tool | Description |
 |---|---|
-| `honeypot_deploy` | Deploy (ssh, http, smtp, ftp, dns, rdp, vnc, redis, mysql, elasticsearch, smb, postgresql, mongodb) |
+| `honeypot_deploy` | Deploy (ssh, http, smtp, ftp, dns, rdp, vnc, redis, mysql, elasticsearch, smb, postgresql, mongodb, mssql) |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
 | `honeypot_stop` / `honeypot_pause` / `honeypot_resume` | Lifecycle control |
 | `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |
@@ -259,7 +259,7 @@ Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), poin
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v          # 279 tests
+uv run pytest tests/unit/ -v          # 291 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

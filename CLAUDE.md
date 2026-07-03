@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (279 unit tests covering security-critical paths)
+# Tests (291 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -250,6 +250,17 @@ attack surfaces. All in-process asyncio, same buffer path as the others.
   (dropDatabase) and `mongodb_ransom_note` (CRITICAL — bitcoin/recover language
   in an insert) with the note text. Replies `ok:1` so the ransom note lands.
   Nothing is persisted or dropped.
+- `engines/mssql.py` — tcp/1433 (TDS). Replies to PRELOGIN with `ENCRYPT_NOT_SUP`
+  so the client sends Login7 in the clear, then parses the Login7 variable-data
+  table to extract hostname/username/password/appname. The password is
+  de-obfuscated (`_decode_tds_password`: XOR 0xA5 + nibble-swap over UTF-16LE).
+  Emits `mssql_login_attempt` with `service="mssql"`; returns an 18456 ERROR
+  token and closes. No query/RPC phase.
+
+Post-auth query capture (like MySQL) also lives in `postgresql.py`: after the
+password is captured it ACCEPTS the login (AuthenticationOk + ParameterStatus +
+ReadyForQuery) and classifies simple-query traffic — `COPY … FROM/TO PROGRAM`
+(CRITICAL RCE), UDF loads, `pg_read_file`/`lo_export` (HIGH), recon (MEDIUM).
 
 ### HTTP realistic endpoints + sessions
 

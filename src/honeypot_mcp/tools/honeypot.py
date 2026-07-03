@@ -31,6 +31,7 @@ async def honeypot_deploy(
         "smb",
         "postgresql",
         "mongodb",
+        "mssql",
     ],
     port: int | None = None,
     name: str | None = None,
@@ -40,7 +41,7 @@ async def honeypot_deploy(
 
     Args:
         type: Protocol type — ssh, http, smtp, ftp, dns, rdp, vnc, redis,
-              mysql, elasticsearch, smb, postgresql, or mongodb.
+              mysql, elasticsearch, smb, postgresql, mongodb, or mssql.
         port: Host port to bind (defaults to the configured default for each type).
         name: Unique name for this honeypot (auto-generated if omitted).
         config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
@@ -62,6 +63,7 @@ async def honeypot_deploy(
         "smb": settings.default_smb_port,
         "postgresql": settings.default_postgresql_port,
         "mongodb": settings.default_mongodb_port,
+        "mssql": settings.default_mssql_port,
     }
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"
@@ -384,6 +386,12 @@ async def honeypot_templates() -> list[dict[str, Any]]:
             "default_port": 27017,
             "config_options": [],
         },
+        {
+            "type": "mssql",
+            "description": "Microsoft SQL Server honeypot: TDS pre-login + Login7 parsing captures the username and de-obfuscated password (plus hostname/app). A heavy brute-force + ransomware target.",
+            "default_port": 1433,
+            "config_options": [],
+        },
     ]
 
 
@@ -559,6 +567,8 @@ async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str, 
             return await _postgresql_probe(port, marker)
         if hp_type == "mongodb":
             return await _mongodb_probe(port, marker)
+        if hp_type == "mssql":
+            return await _mssql_probe(port, marker)
         return False, f"No self-test probe defined for honeypot type {hp_type}", marker
     except Exception as e:
         return False, f"Probe failed: {e}", marker
@@ -759,6 +769,33 @@ async def _elasticsearch_probe(port: int, marker: str) -> tuple[bool, str, str]:
             headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
         )
     return True, f"HTTP {resp.status_code}", marker
+
+
+async def _mssql_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send a minimal TDS Login7 with the marker as the username — lands in
+    payload['username']."""
+    import struct
+
+    from honeypot_mcp.engines.mssql import _TDS_LOGIN7, _tds_packet
+
+    marker_u16 = marker.encode("utf-16-le")
+    data_offset = 72  # right after the fixed header (36) + 9-entry table (36)
+    body = bytearray(72) + marker_u16
+    # UserName is table index 1 → offset 36 + 1*4 = 40. Store ib + cch (chars).
+    struct.pack_into("<HH", body, 40, data_offset, len(marker))
+    struct.pack_into("<I", body, 0, len(body))  # Length field
+    packet = _tds_packet(_TDS_LOGIN7, bytes(body))
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(packet)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "MSSQL Login7 sent", marker
 
 
 async def _smb_probe(port: int, marker: str) -> tuple[bool, str, str]:

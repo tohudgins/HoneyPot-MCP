@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     default_smb_port: int = 445
     default_postgresql_port: int = 5432
     default_mongodb_port: int = 27017
+    default_mssql_port: int = 1433
 
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"
