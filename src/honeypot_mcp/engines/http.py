@@ -118,6 +118,10 @@ _SEV_RANK = {
     AlertSeverity.CRITICAL: 3,
 }
 
+# Upper bound on the request surface fed to the exploit regexes, so a large
+# POST body can't turn every request into an oversized scan.
+_MAX_SCAN_SURFACE = 32_768
+
 
 def _classify_http_attack(surface: str) -> tuple[list[str], AlertSeverity | None]:
     """Scan the request surface for exploit signatures. Returns the matched
@@ -591,7 +595,12 @@ class HTTPEngine(HoneypotEngine):
             surface_parts.extend(f"{k}={v}" for k, v in post_data.items())
             if raw_body_scan:
                 surface_parts.append(raw_body_scan)
-            surface = " ".join(surface_parts)
+            # Bound the scanned surface: exploit strings (jndi, <?php, ../,
+            # UNION SELECT) are short and appear early, so scanning the first
+            # 32 KB catches them without letting a large POST turn each request
+            # into a big regex sweep. The full body is still captured verbatim
+            # in raw_body_b64 for forensics.
+            surface = " ".join(surface_parts)[:_MAX_SCAN_SURFACE]
             exploit_categories, exploit_sev = _classify_http_attack(
                 surface + " " + unquote(surface)
             )
