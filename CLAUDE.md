@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (291 unit tests covering security-critical paths)
+# Tests (297 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -369,6 +369,12 @@ SMTP, FTP, DNS engines run in-process as asyncio servers — no Docker.
 ### Settings
 
 `config.py` uses `pydantic-settings` (`BaseSettings`). Values come from `.env` (highest priority) then `config/settings.yaml`. Access via the `get_settings()` singleton.
+
+### MCP transport + control-plane auth
+
+`server.py:main()` dispatches on `mcp_transport`. `stdio` (default) is the per-chat subprocess Claude Desktop/Code spawn — inherently local, no auth. `http`/`sse`/`streamable-http` run a persistent networked daemon.
+
+The networked control plane can deploy honeypots and read all captured data, so it's **fail-closed**: `main()` calls `_networked_auth_error()` and refuses to start (`SystemExit`) if the transport isn't stdio and neither `mcp_auth_token` nor `mcp_allow_unauthenticated` is set. When `mcp_auth_token` is set, `_build_auth()` attaches FastMCP's `StaticTokenVerifier` (from `fastmcp.server.auth.providers.jwt`) at construction, so clients must send `Authorization: Bearer <token>` (401 otherwise). `_build_auth()` returns `None` for stdio, so the auth object never affects the local path or the test suite (which runs over in-memory stdio). `_networked_auth_error()` is a pure function for testability.
 
 ## Optional external dependencies
 

@@ -52,7 +52,7 @@ Fourteen protocols. SSH is Cowrie (industrial-grade); the rest are custom async 
 | **Operations** | Health watchdog, restart reconciliation, end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboards |
 | **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest + ready-to-deploy CloudTrail/Azure/GCP forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
-291 unit tests cover the security-critical paths; strict mypy passes.
+297 unit tests cover the security-critical paths; strict mypy passes.
 
 ---
 
@@ -87,7 +87,7 @@ uv run python -m honeypot_mcp.server   # or just: honeypot-mcp
 Two modes, and the difference matters:
 
 - **Local (stdio)** — Claude Desktop/Code spawn the server per chat. Simplest for trying it out, but the server (and any honeypot you deploy) lives only as long as the chat. Use this for local testing.
-- **Persistent daemon (HTTP)** — the server runs 24/7 (e.g. via systemd on a VPS) and your MCP client connects over the network. **This is the mode for real deployments**, because honeypots run inside the server process and must outlive any single chat. See [docs/DEPLOY.md](docs/DEPLOY.md) for the full VPS walkthrough (systemd unit, SSH-tunneled control port, observability stack).
+- **Persistent daemon (HTTP)** — the server runs 24/7 (e.g. via systemd on a VPS) and your MCP client connects over the network with a bearer token (`MCP_AUTH_TOKEN`, required — the daemon refuses to start unauthenticated). **This is the mode for real deployments**, because honeypots run inside the server process and must outlive any single chat. See [docs/DEPLOY.md](docs/DEPLOY.md) for the full VPS walkthrough (systemd unit, token auth, SSH-tunneled control port, observability stack).
 
 The rest of this section covers local stdio setup.
 
@@ -277,7 +277,7 @@ Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), poin
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v          # 291 tests
+uv run pytest tests/unit/ -v          # 297 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

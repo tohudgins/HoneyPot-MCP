@@ -255,3 +255,64 @@ async def test_metrics_endpoint_counts_alerts_by_severity():
     body = r.text
     assert 'honeypot_alerts_total{severity="high"} 2' in body
     assert 'honeypot_alerts_total{severity="critical"} 1' in body
+
+
+# ── MCP control-plane authentication ─────────────────────────────────────────
+
+
+def _settings_ns(transport, token="", allow=False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mcp_transport=transport,
+        mcp_auth_token=token,
+        mcp_allow_unauthenticated=allow,
+    )
+
+
+def test_stdio_never_requires_auth():
+    from honeypot_mcp.server import _networked_auth_error
+
+    assert _networked_auth_error(_settings_ns("stdio")) is None
+
+
+def test_networked_without_token_is_refused():
+    from honeypot_mcp.server import _networked_auth_error
+
+    err = _networked_auth_error(_settings_ns("http"))
+    assert err is not None
+    assert "MCP_AUTH_TOKEN" in err
+
+
+def test_networked_with_token_is_allowed():
+    from honeypot_mcp.server import _networked_auth_error
+
+    assert _networked_auth_error(_settings_ns("http", token="s3cret")) is None
+
+
+def test_networked_unauthenticated_override_is_allowed():
+    from honeypot_mcp.server import _networked_auth_error
+
+    assert _networked_auth_error(_settings_ns("http", allow=True)) is None
+
+
+def test_build_auth_none_for_stdio():
+    from honeypot_mcp.server import _build_auth
+
+    # Default transport is stdio → no auth provider.
+    assert _build_auth() is None
+
+
+def test_build_auth_verifier_for_networked_token(monkeypatch):
+    from honeypot_mcp import config
+    from honeypot_mcp.server import _build_auth
+
+    monkeypatch.setenv("MCP_TRANSPORT", "http")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "abc123")
+    monkeypatch.setattr(config, "_settings", None)  # force re-read
+    try:
+        auth = _build_auth()
+        assert auth is not None
+        assert type(auth).__name__ == "StaticTokenVerifier"
+    finally:
+        monkeypatch.setattr(config, "_settings", None)  # don't leak to other tests

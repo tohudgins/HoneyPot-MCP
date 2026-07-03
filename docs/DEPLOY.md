@@ -121,6 +121,10 @@ Open `.env` and set:
 MCP_TRANSPORT=http
 MCP_HOST=0.0.0.0          # so your MCP client can reach it over the network
 MCP_PORT=8000
+# REQUIRED for http/sse — the daemon refuses to start without it. Clients must
+# present it as `Authorization: Bearer <token>`. Generate a fresh one:
+#   openssl rand -hex 32
+MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>
 
 # REQUIRED for canary tokens to fire from the internet
 CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
@@ -138,10 +142,11 @@ If you want geographic data in alerts, register at
 download `GeoLite2-City.mmdb`, and place it at `config/GeoLite2-City.mmdb`.
 MaxMind's license forbids redistribution, so it's intentionally not in the repo.
 
-> **Secure the control-plane port.** `MCP_PORT` (8000) is an authenticated-by-
-> nothing management interface — anyone who can reach it can deploy honeypots.
-> Do **not** open it in the firewall. Reach it from your laptop over an SSH
-> tunnel instead (step 7), or bind it to `127.0.0.1` and tunnel in.
+> **Secure the control-plane port.** `MCP_PORT` (8000) can deploy honeypots and
+> read all captured data. It's now bearer-token authenticated (`MCP_AUTH_TOKEN`,
+> required — the daemon refuses to start without it), but treat the token as
+> defence-in-depth, not the only layer: still do **not** open 8000 in the
+> firewall. Reach it over an SSH tunnel (step 7) or bind it to `127.0.0.1`.
 
 ### 5. Run the server as a persistent daemon (2 min)
 
@@ -198,15 +203,19 @@ exposing it to the internet:
 ssh -p 2200 -N -L 8000:127.0.0.1:8000 honeypot@<vps-ip> &
 ```
 
-Then register the daemon with Claude Code as a networked MCP server:
+Then register the daemon with Claude Code as a networked MCP server, passing
+the bearer token you set in `MCP_AUTH_TOKEN`:
 
 ```bash
-claude mcp add --transport http honeypot-mcp http://127.0.0.1:8000/mcp
+claude mcp add --transport http honeypot-mcp http://127.0.0.1:8000/mcp \
+  --header "Authorization: Bearer <your-MCP_AUTH_TOKEN>"
 ```
 
 (Claude Desktop: add an `mcpServers` entry with `"url":
-"http://127.0.0.1:8000/mcp"` — a URL, not a spawn command.) Every deploy you
-make now lands in the daemon on the VPS and keeps running after you disconnect.
+"http://127.0.0.1:8000/mcp"` and a `"headers": {"Authorization": "Bearer
+<token>"}` — a URL, not a spawn command.) Without the token the server answers
+`401`. Every deploy you make now lands in the daemon on the VPS and keeps
+running after you disconnect.
 
 ### 8. Deploy honeypots and wire an alert channel (2 min)
 
@@ -340,7 +349,8 @@ non-fatal).
 | Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on consumer side | `alert_subscriptions_list` shows `last_error` |
 | Out of disk space | Alert payloads accumulating | Run `alerts_prune` more aggressively, or set up a cron job |
 | Host SSH down (locked out) | You forgot to move admin SSH off 22 before starting the honeypot | Use provider web console; edit `/etc/ssh/sshd_config`; restart sshd |
-| Client can't connect / tools don't appear | Daemon not running, or the SSH tunnel to port 8000 is down | `systemctl status honeypot-mcp`; re-open `ssh -L 8000:127.0.0.1:8000 …`; confirm `MCP_TRANSPORT=http` in `.env` |
+| Client can't connect / tools don't appear | Daemon not running, tunnel down, or wrong/missing bearer token (401) | `systemctl status honeypot-mcp`; re-open `ssh -L 8000:127.0.0.1:8000 …`; confirm the `Authorization: Bearer` header matches `MCP_AUTH_TOKEN` in `.env` |
+| Daemon exits immediately on start with an auth message | `MCP_TRANSPORT=http` but `MCP_AUTH_TOKEN` is unset (fail-closed) | Set `MCP_AUTH_TOKEN` (`openssl rand -hex 32`), or `MCP_ALLOW_UNAUTHENTICATED=true` if you front it with your own auth |
 | SSH honeypots won't deploy | Daemon's user isn't in the `docker` group | `sudo usermod -aG docker honeypot` then `systemctl restart honeypot-mcp` |
 | Daemon won't start / crashes on boot | Config or DB error | `journalctl -u honeypot-mcp -e` — the last lines show the traceback |
 | Honeypots vanished after a reboot | Expected — they're re-established on daemon start | `reconcile` runs on startup; confirm with `honeypot_list`. If any show ERROR, check `journalctl` |

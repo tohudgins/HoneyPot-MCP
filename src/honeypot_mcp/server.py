@@ -63,6 +63,25 @@ async def lifespan(app: FastMCP):
         await close_db()
 
 
+def _build_auth() -> Any:
+    """Build the auth provider for the control plane, or None.
+
+    stdio needs no auth (it's a local per-chat subprocess). A networked
+    transport authenticates clients with a static bearer token when
+    `mcp_auth_token` is set. The fail-closed check (refuse to run a networked
+    transport with no token) lives in `main()`, so importing this module — and
+    the test suite, which runs over in-memory stdio — never trips it.
+    """
+    settings = get_settings()
+    if settings.mcp_transport == "stdio" or not settings.mcp_auth_token:
+        return None
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+    return StaticTokenVerifier(
+        tokens={settings.mcp_auth_token: {"client_id": "honeypot-operator", "scopes": []}}
+    )
+
+
 mcp = FastMCP(
     name="HoneyPot MCP",
     instructions=(
@@ -72,6 +91,7 @@ mcp = FastMCP(
         "All operations are scoped to the local Docker environment by default."
     ),
     lifespan=lifespan,
+    auth=_build_auth(),
 )
 
 # ── Register tool modules ─────────────────────────────────────────────────────
@@ -167,6 +187,23 @@ async def resource_stats_dashboard() -> str:
     )
 
 
+def _networked_auth_error(settings: Any) -> str | None:
+    """Return a fail-closed error message if a networked control plane would be
+    exposed without authentication, else None. stdio needs no auth."""
+    if settings.mcp_transport == "stdio":
+        return None
+    if settings.mcp_auth_token or settings.mcp_allow_unauthenticated:
+        return None
+    return (
+        f"Refusing to start the '{settings.mcp_transport}' control plane without "
+        "authentication.\n"
+        "Set MCP_AUTH_TOKEN (generate one with `openssl rand -hex 32`) so clients must\n"
+        "present it as `Authorization: Bearer <token>`. If you intentionally front the\n"
+        "server with your own auth (reverse proxy / trusted SSH tunnel), set\n"
+        "MCP_ALLOW_UNAUTHENTICATED=true to override."
+    )
+
+
 def main() -> None:
     settings = get_settings()
     # Validated by Settings.validate_mcp_transport to one of these literals.
@@ -174,11 +211,26 @@ def main() -> None:
     if transport == "stdio":
         # Per-chat subprocess launched by Claude Desktop / Claude Code.
         mcp.run()
+        return
+
+    # Networked control plane can deploy honeypots and read all captured data,
+    # so refuse to expose it without authentication (fail-closed).
+    gate_error = _networked_auth_error(settings)
+    if gate_error is not None:
+        raise SystemExit(gate_error)
+    if not settings.mcp_auth_token:
+        log.warning(
+            "MCP control plane running WITHOUT authentication (MCP_ALLOW_UNAUTHENTICATED=true). "
+            "Ensure an external auth layer protects %s:%d.",
+            settings.mcp_host,
+            settings.mcp_port,
+        )
     else:
-        # Persistent networked server — the deployment mode for a public host,
-        # where honeypots must outlive any single client session. Clients
-        # connect to http://<mcp_host>:<mcp_port>/mcp.
-        mcp.run(transport=transport, host=settings.mcp_host, port=settings.mcp_port)
+        log.info("MCP control plane authentication enabled (bearer token).")
+
+    # Persistent networked server — clients connect to
+    # http://<mcp_host>:<mcp_port>/mcp with the bearer token.
+    mcp.run(transport=transport, host=settings.mcp_host, port=settings.mcp_port)
 
 
 if __name__ == "__main__":

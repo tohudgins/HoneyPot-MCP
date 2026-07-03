@@ -65,6 +65,20 @@ class Settings(BaseSettings):
     mcp_transport: str = "stdio"
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8000
+    # Bearer token that clients must present to the networked (http/sse) MCP
+    # control plane. The control plane can deploy honeypots and read all
+    # captured data, so on a networked transport it MUST be authenticated:
+    # if this is empty and the transport isn't stdio, the server refuses to
+    # start (fail-closed) unless `mcp_allow_unauthenticated` is set. stdio is
+    # inherently local (a per-chat subprocess) and needs no token.
+    # Generate one with `openssl rand -hex 32`. Clients send it as
+    # `Authorization: Bearer <token>`.
+    mcp_auth_token: str = ""
+    # Escape hatch: run a networked control plane without a token because you
+    # front it with your own auth (e.g. an authenticating reverse proxy or an
+    # SSH tunnel you fully trust). Off by default so an open control plane is
+    # never the accidental result of a missing token.
+    mcp_allow_unauthenticated: bool = False
 
     # Docker
     docker_socket: str = Field(default="", description="Docker socket URI")
