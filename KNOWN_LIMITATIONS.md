@@ -42,6 +42,21 @@ JA3/JA4-aware scanners something to fingerprint. Realistic `/robots.txt`,
 session cookies persist across a connection (a scanner that hits 5+ paths
 gets escalated to `http_active_recon`).
 
+**Database / service engines (custom asyncio).** PostgreSQL and MSSQL
+decline/deny encryption so the client falls back to cleartext, capturing
+full login credentials — both are cross-referenced against planted
+credential honeytokens. MySQL accepts the login and captures post-auth SQL
+(recon, `INTO OUTFILE` / UDF RCE attempts); PostgreSQL does the same for
+`COPY … FROM PROGRAM` and friends. Redis captures the complete unauth-RCE
+dropper chain including the attacker's SSH key and target path. MongoDB
+answers `isMaster`/`buildInfo` believably and flags `dropDatabase` and
+ransom notes. Elasticsearch classifies recon and data-exfil query patterns.
+SMB classifies EternalBlue / DoublePulsar exploit probes and captures NTLM
+session-setup strings. VNC captures the RFB auth challenge/response. All of
+these are detection-focused protocol facades, not real servers — they hold
+automated tools and scanners (the overwhelming majority of traffic), not a
+skilled human probing manually.
+
 **Canary URLs.** The aiohttp callback server on port 8888 is real. Hitting
 the URL triggers a CRITICAL alert with full request metadata. Set
 `CANARY_PUBLIC_URL` to a publicly reachable address (ngrok, Cloudflare Tunnel,
@@ -85,11 +100,14 @@ functional" below for the caveat.
 
 **Credential tokens.** The match-and-escalate pipeline (see above) only fires
 when the planted credentials hit one of *your own* honeypots — SSH, HTTP form
-POST, FTP login, SMTP AUTH. If an attacker tries the credentials against a
-real production system you have nothing visible there, there's no signal back
-to HoneyPot MCP. Worth it for trip-wire deception inside the honeypot stack;
-not a substitute for real credential canaries that hook into an identity
-provider's audit log.
+POST, FTP login, SMTP AUTH, PostgreSQL and MSSQL logins (both DB engines
+force cleartext auth precisely so the password is capturable). MySQL is the
+exception: the wire protocol sends a SHA1 scramble, never the plaintext, so
+planted creds can't be cross-referenced there. If an attacker tries the
+credentials against a real production system you have nothing visible there,
+there's no signal back to HoneyPot MCP. Worth it for trip-wire deception
+inside the honeypot stack; not a substitute for real credential canaries that
+hook into an identity provider's audit log.
 
 **SMTP / FTP engines.** They catch automated traffic — open-relay scanners,
 FTP credential brute force, port-scanner banner grabs. Post-fidelity-upgrade,
@@ -105,15 +123,19 @@ identify the SMTP engine because we don't implement a real mail queue or
 DSN delivery, and FTP because RETR / STOR still return 550. Comparable to
 OpenCanary fidelity, not a real Postfix or ProFTPD deployment.
 
-**RDP banner honeypot.** Parses the X.224 Connection Request (TPKT layer),
+**RDP honeypot.** Parses the X.224 Connection Request (TPKT layer) and
 extracts the leaked `Cookie: mstshash=user@DOMAIN` field that virtually
-every RDP scanner and brute-force tool sends in the clear, and returns a
-believable "NLA required" negotiation-failure response. RDP brute-force
-is one of the largest categories of public-internet attack traffic, so
-this catches real traffic immediately on a public IP. We do NOT implement
-the rest of the protocol stack (no MCS, no TLS post-handshake, no CredSSP),
-so the connection closes after the banner exchange — looks like a hardened
-server rejecting an insecure protocol negotiation.
+every RDP scanner and brute-force tool sends in the clear. When the client
+requests SSL or HYBRID/CredSSP (most modern clients and tools do), the
+engine upgrades the connection to TLS and parses the MCS Connect Initial
+PDU — capturing the attacker's `clientName`, `clientBuild`, keyboard
+layout, screen resolution, and requested encryption methods as an
+`rdp_mcs_handshake` event. RDP brute-force is one of the largest
+categories of public-internet attack traffic, so this catches real
+traffic immediately on a public IP. We do NOT implement the rest of the
+protocol stack (no MCS Connect Response, no channel join, no CredSSP), so
+the connection closes after the MCS capture — CredSSP would let us
+capture NTLM hashes but is a large implementation for marginal gain.
 
 ---
 
@@ -133,16 +155,21 @@ once the user clicks anywhere in the document. Treat PDF tokens as a
 high-confidence-but-not-guaranteed trigger — the canary URL token is still
 the most reliable wire for adversarial detection.
 
-**AWS API key tokens — no built-in detection.** The generated keys look real
-(correct AKIA/ASIA prefix, correct character set, correct length) and will sit
-plausibly in a `.env` file or `~/.aws/credentials`. **But there is no callback
-path.** Detection requires external infrastructure that HoneyPot MCP does not
-ship: either you register the key in your own AWS account and route CloudTrail
-`AccessDenied` / `ConsoleLogin` events into the MCP webhook, or you use
-[Thinkst's Canarytokens](https://canarytokens.org) (free) for AWS keys with
-the real detection backend. By itself, the generated key is a believable
-decoy and nothing more. The token's `plant_instructions` text now says this
-explicitly.
+**AWS / Azure / GCP key tokens — detection requires deploying a forwarder.**
+The generated keys look real (correct AKIA/ASIA prefix, correct character
+set, correct length) and will sit plausibly in a `.env` file or
+`~/.aws/credentials`. But the key alone has no callback path — detection
+only works if use of the key generates an audit-log event you route back to
+HoneyPot MCP. The operator-side glue for that now ships:
+`examples/cloud-forwarders/{aws,azure,gcp}/` contains ready-to-deploy
+Lambda / Azure Function / GCP Cloud Function forwarders (with Terraform /
+Bicep / gcloud IaC) that relay CloudTrail / Activity Log / Audit Log events
+to the HMAC-signed `/cloud-event` receiver on the canary server. You still
+have to register the decoy key in your own cloud account and deploy the
+forwarder — without that step the generated key is a believable decoy and
+nothing more. [Thinkst's Canarytokens](https://canarytokens.org) (free)
+remains the zero-setup alternative with a hosted detection backend. The
+token's `plant_instructions` text says this explicitly.
 
 **HTTP — no authenticated session flow.** Sessions are issued and tracked
 (cookie persistence + repeat-visit escalation), and `POST /login` now

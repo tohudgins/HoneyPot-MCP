@@ -135,6 +135,57 @@ async def test_any_service_matches_anywhere():
 
 
 @pytest.mark.asyncio
+async def test_postgresql_login_with_planted_creds_matches():
+    """postgresql_login_attempt events carry cleartext creds (the engine
+    forces cleartext auth) and must match tokens planted with
+    service="postgresql" — regression for the prefix map missing DB engines."""
+    from honeypot_mcp import credential_match
+
+    token_id = await _plant("postgresql", [("postgres", "Sup3rSecret!")])
+    credential_match.invalidate_cache()
+
+    ev = _event(
+        "postgresql_login_attempt",
+        {
+            "username": "postgres",
+            "password": "Sup3rSecret!",
+            "database": "prod",
+            "service": "postgresql",
+        },
+    )
+    assert await credential_match.match(ev) == token_id
+
+
+@pytest.mark.asyncio
+async def test_mssql_login_with_planted_creds_matches():
+    from honeypot_mcp import credential_match
+
+    token_id = await _plant("mssql", [("sa", "Str0ng&Pass")])
+    credential_match.invalidate_cache()
+
+    ev = _event(
+        "mssql_login_attempt",
+        {"username": "sa", "password": "Str0ng&Pass", "database": "master", "service": "mssql"},
+    )
+    assert await credential_match.match(ev) == token_id
+
+
+@pytest.mark.asyncio
+async def test_db_service_tokens_do_not_cross_match():
+    """A postgresql-planted token must not fire on an mssql login and vice versa."""
+    from honeypot_mcp import credential_match
+
+    await _plant("postgresql", [("dbadmin", "OnlyForPg1!")])
+    credential_match.invalidate_cache()
+
+    ev = _event(
+        "mssql_login_attempt",
+        {"username": "dbadmin", "password": "OnlyForPg1!", "service": "mssql"},
+    )
+    assert await credential_match.match(ev) is None
+
+
+@pytest.mark.asyncio
 async def test_http_post_data_match():
     from honeypot_mcp import credential_match
 

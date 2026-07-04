@@ -75,18 +75,26 @@ async def _load_index() -> None:
     _loaded_at = now
 
 
+# Event-type prefix → service label the operator picked when planting the
+# credential. MySQL is deliberately absent: the client sends a SHA1 scramble,
+# never the plaintext password, so there is no pair to match against.
+_SERVICE_PREFIXES = {
+    "ssh_": "ssh",
+    "http_": "http",
+    "ftp_": "ftp",
+    "smtp_": "smtp",
+    "postgresql_": "postgresql",
+    "mssql_": "mssql",
+}
+
+
 def _infer_service(event_type: str) -> str:
     """Map an event_type back to the service label the operator picked when
     planting the credential (matches `_USERNAMES`-era choices in CredentialProvider)."""
     et = event_type.lower()
-    if et.startswith("ssh_"):
-        return "ssh"
-    if et.startswith("http_"):
-        return "http"
-    if et.startswith("ftp_"):
-        return "ftp"
-    if et.startswith("smtp_"):
-        return "smtp"
+    for prefix, service in _SERVICE_PREFIXES.items():
+        if et.startswith(prefix):
+            return service
     return "any"
 
 

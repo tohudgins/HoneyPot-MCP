@@ -176,8 +176,11 @@ Payload extraction handles:
   (`username|user|email|login`, `password|pass|passwd|pwd`).
 - SMTP `AUTH PLAIN <b64>` — base64-decodes and splits on `\0` per RFC 4616.
 
-Service is inferred from `event_type` prefix (`ssh_*`, `http_*`, `ftp_*`,
-`smtp_*`). Tokens planted with `service="any"` match across all services.
+Service is inferred from `event_type` prefix via `_SERVICE_PREFIXES`
+(`ssh_*`, `http_*`, `ftp_*`, `smtp_*`, `postgresql_*`, `mssql_*`). MySQL is
+deliberately absent — the client sends a SHA1 scramble, never the plaintext
+password, so there's no pair to match. Tokens planted with `service="any"`
+match across all services.
 
 Limitation: the matcher only fires when the planted creds hit one of our own
 honeypots. It doesn't observe production-system logins — that needs an IdP
