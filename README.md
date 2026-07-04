@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
 
 A Model Context Protocol server that lets Claude (or any MCP client) deploy honeypots, plant honeytokens, monitor alerts, and analyse attacker behaviour — all through natural language. Built on [FastMCP](https://github.com/jlowin/fastmcp), async Python 3.11+.
 
@@ -15,7 +15,7 @@ You ask in plain English; it deploys real honeypots (14 protocols), captures wha
 > Export an iptables blocklist for IPs with 10+ hits.
 ```
 
-> **Read first:** [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — what works (Cowrie SSH, HTTP personas, canary URLs, credential cross-reference) and what doesn't (PDF token prompts, AWS-key callback path). Acknowledging the gaps is the point.
+> **Read first:** [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — a frank account of what works (Cowrie SSH, HTTP personas, canary URLs, credential cross-reference) and what doesn't (PDF tokens prompt in Acrobat; cloud-key tokens need an audit-log forwarder). Acknowledging the gaps is the point.
 >
 > **Deploying to the internet?** [docs/DEPLOY.md](docs/DEPLOY.md) — "$5 VPS → real attack traffic in under 30 minutes," with safety guard-rails.
 
@@ -44,15 +44,15 @@ Fourteen protocols. SSH is Cowrie (industrial-grade); the rest are custom async 
 
 | Category | Capabilities |
 |---|---|
-| **Honeytokens** | Fake AWS keys, canary URLs, credential pairs (auto-matched on honeypot logins), PDF/DOCX file tokens, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks, Azure/GCP cloud credentials |
+| **Honeytokens** | Fake AWS keys, canary URLs, credential pairs (auto-matched on every honeypot login — including hashed MySQL/VNC auth), PDF/DOCX file tokens, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks, Azure/GCP cloud credentials |
 | **Detection pipeline** | Batched async ingestion → suppression (CIDR/glob + rate limit) → honeytoken cross-reference (auto-CRITICAL) → auto-enrichment of CRITICAL alerts (VT + AbuseIPDB + GeoIP/ASN/reverse-DNS, TTL-cached) |
 | **Analysis** | MITRE ATT&CK mapping, attacker profiling + risk score, SSH session reconstruction, cross-honeypot kill-chain timeline, campaign correlation, enriched XSS-safe HTML/Markdown reports |
 | **SIEM delivery** | JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, Syslog RFC 5424 (UDP/TCP), Grafana Loki, Datadog — per-subscription severity thresholds + delivery health stats |
 | **Response** | Blocklist push to Cloudflare / pfSense / AWS WAFv2, blocklist + STIX 2.1 export, AbuseIPDB reporting |
-| **Operations** | Health watchdog, restart reconciliation, end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboards |
+| **Operations** | Health watchdog, opt-in retention sweep, per-IP connection caps, restart reconciliation, end-to-end self-test, Prometheus `/metrics`, Alembic migrations, JSON logging, Grafana dashboards |
 | **Cloud honeytokens** | HMAC-signed `/cloud-event` ingest + ready-to-deploy CloudTrail/Azure/GCP forwarders under [`examples/cloud-forwarders/`](examples/cloud-forwarders/) |
 
-297 unit tests cover the security-critical paths; strict mypy passes.
+317 unit tests cover the security-critical paths; strict mypy passes.
 
 ---
 
@@ -84,12 +84,10 @@ uv run python -m honeypot_mcp.server   # or just: honeypot-mcp
 
 ## Connect an MCP client
 
-Two modes, and the difference matters:
+Run it one of two ways:
 
-- **Local (stdio)** — Claude Desktop/Code spawn the server per chat. Simplest for trying it out, but the server (and any honeypot you deploy) lives only as long as the chat. Use this for local testing.
-- **Persistent daemon (HTTP)** — the server runs 24/7 (e.g. via systemd on a VPS) and your MCP client connects over the network with a bearer token (`MCP_AUTH_TOKEN`, required — the daemon refuses to start unauthenticated). **This is the mode for real deployments**, because honeypots run inside the server process and must outlive any single chat. See [docs/DEPLOY.md](docs/DEPLOY.md) for the full VPS walkthrough (systemd unit, token auth, SSH-tunneled control port, observability stack).
-
-The rest of this section covers local stdio setup.
+- **Local (stdio)** — Claude Desktop/Code spawn the server per chat. Simplest for trying it out, but the server and its honeypots live only as long as the chat. Covered below.
+- **Persistent daemon (HTTP)** — runs 24/7 so honeypots outlive any chat. This is the mode for real deployments; see [Deploy](#deploy--catching-traffic) below.
 
 ### Claude Code
 
@@ -298,17 +296,17 @@ Without a forwarder, cloud credential tokens are believable decoys with no callb
 > enrich_ip 1.2.3.4                        # VT + AbuseIPDB + GeoIP
 > generate_report format=markdown          # weekly write-up
 > export_blocklist format=iptables hits=10 # firewall rules for top attackers
-> alerts_prune older_than_days=30          # retention sweep — schedule weekly
+> alerts_prune older_than_days=30          # one-off prune (or set RETENTION_DAYS for auto)
 ```
 
-Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), point `CANARY_PUBLIC_URL` at a public address (ngrok / Cloudflare Tunnel / real domain), load suppression presets for known scanners before going live, and subscribe a CRITICAL-threshold webhook so you see `honeypot_health_failed` watchdog alerts. Full walkthrough: [docs/DEPLOY.md](docs/DEPLOY.md).
+Going to production: swap `DATABASE_URL` to PostgreSQL (zero code changes), point `CANARY_PUBLIC_URL` at a public address (ngrok / Cloudflare Tunnel / real domain), load suppression presets for known scanners before going live, set `RETENTION_DAYS` so the DB stays bounded, and subscribe a CRITICAL-threshold webhook so you see `honeypot_health_failed` watchdog alerts. Full walkthrough: [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ---
 
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v          # 297 tests
+uv run pytest tests/unit/ -v          # 317 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
@@ -329,7 +327,8 @@ src/honeypot_mcp/
 ├── webhooks.py          — Outbound SIEM/webhook delivery worker (HMAC, retries)
 ├── suppression.py       — Drop / rate-limit rule engine
 ├── credential_match.py  — Planted-credential cross-reference (auto-CRITICAL)
-├── watchdog.py          — Periodic health checks of running honeypots
+├── credential_verify.py — Hashed-auth verification (MySQL scramble, VNC DES)
+├── watchdog.py          — Periodic health checks + opt-in retention sweep
 ├── reconcile.py         — Re-establishes RUNNING honeypots on server restart
 ├── engines/             — Honeypot engines (plugin ABC: HoneypotEngine)
 ├── tokens/              — Honeytoken providers (plugin ABC: HoneytokenProvider)
