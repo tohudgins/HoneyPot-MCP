@@ -80,6 +80,24 @@ class Settings(BaseSettings):
     # never the accidental result of a missing token.
     mcp_allow_unauthenticated: bool = False
 
+    # Alert retention. On a public IP the DB grows continuously from internet
+    # background radiation. Set >0 to have the watchdog auto-delete alerts +
+    # attacker_events older than this many days (the same operation as the
+    # manual `alerts_prune` tool). 0 = disabled (never auto-delete) — the safe
+    # default, so nobody loses data they didn't opt into discarding.
+    retention_days: int = 0
+    # How often the retention sweep runs, in hours. Independent of the
+    # watchdog's health-check cadence — pruning daily is plenty.
+    retention_sweep_interval_hours: float = 24.0
+
+    # Per-source-IP concurrent-connection cap for the in-process TCP engines
+    # (VNC/Redis/MySQL/PostgreSQL/MSSQL/MongoDB/SMTP/SMB). A single hostile or
+    # broken peer can otherwise hold arbitrarily many sockets open. Excess
+    # connections from an IP already at the cap are accepted then immediately
+    # closed. 0 = unlimited. Does not apply to the aiohttp engines (HTTP/
+    # Elasticsearch), which rely on aiohttp's own limits.
+    max_connections_per_ip: int = 32
+
     # Docker
     docker_socket: str = Field(default="", description="Docker socket URI")
 

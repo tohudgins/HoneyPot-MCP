@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from honeypot_mcp.credential_verify import verify_mysql, verify_vnc
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
 
@@ -34,9 +35,19 @@ log = logging.getLogger(__name__)
 
 CRED_REFRESH_SECONDS = 30
 
+# Services whose login events never carry the plaintext password. They can't
+# be matched by exact (service, user, pass) lookup — the engine captures a
+# salted digest instead, verified against candidate passwords in
+# `credential_verify`. See `_match_hashed`.
+_HASHED_SERVICES = {"mysql", "vnc"}
+
 # (service, username_lower, password) → token_id
 # Usernames are lowercased on insert AND lookup; passwords stay case-sensitive.
 _index: dict[tuple[str, str, str], int] = {}
+# service → [(username_lower, password, token_id)] — the candidate list the
+# hashed-service verifier iterates. Built alongside `_index`; requires only a
+# non-empty password (VNC has no username), so it's a looser superset.
+_candidates: dict[str, list[tuple[str, str, int]]] = {}
 _loaded_at: float = 0.0
 
 
@@ -47,7 +58,7 @@ def invalidate_cache() -> None:
 
 
 async def _load_index() -> None:
-    global _index, _loaded_at
+    global _index, _candidates, _loaded_at
     now = time.monotonic()
     if now - _loaded_at < CRED_REFRESH_SECONDS:
         return
@@ -62,22 +73,27 @@ async def _load_index() -> None:
         tokens = list(result.scalars().all())
 
     new_index: dict[tuple[str, str, str], int] = {}
+    new_candidates: dict[str, list[tuple[str, str, int]]] = {}
     for t in tokens:
         meta = t.token_meta or {}
         service = (meta.get("service") or "any").lower()
         for pair in meta.get("credentials") or []:
             u = (pair.get("username") or "").strip().lower()
             p = pair.get("password") or ""
-            if u and p:
+            if not p:
+                continue
+            if u:
                 new_index[(service, u, p)] = t.id
+            new_candidates.setdefault(service, []).append((u, p, t.id))
 
     _index = new_index
+    _candidates = new_candidates
     _loaded_at = now
 
 
 # Event-type prefix → service label the operator picked when planting the
-# credential. MySQL is deliberately absent: the client sends a SHA1 scramble,
-# never the plaintext password, so there is no pair to match against.
+# credential. `mysql_` / `vnc_` route through the hashed-verification path
+# (see `_HASHED_SERVICES`) rather than the plaintext index.
 _SERVICE_PREFIXES = {
     "ssh_": "ssh",
     "http_": "http",
@@ -85,6 +101,9 @@ _SERVICE_PREFIXES = {
     "smtp_": "smtp",
     "postgresql_": "postgresql",
     "mssql_": "mssql",
+    "redis_": "redis",
+    "mysql_": "mysql",
+    "vnc_": "vnc",
 }
 
 
@@ -140,17 +159,65 @@ def _extract_pairs(payload: dict, event_type: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _decode_hex(value: object) -> bytes | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        return None
+
+
+def _match_hashed(service: str, payload: dict) -> int | None:
+    """Verify a captured MySQL/VNC auth digest against planted-password
+    candidates. Candidates for the exact service plus `any`-service tokens are
+    tried; the first plaintext that reproduces the digest wins."""
+    candidates = _candidates.get(service, []) + _candidates.get("any", [])
+    if not candidates:
+        return None
+
+    if service == "mysql":
+        salt = _decode_hex(payload.get("salt_hex"))
+        resp = _decode_hex(payload.get("auth_response_hex"))
+        if salt is None or resp is None:
+            return None
+        username = (payload.get("username") or "").strip().lower()
+        for u, pw, token_id in candidates:
+            if u == username and verify_mysql(salt, resp, pw):
+                return token_id
+        return None
+
+    if service == "vnc":
+        challenge = _decode_hex(payload.get("challenge_hex"))
+        resp = _decode_hex(payload.get("response_hex"))
+        if challenge is None or resp is None:
+            return None
+        # VNC auth is password-only — no username on the wire, so match on
+        # password regardless of the token's username field.
+        for _u, pw, token_id in candidates:
+            if verify_vnc(challenge, resp, pw):
+                return token_id
+        return None
+
+    return None
+
+
 async def match(event: PendingEvent) -> int | None:
     """Return the matching active CREDENTIAL honeytoken id, or None.
 
     Matches in priority: exact service first, then `any`-service tokens as a
     fallback. Usernames compared case-insensitively, passwords case-sensitive.
+    MySQL/VNC events route through `_match_hashed` because their passwords
+    arrive as a salted digest rather than plaintext.
     """
     await _load_index()
-    if not _index:
+    if not _candidates:
         return None
 
     service = _infer_service(event.event_type)
+    if service in _HASHED_SERVICES:
+        return _match_hashed(service, event.payload)
+
     for username, password in _extract_pairs(event.payload, event.event_type):
         u = username.strip().lower()
         if (service, u, password) in _index:

@@ -49,7 +49,9 @@ import logging
 import secrets
 from typing import Any
 
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -566,6 +568,7 @@ class _RedisProtocol(asyncio.Protocol):
 class RedisEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._servers: dict[str, asyncio.AbstractServer] = {}
+        self._limiter = ConnectionLimiter(get_settings().max_connections_per_ip)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         hp_id: int | None = None
@@ -576,7 +579,7 @@ class RedisEngine(HoneypotEngine):
 
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            lambda: _RedisProtocol(name, hp_id),
+            limited_factory(lambda: _RedisProtocol(name, hp_id), self._limiter),
             host="0.0.0.0",
             port=port,
         )

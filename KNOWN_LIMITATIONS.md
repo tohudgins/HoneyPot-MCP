@@ -98,12 +98,17 @@ functional" below for the caveat.
 
 ## What is partially functional
 
-**Credential tokens.** The match-and-escalate pipeline (see above) only fires
-when the planted credentials hit one of *your own* honeypots — SSH, HTTP form
-POST, FTP login, SMTP AUTH, PostgreSQL and MSSQL logins (both DB engines
-force cleartext auth precisely so the password is capturable). MySQL is the
-exception: the wire protocol sends a SHA1 scramble, never the plaintext, so
-planted creds can't be cross-referenced there. If an attacker tries the
+**Credential tokens.** The match-and-escalate pipeline (see above) fires when
+the planted credentials hit one of *your own* honeypots, across every service
+that captures a login — SSH, HTTP form POST, FTP login, SMTP AUTH, Redis AUTH
+(legacy AUTH maps to the `default` user), and PostgreSQL / MSSQL logins (both
+DB engines force cleartext auth precisely so the password is capturable).
+MySQL and VNC never put the plaintext on the wire (MySQL sends a
+`mysql_native_password` scramble over a server salt; VNC a DES
+challenge/response), but because the honeypot generated the salt/challenge it
+recomputes the expected digest for each planted password and matches on that
+(`credential_verify.py`) — so those two are covered too, just verified rather
+than compared. The one true limitation is scope: if an attacker tries the
 credentials against a real production system you have nothing visible there,
 there's no signal back to HoneyPot MCP. Worth it for trip-wire deception
 inside the honeypot stack; not a substitute for real credential canaries that

@@ -41,7 +41,9 @@ import re
 import secrets
 from typing import Any
 
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -411,6 +413,7 @@ class _SMTPProtocol(asyncio.Protocol):
 class SMTPEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._servers: dict[str, tuple[asyncio.AbstractServer, str]] = {}
+        self._limiter = ConnectionLimiter(get_settings().max_connections_per_ip)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         # Pick + persist a hostname on first start so the same honeypot keeps
@@ -439,7 +442,7 @@ class SMTPEngine(HoneypotEngine):
 
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            lambda: _SMTPProtocol(name, hp_id, hostname),
+            limited_factory(lambda: _SMTPProtocol(name, hp_id, hostname), self._limiter),
             host="0.0.0.0",
             port=port,
         )

@@ -171,6 +171,23 @@ async def test_mssql_login_with_planted_creds_matches():
 
 
 @pytest.mark.asyncio
+async def test_redis_auth_with_planted_creds_matches():
+    """redis_auth_attempt events carry the cleartext password (legacy AUTH
+    maps to user "default") and must match tokens planted with
+    service="redis"."""
+    from honeypot_mcp import credential_match
+
+    token_id = await _plant("redis", [("default", "R3disBait!")])
+    credential_match.invalidate_cache()
+
+    ev = _event(
+        "redis_auth_attempt",
+        {"username": "default", "password": "R3disBait!", "service": "redis"},
+    )
+    assert await credential_match.match(ev) == token_id
+
+
+@pytest.mark.asyncio
 async def test_db_service_tokens_do_not_cross_match():
     """A postgresql-planted token must not fire on an mssql login and vice versa."""
     from honeypot_mcp import credential_match
@@ -238,6 +255,114 @@ async def test_revoke_clears_match():
         )
     credential_match.invalidate_cache()
 
+    assert await credential_match.match(ev) is None
+
+
+@pytest.mark.asyncio
+async def test_mysql_hashed_login_matches_planted_password():
+    """MySQL never sends the plaintext password — only the native_password
+    scramble over a server salt. A planted token must still fire when the
+    captured scramble reproduces from its password + the advertised salt."""
+    import secrets
+
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.credential_verify import mysql_native_token
+
+    token_id = await _plant("mysql", [("root", "Tr1cky!Pass")])
+    credential_match.invalidate_cache()
+
+    salt = secrets.token_bytes(20)
+    scramble = mysql_native_token(b"Tr1cky!Pass", salt)
+    ev = _event(
+        "mysql_login_attempt",
+        {
+            "username": "root",
+            "auth_response_hex": scramble.hex(),
+            "salt_hex": salt.hex(),
+            "service": "mysql",
+        },
+    )
+    assert await credential_match.match(ev) == token_id
+
+
+@pytest.mark.asyncio
+async def test_mysql_hashed_wrong_password_does_not_match():
+    import secrets
+
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.credential_verify import mysql_native_token
+
+    await _plant("mysql", [("root", "Tr1cky!Pass")])
+    credential_match.invalidate_cache()
+
+    salt = secrets.token_bytes(20)
+    scramble = mysql_native_token(b"not-the-planted-one", salt)
+    ev = _event(
+        "mysql_login_attempt",
+        {"username": "root", "auth_response_hex": scramble.hex(), "salt_hex": salt.hex()},
+    )
+    assert await credential_match.match(ev) is None
+
+
+@pytest.mark.asyncio
+async def test_mysql_hashed_username_must_match():
+    """Right password, wrong username — MySQL sends the username in the clear,
+    so it's part of the match like the other services."""
+    import secrets
+
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.credential_verify import mysql_native_token
+
+    await _plant("mysql", [("root", "Tr1cky!Pass")])
+    credential_match.invalidate_cache()
+
+    salt = secrets.token_bytes(20)
+    scramble = mysql_native_token(b"Tr1cky!Pass", salt)
+    ev = _event(
+        "mysql_login_attempt",
+        {"username": "admin", "auth_response_hex": scramble.hex(), "salt_hex": salt.hex()},
+    )
+    assert await credential_match.match(ev) is None
+
+
+@pytest.mark.asyncio
+async def test_vnc_hashed_response_matches_planted_password():
+    """VNC auth is password-only (no username): a DES challenge/response. A
+    planted token fires when the captured response reproduces from its
+    password + the server challenge."""
+    import secrets
+
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.credential_verify import vnc_expected_response
+
+    token_id = await _plant("vnc", [("ignored-by-vnc", "vncSecret")])
+    credential_match.invalidate_cache()
+
+    challenge = secrets.token_bytes(16)
+    response = vnc_expected_response(b"vncSecret", challenge)
+    ev = _event(
+        "vnc_auth_attempt",
+        {"challenge_hex": challenge.hex(), "response_hex": response.hex()},
+    )
+    assert await credential_match.match(ev) == token_id
+
+
+@pytest.mark.asyncio
+async def test_vnc_hashed_wrong_password_does_not_match():
+    import secrets
+
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.credential_verify import vnc_expected_response
+
+    await _plant("vnc", [("ignored", "vncSecret")])
+    credential_match.invalidate_cache()
+
+    challenge = secrets.token_bytes(16)
+    response = vnc_expected_response(b"wrongpw", challenge)
+    ev = _event(
+        "vnc_auth_attempt",
+        {"challenge_hex": challenge.hex(), "response_hex": response.hex()},
+    )
     assert await credential_match.match(ev) is None
 
 

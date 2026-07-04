@@ -8,15 +8,23 @@ shows up in the alert stream alongside attack events).
 Without this, a crashed Cowrie container or a dead in-process server would
 just go quiet — the worst failure mode for a honeypot, since you'd have no
 way to tell normal-low-traffic from broken.
+
+The watchdog also hosts the retention sweep (opt-in via `retention_days`):
+folding it in here reuses the proven periodic loop rather than standing up a
+second lifespan-managed task, and DB housekeeping is a natural fit alongside
+liveness housekeeping.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
 
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines import get_engine
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -36,6 +44,9 @@ class HoneypotWatchdog:
         # Honeypot IDs we've already alerted about — so a single failure doesn't
         # flood the alert stream every interval. Cleared when health recovers.
         self._reported_dead: set[int] = set()
+        # Monotonic timestamp of the last retention sweep. 0.0 means "never" so
+        # the first cycle after startup runs it immediately when enabled.
+        self._last_prune_at: float = 0.0
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -58,9 +69,40 @@ class HoneypotWatchdog:
             except Exception as e:
                 log.warning("Watchdog cycle failed: %s", e)
             try:
+                await self._maybe_prune()
+            except Exception as e:
+                log.warning("Retention sweep failed: %s", e)
+            try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except TimeoutError:
                 continue
+
+    async def _maybe_prune(self) -> None:
+        """Delete alerts + attacker_events older than `retention_days`, at most
+        once per `retention_sweep_interval_hours`. No-op unless retention is
+        enabled (retention_days > 0)."""
+        settings = get_settings()
+        days = settings.retention_days
+        if days < 1:
+            return
+
+        interval = max(settings.retention_sweep_interval_hours, 0.0) * 3600
+        now = time.monotonic()
+        if self._last_prune_at != 0.0 and now - self._last_prune_at < interval:
+            return
+        self._last_prune_at = now
+
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        async with get_session() as session:
+            result = await queries.prune_alerts_before(session, cutoff)
+        deleted = result.get("alerts_deleted", 0) + result.get("attacker_events_deleted", 0)
+        if deleted:
+            log.info(
+                "Retention sweep removed %d alerts + %d attacker_events older than %d days.",
+                result.get("alerts_deleted", 0),
+                result.get("attacker_events_deleted", 0),
+                days,
+            )
 
     async def _check_all(self) -> None:
         async with get_session() as session:

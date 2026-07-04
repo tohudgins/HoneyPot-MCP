@@ -40,7 +40,9 @@ import secrets
 import struct
 from typing import Any
 
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -291,6 +293,9 @@ class _MySQLProtocol(asyncio.Protocol):
         self._buf = b""
         self._sent_handshake = False
         self._authed = False
+        # Full 20-byte scramble we advertised — needed to verify the client's
+        # mysql_native_password response against a planted honeytoken password.
+        self._salt = b""
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -301,6 +306,7 @@ class _MySQLProtocol(asyncio.Protocol):
         # this on connection — the client doesn't write first.
         salt_1 = secrets.token_bytes(8)
         salt_2 = secrets.token_bytes(12)
+        self._salt = salt_1 + salt_2
         transport.write(_build_handshake_packet(salt_1, salt_2))
         self._sent_handshake = True
 
@@ -324,7 +330,11 @@ class _MySQLProtocol(asyncio.Protocol):
     def _handle_login(self, seq: int, payload: bytes) -> None:
         parsed = _parse_handshake_response(payload)
         asyncio.create_task(
-            self._record("mysql_login_attempt", AlertSeverity.HIGH, {**parsed, "service": "mysql"})
+            self._record(
+                "mysql_login_attempt",
+                AlertSeverity.HIGH,
+                {**parsed, "service": "mysql", "salt_hex": self._salt.hex()},
+            )
         )
         # Accept the login and enter the command phase. This is a fake datastore
         # with no real data, so granting "access" is safe — and it's what lets
@@ -396,6 +406,7 @@ class _MySQLProtocol(asyncio.Protocol):
 class MySQLEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._servers: dict[str, asyncio.AbstractServer] = {}
+        self._limiter = ConnectionLimiter(get_settings().max_connections_per_ip)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         hp_id: int | None = None
@@ -406,7 +417,7 @@ class MySQLEngine(HoneypotEngine):
 
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            lambda: _MySQLProtocol(name, hp_id),
+            limited_factory(lambda: _MySQLProtocol(name, hp_id), self._limiter),
             host="0.0.0.0",
             port=port,
         )

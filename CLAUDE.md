@@ -170,17 +170,30 @@ token's id, `event_type` → `honeytoken_triggered_credential_via_<original>`.
 The flusher then calls `mark_honeytoken_triggered()` for any flushed event
 with that event_type prefix.
 
-Payload extraction handles:
+Two match paths:
+
+*Plaintext* (`_index`, keyed by `(service, username_lower, password)`) — the
+common case. Payload extraction handles:
 - SSH/FTP/HTTP form `{"username": ..., "password": ...}` keys directly.
 - HTTP `post_data` nested dicts — checks common field aliases
   (`username|user|email|login`, `password|pass|passwd|pwd`).
 - SMTP `AUTH PLAIN <b64>` — base64-decodes and splits on `\0` per RFC 4616.
 
+*Hashed* (`_match_hashed`, services in `_HASHED_SERVICES` = `{mysql, vnc}`) —
+these protocols never send the plaintext password. MySQL sends a
+`mysql_native_password` scramble over a server salt; VNC sends the server
+challenge DES-encrypted under the password. Since the engine generated the
+salt/challenge (and includes `salt_hex` / `challenge_hex` + the captured
+response in the event payload), `credential_verify.py` recomputes the expected
+digest for each planted-password candidate and compares. MySQL also matches on
+the plaintext username it sends in the clear; VNC is password-only. A parallel
+`_candidates` dict (service → `[(user_lower, password, token_id)]`) is built
+alongside `_index` at load time to feed this path.
+
 Service is inferred from `event_type` prefix via `_SERVICE_PREFIXES`
-(`ssh_*`, `http_*`, `ftp_*`, `smtp_*`, `postgresql_*`, `mssql_*`). MySQL is
-deliberately absent — the client sends a SHA1 scramble, never the plaintext
-password, so there's no pair to match. Tokens planted with `service="any"`
-match across all services.
+(`ssh_*`, `http_*`, `ftp_*`, `smtp_*`, `postgresql_*`, `mssql_*`, `redis_*`,
+`mysql_*`, `vnc_*`). Tokens planted with `service="any"` match across all
+services (including the hashed ones).
 
 Limitation: the matcher only fires when the planted creds hit one of our own
 honeypots. It doesn't observe production-system logins — that needs an IdP
@@ -314,6 +327,26 @@ query and waits for any reply.
 The `_reported_dead` set prevents alert spam: a dead honeypot generates exactly
 one alert. If it later recovers (becomes alive again), the entry is cleared, so
 a subsequent failure will alert again.
+
+The watchdog also hosts the **retention sweep** (`_maybe_prune`): opt-in via
+`retention_days > 0` (default 0 = off), it deletes alerts + attacker_events
+older than the cutoff at most once per `retention_sweep_interval_hours`
+(default 24h), tracked with a monotonic `_last_prune_at`. Folded in here rather
+than as a separate lifespan task — same operation as the manual `alerts_prune`
+tool, just automatic. On a public IP the DB otherwise grows without bound.
+
+### Per-IP connection caps
+
+`engines/conn_limit.py` caps concurrent connections per source IP for the
+in-process TCP engines. `ConnectionLimiter(max_per_ip)` counts live
+connections; `limited_factory()` wraps a `create_server` protocol factory
+(VNC/Redis/MySQL/PostgreSQL/MSSQL/MongoDB/SMTP) and `limited_handler()` wraps a
+`start_server` coroutine handler (SMB). Each engine holds one limiter in
+`__init__`, sized from `max_connections_per_ip` (default 32, 0 = unlimited).
+Over-cap connections are accepted then immediately closed, and the wrapped
+`_LimitedProtocol` never drives the real protocol for a rejected peer — so its
+state machine only ever runs for admitted connections. The aiohttp engines
+(HTTP/Elasticsearch) are not wrapped; they rely on aiohttp's own limits.
 
 ### Startup reconciliation
 
