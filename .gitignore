@@ -45,11 +45,13 @@ ENV/
 *.db-wal
 *.db-shm
 
-# Large user-downloaded data files
-config/GeoLite2-City.mmdb
+# Large user-downloaded data files.
+# MaxMind's GeoLite2 EULA forbids redistribution, so NO .mmdb may ever be
+# committed — match on the extension, not on specific filenames (an earlier
+# City-only rule let GeoLite2-ASN.mmdb slip into a commit).
+config/*.mmdb
 config/mitre_attack.json
-# GeoIP MMDB dropped into the Docker mount point at deploy time —
-# MaxMind license forbids redistribution.
+# Same rule for the Docker mount point, populated at deploy time.
 docker/geoip/*.mmdb
 
 # Generated attack reports
