@@ -56,7 +56,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - honeypot-net
-    read_only: true
+    # NOT read_only: the entrypoint renders /usr/local/etc/haproxy/haproxy.cfg
+    # from the env vars above at every boot, and that directory also holds the
+    # image's own haproxy.cfg.template — so it can be neither read-only nor
+    # masked by a tmpfs. The hardening that matters for this sidecar is the
+    # restricted API surface above (it can only reach container + image
+    # endpoints) plus no-new-privileges; a read-only rootfs would add little
+    # on top of that and costs a crash loop.
     tmpfs:
       - /run
     security_opt:
@@ -82,6 +88,11 @@ services:
       # baked into the image — download it yourself with a free MaxMind account.
       - ./geoip:/app/geoip:ro
     environment:
+      # Collector mode: run the capture plane (canary callbacks, watchdog,
+      # webhook delivery, /metrics) with no MCP control plane. A detached
+      # container has no stdin, so the default stdio transport would read EOF
+      # and exit immediately, restart-looping forever.
+      MCP_TRANSPORT: none
       # Talk to Docker via the proxy, not /var/run/docker.sock directly.
       DOCKER_HOST: tcp://socket-proxy:2375
       DATABASE_URL: sqlite+aiosqlite:////app/data/honeypot_mcp.db
@@ -95,6 +106,11 @@ services:
       CANARY_CALLBACK_HOST: 0.0.0.0
       CANARY_CALLBACK_PORT: "8888"
       GEOIP_DB_PATH: /app/geoip/GeoLite2-City.mmdb
+      # Optional second database: origin AS number + org — the key pivot for
+      # spotting hosting/VPN/botnet networks. Same MaxMind account, same drop
+      # into ./geoip. Must be set explicitly: inside the container the code's
+      # default path resolves relative to the installed package, not /app.
+      GEOIP_ASN_DB_PATH: /app/geoip/GeoLite2-ASN.mmdb
     ports:
       - "8888:8888"   # Canary callback server (publicly reachable)
       - "127.0.0.1:9090:9090"   # Prometheus /metrics — bound to localhost only

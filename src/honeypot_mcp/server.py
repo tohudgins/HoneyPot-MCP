@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import signal
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -189,8 +192,9 @@ async def resource_stats_dashboard() -> str:
 
 def _networked_auth_error(settings: Any) -> str | None:
     """Return a fail-closed error message if a networked control plane would be
-    exposed without authentication, else None. stdio needs no auth."""
-    if settings.mcp_transport == "stdio":
+    exposed without authentication, else None. stdio needs no auth, and `none`
+    exposes no control plane to authenticate."""
+    if settings.mcp_transport in ("stdio", "none"):
         return None
     if settings.mcp_auth_token or settings.mcp_allow_unauthenticated:
         return None
@@ -204,13 +208,41 @@ def _networked_auth_error(settings: Any) -> str | None:
     )
 
 
+async def _run_collector() -> None:
+    """Run the capture plane with no MCP transport, until signalled to stop.
+
+    Everything that collects attacks — honeypot engines, the canary callback
+    server, the watchdog, webhook delivery, /metrics — lives in the lifespan.
+    The MCP transport is only the control plane layered on top, so dropping it
+    leaves a fully functional headless collector.
+    """
+    async with lifespan(mcp):
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            # Not available on Windows; KeyboardInterrupt still unwinds there.
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, stop.set)
+        log.info("Collector mode — capture plane running, no MCP control plane.")
+        await stop.wait()
+
+
 def main() -> None:
     settings = get_settings()
     # Validated by Settings.validate_mcp_transport to one of these literals.
-    transport = cast('Literal["stdio", "http", "sse", "streamable-http"]', settings.mcp_transport)
+    transport = cast(
+        'Literal["stdio", "http", "sse", "streamable-http", "none"]',
+        settings.mcp_transport,
+    )
     if transport == "stdio":
         # Per-chat subprocess launched by Claude Desktop / Claude Code.
         mcp.run()
+        return
+
+    if transport == "none":
+        # Collector mode. Also the only correct mode for a detached container:
+        # stdio would read EOF from an unattached stdin and exit at once.
+        asyncio.run(_run_collector())
         return
 
     # Networked control plane can deploy honeypots and read all captured data,

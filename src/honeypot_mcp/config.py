@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     # public deployment: honeypots must outlive any single chat, and in-process
     # engines hold their listeners in the server process. Run it as a daemon
     # (systemd) and point your MCP client at http://<host>:<port>/mcp.
+    # `none` is collector mode: run the capture plane (honeypots, canary
+    # callbacks, watchdog, webhook delivery, /metrics) with NO control plane
+    # at all. That's the right mode for a detached container — stdio there
+    # reads EOF from an unattached stdin and exits immediately — and for any
+    # host that should collect attacks but never accept control commands.
     mcp_transport: str = "stdio"
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8000
@@ -132,7 +137,7 @@ class Settings(BaseSettings):
     @field_validator("mcp_transport")
     @classmethod
     def validate_mcp_transport(cls, v: str) -> str:
-        valid = {"stdio", "http", "sse", "streamable-http"}
+        valid = {"stdio", "http", "sse", "streamable-http", "none"}
         lower = v.lower()
         if lower not in valid:
             raise ValueError(f"mcp_transport must be one of {valid}")

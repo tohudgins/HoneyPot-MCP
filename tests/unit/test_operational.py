@@ -190,6 +190,42 @@ def test_mcp_transport_rejects_garbage(monkeypatch):
         Settings()
 
 
+def test_mcp_transport_accepts_collector_mode(monkeypatch):
+    """`none` runs the capture plane with no control plane — the only mode that
+    works in a detached container, where stdio reads EOF and exits at once."""
+    from honeypot_mcp.config import Settings
+
+    monkeypatch.setenv("MCP_TRANSPORT", "none")
+    assert Settings().mcp_transport == "none"
+
+
+@pytest.mark.asyncio
+async def test_collector_mode_runs_lifespan_and_stops_on_signal(monkeypatch):
+    """_run_collector must actually enter the lifespan (so honeypots, the
+    watchdog and webhook delivery come up) and unblock when signalled."""
+    import signal as _signal
+    from contextlib import asynccontextmanager
+
+    from honeypot_mcp import server
+
+    entered = asyncio.Event()
+
+    @asynccontextmanager
+    async def fake_lifespan(_app):
+        entered.set()
+        yield
+
+    monkeypatch.setattr(server, "lifespan", fake_lifespan)
+
+    task = asyncio.create_task(server._run_collector())
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    assert not task.done(), "collector should stay running until signalled"
+
+    # The real stop path: the handler _run_collector registered for SIGINT.
+    asyncio.get_running_loop().call_soon(lambda: _signal.raise_signal(_signal.SIGINT))
+    await asyncio.wait_for(task, timeout=5)
+
+
 # ── Prometheus /metrics ─────────────────────────────────────────────────
 
 
@@ -274,6 +310,13 @@ def test_stdio_never_requires_auth():
     from honeypot_mcp.server import _networked_auth_error
 
     assert _networked_auth_error(_settings_ns("stdio")) is None
+
+
+def test_collector_mode_never_requires_auth():
+    """Collector mode exposes no control plane, so there is nothing to gate."""
+    from honeypot_mcp.server import _networked_auth_error
+
+    assert _networked_auth_error(_settings_ns("none")) is None
 
 
 def test_networked_without_token_is_refused():

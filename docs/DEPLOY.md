@@ -133,14 +133,18 @@ CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
 VIRUSTOTAL_API_KEY=...
 ABUSEIPDB_API_KEY=...
 
-# OPTIONAL — drop a GeoLite2-City.mmdb in config/ for geo enrichment
+# OPTIONAL — drop GeoLite2 databases in config/ for geo + network enrichment
 GEOIP_DB_PATH=config/GeoLite2-City.mmdb
+GEOIP_ASN_DB_PATH=config/GeoLite2-ASN.mmdb
 ```
 
-If you want geographic data in alerts, register at
-[maxmind.com](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data),
-download `GeoLite2-City.mmdb`, and place it at `config/GeoLite2-City.mmdb`.
-MaxMind's license forbids redistribution, so it's intentionally not in the repo.
+If you want geographic and network data in alerts, register at
+[maxmind.com](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data)
+and download two databases: `GeoLite2-City.mmdb` (country/city/coords — feeds
+the threat map) and `GeoLite2-ASN.mmdb` (origin AS number + org — the
+highest-signal pivot for spotting hosting/VPN/botnet networks). Place both
+under `config/`. Each is independently optional; a missing one just leaves its
+fields out. MaxMind's license forbids redistribution, so neither is in the repo.
 
 > **Secure the control-plane port.** `MCP_PORT` (8000) can deploy honeypots and
 > read all captured data. It's now bearer-token authenticated (`MCP_AUTH_TOKEN`,
