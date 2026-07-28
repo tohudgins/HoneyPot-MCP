@@ -69,6 +69,9 @@ async def honeypot_deploy(
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"
     resolved_config = config or {}
 
+    if not 1 <= resolved_port <= 65535:
+        return {"error": f"Port {resolved_port} is out of range — must be between 1 and 65535."}
+
     hp_type = HoneypotType(type)
     engine = get_engine(hp_type)
 
@@ -76,6 +79,18 @@ async def honeypot_deploy(
         existing = await queries.get_honeypot_by_name(session, resolved_name)
         if existing:
             return {"error": f"Honeypot named '{resolved_name}' already exists (id={existing.id})."}
+        # A port collision with one of our own honeypots is the most common
+        # deploy failure. Catching it here names the conflicting honeypot,
+        # instead of surfacing a bind error from deep inside the engine.
+        conflict = await queries.get_honeypot_by_port(session, resolved_port)
+        if conflict and conflict.status == HoneypotStatus.RUNNING:
+            return {
+                "error": (
+                    f"Port {resolved_port} is already used by honeypot "
+                    f"'{conflict.name}' ({conflict.type.value}, id={conflict.id})."
+                ),
+                "hint": "Pick a different port, or stop that honeypot first.",
+            }
 
         hp = Honeypot(
             name=resolved_name,
@@ -306,7 +321,12 @@ async def honeypot_logs(name: str, lines: int = 50) -> dict[str, Any]:
 
 @mcp.tool
 async def honeypot_templates() -> list[dict[str, Any]]:
-    """List available pre-built honeypot profiles for each protocol type."""
+    """List pre-built honeypot profiles, one per protocol type.
+
+    Each entry shows the protocol, its default port, what that engine captures,
+    and whether it needs Docker. Call this before `honeypot_deploy` to pick the
+    right protocol for what someone wants to catch, or to check default ports.
+    """
     return [
         {
             "type": "ssh",

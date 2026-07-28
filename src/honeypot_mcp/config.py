@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"
 
+    # Where generated artifacts land (alert exports, HTML/Markdown reports).
+    # Tools write here instead of returning bulk content inline — a full export
+    # is far too large to put in an MCP response. The Docker image pre-creates
+    # /app/reports and mounts a volume over it.
+    reports_dir: Path = _PROJECT_ROOT / "reports"
+
     # Logging
     log_level: str = "INFO"
     # `text` (human-readable) or `json` (one JSON object per line — pipes
@@ -168,7 +174,9 @@ class Settings(BaseSettings):
             return v
         return f"{scheme}:///{(_PROJECT_ROOT / path).as_posix()}"
 
-    @field_validator("geoip_db_path", "geoip_asn_db_path", "mitre_data_path", mode="after")
+    @field_validator(
+        "geoip_db_path", "geoip_asn_db_path", "mitre_data_path", "reports_dir", mode="after"
+    )
     @classmethod
     def _anchor_to_project_root(cls, v: Path) -> Path:
         return v if v.is_absolute() else _PROJECT_ROOT / v

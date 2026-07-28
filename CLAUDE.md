@@ -390,6 +390,47 @@ TTLs: VT 30 min, AbuseIPDB 15 min, GeoIP 24 h.
 
 `intel/mitre.py` ships built-in regex mappings keyed by event-type/payload patterns. `_load_stix_index()` is `lru_cache`d and returns `{technique_id: stix_object}` — the index is built once, not on every `map_to_attack` call. If `config/mitre_attack.json` exists, technique descriptions are added; otherwise the built-in mappings still produce technique IDs and tactics.
 
+### Tool response shaping
+
+An MCP tool result lands directly in a model's context window, so response
+*size* is a correctness concern, not a style preference. Honeypot payloads are
+the worst case: the HTTP engine captures every request header plus up to 64 KB
+of base64 body per event (`_MAX_RAW_BODY_BYTES`), so an unshaped 200-row
+triage query returns megabytes and can consume a whole context in one call.
+
+The rule: **list tools summarise, detail tools expand, bulk goes to disk.**
+
+`tools/_format.py` implements it:
+- `digest_payload()` — keeps the fields analysts triage on (credentials, path,
+  command, exploit categories, lifted geo/VT/AbuseIPDB verdicts), drops bulk
+  (`headers`, `raw_body_b64`, `cookies`, nested `enrichment`), clips values at
+  160 chars. Unknown keys still pass through, so a new engine's fields aren't
+  invisible just because the allow-list predates it.
+- `truncate_payload()` — full structure, clips only individually oversized
+  values (4,000 chars) with an explicit marker. For detail tools.
+- `validate_ip()` — every IP reaching a tool was transcribed by a model reading
+  an alert, so a typo is realistic. Without validation the query matches
+  nothing and reports "no activity", which reads as a clean bill of health.
+
+So: `alerts_recent`/`alerts_search` return digests, `alerts_get` returns the
+full payload, `alerts_export` writes a file and returns the path. New tools
+that return per-row captured data should follow the same split. List tools also
+return `{count, alerts: [...]}` rather than a bare list, so they can carry a
+`window` and a `note` when results were truncated at the limit — a caller must
+never read a capped list as the complete picture.
+
+Time filtering (`since_hours`) belongs on anything an analyst asks about
+"recently" — it is the single most common natural-language qualifier.
+
+### Alert query indexes
+
+`alerts` carries two composite indexes (`0010_add_alert_query_indexes`) because
+every triage path filters on a time window plus either severity or source IP.
+Measured at 500k rows: severity+window 30.7 ms → 5.4 ms, ip+window 23.6 ms →
+0.04 ms. The single-column indexes can't serve those pairs, and `severity` had
+no index at all. Keep new query patterns in mind here — an unindexed filter on
+a hot path is invisible until the DB is large.
+
 ### Reports
 
 `analysis/reporter.py` uses Jinja2 with `autoescape=select_autoescape(["html", "xml"])`. Markdown rendering escapes pipe / backslash / newline in cell values via `_md_cell()`. Attacker-controlled fields (IPs, event types, payload values) cannot break out of either format.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # Store enum values (lowercase) not names in the DB
@@ -92,6 +92,15 @@ class Honeypot(Base):
 
 class Alert(Base):
     __tablename__ = "alerts"
+
+    # Composite indexes for how alerts are actually queried. Every triage call
+    # filters by a time window and usually a severity or an IP; the individual
+    # column indexes below can't serve those pairs, so a busy deployment ends
+    # up scanning. Severity had no index at all despite being filterable.
+    __table_args__ = (
+        Index("ix_alerts_timestamp_severity", "timestamp", "severity"),
+        Index("ix_alerts_source_ip_timestamp", "source_ip", "timestamp"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     honeypot_id: Mapped[int | None] = mapped_column(

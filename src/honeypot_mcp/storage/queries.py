@@ -76,6 +76,7 @@ async def get_recent_alerts(
     severity: AlertSeverity | None = None,
     honeypot_id: int | None = None,
     event_type: str | None = None,
+    since: datetime | None = None,
 ) -> list[Alert]:
     q = select(Alert)
     if source_ip:
@@ -86,26 +87,49 @@ async def get_recent_alerts(
         q = q.where(Alert.honeypot_id == honeypot_id)
     if event_type:
         q = q.where(Alert.event_type == event_type)
+    if since is not None:
+        q = q.where(Alert.timestamp >= since)
     q = q.order_by(desc(Alert.timestamp)).limit(limit)
     result = await session.execute(q)
     return list(result.scalars().all())
 
 
-async def search_alerts(session: AsyncSession, query: str, limit: int = 50) -> list[Alert]:
+async def get_honeypot_by_port(session: AsyncSession, port: int) -> Honeypot | None:
+    """Find a honeypot bound to `port`, preferring a RUNNING one — a stopped
+    row on the same port is not a conflict."""
+    result = await session.execute(
+        select(Honeypot)
+        .where(Honeypot.port == port)
+        .order_by(desc(Honeypot.status == HoneypotStatus.RUNNING))
+    )
+    return result.scalars().first()
+
+
+async def get_honeypot_names(session: AsyncSession) -> dict[int, str]:
+    """Map honeypot id → name, so alert rows can name their source without an
+    N+1 lookup per row."""
+    result = await session.execute(select(Honeypot.id, Honeypot.name))
+    return {row[0]: row[1] for row in result.all()}
+
+
+async def search_alerts(
+    session: AsyncSession,
+    query: str,
+    limit: int = 50,
+    since: datetime | None = None,
+) -> list[Alert]:
     """Substring search across IP, event type, AND payload contents.
     Payload search uses TEXT cast — works on SQLite (JSON-as-TEXT) and
     Postgres (JSON-cast-to-text). Matches anywhere in the serialised JSON,
     so an analyst can search for commands, usernames, passwords, headers, etc."""
-    result = await session.execute(
-        select(Alert)
-        .where(
-            Alert.source_ip.contains(query)
-            | Alert.event_type.contains(query)
-            | cast(Alert.payload, String).contains(query)
-        )
-        .order_by(desc(Alert.timestamp))
-        .limit(limit)
+    q = select(Alert).where(
+        Alert.source_ip.contains(query)
+        | Alert.event_type.contains(query)
+        | cast(Alert.payload, String).contains(query)
     )
+    if since is not None:
+        q = q.where(Alert.timestamp >= since)
+    result = await session.execute(q.order_by(desc(Alert.timestamp)).limit(limit))
     return list(result.scalars().all())
 
 
@@ -119,22 +143,38 @@ async def acknowledge_alert(session: AsyncSession, alert_id: int) -> bool:
     return result.rowcount > 0  # type: ignore[attr-defined]
 
 
-async def get_alert_stats(session: AsyncSession) -> dict:
-    total = await session.execute(select(func.count()).select_from(Alert))
+async def get_alert_stats(session: AsyncSession, since: datetime | None = None) -> dict:
+    def _scoped(q):  # type: ignore[no-untyped-def]
+        return q.where(Alert.timestamp >= since) if since is not None else q
+
+    total = await session.execute(_scoped(select(func.count()).select_from(Alert)))
+    unique_ips = await session.execute(
+        _scoped(select(func.count(func.distinct(Alert.source_ip))).select_from(Alert))
+    )
+    # Severity breakdown is the first thing an analyst wants — "how bad is it"
+    # before "who and what".
+    severity_result = await session.execute(
+        _scoped(select(Alert.severity, func.count().label("cnt"))).group_by(Alert.severity)
+    )
     top_ips_result = await session.execute(
-        select(Alert.source_ip, func.count().label("cnt"))
+        _scoped(select(Alert.source_ip, func.count().label("cnt")))
         .group_by(Alert.source_ip)
         .order_by(desc("cnt"))
         .limit(10)
     )
     top_types_result = await session.execute(
-        select(Alert.event_type, func.count().label("cnt"))
+        _scoped(select(Alert.event_type, func.count().label("cnt")))
         .group_by(Alert.event_type)
         .order_by(desc("cnt"))
         .limit(10)
     )
     return {
         "total_alerts": total.scalar_one(),
+        "unique_source_ips": unique_ips.scalar_one(),
+        "by_severity": {
+            (r[0].value if hasattr(r[0], "value") else str(r[0])): r[1]
+            for r in severity_result.all()
+        },
         "top_source_ips": [{"ip": r[0], "count": r[1]} for r in top_ips_result.all()],
         "top_event_types": [{"type": r[0], "count": r[1]} for r in top_types_result.all()],
     }

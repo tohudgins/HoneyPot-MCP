@@ -116,6 +116,10 @@ Three design decisions worth calling out:
 - **Enrichment is fire-and-forget and TTL-cached.** A CRITICAL alert triggers parallel
   VT/AbuseIPDB/GeoIP lookups that merge into the payload when they land. Repeat hits
   from the same IP cost zero external calls.
+- **Tool responses are shaped for a context window.** A single HTTP alert can carry
+  64 KB of captured body, so list tools return a digest of the fields you triage on,
+  `alerts_get` expands one alert in full, and exports go to disk. Getting this wrong
+  is how an MCP server becomes unusable on real traffic volume.
 
 ---
 
@@ -292,8 +296,11 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 
 | Tool | Description |
 |---|---|
-| `alerts_recent` / `alerts_get` / `alerts_search` | Triage by IP/severity/type, detail, payload substring search |
-| `alerts_stats` / `alerts_export` / `alerts_acknowledge` / `alerts_prune` | Stats, JSON/CSV export, review workflow, retention |
+| `alerts_recent` | Triage by time window, severity, IP, or honeypot — returns a compact digest per alert |
+| `alerts_get` | Full captured payload for one alert (headers, decoded bodies, enrichment) |
+| `alerts_search` | Find alerts by payload content — a command, username, path, User-Agent, or hash |
+| `alerts_stats` | Totals by severity, top attacker IPs, top event types, optionally windowed |
+| `alerts_export` / `alerts_acknowledge` / `alerts_prune` | Write JSON/CSV to disk, review workflow, retention |
 
 </details>
 

@@ -8,6 +8,7 @@ from typing import Any, Literal
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
+from honeypot_mcp.tools._format import validate_ip
 
 
 @mcp.tool
@@ -19,6 +20,9 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
         ip: IPv4 or IPv6 address to look up.
     """
     import asyncio
+
+    if err := validate_ip(ip):
+        return {"error": err}
 
     from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
     from honeypot_mcp.intel.geoip import lookup_geoip
@@ -72,6 +76,9 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
         ip: The attacker's IP address.
     """
     import asyncio
+
+    if err := validate_ip(ip):
+        return {"error": err}
 
     from honeypot_mcp.analysis.profiler import build_profile
     from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
@@ -278,6 +285,9 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         ip: The attacker's IP address.
         hours: Look-back window in hours (default 168 = 7 days).
     """
+    if err := validate_ip(ip):
+        return {"error": err}
+
     from datetime import datetime, timedelta
 
     from sqlalchemy import select

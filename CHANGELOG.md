@@ -4,6 +4,51 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Tool-layer audit — response shaping, time windows, validation
+
+The MCP tool layer is this project's entire user interface, so it got the same
+scrutiny as the engines. Findings and fixes:
+
+- **Triage calls no longer flood the context window.** `alerts_recent` returned
+  each alert's complete payload for up to 200 alerts. Because the HTTP engine
+  captures every request header plus up to 64 KB of base64 body per event, one
+  call could return ~2 MB — enough to consume a context in a single turn. List
+  tools now return a `digest` of the fields analysts triage on (credentials
+  tried, path, command, exploit category, lifted geo/VT/abuse verdicts);
+  `include_payload=True` opts back into the full capture. Measured against the
+  live demo stack, a 5-alert triage call is now ~1 KB. New `tools/_format.py`
+  holds `digest_payload` / `truncate_payload` / `validate_ip`.
+- **`alerts_export` no longer returns bulk content inline** — at its 5,000-alert
+  ceiling that was tens of megabytes into the conversation. It now writes to
+  `reports_dir` (new setting) and returns the path, byte count, and a 5-row
+  preview, with added `since_hours` / `severity` filters.
+- **Time windows everywhere they were missing.** `alerts_recent`, `alerts_stats`
+  and `alerts_search` gained `since_hours`. "Anything critical in the last
+  hour?" was previously inexpressible despite being the README's own example
+  query — only `threat_timeline` had a time filter.
+- **Descriptions that undersold the tools.** `alerts_search` was documented as
+  matching "IP addresses and event types" when it also substring-matches
+  payloads — so a model reading the description would never reach for it to
+  find an alert by captured command or username, its best use. Rewrote that
+  plus the thin `alerts_stats` / `honeypot_templates` /
+  `suppression_list_presets` descriptions.
+- **List responses report their own truncation.** List tools now return
+  `{count, alerts: [...]}` with a `note` when results hit the limit, so a
+  capped list is never mistaken for the complete picture.
+- **Input validation with actionable errors.** A malformed IP previously
+  returned "no activity found", which reads as a clean bill of health rather
+  than a bad request; `enrich_ip` / `analyze_attacker` /
+  `analyze_attacker_journey` now reject it explicitly. `honeypot_deploy`
+  validates the port range and names the honeypot already holding a port
+  instead of surfacing a bind error from inside the engine.
+- **Composite alert indexes** (`0010_add_alert_query_indexes`) for the
+  time-window access pattern the above makes primary. At 500k rows:
+  severity+window 30.7 ms → 5.4 ms, ip+window 23.6 ms → 0.04 ms. `severity`
+  previously had no index at all despite being filterable.
+- **19 new tests** covering the alert tool surface, which previously had **zero**
+  test coverage — a breaking change to its return shape passed the whole suite
+  silently before this.
+
 ## Front-door + demo-stack repair pass
 
 - **Collector mode (`MCP_TRANSPORT=none`)** — runs the full capture plane

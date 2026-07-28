@@ -401,6 +401,11 @@ def _list_available_presets() -> list[str]:
 
 @mcp.tool
 async def suppression_list_presets() -> list[str]:
-    """List available bundled suppression presets that can be applied via
-    `suppression_load_preset`."""
+    """List bundled suppression presets available to `suppression_load_preset`.
+
+    Presets are curated rule sets for known-benign noise sources — internet
+    scanning services (shodan, censys) and internal RFC1918 ranges — so their
+    traffic stops drowning out real attacks. Worth loading before exposing a
+    honeypot to the internet.
+    """
     return _list_available_presets()
