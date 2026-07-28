@@ -4,6 +4,42 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Front-door + demo-stack repair pass
+
+- **Collector mode (`MCP_TRANSPORT=none`)** — runs the full capture plane
+  (engines, canary callbacks, watchdog, webhook delivery, `/metrics`) with no
+  MCP control plane. This fixes the demo stack's `honeypot-mcp` container,
+  which previously restart-looped forever: it ran the default stdio transport
+  with no stdin attached, so FastMCP read EOF and exited immediately. Since
+  collector mode exposes no control plane, the fail-closed auth gate treats it
+  like stdio. Covered by three new tests (config validation, auth gate, and a
+  lifespan-entry + SIGINT-shutdown test for `_run_collector`).
+- **socket-proxy crash-loop fixed** — `read_only: true` prevented the
+  tecnativa entrypoint from rendering `haproxy.cfg` at boot. Dropped the
+  read-only rootfs (the sidecar's real hardening is its restricted API surface
+  + `no-new-privileges`) and documented the reasoning in the compose file.
+- **Grafana dashboards actually render** — every SQLite-backed panel showed
+  "No data" because targets carried only `queryText`; the frser plugin's
+  frontend interpolates from `rawQueryText`, so the browser sent empty
+  queries. Added `rawQueryText` to all 12 targets. The engine pie chart and
+  MITRE tactic bars also collapsed to a single value — added `rowsToFields`
+  transformations so each row becomes a series.
+- **Reproducible screenshots** — `scripts/capture_screenshots.sh` +
+  `docker/docker-compose.screenshots.yml` (grafana-image-renderer sidecar)
+  regenerate `docs/screenshots/*.png` from the live stack; the README now
+  embeds them. The seed-freshness check counts events inside the render
+  window, not table rows, so a stale DB reseeds instead of rendering empty.
+- **`scripts/attack_report.py`** — read-only campaign statistics from a live
+  DB (volume, unique IPs, countries, ASNs, credential pairs, exploit
+  categories, per-engine counts) in text / Markdown / JSON, with
+  `--anonymise-ips`. Turns a VPS collection run into publishable numbers.
+- **MaxMind EULA compliance** — `config/GeoLite2-ASN.mmdb` was committed;
+  GeoLite2 forbids redistribution. Untracked it and widened the ignore rule
+  to `config/*.mmdb` so no .mmdb can slip in again.
+- **README rewritten** — leads with the rendered dashboards, a mermaid
+  diagram of the ingestion pipeline, and the three-mode run matrix
+  (stdio / http / none); tool tables collapsed behind `<details>`.
+
 ## Security + ops hardening pass
 
 - **Migration chain idempotency** — `ALTER TABLE` migrations now guard
