@@ -1,42 +1,77 @@
 {
   "uid": "honeypot-overview",
-  "title": "HoneyPot MCP — Overview",
-  "tags": ["honeypot", "soc"],
+  "title": "HoneyPot MCP \u2014 Overview",
+  "tags": [
+    "honeypot",
+    "soc"
+  ],
   "timezone": "browser",
   "schemaVersion": 40,
   "version": 1,
   "refresh": "30s",
-  "time": {"from": "now-24h", "to": "now"},
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "editable": true,
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "Alerts (window)",
-      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
-      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
       "targets": [
         {
           "refId": "A",
           "queryText": "SELECT COUNT(*) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')",
           "queryType": "table",
-          "timeColumns": []
+          "timeColumns": [],
+          "rawQueryText": "SELECT COUNT(*) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')"
         }
       ],
       "options": {
         "graphMode": "area",
         "colorMode": "background",
         "textMode": "value",
-        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
-          "thresholds": {"mode": "absolute", "steps": [
-            {"color": "green", "value": null},
-            {"color": "orange", "value": 1000},
-            {"color": "red", "value": 5000}
-          ]},
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
+            ]
+          },
           "unit": "short"
         }
       }
@@ -45,25 +80,43 @@
       "id": 2,
       "type": "stat",
       "title": "Unique attacker IPs",
-      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
-      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
       "targets": [
         {
           "refId": "A",
           "queryText": "SELECT COUNT(DISTINCT source_ip) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')",
           "queryType": "table",
-          "timeColumns": []
+          "timeColumns": [],
+          "rawQueryText": "SELECT COUNT(DISTINCT source_ip) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')"
         }
       ],
       "options": {
         "graphMode": "none",
         "colorMode": "value",
         "textMode": "value",
-        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "fixed", "fixedColor": "blue"},
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
           "unit": "short"
         }
       }
@@ -72,20 +125,40 @@
       "id": 3,
       "type": "stat",
       "title": "Active honeypots",
-      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
-        {"refId": "A", "expr": "honeypot_active_honeypots"}
+        {
+          "refId": "A",
+          "expr": "honeypot_active_honeypots"
+        }
       ],
       "options": {
         "graphMode": "none",
         "colorMode": "value",
         "textMode": "value",
-        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "fixed", "fixedColor": "green"},
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
           "unit": "short"
         }
       }
@@ -94,30 +167,59 @@
       "id": 4,
       "type": "stat",
       "title": "CRITICAL alerts (window)",
-      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
-      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
       "targets": [
         {
           "refId": "A",
           "queryText": "SELECT COUNT(*) AS value FROM alerts WHERE severity = 'critical' AND timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')",
           "queryType": "table",
-          "timeColumns": []
+          "timeColumns": [],
+          "rawQueryText": "SELECT COUNT(*) AS value FROM alerts WHERE severity = 'critical' AND timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')"
         }
       ],
       "options": {
         "graphMode": "area",
         "colorMode": "background",
         "textMode": "value",
-        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "color": {"mode": "thresholds"},
-          "thresholds": {"mode": "absolute", "steps": [
-            {"color": "green", "value": null},
-            {"color": "orange", "value": 1},
-            {"color": "red", "value": 10}
-          ]},
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
           "unit": "short"
         }
       }
@@ -126,14 +228,25 @@
       "id": 5,
       "type": "timeseries",
       "title": "Alerts over time by severity",
-      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 4},
-      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
       "targets": [
         {
           "refId": "A",
           "queryText": "SELECT strftime('%Y-%m-%dT%H:%M:00Z', timestamp) AS time, SUM(CASE WHEN severity='low' THEN 1 ELSE 0 END) AS low, SUM(CASE WHEN severity='medium' THEN 1 ELSE 0 END) AS medium, SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) AS high, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H:%M', timestamp) ORDER BY time",
           "queryType": "time series",
-          "timeColumns": ["time"]
+          "timeColumns": [
+            "time"
+          ],
+          "rawQueryText": "SELECT strftime('%Y-%m-%dT%H:%M:00Z', timestamp) AS time, SUM(CASE WHEN severity='low' THEN 1 ELSE 0 END) AS low, SUM(CASE WHEN severity='medium' THEN 1 ELSE 0 END) AS medium, SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) AS high, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H:%M', timestamp) ORDER BY time"
         }
       ],
       "fieldConfig": {
@@ -141,65 +254,215 @@
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
-            "stacking": {"mode": "normal", "group": "A"},
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
             "lineWidth": 1
           },
           "unit": "short"
         },
         "overrides": [
-          {"matcher": {"id": "byName", "options": "low"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-          {"matcher": {"id": "byName", "options": "medium"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]},
-          {"matcher": {"id": "byName", "options": "high"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
-          {"matcher": {"id": "byName", "options": "critical"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "low"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "medium"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "high"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "critical"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
         ]
       },
       "options": {
-        "legend": {"displayMode": "list", "placement": "bottom"},
-        "tooltip": {"mode": "multi", "sort": "desc"}
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       }
     },
     {
       "id": 6,
       "type": "piechart",
       "title": "Alerts by honeypot engine",
-      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 4},
-      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
       "targets": [
         {
           "refId": "A",
           "queryText": "SELECT h.type AS engine, COUNT(*) AS count FROM alerts a LEFT JOIN honeypots h ON a.honeypot_id = h.id WHERE a.timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY h.type ORDER BY count DESC",
           "queryType": "table",
-          "timeColumns": []
+          "timeColumns": [],
+          "rawQueryText": "SELECT h.type AS engine, COUNT(*) AS count FROM alerts a LEFT JOIN honeypots h ON a.honeypot_id = h.id WHERE a.timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY h.type ORDER BY count DESC"
         }
       ],
       "options": {
         "pieType": "donut",
-        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
-        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^count$/", "values": false}
-      }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "transformations": [
+        {
+          "id": "rowsToFields",
+          "options": {}
+        }
+      ]
     },
     {
       "id": 7,
       "type": "table",
       "title": "Top 10 attackers (window)",
-      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 13},
-      "datasource": {"type": "frser-sqlite-datasource", "uid": "honeypot-db"},
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
       "targets": [
         {
           "refId": "A",
           "queryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, MAX(timestamp) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10",
           "queryType": "table",
-          "timeColumns": []
+          "timeColumns": [],
+          "rawQueryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, MAX(timestamp) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10"
         }
       ],
       "fieldConfig": {
-        "defaults": {"custom": {"align": "left", "displayMode": "auto"}},
+        "defaults": {
+          "custom": {
+            "align": "left",
+            "displayMode": "auto"
+          }
+        },
         "overrides": [
-          {"matcher": {"id": "byName", "options": "hits"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "continuous-BlPu"}}]},
-          {"matcher": {"id": "byName", "options": "critical_hits"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "continuous-reds"}}]}
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hits"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-BlPu"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "critical_hits"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-reds"
+                }
+              }
+            ]
+          }
         ]
       },
-      "options": {"showHeader": true, "footer": {"show": false}}
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "show": false
+        }
+      }
     }
   ]
 }

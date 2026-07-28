@@ -1,0 +1,35 @@
+# Screenshot-capture overlay for the demo stack.
+#
+# Adds Grafana's headless-Chromium renderer so dashboard PNGs can be produced
+# from the command line instead of by hand. Kept out of docker-compose.yml
+# because it pulls a ~400 MB image that a normal demo run has no use for.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.screenshots.yml up -d
+#   ../scripts/capture_screenshots.sh
+#
+# See scripts/capture_screenshots.sh — it drives both steps for you.
+services:
+  renderer:
+    image: grafana/grafana-image-renderer:3.11.6
+    container_name: honeypot-grafana-renderer
+    restart: unless-stopped
+    environment:
+      ENABLE_METRICS: "false"
+      # Chromium needs a decent shm; the default 64 MB causes blank renders
+      # on wide dashboards.
+      RENDERING_MODE: default
+    shm_size: 1gb
+    networks:
+      - honeypot-net
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    environment:
+      # Point Grafana at the sidecar renderer. The callback URL is how the
+      # renderer reaches Grafana back over the internal network — it must be
+      # the compose service name, not localhost.
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+    depends_on:
+      - renderer
