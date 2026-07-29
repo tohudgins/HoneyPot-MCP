@@ -11,6 +11,28 @@ from typing import Any
 from honeypot_mcp import self_probe
 
 
+def _source_address_for(host: str, port: int) -> str | None:
+    """Local IP the kernel would use to reach `host`, without sending anything.
+
+    Needed so the probe can bind — and therefore claim — its source address
+    before it connects. `connect()` on a UDP socket only sets the destination
+    in the kernel; no packet leaves, but the routing decision is made and
+    `getsockname()` reports the chosen source.
+
+    Binding to `host` directly would only work when the target is a local
+    address. It isn't always: the SSH health check falls back to probing a
+    sibling container's IP, and that probe went unclaimed, so the watchdog's
+    own SSH connections showed up as attacks every 30 seconds.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((host, port))
+            local: str = probe.getsockname()[0]
+            return local
+    except OSError:
+        return None
+
+
 async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) -> dict[str, Any]:
     """Default health-check primitive: open a TCP connection and immediately close.
     Confirms the OS is actually accepting connections on the port — catches
@@ -31,12 +53,11 @@ async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) ->
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setblocking(False)
-        # Only valid when the target is a local address, which is the only way
-        # the watchdog uses this. Anywhere else the bind fails harmlessly and
-        # we simply probe without a claim.
-        with contextlib.suppress(OSError):
-            sock.bind((host, 0))
-            self_probe.register(sock.getsockname())
+        source_ip = _source_address_for(host, port)
+        if source_ip is not None:
+            with contextlib.suppress(OSError):
+                sock.bind((source_ip, 0))
+                self_probe.register(sock.getsockname())
 
         loop = asyncio.get_running_loop()
         await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=timeout)

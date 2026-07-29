@@ -120,6 +120,16 @@ services:
       - "8888:8888"   # Canary callback server (publicly reachable)
       - "127.0.0.1:8090:8090"   # Live console — localhost only
       - "127.0.0.1:9090:9090"   # Prometheus /metrics — bound to localhost only
+      # The in-process honeypots the demo seeds (SMTP/FTP/RDP) listen inside
+      # this container. Without publishing them they are unreachable from
+      # anywhere but the container itself, so the only traffic they ever saw
+      # was the watchdog's own health probe — honeypots that cannot be
+      # attacked. Published on 0.0.0.0 deliberately: being reachable is the
+      # entire point of a honeypot. Restrict to 127.0.0.1 if you only want
+      # them exercised locally.
+      - "2525:2525"   # demo-smtp
+      - "2121:2121"   # demo-ftp
+      - "3389:3389"   # demo-rdp
     networks:
       - honeypot-net
     labels:

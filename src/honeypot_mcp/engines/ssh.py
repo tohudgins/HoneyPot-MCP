@@ -10,6 +10,7 @@ from typing import Any
 import docker.errors
 
 import docker
+from honeypot_mcp import self_probe
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -341,6 +342,10 @@ class SSHEngine(HoneypotEngine):
 
         recent_hashes: deque[int] = deque(maxlen=512)
         seen: set[int] = set()
+        # Cowrie sessions belonging to our own health probes. Bounded the same
+        # way as `seen` so a long-lived honeypot can't grow them without limit.
+        probe_sessions: set[str] = set()
+        probe_session_order: deque[str] = deque(maxlen=128)
         # Start two seconds in the past to avoid missing logs written between
         # container start and the first poll.
         last_check = datetime.now(UTC) - timedelta(seconds=2)
@@ -388,6 +393,24 @@ class SSHEngine(HoneypotEngine):
                 event_type, severity = _EVENT_MAP[event_id]
                 src_ip = entry.get("src_ip", "0.0.0.0")
                 src_port = entry.get("src_port")
+                session_id = entry.get("session")
+
+                # Self-probe filtering has to be session-scoped here, not just
+                # socket-scoped. Only `cowrie.session.connect` carries
+                # `src_port`; `session.closed` and `client.version` identify
+                # the connection by `session` alone, so matching on the socket
+                # dropped the watchdog's connect event and let its
+                # `ssh_session_closed` through every 30 seconds.
+                if session_id is not None and session_id in probe_sessions:
+                    continue
+                if src_port is not None and self_probe.claim(src_ip, src_port):
+                    if session_id is not None:
+                        if len(probe_session_order) == probe_session_order.maxlen:
+                            probe_sessions.discard(probe_session_order[0])
+                        probe_session_order.append(session_id)
+                        probe_sessions.add(session_id)
+                    continue
+
                 payload = {
                     k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")
                 }

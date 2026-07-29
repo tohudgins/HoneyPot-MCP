@@ -137,17 +137,64 @@ async def test_probe_is_claimed_before_the_server_sees_it(monkeypatch):
         await server.wait_closed()
 
 
-async def test_claim_is_one_shot():
-    """A probe drops exactly one event, never a second from the same peer.
+async def test_probe_to_a_non_loopback_local_address_is_also_claimed():
+    """Claims must not be limited to 127.0.0.1.
 
-    Without this, an attacker who happened to reuse the ephemeral port would
-    get a free pass for as long as the entry lived.
+    The SSH health check falls back to probing a sibling container's IP when
+    the host-published port isn't reachable from inside a container. Binding
+    the probe to the *target* address only works for loopback, so that
+    fallback went unclaimed and the watchdog's own SSH connections were
+    recorded as attacks every 30 seconds.
+    """
+    from honeypot_mcp import self_probe
+    from honeypot_mcp.engines.base import tcp_probe
+
+    seen: list[tuple[str, int]] = []
+
+    class _Server(asyncio.Protocol):
+        def connection_made(self, transport):
+            seen.append(transport.get_extra_info("peername"))
+            transport.close()
+
+    loop = asyncio.get_running_loop()
+    # A routable local address that is not 127.0.0.1, so `bind((host, 0))`
+    # would have been the only thing that worked before.
+    host = socket.gethostbyname(socket.gethostname())
+    try:
+        server = await loop.create_server(_Server, host, 0)
+    except OSError:
+        pytest.skip("no non-loopback address available in this environment")
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert (await tcp_probe(port, host=host))["alive"] is True
+        for _ in range(20):
+            await asyncio.sleep(0.02)
+            if seen:
+                break
+        assert seen, "server never saw the probe"
+        assert self_probe.claim(*seen[0]) is True, (
+            f"probe from {seen[0]} was not claimed and would be logged as an attack"
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_claim_covers_every_event_from_one_probe_connection():
+    """A claim is per-connection, not per-event.
+
+    One probe connection produces several events — Cowrie emits
+    session-connect, client-version and session-closed for a single TCP
+    open/close. A claim consumed on first use dropped the connect and let
+    `ssh_session_closed` straight through, so the noise came back in a
+    different shape.
     """
     from honeypot_mcp import self_probe
 
     self_probe.register(("127.0.0.1", 54321))
     assert self_probe.claim("127.0.0.1", 54321) is True
-    assert self_probe.claim("127.0.0.1", 54321) is False
+    assert self_probe.claim("127.0.0.1", 54321) is True
+    assert self_probe.claim("127.0.0.1", 54321) is True
 
 
 async def test_claim_requires_both_ip_and_port_to_match():

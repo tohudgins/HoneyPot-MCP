@@ -21,8 +21,7 @@ this safe to do silently:
 
 * The ephemeral port is bound by our socket for the probe's lifetime, so no
   other process can be sourcing traffic from it at the same time.
-* Claims are one-shot, so a probe can never mask a second event.
-* Entries expire after `_TTL` seconds, so a probe that somehow never produces
+* Entries expire after `_TTL_SECONDS`, so a probe that somehow never produces
   an event cannot suppress a later, unrelated one.
 
 Suppressing by rule instead — "drop `*_connection` from 127.0.0.1" — would have
@@ -67,15 +66,25 @@ def register(sockname: object) -> None:
 def claim(source_ip: str | None, source_port: int | None) -> bool:
     """True if this event came from one of our own probes.
 
-    One-shot: a claimed probe is removed, so only the single event it
-    generated is dropped.
+    A claim covers the whole probe connection, not one event, and stays valid
+    until it expires. One connection routinely produces several events — Cowrie
+    alone emits session-connect, client-version and session-closed — so
+    consuming the claim on first use dropped the first and let the rest through,
+    which is exactly what left `ssh_session_closed` in the alert stream after
+    the connect had been suppressed.
+
+    Leaving the entry in place until the TTL does mean a real connection from
+    the identical `(ip, port)` inside the window would also be dropped. That
+    needs an attacker to source traffic from the exact ephemeral port the
+    watchdog just used, on the same host, within seconds, while that port sits
+    in TIME_WAIT — and the payoff is hiding a couple of low-severity events.
+    Against that, letting probes through is a certainty on every sweep.
     """
     if source_ip is None or source_port is None:
         return False
     now = time.monotonic()
     _evict(now)
-    deadline = _probes.pop((source_ip, source_port), None)
-    if deadline is None:
+    if (source_ip, source_port) not in _probes:
         return False
     log.debug("Dropped self-probe event from %s:%s", source_ip, source_port)
     return True
