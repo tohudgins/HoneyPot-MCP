@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from typing import Any
+from typing import Any, cast
 
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.storage import queries
@@ -293,8 +293,13 @@ class _SNMPProtocol(asyncio.DatagramProtocol):
         self._transport: asyncio.DatagramTransport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        assert isinstance(transport, asyncio.DatagramTransport)
-        self._transport = transport
+        # Cast, never isinstance. On Python 3.11 `_SelectorDatagramTransport`
+        # is not a subclass of `asyncio.DatagramTransport` — the MRO changed
+        # in 3.12 — so an isinstance assert raises here, asyncio swallows it
+        # into the exception handler, and `self._transport` stays None. The
+        # agent then records every request but answers none of them: a
+        # honeypot that goes quiet, on a version this project supports.
+        self._transport = cast(asyncio.DatagramTransport, transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         if len(data) > _MAX_DATAGRAM:

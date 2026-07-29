@@ -45,7 +45,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -450,8 +450,12 @@ class _SyslogUDPProtocol(asyncio.DatagramProtocol):
         self.error: Exception | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        assert isinstance(transport, asyncio.DatagramTransport)
-        self.transport = transport
+        # Cast rather than isinstance: on Python 3.11
+        # `_SelectorDatagramTransport` is not a subclass of
+        # `asyncio.DatagramTransport` (the MRO changed in 3.12), so an
+        # isinstance assert fires on every UDP syslog delivery and asyncio
+        # logs it as an unhandled callback exception.
+        self.transport = cast(asyncio.DatagramTransport, transport)
 
     def error_received(self, exc: Exception) -> None:
         self.error = exc

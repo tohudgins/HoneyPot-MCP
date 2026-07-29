@@ -305,6 +305,42 @@ async def test_snmp_answers_default_communities_and_ignores_others():
     assert "snmp_community_attempt" in types
 
 
+async def test_datagram_protocols_do_not_type_check_the_transport():
+    """`connection_made` must accept whatever asyncio hands it.
+
+    On Python 3.11 `_SelectorDatagramTransport` is not a subclass of
+    `asyncio.DatagramTransport` — the MRO changed in 3.12 — so an
+    `assert isinstance(transport, asyncio.DatagramTransport)` raises. asyncio
+    swallows that into its exception handler, the protocol never stores its
+    transport, and the SNMP agent then records every request while answering
+    none of them. It was a silent, version-specific mute button on a supported
+    interpreter, and CI on 3.11 was the only thing that saw it.
+
+    Passing an object that is deliberately *not* a DatagramTransport pins the
+    behaviour on every version, including the ones where the isinstance check
+    would happen to pass.
+    """
+    from honeypot_mcp.engines.snmp import _SNMPProtocol
+    from honeypot_mcp.webhooks import _SyslogUDPProtocol
+
+    class _NotATransport:
+        def sendto(self, data, addr=None):  # pragma: no cover - never called
+            pass
+
+        def get_extra_info(self, name, default=None):  # pragma: no cover
+            return default
+
+    stand_in = _NotATransport()
+
+    snmp_protocol = _SNMPProtocol("t", None)
+    snmp_protocol.connection_made(stand_in)  # type: ignore[arg-type]
+    assert snmp_protocol._transport is stand_in
+
+    syslog_protocol = _SyslogUDPProtocol()
+    syslog_protocol.connection_made(stand_in)  # type: ignore[arg-type]
+    assert syslog_protocol.transport is stand_in
+
+
 async def test_snmp_records_the_community_as_a_credential():
     """So planted community strings cross-reference like any other secret."""
     from honeypot_mcp.credential_match import _infer_service
