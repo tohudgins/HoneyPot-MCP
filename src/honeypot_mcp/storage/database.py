@@ -16,6 +16,12 @@ log = logging.getLogger(__name__)
 _engine = None
 _session_factory = None
 
+# Sessions currently open. `close_db` waits on this so a fire-and-forget write
+# is not cut off mid-statement by `dispose()`.
+_active_sessions = 0
+# Bounded so a leaked session can never hang shutdown.
+_CLOSE_GRACE_SECONDS = 2.0
+
 
 def _get_engine():
     global _engine
@@ -160,20 +166,63 @@ def _has_psycopg2() -> bool:
 
 
 async def close_db() -> None:
+    """Dispose the engine, waiting for in-flight sessions to finish first.
+
+    Plenty of writes here are fire-and-forget: every engine's `_record` call,
+    `_enrich_alert_async`, `record_action`. Disposing while one of those is
+    mid-statement kills its connection underneath it, and the write is lost —
+    an audit entry or an enrichment merge, gone, reported only as a stray
+    "Cannot operate on a closed database" traceback from a task nobody is
+    awaiting. It also made CI intermittently red with a `KeyError: 'connection'`
+    raised out of `dispose()` itself.
+
+    Waiting on the *session count* rather than on pending tasks is deliberate.
+    An earlier attempt drained every outstanding asyncio task, which under
+    in-memory SQLite's StaticPool made abandoned writes resume and overlap on
+    the single shared connection ("cannot commit transaction - SQL statements
+    in progress"). This waits only for sessions already open, and never lets a
+    new one start something.
+    """
     global _engine, _session_factory
-    if _engine:
-        await _engine.dispose()
-        _engine = None
+    if _engine is None:
+        _session_factory = None
+        return
+
+    # Yield first. A fire-and-forget write is *scheduled*, not running, so at
+    # this instant its session does not exist yet and the counter below would
+    # read zero and dispose straight through it. A couple of loop turns let
+    # every already-created task reach its `get_session()` and register.
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    deadline = asyncio.get_event_loop().time() + _CLOSE_GRACE_SECONDS
+    while _active_sessions > 0 and asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    if _active_sessions > 0:
+        log.warning(
+            "Closing the database with %d session(s) still open after %.1fs — "
+            "their writes may be lost.",
+            _active_sessions,
+            _CLOSE_GRACE_SECONDS,
+        )
+
+    await _engine.dispose()
+    _engine = None
     _session_factory = None
 
 
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    global _active_sessions
     factory = _get_session_factory()
-    async with factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
+    _active_sessions += 1
+    try:
+        async with factory() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    finally:
+        _active_sessions -= 1

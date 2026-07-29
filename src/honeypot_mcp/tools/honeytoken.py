@@ -18,6 +18,7 @@ async def honeytoken_create(
     type: Literal["api_key", "canary_url", "credential", "file", "ssh_key", "jwt", "db_row"],
     label: str,
     metadata: dict[str, Any] | None = None,
+    planted_at: str | None = None,
 ) -> dict[str, Any]:
     """Create a new honeytoken.
 
@@ -32,6 +33,12 @@ async def honeytoken_create(
               - db_row: canary database row with unique email (match on SMTP RCPT TO)
         label: Human-readable label to identify this token (e.g. 'prod-server .env backup').
         metadata: Optional type-specific settings (e.g. {'service': 'aws', 'region': 'us-east-1'}).
+        planted_at: Where this token is being placed — "the finance file share",
+                    "wiki page IT-114", "~/.aws/credentials on the build server".
+                    Strongly recommended. When a token fires months later the
+                    alert says *which* token, and this is what says which system
+                    the attacker actually reached; without it a CRITICAL arrives
+                    with no location and triage starts from nothing.
     """
     provider = get_provider(HoneytokenType(type))
     token_value, extra_meta = await provider.create(metadata or {})
@@ -42,7 +49,11 @@ async def honeytoken_create(
             label=label,
             token_value=token_value,
             status=HoneytokenStatus.ACTIVE,
-            token_meta={**(metadata or {}), **extra_meta},
+            token_meta={
+                **(metadata or {}),
+                **extra_meta,
+                **({"planted_at": planted_at} if planted_at else {}),
+            },
         )
         session.add(token)
         await session.flush()

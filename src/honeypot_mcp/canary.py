@@ -141,6 +141,10 @@ async def _trigger(token: Honeytoken, request: web.Request) -> None:
                 "token_id": live.id,
                 "token_label": live.label,
                 "token_type": live.type.value,
+                # Where it was planted, if the operator recorded it. This is
+                # what turns "a token fired" into "someone reached the finance
+                # share" — the first question triage asks.
+                "planted_at": (live.token_meta or {}).get("planted_at", ""),
                 **trigger_meta,
             },
             severity=AlertSeverity.CRITICAL,
@@ -304,6 +308,10 @@ async def _trigger_cloud(token: Honeytoken, request: web.Request, event: dict, s
                 "token_id": live.id,
                 "token_label": live.label,
                 "token_type": live.type.value,
+                # Where it was planted, if the operator recorded it. This is
+                # what turns "a token fired" into "someone reached the finance
+                # share" — the first question triage asks.
+                "planted_at": (live.token_meta or {}).get("planted_at", ""),
                 **trigger_meta,
             },
             severity=AlertSeverity.CRITICAL,

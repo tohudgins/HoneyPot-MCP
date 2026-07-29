@@ -227,6 +227,10 @@ async def deception_deploy_plan(
                     type=token_type,  # type: ignore[arg-type]
                     label=str(token.get("label")),
                     metadata=token.get("metadata") or {},
+                    # The plan already says where this belongs; recording it
+                    # now means a trigger months later arrives with its
+                    # location attached.
+                    planted_at=token.get("plant_location") or None,
                 )
             except Exception as e:  # a bad token must not undo working sensors
                 failures.append({"token": str(token.get("label")), "error": str(e)})
@@ -443,7 +447,13 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         },
         "needs_attention": needs_attention,
         "triggered_tokens": [
-            {"id": t.id, "type": t.type.value, "label": t.label} for t in token_trips
+            {
+                "id": t.id,
+                "type": t.type.value,
+                "label": t.label,
+                "planted_at": (t.token_meta or {}).get("planted_at", ""),
+            }
+            for t in token_trips
         ],
         "sensors": {
             "total": len(sensors),
