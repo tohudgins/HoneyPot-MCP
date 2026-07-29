@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"
 
+    # How long the event buffer waits before flushing a partial batch. Lower
+    # means alerts reach the database (and your SIEM) sooner at the cost of
+    # more, smaller transactions. The test suite drops this so assertions
+    # don't race a 1-second flush.
+    event_flush_interval_seconds: float = 1.0
+
     # Live operations console — a read-only wall display served by the server
     # itself (see console/). Bound to localhost by default: it exposes every
     # captured attack, so putting it on 0.0.0.0 is an explicit choice.

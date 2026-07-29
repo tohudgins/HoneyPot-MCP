@@ -700,3 +700,21 @@ running from the repo root hides the bug entirely.
 
 Version lives in two places (`pyproject.toml` and `__init__.py`); a test
 asserts they agree and the release workflow refuses a mismatched git tag.
+
+### Test timing
+
+`tests/conftest.py` sets `EVENT_FLUSH_INTERVAL_SECONDS=0.05`. This is not
+cosmetic: the suite contains ~44 `await asyncio.sleep(1.0)` calls followed
+immediately by a query for rows the event buffer wrote, and the buffer's
+default `flush_interval` is also 1.0 second. Those waits sit exactly on the
+boundary — they win on an idle laptop and lose on a loaded CI runner, so the
+failure appears on whichever engine test lost the race that run, in whichever
+Python version happened to be slow. Two separate CI failures were traced to it.
+
+Shortening the interval for tests gives a 20x margin without rewriting the
+assertions, and made the unit suite ~26% faster as a side effect. If you add a
+test that waits for a flush, prefer polling until the row appears (see
+`tests/integration/test_pipeline.py:_alerts_after_flush`) over a fixed sleep.
+
+The interval is a real setting, not a test-only hook — operators can lower it
+to reduce alert latency.

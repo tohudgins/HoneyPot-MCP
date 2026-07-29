@@ -165,7 +165,9 @@ _buffer: EventBuffer | None = None
 def get_buffer() -> EventBuffer:
     global _buffer
     if _buffer is None:
-        _buffer = EventBuffer()
+        from honeypot_mcp.config import get_settings
+
+        _buffer = EventBuffer(flush_interval=get_settings().event_flush_interval_seconds)
     return _buffer
 
 
