@@ -256,7 +256,16 @@ async def test_coverage_of_an_empty_deployment_points_at_the_planner():
 # ── SOC brief ───────────────────────────────────────────────────────────────
 
 
-async def _alert(event_type: str, severity, source_ip: str = "45.148.10.72"):
+async def _alert(event_type: str, severity, source_ip: str = "192.0.2.10"):
+    """Submit an alert from a TEST-NET address, deliberately.
+
+    A CRITICAL event from a *globally routable* IP schedules a fire-and-forget
+    `_enrich_alert_async` task. That task outlives the test, re-opens a session
+    after the fixture has closed the database, and poisons whichever module
+    happens to run next — which is how this file broke `test_vnc.py` on one
+    Python version and nothing else. `_is_enrichable_ip` filters TEST-NET, so
+    no background task is created and the test owns its own lifetime.
+    """
     from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 
     await submit_event(
@@ -347,7 +356,7 @@ async def test_brief_digests_payloads_rather_than_returning_them_whole():
     await submit_event(
         PendingEvent(
             honeypot_id=None,
-            source_ip="45.148.10.72",
+            source_ip="192.0.2.10",
             event_type="http_exploit_attempt",
             payload={"raw_body_b64": "A" * 50_000, "path": "/admin"},
             severity=AlertSeverity.CRITICAL,
