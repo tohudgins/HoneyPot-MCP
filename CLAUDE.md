@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (577 unit tests covering security-critical paths)
+# Tests (599 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -394,6 +394,27 @@ Four more surfaces, each chosen because its traffic means something specific.
 
 `nmap -sV` hard-matches all four: `Dovecot imapd`, `Asterisk PBX 18.10.0`
 (with `Device: PBX`), `rsync (protocol version 31)`, `rpcbind`.
+
+### POP3 / Kubernetes API engines
+
+The pair that takes the catalogue to 25.
+
+- `engines/pop3.py` — tcp/110. The same botnets sweep 110 and 143 in one pass,
+  so a host answering IMAP but refusing POP3 is an odd configuration a scanner
+  notices. `USER`/`PASS` sends the password with no encoding at all. `APOP` is
+  offered too and its digest is stored *with the challenge that produced it* —
+  a hash without its salt is not crackable, and the challenge is ours, so
+  keeping both is what makes the capture worth anything.
+- `engines/kubernetes.py` — tcp/6443, the cloud sibling of `docker_api`.
+  `analyse_pod_spec()` names escape indicators the same way
+  `analyse_container_create()` does: `hostPath: /`, host namespaces,
+  `privileged`, dangerous capabilities, miner images, payload commands. Reading
+  Secrets is CRITICAL on its own, because service-account tokens there are
+  usually the whole cluster rather than one workload. Responses carry
+  `Audit-Id` and the `X-Kubernetes-Pf-*` flow-control UIDs that a real API
+  server always sends, and errors use the `Status` object shape — their absence
+  identifies a decoy in one request. It presents as `nginx` because that is
+  what actually fronts 6443 in practice.
 
 ### HTTP realistic endpoints + sessions
 

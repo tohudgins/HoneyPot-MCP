@@ -134,6 +134,9 @@ class Settings(BaseSettings):
     default_sip_port: int = 5060
     default_rsync_port: int = 8873
     default_nfs_port: int = 2049
+    # POP3 is privileged (110); the Kubernetes API server is not.
+    default_pop3_port: int = 1110
+    default_kubernetes_port: int = 6443
 
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"

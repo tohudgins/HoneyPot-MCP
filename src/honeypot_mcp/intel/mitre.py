@@ -80,13 +80,16 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     # the generic Execution techniques here would lose that. Ordered before the
     # generic shell rules so the container-specific finding is the headline.
     (
-        re.compile(r"docker_api_(container_create|container_start|image_pull)", re.I),
+        re.compile(
+            r"(docker_api_(container_create|container_start|image_pull)|kubernetes_pod_create)",
+            re.I,
+        ),
         "T1610",
         "Deploy Container",
         "Execution",
     ),
     (
-        re.compile(r"docker_api_exec", re.I),
+        re.compile(r"(docker_api_exec|kubernetes_pod_exec)", re.I),
         "T1609",
         "Container Administration Command",
         "Execution",
@@ -113,7 +116,11 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         # or shares the host PID namespace is a break-out attempt, and ATT&CK
         # names it. This is the single most consequential thing the Docker API
         # engine can observe, so it must not fall through to Deploy Container.
-        re.compile(r"(container_escape|escape.to.host|privileged.container|host.namespace)", re.I),
+        re.compile(
+            r"(container_escape|escape.to.host|privileged.container|host.namespace"
+            r"|kubernetes_pod_escape)",
+            re.I,
+        ),
         "T1611",
         "Escape to Host",
         "Privilege Escalation",
@@ -181,7 +188,9 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         # out of the big protocol alternation above because `sip_scan` and
         # `rsync_module_enumeration` must stay Discovery, not brute force.
         re.compile(
-            r"(imap_login_attempt|imap_auth_attempt|sip_register_attempt|rsync_auth_attempt)", re.I
+            r"(imap_login_attempt|imap_auth_attempt|pop3_login_attempt|pop3_auth_attempt"
+            r"|sip_register_attempt|rsync_auth_attempt)",
+            re.I,
         ),
         "T1110.001",
         "Brute Force: Password Guessing",
@@ -279,10 +288,25 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Collection",
     ),
     (
+        # Kubernetes Secrets are a credential store; reading them is not
+        # generic "data from a repository", it is credential theft.
+        re.compile(r"kubernetes_secret_access", re.I),
+        "T1552.007",
+        "Unsecured Credentials: Container API",
+        "Credential Access",
+    ),
+    (
+        re.compile(r"kubernetes_rbac_enumerate", re.I),
+        "T1069",
+        "Permission Groups Discovery",
+        "Discovery",
+    ),
+    (
         # Mounting an export or pulling an rsync module is taking the files,
         # not looking at the directory.
         re.compile(
-            r"(nfs_mount_attempt|rsync_anonymous_access|rsync_file_request|imap_mailbox_access)",
+            r"(nfs_mount_attempt|rsync_anonymous_access|rsync_file_request"
+            r"|imap_mailbox_access|pop3_mailbox_access)",
             re.I,
         ),
         "T1039",
@@ -388,7 +412,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     (
         # ATT&CK's Containers matrix names this exactly — listing containers
         # and images on a runtime you do not own.
-        re.compile(r"docker_api_(enumerate|list)", re.I),
+        re.compile(r"(docker_api_(enumerate|list)|kubernetes_(enumerate|recon|probe))", re.I),
         "T1613",
         "Container and Resource Discovery",
         "Discovery",

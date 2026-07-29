@@ -101,6 +101,7 @@ _SERVICE_PREFIXES = {
     "ldap_": "ldap",
     "memcached_": "memcached",
     "imap_": "imap",
+    "pop3_": "pop3",
     "sip_": "sip",
     "rsync_": "rsync",
     "http_": "http",

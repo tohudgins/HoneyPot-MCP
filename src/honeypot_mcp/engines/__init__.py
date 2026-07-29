@@ -102,6 +102,14 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.nfs import NFSEngine
 
             _engines[hp_type] = NFSEngine()
+        elif hp_type == HoneypotType.POP3:
+            from honeypot_mcp.engines.pop3 import POP3Engine
+
+            _engines[hp_type] = POP3Engine()
+        elif hp_type == HoneypotType.KUBERNETES:
+            from honeypot_mcp.engines.kubernetes import KubernetesEngine
+
+            _engines[hp_type] = KubernetesEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

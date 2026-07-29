@@ -463,6 +463,45 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         ),
         notes="An export shared to * with no_root_squash is data loss and often RCE.",
     ),
+    EngineCapability(
+        type="pop3",
+        display_name="POP3",
+        default_port=1110,
+        real_world_port=110,
+        os_family="neutral",
+        roles=("mail", "public_facing"),
+        summary=(
+            "The other half of the mail sweep. USER/PASS sends the password with no "
+            "encoding at all; APOP digests are captured with the challenge that "
+            "produced them. Deploy alongside IMAP — a host answering 143 but "
+            "refusing 110 is an odd configuration a scanner will notice."
+        ),
+        signature_events=("pop3_login_attempt", "pop3_mailbox_access", "pop3_auth_attempt"),
+        captures_credentials_as="pop3",
+        pairs_well_with=("imap", "smtp"),
+    ),
+    EngineCapability(
+        type="kubernetes",
+        display_name="Kubernetes API server",
+        default_port=6443,
+        real_world_port=6443,
+        os_family="linux",
+        roles=("container", "cloud"),
+        summary=(
+            "Anonymous cluster access — the cloud-native equivalent of an open Docker "
+            "socket. Separates recon from namespace enumeration from secret theft "
+            "from a pod that mounts the node's root filesystem."
+        ),
+        signature_events=(
+            "kubernetes_secret_access",
+            "kubernetes_pod_escape",
+            "kubernetes_pod_exec",
+            "kubernetes_enumerate",
+            "kubernetes_rbac_enumerate",
+        ),
+        pairs_well_with=("docker_api",),
+        notes="Reading Secrets is usually the whole cluster, not one workload.",
+    ),
 )
 
 BY_TYPE: dict[str, EngineCapability] = {c.type: c for c in _CAPABILITIES}
@@ -515,7 +554,7 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         description="A public web application on Linux with a database behind it and SSH for admin.",
         os_family="linux",
         core=("http", "ssh", "postgresql"),
-        optional=("redis", "mysql", "ftp", "imap", "rsync"),
+        optional=("redis", "mysql", "ftp", "imap", "pop3", "rsync"),
         hostname_prefix="web",
     ),
     EnvironmentProfile(
@@ -526,8 +565,8 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
             "cryptomining campaigns hunt for."
         ),
         os_family="linux",
-        core=("docker_api", "http", "ssh"),
-        optional=("elasticsearch", "redis", "postgresql"),
+        core=("docker_api", "kubernetes", "http", "ssh"),
+        optional=("elasticsearch", "redis", "postgresql", "kubernetes"),
         hostname_prefix="node",
     ),
     EnvironmentProfile(

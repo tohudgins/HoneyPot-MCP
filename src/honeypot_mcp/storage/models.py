@@ -38,6 +38,8 @@ class HoneypotType(str, enum.Enum):
     SIP = "sip"
     RSYNC = "rsync"
     NFS = "nfs"
+    POP3 = "pop3"
+    KUBERNETES = "kubernetes"
 
 
 class HoneypotStatus(str, enum.Enum):
