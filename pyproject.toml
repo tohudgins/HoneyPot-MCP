@@ -60,6 +60,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PostgreSQL support. The docs offer swapping DATABASE_URL to Postgres as the
+# production path, which needs a driver SQLAlchemy can import — without this
+# extra that swap fails at startup with ModuleNotFoundError: asyncpg.
+postgres = [
+    "asyncpg>=0.29.0",
+]
 dev = [
     "pytest>=8.2.0",
     "pytest-asyncio>=0.23.0",
@@ -67,6 +73,8 @@ dev = [
     "anyio>=4.4.0",
     "ruff>=0.4.0",
     "mypy>=1.10.0",
+    # So `pytest` can exercise the Postgres path in CI.
+    "asyncpg>=0.29.0",
 ]
 
 [project.scripts]

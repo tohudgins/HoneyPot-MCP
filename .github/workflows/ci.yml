@@ -53,6 +53,11 @@ jobs:
             --cov-fail-under=60 \
             --junitxml=pytest-results.xml
 
+      - name: Integration tests (real sockets, full pipeline)
+        env:
+          DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+        run: pytest tests/integration/ -q
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -62,6 +67,80 @@ jobs:
             pytest-results.xml
             coverage.xml
           if-no-files-found: ignore
+
+  postgres:
+    name: postgres compatibility (blocking)
+    runs-on: ubuntu-latest
+    # The docs offer PostgreSQL as the production database. That claim went
+    # untested for the project's whole life and was broken the entire time: an
+    # over-length Alembic revision id is accepted by SQLite and rejected by
+    # Postgres, so the migration chain died mid-way and init_db's create_all
+    # fallback silently hid it — every restart re-ran every migration. Nothing
+    # but a real Postgres catches that class of bug.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: honeypot
+          POSTGRES_DB: honeypot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project + dev + postgres extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,postgres]"
+
+      - name: Migrations apply cleanly and stamp the version
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:honeypot@localhost:5432/honeypot_test
+        run: |
+          python - <<'PY'
+          import asyncio, logging, sys
+          problems = []
+          class Catch(logging.Handler):
+              def emit(self, record):
+                  if "fallback" in record.getMessage().lower():
+                      problems.append(record.getMessage())
+          logging.getLogger().addHandler(Catch())
+          logging.getLogger().setLevel(logging.WARNING)
+          from honeypot_mcp.storage.database import init_db, close_db
+          asyncio.run(init_db()); asyncio.run(close_db())
+          if problems:
+              sys.exit("init_db fell back to create_all on PostgreSQL: %s" % problems)
+          print("migrations applied without fallback")
+          PY
+
+      - name: Re-running startup is a no-op (version stamp persisted)
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:honeypot@localhost:5432/honeypot_test
+        run: |
+          python - <<'PY' 2>&1 | tee /tmp/second.log
+          import asyncio, logging
+          logging.basicConfig(level=logging.INFO, format="%(message)s")
+          from honeypot_mcp.storage.database import init_db, close_db
+          asyncio.run(init_db()); asyncio.run(close_db())
+          PY
+          if grep -q "Running upgrade" /tmp/second.log; then
+            echo "::error::migrations re-ran on an already-migrated database — version stamp not persisted"
+            exit 1
+          fi
+          echo "second startup was a no-op"
+
+      - name: Full unit suite against PostgreSQL
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:honeypot@localhost:5432/honeypot_test
+        run: pytest tests/unit/ -q
 
   typecheck:
     name: typecheck (blocking)

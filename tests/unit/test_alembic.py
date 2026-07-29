@@ -152,7 +152,7 @@ def test_drop_shodan_data_migration_roundtrip(tmp_path: Path):
         )
         command.stamp(cfg, "0006_add_subscription_format")
 
-        command.upgrade(cfg, "0007_drop_attacker_profile_shodan_data")
+        command.upgrade(cfg, "0007_drop_profile_shodan")
         cols = {c["name"] for c in inspect(engine).get_columns("attacker_profiles")}
         assert "shodan_data" not in cols, "shodan_data should be gone after upgrade"
 
@@ -160,7 +160,7 @@ def test_drop_shodan_data_migration_roundtrip(tmp_path: Path):
         cols = {c["name"] for c in inspect(engine).get_columns("attacker_profiles")}
         assert "shodan_data" in cols, "downgrade should restore shodan_data"
 
-        command.upgrade(cfg, "0007_drop_attacker_profile_shodan_data")
+        command.upgrade(cfg, "0007_drop_profile_shodan")
         cols = {c["name"] for c in inspect(engine).get_columns("attacker_profiles")}
         assert "shodan_data" not in cols, "re-upgrade should drop again"
     finally:
@@ -222,3 +222,51 @@ async def test_baseline_migration_is_idempotent_against_pre_alembic_db(tmp_path)
     # alembic_version is now present — Alembic adopted the existing DB.
     assert "alembic_version" in post_tables
     assert "honeypots" in post_tables
+
+
+def test_revision_ids_fit_alembics_version_column():
+    """Alembic's `alembic_version.version_num` is VARCHAR(32).
+
+    SQLite does not enforce VARCHAR length, so an over-length revision id looks
+    fine locally and then fails on PostgreSQL with StringDataRightTruncation —
+    mid-chain, where `init_db`'s create_all fallback silently masks it. That
+    combination left the documented production database backend re-running every
+    migration on every startup, unnoticed. Keep ids short.
+    """
+    import pathlib
+    import re
+
+    versions = pathlib.Path("src/honeypot_mcp/migrations/versions")
+    ids = []
+    for path in versions.glob("[0-9]*.py"):
+        match = re.search(r'^revision = "([^"]+)"', path.read_text(), re.M)
+        assert match, f"{path.name} has no revision id"
+        ids.append((path.name, match.group(1)))
+
+    assert ids, "no migrations found"
+    too_long = [(f, r, len(r)) for f, r in ids if len(r) > 32]
+    assert not too_long, f"revision ids exceed VARCHAR(32): {too_long}"
+
+
+def test_migration_chain_is_linear_and_complete():
+    """Every down_revision must name a revision that exists, with exactly one
+    root and one head — a broken link only shows up at deploy time otherwise."""
+    import pathlib
+    import re
+
+    versions = pathlib.Path("src/honeypot_mcp/migrations/versions")
+    revs, downs = {}, {}
+    for path in versions.glob("[0-9]*.py"):
+        text = path.read_text()
+        rev = re.search(r'^revision = "([^"]+)"', text, re.M).group(1)
+        down = re.search(r"^down_revision = (.+)$", text, re.M).group(1).strip()
+        revs[rev] = path.name
+        downs[rev] = None if down == "None" else down.strip('"')
+
+    for rev, down in downs.items():
+        assert down is None or down in revs, f"{revs[rev]} points at missing revision {down!r}"
+
+    roots = [r for r, d in downs.items() if d is None]
+    heads = [r for r in revs if r not in set(downs.values())]
+    assert len(roots) == 1, f"expected one root migration, found {roots}"
+    assert len(heads) == 1, f"expected one head migration, found {heads}"

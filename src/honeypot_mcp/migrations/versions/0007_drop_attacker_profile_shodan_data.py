@@ -5,7 +5,7 @@ integration was removed earlier; the column had been left in place pending the
 next model touch. Downgrade re-adds it with the original default so a rollback
 restores the prior schema shape.
 
-Revision ID: 0007_drop_attacker_profile_shodan_data
+Revision ID: 0007_drop_profile_shodan
 Revises: 0006_add_subscription_format
 Create Date: 2026-05-27
 """
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import inspect
 
-revision = "0007_drop_attacker_profile_shodan_data"
+revision = "0007_drop_profile_shodan"
 down_revision = "0006_add_subscription_format"
 branch_labels = None
 depends_on = None

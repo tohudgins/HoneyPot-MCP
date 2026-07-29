@@ -98,6 +98,37 @@ async def init_db() -> None:
             await conn.run_sync(Base.metadata.create_all)
 
 
+# Revision ids that were renamed after the fact. Alembic's `alembic_version`
+# column is VARCHAR(32); anything longer is silently accepted by SQLite and
+# rejected by PostgreSQL, so `0007_drop_attacker_profile_shodan_data` (38 chars)
+# had to be shortened. A database stamped with the old id before that change
+# would otherwise fail with "Can't locate revision", so rewrite it in place.
+_RENAMED_REVISIONS = {
+    "0007_drop_attacker_profile_shodan_data": "0007_drop_profile_shodan",
+}
+
+
+def _rewrite_renamed_revisions(sync_url: str) -> None:
+    """Update any stamp that refers to a revision id we have since renamed."""
+    from sqlalchemy import create_engine, text
+
+    try:
+        engine = create_engine(sync_url)
+        with engine.begin() as conn:
+            if not engine.dialect.has_table(conn, "alembic_version"):
+                return
+            for old, new in _RENAMED_REVISIONS.items():
+                result = conn.execute(
+                    text("UPDATE alembic_version SET version_num = :new WHERE version_num = :old"),
+                    {"new": new, "old": old},
+                )
+                if result.rowcount:
+                    log.info("Rewrote migration stamp %s → %s", old, new)
+        engine.dispose()
+    except Exception as e:  # noqa: BLE001 — best effort; upgrade reports real errors
+        log.debug("Could not check for renamed revisions: %s", e)
+
+
 def _run_alembic_upgrade() -> None:
     """Synchronous Alembic invocation. Imported here so test suites that use
     in-memory DBs never load Alembic at all."""
@@ -106,11 +137,26 @@ def _run_alembic_upgrade() -> None:
     from alembic import command
     from alembic.config import Config
 
+    url = get_settings().database_url
+    # The rewrite needs a sync driver; strip the async dialect suffix.
+    sync_url = url.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg2")
+    if "+psycopg2" not in sync_url or _has_psycopg2():
+        _rewrite_renamed_revisions(sync_url)
+
     package_root = files("honeypot_mcp")
     cfg = Config()
     cfg.set_main_option("script_location", str(package_root / "migrations"))
-    cfg.set_main_option("sqlalchemy.url", get_settings().database_url)
+    cfg.set_main_option("sqlalchemy.url", url)
     command.upgrade(cfg, "head")
+
+
+def _has_psycopg2() -> bool:
+    try:
+        import psycopg2  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 async def close_db() -> None:

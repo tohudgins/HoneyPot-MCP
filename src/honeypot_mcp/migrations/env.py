@@ -54,6 +54,14 @@ async def run_async_migrations() -> None:
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
+        # SQLAlchemy 2.0's `connect()` does not autocommit, so without this the
+        # version stamp is discarded. SQLite's driver commits DDL implicitly and
+        # hid the bug; PostgreSQL has transactional DDL and rolled `alembic_version`
+        # back on every run, so a Postgres deployment re-executed the entire
+        # migration chain at every startup — surviving only because these
+        # migrations happen to be idempotent, and one non-idempotent revision
+        # away from corrupting a production database.
+        await connection.commit()
     await connectable.dispose()
 
 

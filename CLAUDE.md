@@ -91,7 +91,22 @@ No direct DB sessions in engines — go through the buffer.
 
 `storage/database.py` exposes a single context manager `get_session()`. Auto-commits on clean exit, auto-rolls back on exception. Sessions aren't shared across blocks — each `async with` is its own transaction.
 
-Default is SQLite (`honeypot_mcp.db`). Swap `DATABASE_URL` in `.env` to a PostgreSQL URL — zero code changes.
+Default is SQLite (`honeypot_mcp.db`). For PostgreSQL, install the driver
+extra and swap the URL — no code changes:
+
+```bash
+pip install -e ".[postgres]"
+DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/honeypot
+```
+
+A CI job runs the full suite against a real PostgreSQL, because this path was
+broken for the project's entire life without anyone noticing: Alembic's
+`alembic_version.version_num` is `VARCHAR(32)`, revision
+`0007_drop_attacker_profile_shodan_data` was 38 characters, SQLite ignores
+VARCHAR limits and PostgreSQL enforces them. The chain died mid-way, `init_db`'s
+`create_all` fallback silently produced a working-looking schema with no version
+stamp, and every restart re-ran every migration. Keep revision ids short — there
+is a test for it.
 
 **Alembic** owns schema for persistent DBs. `init_db()` runs `alembic upgrade head` at startup; in-memory DBs (`":memory:"` in URL) skip Alembic and use `create_all` directly. Migrations live at `src/honeypot_mcp/migrations/versions/`.
 

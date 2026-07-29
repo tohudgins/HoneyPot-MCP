@@ -4,6 +4,49 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Ship-readiness pass — PostgreSQL was broken the whole time
+
+- **The documented production database never worked.** The docs offer swapping
+  `DATABASE_URL` to PostgreSQL as the production path. Following that
+  instruction verbatim failed immediately — `asyncpg` was not a dependency at
+  all. Adding the driver exposed the real bug underneath: Alembic's
+  `alembic_version.version_num` column is `VARCHAR(32)` and the revision id
+  `0007_drop_attacker_profile_shodan_data` is 38 characters. SQLite does not
+  enforce VARCHAR limits, so it passed locally forever; PostgreSQL does, so the
+  migration chain died at 0007 with `StringDataRightTruncation` — and
+  `init_db`'s `create_all` fallback caught the exception, produced a
+  working-*looking* schema with no version stamp, and logged a warning nobody
+  read. The consequence: **every startup on PostgreSQL re-ran all seven
+  migrations**, surviving only because those migrations happen to be
+  idempotent, and one non-idempotent revision away from damaging a real
+  database. Renamed the revision (with an in-place stamp rewrite so any
+  database already carrying the old id keeps working), added a `postgres`
+  install extra, and verified the whole application — JSON-payload search, enum
+  filters, bulk triage updates, audit log, profiler, console — against a real
+  PostgreSQL 16.
+- **CI now proves the claim instead of asserting it.** A new blocking job runs
+  migrations against a real PostgreSQL service, fails if `init_db` falls back
+  to `create_all`, fails if a second startup re-runs any migration, and then
+  runs the full unit suite against it. Two unit tests guard the class of bug
+  directly: every revision id must fit `VARCHAR(32)`, and the migration chain
+  must be linear with exactly one root and one head.
+- **`tests/integration/` was an empty directory.** Every one of the 400+ tests
+  was a unit test, so nothing exercised the wiring *between* stages — an engine
+  that captured perfectly but never reached the buffer would have passed the
+  entire suite. Five end-to-end tests now drive real engines over real sockets:
+  attack → database, planted credential → CRITICAL escalation → token marked
+  triggered, suppression dropping events before they persist, webhook delivery
+  to a live HTTP receiver, and HTTP exploit classification. CI runs them.
+  (Writing them surfaced a test-isolation trap worth knowing: the suppression
+  and credential caches are process-global with a 30s TTL, so a rule loaded by
+  one test stays in force for the next.)
+- **SECURITY.md and CONTRIBUTING.md.** A security tool with no vulnerability
+  disclosure policy is conspicuous. SECURITY.md also draws the line between
+  intentional behaviour (accepting hostile input, generating fake credentials)
+  and an actual vulnerability (escaping the deception boundary, forging events
+  into a SIEM, leaking secrets). CONTRIBUTING.md records the non-obvious rules
+  that were each learned the hard way.
+
 ## Operations console — the product gets a face
 
 Everything visual belonged to Grafana: a third-party tool with generic styling,

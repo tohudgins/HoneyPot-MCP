@@ -9,7 +9,7 @@ On SQLite this is a no-op (the enum is a CHECK constraint that
 `ALTER TYPE … ADD VALUE IF NOT EXISTS`, same pattern as 0004.
 
 Revision ID: 0008_add_smb_pg_mongo_types
-Revises: 0007_drop_attacker_profile_shodan_data
+Revises: 0007_drop_profile_shodan
 Create Date: 2026-07-03
 """
 
@@ -17,7 +17,7 @@ from alembic import op
 from sqlalchemy.engine import Connection
 
 revision = "0008_add_smb_pg_mongo_types"
-down_revision = "0007_drop_attacker_profile_shodan_data"
+down_revision = "0007_drop_profile_shodan"
 branch_labels = None
 depends_on = None
 
