@@ -385,6 +385,84 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         ),
         notes="An exposed daemon is host compromise, not a foothold.",
     ),
+    EngineCapability(
+        type="imap",
+        display_name="IMAP",
+        default_port=1143,
+        real_world_port=143,
+        os_family="neutral",
+        roles=("mail", "public_facing"),
+        summary=(
+            "Cleartext mailbox login on the unencrypted port. Advertises a real "
+            "Dovecot capability set *without* LOGINDISABLED, so credential-stuffing "
+            "bots actually send the password instead of being forced to STARTTLS."
+        ),
+        signature_events=("imap_login_attempt", "imap_mailbox_access", "imap_auth_attempt"),
+        config_options=("fake_banner",),
+        captures_credentials_as="imap",
+        pairs_well_with=("smtp",),
+        notes="Mail access is how credential stuffing cashes out — it owns password resets everywhere else.",
+    ),
+    EngineCapability(
+        type="sip",
+        display_name="SIP / VoIP",
+        default_port=5060,
+        real_world_port=5060,
+        os_family="neutral",
+        roles=("voip", "public_facing"),
+        summary=(
+            "Asterisk-flavoured PBX on tcp+udp. Separates SIPVicious-style scanning "
+            "from extension enumeration from actual toll fraud, and captures the "
+            "digest response against a known nonce."
+        ),
+        signature_events=(
+            "sip_toll_fraud_attempt",
+            "sip_register_attempt",
+            "sip_extension_probe",
+            "sip_scan",
+        ),
+        captures_credentials_as="sip",
+        notes="One of the few services where the attacker's motive is immediate revenue.",
+    ),
+    EngineCapability(
+        type="rsync",
+        display_name="rsync daemon",
+        default_port=8873,
+        real_world_port=873,
+        os_family="linux",
+        roles=("file_transfer", "backup"),
+        summary=(
+            "Exposed backup daemon. Module enumeration is the whole discovery phase "
+            "in one command, and an open module means the next step is bulk file copy."
+        ),
+        signature_events=(
+            "rsync_anonymous_access",
+            "rsync_module_enumeration",
+            "rsync_file_request",
+            "rsync_auth_attempt",
+        ),
+        captures_credentials_as="rsync",
+        notes="Backup servers are the usual victim, so the exposure is the archive itself.",
+    ),
+    EngineCapability(
+        type="nfs",
+        display_name="NFS",
+        default_port=2049,
+        real_world_port=2049,
+        os_family="linux",
+        roles=("file_share",),
+        summary=(
+            "ONC RPC with MOUNT and portmapper. `showmount -e` discloses the export "
+            "list, and a mount of a world-exported share is treated as the breach it is."
+        ),
+        signature_events=(
+            "nfs_mount_attempt",
+            "nfs_export_enumeration",
+            "nfs_portmap_dump",
+            "nfs_request",
+        ),
+        notes="An export shared to * with no_root_squash is data loss and often RCE.",
+    ),
 )
 
 BY_TYPE: dict[str, EngineCapability] = {c.type: c for c in _CAPABILITIES}
@@ -437,7 +515,7 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         description="A public web application on Linux with a database behind it and SSH for admin.",
         os_family="linux",
         core=("http", "ssh", "postgresql"),
-        optional=("redis", "mysql", "ftp"),
+        optional=("redis", "mysql", "ftp", "imap", "rsync"),
         hostname_prefix="web",
     ),
     EnvironmentProfile(
@@ -479,7 +557,17 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         ),
         os_family="neutral",
         core=("ssh", "http", "smb", "rdp", "postgresql"),
-        optional=("ldap", "mysql", "redis", "docker_api", "telnet", "snmp"),
+        optional=(
+            "ldap",
+            "mysql",
+            "redis",
+            "docker_api",
+            "telnet",
+            "snmp",
+            "imap",
+            "nfs",
+            "sip",
+        ),
         hostname_prefix="srv",
         domain="corp.local",
     ),

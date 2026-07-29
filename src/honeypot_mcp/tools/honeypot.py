@@ -39,6 +39,10 @@ async def honeypot_deploy(
         "snmp",
         "ldap",
         "docker_api",
+        "imap",
+        "sip",
+        "rsync",
+        "nfs",
     ],
     port: int | None = None,
     name: str | None = None,
@@ -49,7 +53,7 @@ async def honeypot_deploy(
     Args:
         type: Protocol type — ssh, telnet, http, smtp, ftp, dns, rdp, vnc,
               redis, mysql, elasticsearch, smb, postgresql, mongodb, mssql,
-              memcached, snmp, ldap, or docker_api.
+              memcached, snmp, ldap, docker_api, imap, sip, rsync, or nfs.
         port: Host port to bind (defaults to the configured default for each type).
         name: Unique name for this honeypot (auto-generated if omitted).
         config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
@@ -77,6 +81,10 @@ async def honeypot_deploy(
         "snmp": settings.default_snmp_port,
         "ldap": settings.default_ldap_port,
         "docker_api": settings.default_docker_api_port,
+        "imap": settings.default_imap_port,
+        "sip": settings.default_sip_port,
+        "rsync": settings.default_rsync_port,
+        "nfs": settings.default_nfs_port,
     }
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"

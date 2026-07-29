@@ -128,6 +128,12 @@ class Settings(BaseSettings):
     default_ldap_port: int = 1389
     default_memcached_port: int = 11211
     default_docker_api_port: int = 2375
+    # IMAP (143) and rsync (873) are privileged in the wild; SIP and NFS are
+    # not, so those keep their real ports.
+    default_imap_port: int = 1143
+    default_sip_port: int = 5060
+    default_rsync_port: int = 8873
+    default_nfs_port: int = 2049
 
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"

@@ -61,6 +61,14 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Impact",
     ),
     (
+        # Toll fraud monetises the victim's own phone service — resource
+        # hijacking, the same shape as cryptomining on someone else's CPU.
+        re.compile(r"(sip_toll_fraud|toll.fraud|premium.rate)", re.I),
+        "T1496",
+        "Resource Hijacking",
+        "Impact",
+    ),
+    (
         # An SNMP write reconfigures the device rather than reading it.
         re.compile(r"snmp_set_request", re.I),
         "T1565",
@@ -169,6 +177,17 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Credential Access",
     ),
     (
+        # Mail, VoIP and rsync all hand over a credential on the wire. Kept
+        # out of the big protocol alternation above because `sip_scan` and
+        # `rsync_module_enumeration` must stay Discovery, not brute force.
+        re.compile(
+            r"(imap_login_attempt|imap_auth_attempt|sip_register_attempt|rsync_auth_attempt)", re.I
+        ),
+        "T1110.001",
+        "Brute Force: Password Guessing",
+        "Credential Access",
+    ),
+    (
         # An SNMP community string is a shared secret; guessing it is the same
         # activity, and `public`/`private` are the default-credential case.
         re.compile(r"snmp_(community_attempt|default_community)", re.I),
@@ -260,6 +279,17 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Collection",
     ),
     (
+        # Mounting an export or pulling an rsync module is taking the files,
+        # not looking at the directory.
+        re.compile(
+            r"(nfs_mount_attempt|rsync_anonymous_access|rsync_file_request|imap_mailbox_access)",
+            re.I,
+        ),
+        "T1039",
+        "Data from Network Shared Drive",
+        "Collection",
+    ),
+    (
         # SNMP GET/GETNEXT walks are the textbook way to pull a device's
         # running configuration; ATT&CK names this case explicitly.
         re.compile(r"snmp_(default_community|community_attempt|walk|get)", re.I),
@@ -333,6 +363,23 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     (
         re.compile(
             r"(port.scan|nmap|masscan|zmap|smb.negotiate|smb.version|docker_api_recon)", re.I
+        ),
+        "T1046",
+        "Network Service Discovery",
+        "Discovery",
+    ),
+    (
+        # Listing NFS exports or rsync modules is remote share discovery, and
+        # ATT&CK names it precisely.
+        re.compile(r"(nfs_export_enumeration|rsync_module_enumeration|nfs_portmap_dump)", re.I),
+        "T1135",
+        "Network Share Discovery",
+        "Discovery",
+    ),
+    (
+        # SIP sweeps and extension guessing are service/host enumeration.
+        re.compile(
+            r"(sip_scan|sip_options_probe|sip_extension_probe|nfs_portmap_query|nfs_request)", re.I
         ),
         "T1046",
         "Network Service Discovery",

@@ -86,6 +86,22 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.docker_api import DockerAPIEngine
 
             _engines[hp_type] = DockerAPIEngine()
+        elif hp_type == HoneypotType.IMAP:
+            from honeypot_mcp.engines.imap import IMAPEngine
+
+            _engines[hp_type] = IMAPEngine()
+        elif hp_type == HoneypotType.SIP:
+            from honeypot_mcp.engines.sip import SIPEngine
+
+            _engines[hp_type] = SIPEngine()
+        elif hp_type == HoneypotType.RSYNC:
+            from honeypot_mcp.engines.rsync import RsyncEngine
+
+            _engines[hp_type] = RsyncEngine()
+        elif hp_type == HoneypotType.NFS:
+            from honeypot_mcp.engines.nfs import NFSEngine
+
+            _engines[hp_type] = NFSEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

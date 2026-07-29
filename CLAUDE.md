@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (547 unit tests covering security-critical paths)
+# Tests (577 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -361,6 +361,39 @@ default port in `config.py`, the `Literal` and `default_ports` dict in
 `tools/honeypot.py`, `engines/__init__.py:get_engine()`, and an Alembic
 migration (`Enum(...)` is a native PostgreSQL type — `ALTER TYPE … ADD VALUE`,
 one statement per value; see `0012_add_five_types`).
+
+### IMAP / SIP / rsync / NFS engines
+
+Four more surfaces, each chosen because its traffic means something specific.
+
+- `engines/imap.py` — tcp/143. Mail is where credential stuffing cashes out: a
+  working mailbox owns password resets everywhere else. The greeting
+  deliberately omits `LOGINDISABLED` — a hardened server advertises it to force
+  STARTTLS, but then the attacker never sends the password, and impersonating
+  the misconfigured server is the entire point. Handles `LOGIN` (with IMAP
+  quoted-string parsing, so a password containing a space survives) and SASL
+  `AUTHENTICATE PLAIN`, both SASL-IR and two-step.
+- `engines/sip.py` — tcp+udp/5060, both because a service on only one is a
+  tell. Separates the three phases that mean different things: `OPTIONS`
+  sweeps (`friendly-scanner` and friends are named in the alert), extension
+  enumeration via bare `REGISTER`, and `INVITE` to a satellite or premium
+  prefix, which is `sip_toll_fraud_attempt` at CRITICAL. Digest auth is
+  challenged with a fresh nonce so the tool computes a response — captured
+  *with* its nonce, since that is what makes it crackable.
+- `engines/rsync.py` — tcp/873. Backup servers are the usual victim, so the
+  exposure is the archive itself. Listing modules is the whole discovery phase
+  in one command (`rsync_module_enumeration`, HIGH); selecting a module with no
+  `auth users` is `rsync_anonymous_access` at CRITICAL, because the next thing
+  the client sends is a file request.
+- `engines/nfs.py` — tcp/2049, ONC RPC and XDR by hand. `showmount -e` is one
+  MOUNT EXPORT call and discloses everything, so the alert names the exports
+  *and* which are shared to `*` — the detail that decides the attacker's next
+  move. A MNT of a world-shared export is CRITICAL and granted; a restricted
+  one is HIGH and refused. Getting the export list's terminator wrong makes
+  `showmount` hang, which is louder than not answering at all.
+
+`nmap -sV` hard-matches all four: `Dovecot imapd`, `Asterisk PBX 18.10.0`
+(with `Device: PBX`), `rsync (protocol version 31)`, `rpcbind`.
 
 ### HTTP realistic endpoints + sessions
 

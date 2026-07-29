@@ -34,6 +34,10 @@ class HoneypotType(str, enum.Enum):
     SNMP = "snmp"
     LDAP = "ldap"
     DOCKER_API = "docker_api"
+    IMAP = "imap"
+    SIP = "sip"
+    RSYNC = "rsync"
+    NFS = "nfs"
 
 
 class HoneypotStatus(str, enum.Enum):
