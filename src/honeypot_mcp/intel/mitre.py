@@ -215,9 +215,24 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Ingress Tool Transfer",
         "Command and Control",
     ),
+    # Cowrie's `session.file_download` / `file_upload` are the attacker pulling
+    # a payload *into* the honeypot — `wget http://…/bins.sh` is the defining
+    # Mirai behaviour — so they are Ingress Tool Transfer. This used to be
+    # caught by the `file.download` alternative in the T1041 rule below and
+    # filed under Exfiltration, which inverted the direction of the single most
+    # valuable artifact a honeypot collects: every captured malware sample
+    # appeared on the ATT&CK dashboard as data leaving. Matched ahead of the
+    # generic rule, and `file.download` was removed from it, because all
+    # matches are collected and both would otherwise fire.
+    (
+        re.compile(r"(ssh|telnet)_file_(download|upload)", re.I),
+        "T1105",
+        "Ingress Tool Transfer",
+        "Command and Control",
+    ),
     # ── Exfiltration ─────────────────────────────────────────────────────────
     (
-        re.compile(r"(file.download|sftp|scp|lo_export|outfile.*/tmp)", re.I),
+        re.compile(r"(sftp|scp|lo_export|outfile.*/tmp)", re.I),
         "T1041",
         "Exfiltration Over C2 Channel",
         "Exfiltration",

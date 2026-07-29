@@ -31,11 +31,34 @@ _EVENT_MAP = {
     "cowrie.session.connect": ("ssh_session_connect", AlertSeverity.LOW),
     "cowrie.session.closed": ("ssh_session_closed", AlertSeverity.LOW),
     "cowrie.session.file_download": ("ssh_file_download", AlertSeverity.CRITICAL),
+    # SCP/SFTP push of a payload into the honeypot — same value as a wget
+    # download and previously dropped on the floor, because an unmapped
+    # eventid is skipped entirely by the ingester.
+    "cowrie.session.file_upload": ("ssh_file_upload", AlertSeverity.CRITICAL),
     "cowrie.direct-tcpip.request": ("ssh_port_forward", AlertSeverity.HIGH),
     # Client banner exchange — useful for fingerprinting attacker tools
     # (e.g. libssh / Paramiko / OpenSSH variants) and for the self-test probe.
     "cowrie.client.version": ("ssh_client_version", AlertSeverity.LOW),
 }
+
+
+def _retag_for_protocol(event_type: str, protocol: str | None) -> str:
+    """Rewrite an `ssh_*` event type to `telnet_*` when Cowrie says so.
+
+    One Cowrie container serves both protocols, and its event ids are shared —
+    a Telnet login emits `cowrie.login.success` exactly like an SSH one, with
+    only the `protocol` field to tell them apart. Taking the mapping at face
+    value filed every Telnet capture under `ssh_*`, which quietly mattered:
+    Telnet disappeared as a distinct attack surface in every dashboard and
+    statistic, ATT&CK mapped it as SSH brute force, and planted credentials
+    tried over Telnet were cross-referenced against the wrong service.
+
+    Telnet on port 23 is a large share of internet background radiation —
+    Mirai and its descendants — so it is worth counting separately.
+    """
+    if protocol == "telnet" and event_type.startswith("ssh_"):
+        return f"telnet_{event_type[4:]}"
+    return event_type
 
 
 class SSHEngine(HoneypotEngine):
@@ -391,6 +414,7 @@ class SSHEngine(HoneypotEngine):
                     continue
 
                 event_type, severity = _EVENT_MAP[event_id]
+                event_type = _retag_for_protocol(event_type, entry.get("protocol"))
                 src_ip = entry.get("src_ip", "0.0.0.0")
                 src_port = entry.get("src_port")
                 session_id = entry.get("session")

@@ -96,6 +96,7 @@ async def _load_index() -> None:
 # (see `_HASHED_SERVICES`) rather than the plaintext index.
 _SERVICE_PREFIXES = {
     "ssh_": "ssh",
+    "telnet_": "telnet",
     "http_": "http",
     "ftp_": "ftp",
     "smtp_": "smtp",
