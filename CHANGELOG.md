@@ -4,6 +4,48 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## SOC workflow pass — triage, audit trail, and the rest of the tool sweep
+
+Audited all 49 MCP tools for the defect classes the previous pass turned up,
+then closed the gaps that stop a real analyst using this across a shift.
+
+- **The remaining context blowouts.** The response-shaping rule had only been
+  applied to `alerts_export`. Measured on 300 alerts from 250 IPs,
+  `export_stix` returned **138 KB inline** (~35k tokens), `export_blocklist`
+  13 KB and `generate_report` 10 KB — all destined for a firewall, a TIP or a
+  browser, and all scaling with attacker count. All three now write via
+  `_format.write_artifact()` and return the path plus headline figures. The
+  `.gitignore` had expected `reports/*.html` and `reports/*.md` since the
+  beginning; the file-based design was intended and simply never implemented.
+- **Triage that survives a scanner sweep.** `alerts_acknowledge` took a single
+  id and set a boolean, so clearing a few hundred alerts meant a few hundred
+  tool calls, and nothing recorded *what was concluded*. It now takes explicit
+  ids or a filter (`source_ip`/`event_type`/`severity`/`since_hours`) and
+  records a `disposition` (true_positive / false_positive / benign /
+  duplicate), a note, and the analyst. `benign` is kept distinct from
+  `false_positive` — one means the detection was wrong, the other that it fired
+  correctly on authorised activity, and conflating them makes tuning metrics
+  meaningless. Selection SELECTs before it UPDATEs so the caller learns the
+  match count and whether the `max_alerts` cap truncated it; a call with
+  neither ids nor filters is refused rather than clearing the board.
+- **A control-plane audit trail.** Nothing recorded that a honeypot was stopped
+  or that `alerts_prune` had deleted months of evidence. New `audit_log` table,
+  `tools/_audit.py`, and an `audit_log_search` tool covering
+  `honeypot_deploy` (success and failure), `honeypot_stop`,
+  `honeytoken_revoke`, `alerts_prune` and `alerts_acknowledge`. This matters
+  more here than in a conventional tool because the control plane is driven by
+  a language model: "what did the agent actually do?" needs an answer.
+  Auditing never breaks the action it records, and credential-shaped arguments
+  are redacted before they are persisted.
+- **Smaller sweep findings.** `generate_report` took `format: str` (no enum
+  guidance for the model) and had no time window, so "report on the last 24
+  hours" was inexpressible; it now takes a `Literal` and `since_hours`, and
+  validates its `ip`. `honeypot_logs` had an uncapped `lines`.
+
+Migration `0011_add_triage_and_audit_log`, idempotent per the project
+convention and verified against both a fresh database and a simulated pre-0011
+one with existing rows preserved. 32 new tests (374 total).
+
 ## Protocol-fidelity audit — real clients and `nmap -sV`
 
 Pointed the actual client software (redis-py, pymongo, psycopg) and

@@ -45,6 +45,21 @@ class AlertSeverity(str, enum.Enum):
     CRITICAL = "critical"
 
 
+class AlertDisposition(str, enum.Enum):
+    """What an analyst concluded about an alert.
+
+    `benign` is distinct from `false_positive`: a false positive means the
+    detection was wrong, while benign means it fired correctly on activity that
+    turned out to be authorised (a pentest, an asset scan). Conflating them
+    makes detection-tuning metrics meaningless.
+    """
+
+    TRUE_POSITIVE = "true_positive"
+    FALSE_POSITIVE = "false_positive"
+    BENIGN = "benign"
+    DUPLICATE = "duplicate"
+
+
 class HoneytokenType(str, enum.Enum):
     API_KEY = "api_key"
     CANARY_URL = "canary_url"
@@ -114,6 +129,15 @@ class Alert(Base):
         Enum(AlertSeverity, values_callable=_ev), default=AlertSeverity.MEDIUM, nullable=False
     )
     acknowledged: Mapped[bool] = mapped_column(default=False)
+    # Triage outcome. A bare `acknowledged` flag records that somebody looked,
+    # but not what they concluded — so a shift can't hand over, and nobody can
+    # answer "what are we dismissing, and should we suppress it instead?".
+    disposition: Mapped[AlertDisposition | None] = mapped_column(
+        Enum(AlertDisposition, values_callable=_ev), nullable=True
+    )
+    triage_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    triaged_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    triaged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
@@ -239,4 +263,35 @@ class AttackerProfile(Base):
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AuditLog(Base):
+    """Record of every state-changing control-plane action.
+
+    Matters more here than in a conventional tool: the control plane is driven
+    by a language model, so "what did the agent actually do?" is a question an
+    operator will need answered after the fact. `alerts_prune` can delete
+    months of evidence and previously left no trace that it ran.
+
+    Deliberately append-only — nothing in the codebase updates or deletes these
+    rows, and the retention sweep does not touch them.
+    """
+
+    __tablename__ = "audit_log"
+
+    __table_args__ = (Index("ix_audit_log_timestamp_tool", "timestamp", "tool"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tool: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Human-readable one-liner: "deployed ssh honeypot 'web-01' on port 2222".
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    # Arguments as supplied, minus anything secret (see tools/_audit.py).
+    arguments: Mapped[dict] = mapped_column(JSON, default=dict)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False, default="ok")
+    # What the action touched, so an operator can filter to one honeypot/token.
+    target: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
     )

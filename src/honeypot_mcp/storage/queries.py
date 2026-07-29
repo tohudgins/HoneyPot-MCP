@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from honeypot_mcp.storage.models import (
     Alert,
+    AlertDisposition,
     AlertSeverity,
     AttackerEvent,
     AttackerProfile,
@@ -131,6 +132,68 @@ async def search_alerts(
         q = q.where(Alert.timestamp >= since)
     result = await session.execute(q.order_by(desc(Alert.timestamp)).limit(limit))
     return list(result.scalars().all())
+
+
+async def triage_alerts(
+    session: AsyncSession,
+    *,
+    alert_ids: list[int] | None = None,
+    disposition: AlertDisposition | None = None,
+    note: str | None = None,
+    analyst: str = "mcp-client",
+    source_ip: str | None = None,
+    event_type: str | None = None,
+    severity: AlertSeverity | None = None,
+    since: datetime | None = None,
+    max_alerts: int = 500,
+) -> dict:
+    """Acknowledge alerts by id or by filter, recording the triage verdict.
+
+    Selection happens as an explicit SELECT rather than a bare UPDATE…WHERE so
+    the caller learns exactly how many alerts matched and whether the safety cap
+    truncated the set — an over-broad filter silently clearing thousands of
+    alerts is not a recoverable mistake.
+    """
+    q = select(Alert.id)
+    if alert_ids:
+        q = q.where(Alert.id.in_(alert_ids))
+    if source_ip:
+        q = q.where(Alert.source_ip == source_ip)
+    if event_type:
+        q = q.where(Alert.event_type == event_type)
+    if severity:
+        q = q.where(Alert.severity == severity)
+    if since is not None:
+        q = q.where(Alert.timestamp >= since)
+
+    # Fetch one beyond the cap so we can tell "exactly at the limit" from
+    # "there is more".
+    rows = (await session.execute(q.order_by(desc(Alert.timestamp)).limit(max_alerts + 1))).all()
+    matched = [r[0] for r in rows]
+    capped = len(matched) > max_alerts
+    matched = matched[:max_alerts]
+
+    if not matched:
+        return {"acknowledged": 0, "alert_ids": [], "capped": False}
+
+    values: dict = {
+        "acknowledged": True,
+        "triaged_by": analyst,
+        "triaged_at": datetime.now(UTC),
+    }
+    if disposition is not None:
+        values["disposition"] = disposition
+    if note is not None:
+        values["triage_note"] = note
+
+    await session.execute(update(Alert).where(Alert.id.in_(matched)).values(**values))
+    return {
+        "acknowledged": len(matched),
+        "alert_ids": matched[:50],
+        "disposition": disposition.value if disposition else None,
+        "analyst": analyst,
+        "capped": capped,
+    }
 
 
 async def acknowledge_alert(session: AsyncSession, alert_id: int) -> bool:

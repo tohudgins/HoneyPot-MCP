@@ -11,7 +11,8 @@ from typing import Any, Literal
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.storage.models import AlertSeverity
+from honeypot_mcp.storage.models import AlertDisposition, AlertSeverity
+from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import digest_payload, truncate_payload
 
 
@@ -87,6 +88,10 @@ async def alerts_recent(
         }
         if a.acknowledged:
             row["acknowledged"] = True
+            # Surfacing the verdict here is what lets a shift skip what the
+            # previous one already resolved.
+            if a.disposition is not None:
+                row["disposition"] = a.disposition.value
         if include_payload:
             row["payload"] = truncate_payload(a.payload)
         elif digest := digest_payload(a.payload):
@@ -136,6 +141,10 @@ async def alerts_get(alert_id: int) -> dict[str, Any]:
             "severity": alert.severity.value,
             "payload": truncate_payload(alert.payload),
             "acknowledged": alert.acknowledged,
+            "disposition": alert.disposition.value if alert.disposition else None,
+            "triage_note": alert.triage_note,
+            "triaged_by": alert.triaged_by,
+            "triaged_at": alert.triaged_at.isoformat() if alert.triaged_at else None,
             "timestamp": alert.timestamp.isoformat(),
         }
 
@@ -216,17 +225,99 @@ async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
 
 
 @mcp.tool
-async def alerts_acknowledge(alert_id: int) -> dict[str, Any]:
-    """Mark an alert as reviewed/acknowledged.
+async def alerts_acknowledge(
+    alert_ids: list[int] | None = None,
+    disposition: Literal["true_positive", "false_positive", "benign", "duplicate"] | None = None,
+    note: str | None = None,
+    analyst: str | None = None,
+    source_ip: str | None = None,
+    event_type: str | None = None,
+    severity: Literal["low", "medium", "high", "critical"] | None = None,
+    since_hours: float | None = None,
+    max_alerts: int = 500,
+) -> dict[str, Any]:
+    """Triage alerts — acknowledge them, individually or in bulk, with a verdict.
+
+    Either pass explicit `alert_ids`, or describe a set with the filters and
+    every matching alert is triaged at once ("mark today's Shodan scanner hits
+    as benign"). One-at-a-time acknowledgement does not survive contact with a
+    scanner sweep, which produces hundreds of alerts in minutes.
+
+    Recording a `disposition` is what makes triage useful later: it separates
+    "nobody has looked at this" from "we looked and it was nothing", and lets
+    you ask what is being dismissed and whether it should be suppressed instead.
 
     Args:
-        alert_id: The alert ID to acknowledge.
+        alert_ids: Explicit alert IDs to triage. Omit to use the filters below.
+        disposition: The verdict — `true_positive` (a real attack),
+              `false_positive` (the detection was wrong), `benign` (fired
+              correctly on authorised activity, e.g. your own pentest), or
+              `duplicate`.
+        note: Why. Free text, shown to whoever reviews this later.
+        analyst: Who triaged it. Defaults to "mcp-client".
+        source_ip: Triage every alert from this IP (filter mode).
+        event_type: Triage every alert of this exact event type (filter mode).
+        severity: Triage every alert at this severity (filter mode).
+        since_hours: Restrict the filters to the last N hours.
+        max_alerts: Safety cap on how many a single filtered call may triage
+              (default 500). Prevents an over-broad filter clearing the board.
     """
+    has_filters = any((source_ip, event_type, severity, since_hours is not None))
+    if not alert_ids and not has_filters:
+        return {
+            "error": (
+                "Nothing selected. Pass alert_ids, or at least one of "
+                "source_ip / event_type / severity / since_hours."
+            )
+        }
+
+    disp = AlertDisposition(disposition) if disposition else None
+    sev = AlertSeverity(severity) if severity else None
+    since = None
+    if since_hours is not None:
+        if since_hours <= 0:
+            return {"error": "since_hours must be greater than 0."}
+        since = datetime.now(UTC) - timedelta(hours=since_hours)
+
     async with get_session() as session:
-        updated = await queries.acknowledge_alert(session, alert_id)
-    if not updated:
-        return {"error": f"No alert with id={alert_id}."}
-    return {"alert_id": alert_id, "acknowledged": True}
+        result = await queries.triage_alerts(
+            session,
+            alert_ids=alert_ids,
+            disposition=disp,
+            note=note,
+            analyst=analyst or "mcp-client",
+            source_ip=source_ip,
+            event_type=event_type,
+            severity=sev,
+            since=since,
+            max_alerts=max(1, min(max_alerts, 10_000)),
+        )
+
+    await record_action(
+        "alerts_acknowledge",
+        summary=(
+            f"triaged {result['acknowledged']} alert(s)"
+            + (f" as {disposition}" if disposition else "")
+        ),
+        arguments={
+            "alert_ids": alert_ids,
+            "disposition": disposition,
+            "source_ip": source_ip,
+            "event_type": event_type,
+            "severity": severity,
+            "since_hours": since_hours,
+        },
+        target=source_ip,
+    )
+
+    if result["acknowledged"] == 0:
+        result["note"] = "No alerts matched — nothing was changed."
+    elif result.get("capped"):
+        result["note"] = (
+            f"Stopped at max_alerts={max_alerts}; more alerts still match. "
+            f"Re-run to continue, or narrow the filters."
+        )
+    return result
 
 
 @mcp.tool
@@ -245,6 +336,14 @@ async def alerts_prune(older_than_days: int = 90) -> dict[str, Any]:
     cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
     async with get_session() as session:
         result = await queries.prune_alerts_before(session, cutoff)
+    await record_action(
+        "alerts_prune",
+        summary=(
+            f"deleted {result.get('alerts_deleted', 0)} alert(s) and "
+            f"{result.get('events_deleted', 0)} event(s) older than {older_than_days}d"
+        ),
+        arguments={"older_than_days": older_than_days, "cutoff": cutoff.isoformat()},
+    )
     return {
         "older_than_days": older_than_days,
         "cutoff": cutoff.isoformat(),
@@ -337,3 +436,77 @@ async def alerts_export(
             for r in rows[:5]
         ],
     }
+
+
+@mcp.tool
+async def audit_log_search(
+    tool: str | None = None,
+    target: str | None = None,
+    since_hours: float | None = None,
+    outcome: Literal["ok", "error"] | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Review what the control plane did — every honeypot deployed or stopped,
+    every prune, every token revoked.
+
+    This server's control plane is driven by a language model, so "what did the
+    agent actually do, and when?" is a question you will eventually need
+    answered — after an unexpected gap in collection, or when alerts you
+    expected to find have been pruned. The log is append-only and is not
+    touched by the retention sweep.
+
+    Args:
+        tool: Filter to one tool name (e.g. alerts_prune, honeypot_stop).
+        target: Filter to what was acted on — a honeypot name, IP, or token id.
+        since_hours: Only actions from the last N hours.
+        outcome: Filter to successful (`ok`) or failed (`error`) actions.
+        limit: Maximum entries to return (default 50, max 500).
+    """
+    from sqlalchemy import desc, select
+
+    from honeypot_mcp.storage.models import AuditLog
+
+    limit = max(1, min(limit, 500))
+    since = None
+    if since_hours is not None:
+        if since_hours <= 0:
+            return {"error": "since_hours must be greater than 0."}
+        since = datetime.now(UTC) - timedelta(hours=since_hours)
+
+    q = select(AuditLog)
+    if tool:
+        q = q.where(AuditLog.tool == tool)
+    if target:
+        q = q.where(AuditLog.target == target)
+    if outcome:
+        q = q.where(AuditLog.outcome == outcome)
+    if since is not None:
+        q = q.where(AuditLog.timestamp >= since)
+
+    async with get_session() as session:
+        rows = (
+            (await session.execute(q.order_by(desc(AuditLog.timestamp)).limit(limit)))
+            .scalars()
+            .all()
+        )
+
+    entries = [
+        {
+            "id": r.id,
+            "timestamp": r.timestamp.isoformat(),
+            "tool": r.tool,
+            "summary": r.summary,
+            "target": r.target,
+            "outcome": r.outcome,
+            **({"error": r.error} if r.error else {}),
+            **({"arguments": r.arguments} if r.arguments else {}),
+        }
+        for r in rows
+    ]
+    result: dict[str, Any] = {"count": len(entries), "actions": entries}
+    if not entries:
+        result["note"] = (
+            "No matching control-plane actions. Note that auditing records "
+            "state-changing calls only — reads like alerts_recent are not logged."
+        )
+    return result

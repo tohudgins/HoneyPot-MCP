@@ -13,6 +13,7 @@ The rule these helpers implement: **list tools summarise, detail tools expand.**
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 # Fields worth showing in a triage digest, grouped by why an analyst cares.
@@ -127,6 +128,44 @@ def digest_payload(payload: Any) -> dict[str, Any]:
         digest[key] = _clip(value, _MAX_DIGEST_VALUE_CHARS)
 
     return digest
+
+
+def write_artifact(
+    content: str,
+    *,
+    prefix: str,
+    extension: str,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Write bulk tool output to disk and describe it, instead of returning it.
+
+    Exports scale with attacker count, not with anything the caller chose: a
+    STIX bundle for a few hundred alerts is well over 100 KB, and a blocklist
+    grows a line per offending IP. Returning that inline spends the whole
+    budget on content destined for a firewall or a TIP, not for reading.
+
+    Returns the path plus size metadata, or an `error` key if the write failed.
+    """
+    from pathlib import Path
+
+    from honeypot_mcp.config import get_settings
+
+    if output_path:
+        dest = Path(output_path).expanduser()
+    else:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        dest = get_settings().reports_dir / f"{prefix}-{stamp}.{extension}"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return {"error": f"Could not write {dest}: {e}"}
+
+    return {
+        "path": str(dest),
+        "bytes": len(content.encode("utf-8")),
+        "lines": content.count("\n") + 1,
+    }
 
 
 def validate_ip(ip: str) -> str | None:

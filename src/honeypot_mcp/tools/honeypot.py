@@ -13,6 +13,7 @@ from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
+from honeypot_mcp.tools._audit import record_action
 
 
 @mcp.tool
@@ -112,6 +113,14 @@ async def honeypot_deploy(
             hp_row = await queries.get_honeypot_by_id(session, hp_id)
             if hp_row:
                 await session.delete(hp_row)
+        await record_action(
+            "honeypot_deploy",
+            summary=f"failed to deploy {type} honeypot '{resolved_name}' on port {resolved_port}",
+            arguments={"type": type, "port": resolved_port, "name": resolved_name},
+            target=resolved_name,
+            outcome="error",
+            error=str(e),
+        )
         return {
             "error": f"Failed to start {type} honeypot on port {resolved_port}: {e}",
             "hint": "Common causes: port already in use, or Docker not running (ssh type).",
@@ -123,6 +132,12 @@ async def honeypot_deploy(
             hp_refresh.status = HoneypotStatus.RUNNING
             hp_refresh.container_id = container_id
 
+    await record_action(
+        "honeypot_deploy",
+        summary=f"deployed {type} honeypot '{resolved_name}' on port {resolved_port}",
+        arguments={"type": type, "port": resolved_port, "name": resolved_name},
+        target=resolved_name,
+    )
     return {
         "id": hp_id,
         "name": resolved_name,
@@ -233,6 +248,12 @@ async def honeypot_stop(name: str, remove: bool = False) -> dict[str, Any]:
             hp.status = HoneypotStatus.STOPPED
             hp.container_id = None
 
+    await record_action(
+        "honeypot_stop",
+        summary=f"{'removed' if remove else 'stopped'} honeypot '{name}' — collection ended",
+        arguments={"name": name, "remove": remove},
+        target=name,
+    )
     return {"name": name, "action": "removed" if remove else "stopped", "status": "ok"}
 
 
@@ -304,8 +325,11 @@ async def honeypot_logs(name: str, lines: int = 50) -> dict[str, Any]:
 
     Args:
         name: The honeypot name.
-        lines: Number of log lines to return (default 50).
+        lines: Number of log lines to return (default 50, max 1000).
     """
+    # Raw container logs are unbounded; an uncapped `lines` would put an
+    # arbitrary slice of Cowrie's JSON log into the response.
+    lines = max(1, min(lines, 1000))
     async with get_session() as session:
         hp = await queries.get_honeypot_by_name(session, name)
         if not hp:

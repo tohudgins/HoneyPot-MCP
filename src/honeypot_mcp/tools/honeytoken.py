@@ -10,6 +10,7 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
 from honeypot_mcp.tokens import get_provider
+from honeypot_mcp.tools._audit import record_action
 
 
 @mcp.tool
@@ -178,6 +179,12 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
     invalidate_creds()
     invalidate_token_match()
 
+    await record_action(
+        "honeytoken_revoke",
+        summary=f"revoked honeytoken id={token_id} — it will no longer match",
+        arguments={"token_id": token_id},
+        target=str(token_id),
+    )
     return {"token_id": token_id, "status": "revoked"}
 
 

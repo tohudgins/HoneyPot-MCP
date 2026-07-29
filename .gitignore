@@ -54,9 +54,11 @@ config/mitre_attack.json
 # Same rule for the Docker mount point, populated at deploy time.
 docker/geoip/*.mmdb
 
-# Generated attack reports
-reports/*.html
-reports/*.md
+# Generated artifacts written by tools (reports, STIX bundles, blocklists,
+# alert exports). Match the whole directory rather than specific extensions —
+# an earlier html/md-only rule let generated .txt and .json artifacts through.
+reports/*
+!reports/.gitkeep
 
 # Self-signed TLS certs generated per-honeypot at deploy time (engines/tls.py).
 # Keys are private; certs are deployment-specific.

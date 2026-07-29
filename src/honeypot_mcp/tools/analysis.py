@@ -8,7 +8,7 @@ from typing import Any, Literal
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.tools._format import validate_ip
+from honeypot_mcp.tools._format import validate_ip, write_artifact
 
 
 @mcp.tool
@@ -171,22 +171,42 @@ async def map_ttps(
 async def generate_report(
     title: str = "Attack Analysis Report",
     ip: str | None = None,
-    format: str = "html",
+    format: Literal["html", "markdown"] = "html",
+    since_hours: float | None = None,
     limit: int = 500,
-) -> str:
-    """Generate a comprehensive attack report with timeline, top attackers, and MITRE TTPs.
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Write an attack report — timeline, top attackers, MITRE TTPs — to a file.
+
+    Returns the path plus the headline figures, so the report can be opened or
+    sent on without spending the conversation on rendered HTML. Scoping to an
+    `ip` additionally attaches the full intelligence picture (geo/ASN, VT and
+    AbuseIPDB reputation, risk score, recommendations).
 
     Args:
         title: Report title.
         ip: Scope the report to a single attacker IP (omit for all activity).
         format: Output format — html or markdown.
-        limit: Maximum number of alerts to include in the analysis.
+        since_hours: Only include activity from the last N hours (e.g. 168 for a
+              weekly write-up). Omit for all available history.
+        limit: Maximum alerts to analyse (default 500).
+        output_path: Where to write. Defaults to `reports/report-<timestamp>.<ext>`.
     """
+    from datetime import timedelta
+
     from honeypot_mcp.analysis.reporter import generate
 
+    if ip and (err := validate_ip(ip)):
+        return {"error": err}
+    since = None
+    if since_hours is not None:
+        if since_hours <= 0:
+            return {"error": "since_hours must be greater than 0."}
+        since = datetime.now(UTC) - timedelta(hours=since_hours)
+
     async with get_session() as session:
-        alerts = await queries.get_recent_alerts(session, limit=limit, source_ip=ip)
-        stats = await queries.get_alert_stats(session)
+        alerts = await queries.get_recent_alerts(session, limit=limit, source_ip=ip, since=since)
+        stats = await queries.get_alert_stats(session, since=since)
         events = await queries.get_events_for_ip(session, ip) if ip else []
 
     # For an IP-scoped report, attach the full intelligence picture (geo/ASN/
@@ -212,7 +232,7 @@ async def generate_report(
             ip=ip, alerts=alerts, events=events, geoip=geo, vt=vt, abuse=abuse
         )
 
-    return await generate(
+    content = await generate(
         title=title,
         alerts=alerts,
         stats=stats,
@@ -220,6 +240,24 @@ async def generate_report(
         format=format,
         intel=intel,
     )
+    written = write_artifact(
+        content,
+        prefix="report",
+        extension="html" if format == "html" else "md",
+        output_path=output_path,
+    )
+    if "error" in written:
+        return written
+    return {
+        **written,
+        "title": title,
+        "format": format,
+        "alerts_analysed": len(alerts),
+        "scoped_to_ip": ip,
+        "window_hours": since_hours,
+        "unique_source_ips": stats.get("unique_source_ips"),
+        "by_severity": stats.get("by_severity"),
+    }
 
 
 # MITRE kill-chain order — used to lay out journey phases left-to-right.
@@ -536,21 +574,30 @@ async def export_blocklist(
     format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
     hours: int = 24,
     min_hits: int = 5,
-) -> str:
-    """Export attacker IPs above a hit threshold as a blocklist. Plug the
-    output into your perimeter firewall, fail2ban jail, or Cloudflare list.
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Export attacker IPs above a hit threshold as a blocklist file.
+
+    Writes the list to disk and returns the path plus the top offenders —
+    the content is destined for a firewall, a fail2ban jail or a Cloudflare
+    list, and it grows one line per offending IP, so a busy sensor produces
+    far more than is useful to read back.
 
     Args:
         format: 'plain' (one IP per line), 'iptables' (DROP rules),
                 'fail2ban' (jail-friendly), or 'cidr' (one IP per line, /32 suffix).
         hours: Time window — only count alerts in the last N hours (default 24).
         min_hits: Only include IPs with at least this many alerts (default 5).
+        output_path: Where to write. Defaults to `reports/blocklist-<timestamp>.txt`.
     """
     async with get_session() as session:
         offenders = await queries.get_top_offenders(session, hours, min_hits)
 
     if not offenders:
-        return f"# No attackers met the threshold (>= {min_hits} hits in {hours}h)."
+        return {
+            "ip_count": 0,
+            "note": f"No attackers met the threshold (>= {min_hits} hits in {hours}h).",
+        }
 
     header = (
         f"# HoneyPot MCP blocklist — generated {datetime.now(UTC).isoformat()}\n"
@@ -564,12 +611,32 @@ async def export_blocklist(
         lines = [f"{ip}/32" for ip, _ in offenders]
     else:
         lines = [ip for ip, _ in offenders]
-    return header + "\n".join(lines) + "\n"
+    content = header + "\n".join(lines) + "\n"
+
+    written = write_artifact(content, prefix="blocklist", extension="txt", output_path=output_path)
+    if "error" in written:
+        return written
+    return {
+        **written,
+        "format": format,
+        "ip_count": len(offenders),
+        "window_hours": hours,
+        "min_hits": min_hits,
+        "top_offenders": [{"ip": ip, "hits": cnt} for ip, cnt in offenders[:10]],
+    }
 
 
 @mcp.tool
-async def export_stix(hours: int = 24, min_hits: int = 1) -> str:
-    """Export attacker IPs as a STIX 2.1 bundle for sharing with other SOCs.
+async def export_stix(
+    hours: int = 24,
+    min_hits: int = 1,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Export attacker IPs as a STIX 2.1 bundle file for sharing with other SOCs.
+
+    Writes the bundle to disk and returns the path. STIX is verbose by design —
+    a few hundred alerts produce well over 100 KB of JSON — and it is meant to
+    be loaded into a TIP or MISP instance, not read back in conversation.
 
     Each unique attacker IP becomes an Indicator SDO with the standard
     `[ipv4-addr:value = '...']` pattern and the 'malicious-activity' label.
@@ -577,6 +644,7 @@ async def export_stix(hours: int = 24, min_hits: int = 1) -> str:
     Args:
         hours: Time window — only IPs seen in the last N hours.
         min_hits: Minimum alert count for inclusion.
+        output_path: Where to write. Defaults to `reports/stix-<timestamp>.json`.
     """
     import json
     import uuid
@@ -607,7 +675,18 @@ async def export_stix(hours: int = 24, min_hits: int = 1) -> str:
         "id": f"bundle--{uuid.uuid4()}",
         "objects": objects,
     }
-    return json.dumps(bundle, indent=2)
+    written = write_artifact(
+        json.dumps(bundle, indent=2), prefix="stix", extension="json", output_path=output_path
+    )
+    if "error" in written:
+        return written
+    return {
+        **written,
+        "bundle_id": bundle["id"],
+        "indicator_count": len(objects),
+        "window_hours": hours,
+        "min_hits": min_hits,
+    }
 
 
 @mcp.tool

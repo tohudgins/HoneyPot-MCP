@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-358%20passing-brightgreen)](tests/unit)
+[![Tests](https://img.shields.io/badge/tests-374%20passing-brightgreen)](tests/unit)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 14
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -136,7 +136,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-358 unit tests cover the security-critical paths; ruff and mypy are blocking in CI
+374 unit tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -300,7 +300,9 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 | `alerts_get` | Full captured payload for one alert (headers, decoded bodies, enrichment) |
 | `alerts_search` | Find alerts by payload content — a command, username, path, User-Agent, or hash |
 | `alerts_stats` | Totals by severity, top attacker IPs, top event types, optionally windowed |
-| `alerts_export` / `alerts_acknowledge` / `alerts_prune` | Write JSON/CSV to disk, review workflow, retention |
+| `alerts_acknowledge` | Triage in bulk with a disposition (true/false positive, benign), note and analyst |
+| `alerts_export` / `alerts_prune` | Write JSON/CSV to disk, retention |
+| `audit_log_search` | Review every state-changing action the control plane took |
 
 </details>
 
@@ -312,8 +314,9 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 | `enrich_ip` | VirusTotal + AbuseIPDB + GeoIP, parallel and cached |
 | `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile + risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline |
 | `analyze_campaign` / `map_ttps` / `threat_timeline` | Campaign correlation, MITRE mapping, chronological timeline |
-| `generate_report` | XSS-safe HTML or Markdown report |
-| `export_blocklist` / `export_stix` / `report_ip_abuse` | iptables/fail2ban/CIDR, STIX 2.1 bundle, AbuseIPDB submission |
+| `generate_report` | Write an XSS-safe HTML or Markdown report to disk |
+| `export_blocklist` / `export_stix` | Write iptables/fail2ban/CIDR list or a STIX 2.1 bundle to disk |
+| `report_ip_abuse` | Submit an attacker IP to AbuseIPDB |
 
 </details>
 
@@ -382,7 +385,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 358 tests
+uv run pytest tests/unit/ -v     # 374 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
