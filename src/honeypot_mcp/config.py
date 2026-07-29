@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
-import yaml
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -152,9 +150,6 @@ class Settings(BaseSettings):
     # cleanly into Loki / Splunk / Cloudwatch Logs Insights).
     log_format: str = "text"
 
-    # YAML config overlay (loaded separately)
-    _yaml_config: dict[str, Any] = {}
-
     @field_validator("mcp_transport")
     @classmethod
     def validate_mcp_transport(cls, v: str) -> str:
@@ -196,28 +191,22 @@ class Settings(BaseSettings):
     def _anchor_to_project_root(cls, v: Path) -> Path:
         return v if v.is_absolute() else _PROJECT_ROOT / v
 
-    @classmethod
-    def load(cls, yaml_path: Path | None = None) -> Settings:
-        instance = cls()
-        if yaml_path and yaml_path.exists():
-            with yaml_path.open() as f:
-                instance._yaml_config = yaml.safe_load(f) or {}
-        return instance
-
-    def get_yaml(self, *keys: str, default: Any = None) -> Any:
-        node: Any = self._yaml_config
-        for key in keys:
-            if not isinstance(node, dict):
-                return default
-            node = node.get(key, default)
-        return node
-
 
 _settings: Settings | None = None
 
 
 def get_settings() -> Settings:
+    """Process-wide settings singleton.
+
+    Configuration comes from environment variables and `.env` only. A
+    `config/settings.yaml` overlay used to be loaded here alongside them, but
+    nothing ever read from it — the accessor was defined and never called — so
+    editing that file silently changed nothing while the docs presented it as a
+    config source. It has been removed rather than wired up: pydantic-settings
+    already covers every value, and one authoritative mechanism beats two where
+    one is a decoy.
+    """
     global _settings
     if _settings is None:
-        _settings = Settings.load(_PROJECT_ROOT / "config" / "settings.yaml")
+        _settings = Settings()
     return _settings

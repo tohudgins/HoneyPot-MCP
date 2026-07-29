@@ -305,7 +305,8 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     """Apply a bundled suppression preset (e.g. 'shodan', 'censys',
     'internal-rfc1918').
 
-    Presets live in `config/suppression_presets/<name>.yaml` and bundle a set
+    Bundled presets ship inside the package; a matching file under
+    `config/suppression_presets/<name>.yaml` overrides one. Each bundles a set
     of suppression rules for known-noise sources so the operator doesn't have
     to build the same `suppression_add` chain on every deployment.
 

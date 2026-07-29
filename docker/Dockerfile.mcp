@@ -56,16 +56,15 @@ RUN apt-get update \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
-# Suppression presets + settings.yaml are read relative to cwd at runtime
-# (tools/integrations.py looks for `config/suppression_presets/*.yaml`).
-# Migrations live inside the installed package, so no separate copy needed.
-COPY --chown=honeypot:honeypot config ./config
 # Ops scripts (seed demo data, fingerprint audit) live alongside config so
 # they're accessible via `docker compose exec honeypot-mcp python -m scripts.<name>`.
 COPY --chown=honeypot:honeypot scripts ./scripts
 # Pre-create the directories that named volumes mount on top of, so Docker
 # initializes them with the honeypot user's ownership rather than root.
-RUN mkdir -p /app/reports /app/tls /app/data /app/geoip \
+# `config/` is for optional operator overrides at runtime (a user-supplied
+# suppression preset, a GeoLite2 database) — the bundled presets and the
+# migrations ship inside the installed package, so nothing is copied into it.
+RUN mkdir -p /app/reports /app/tls /app/data /app/geoip /app/config \
  && chown -R honeypot:honeypot /app
 
 USER honeypot

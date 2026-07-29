@@ -1,36 +1,42 @@
-# Dashboard screenshots
+# Screenshots
 
-Drop captured PNGs here and they'll render in the main README:
+These are embedded in the main [README](../../README.md) and are **generated,
+not hand-captured** — regenerate them rather than replacing by hand, so they
+cannot drift from what the software actually renders.
 
-- `overview.png` — `HoneyPot MCP — Overview` dashboard
-- `threat-map.png` — `HoneyPot MCP — Threat Map` dashboard
-- `mitre.png` — `HoneyPot MCP — MITRE ATT&CK Coverage` dashboard
+| File | What it shows |
+|---|---|
+| `console.png` | The built-in operations console (`:8090`) — live attack feed, sensor health, volume by severity |
+| `overview.png` | Grafana — severity over time, top attackers, per-engine breakdown |
+| `threat-map.png` | Grafana — geo-located attacker origins |
+| `mitre.png` | Grafana — MITRE ATT&CK tactic coverage |
 
-## How to capture them
+## Regenerating
 
 ```bash
-# Stand up the stack
-cd docker
-docker compose up -d --build
-
-# Wait ~20s for Grafana to start, then seed demo data
-docker compose exec honeypot-mcp python scripts/seed_demo_data.py
-
-# Open Grafana
-#   URL:       http://localhost:3000
-#   username:  admin
-#   password:  honeypot   (override with GRAFANA_ADMIN_PASSWORD env var)
-
-# Browse to each dashboard. Use the share menu in Grafana
-# (chain icon) → "Share externally" → toggle "Render image"
-# for a PNG export with the current time range.
+./scripts/capture_screenshots.sh
 ```
 
-## Sizing tips
+That brings the demo stack up with a headless-Chromium renderer sidecar, seeds
+demo data if the last 24 hours are empty, and writes all four PNGs here at
+1920px wide. Requires Docker; everything else runs in containers.
 
-- 1920×1080 is the right capture size for README embedding — Grafana
-  renders cleanly at that resolution and the panels stay readable.
-- Set the time range to "Last 24h" before capturing so the seed data
-  fully fills the panels.
-- The Threat Map dashboard looks best in dark mode (Grafana's default
-  for this deployment via `GF_USERS_DEFAULT_THEME=dark`).
+Tear the renderer back down afterwards — it is a ~400 MB image a normal demo
+run has no use for:
+
+```bash
+docker compose -f docker/docker-compose.yml \
+               -f docker/docker-compose.screenshots.yml down
+```
+
+## Notes for whoever touches this next
+
+- The seed check counts events **inside the render window**, not rows in the
+  table. A database seeded yesterday is full of data and still renders empty
+  panels, so a stale window triggers a reseed.
+- Dark throughout: the Grafana stack sets `GF_USERS_DEFAULT_THEME=dark`, and
+  the console is dark by design.
+- If a Grafana panel shows "No data" while the same SQL works through the API,
+  check that every target carries `rawQueryText`. The SQLite plugin's frontend
+  interpolates from that field, and without it the browser sends an empty
+  query — which is exactly how all three dashboards were silently broken.

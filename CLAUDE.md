@@ -512,7 +512,9 @@ SMTP, FTP, DNS engines run in-process as asyncio servers — no Docker.
 
 ### Settings
 
-`config.py` uses `pydantic-settings` (`BaseSettings`). Values come from `.env` (highest priority) then `config/settings.yaml`. Access via the `get_settings()` singleton.
+`config.py` uses `pydantic-settings` (`BaseSettings`). Values come from environment variables and `.env`, accessed through the `get_settings()` singleton — that is the only configuration mechanism.
+
+A `config/settings.yaml` overlay used to be loaded alongside it. Nothing ever read from it: the accessor was defined and never called, so editing that file silently changed nothing while this document presented it as a config source. It was removed rather than wired up — every value it described already exists as a setting, and one authoritative mechanism beats two where one is a decoy. `config/` now holds only operator-supplied runtime files (GeoLite2 databases, override suppression presets), all gitignored.
 
 ### MCP transport + control-plane auth
 

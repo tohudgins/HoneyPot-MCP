@@ -59,8 +59,8 @@ dependencies = [
     "boto3>=1.34.0",
     # Threat intel
     "geoip2>=4.8.0",
-    # Honeypot protocols
-    "pyftpdlib>=1.5.9",
+    # Honeypot protocols. Only DNS needs a library — every other engine is a
+    # hand-written asyncio protocol implementation.
     "dnslib>=0.9.24",
     # TLS (self-signed cert generation for HTTPS + SMTP STARTTLS)
     "cryptography>=42.0.0",
@@ -72,9 +72,6 @@ dependencies = [
     # Config
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.1",
-    # Utilities
-    "rich>=13.7.0",
-    "click>=8.1.0",
 ]
 
 [project.optional-dependencies]

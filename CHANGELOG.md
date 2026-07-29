@@ -4,6 +4,39 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Housekeeping — remove what was never wired up
+
+A custodial pass over the repository, looking for things that were outdated,
+unused, or actively misleading rather than merely imperfect.
+
+- **`config/settings.yaml` was a decoy.** It was loaded at startup and described
+  six sections of configuration — database URL, honeypot profiles, canary,
+  intel, analysis, logging — and *nothing ever read from it*. The accessor
+  (`Settings.get_yaml`) was defined and never called, so anyone editing that
+  file to change the SSH persona or the database URL would have seen no effect
+  and no error, while CLAUDE.md presented it as a live config source ranked
+  below `.env`. Removed along with the accessor and the YAML overlay; the
+  documentation now says plainly that environment variables and `.env` are the
+  only mechanism.
+- **Three dependencies were never imported.** `pyftpdlib` — an entire FTP server
+  library — was pulled in despite the FTP engine being a hand-written asyncio
+  implementation. `click` and `rich` were speculative CLI dependencies for a
+  CLI that does not exist and, given the natural-language interface is the
+  point, is not planned. 21 dependencies down to 18.
+- **`docs/screenshots/README.md` still described capturing images by hand**
+  through Grafana's share menu, and did not mention the console at all — for
+  screenshots that have been script-generated since the console shipped.
+  Rewritten around `capture_screenshots.sh`.
+- **Stale paths after the preset move**: the Dockerfile copied a `config/`
+  directory for presets that now ship inside the package, and a tool docstring
+  still pointed at the old location.
+- **`config/` had no tracked files**, so it did not exist on a fresh clone even
+  though the code and DEPLOY.md both point at it. It now carries a README
+  explaining what an operator puts there and why nothing is committed.
+
+Verified the container still builds and that the built image resolves both the
+bundled presets and the console asset.
+
 ## 0.2.0 — installable
 
 The project was only usable by cloning it. This pass makes
