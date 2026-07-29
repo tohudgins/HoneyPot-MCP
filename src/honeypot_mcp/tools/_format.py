@@ -13,6 +13,7 @@ The rule these helpers implement: **list tools summarise, detail tools expand.**
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -130,6 +131,43 @@ def digest_payload(payload: Any) -> dict[str, Any]:
     return digest
 
 
+def resolve_artifact_path(output_path: str | None, *, prefix: str, extension: str) -> Any:
+    """Resolve a caller-supplied artifact path, confined to `reports_dir`.
+
+    Returns a `Path`, or a `str` error message if the path escapes the
+    directory.
+
+    This is a security boundary, not tidiness. Exports embed captured attack
+    payloads, and this server's control plane is driven by a language model
+    that *reads those payloads* — so attacker-authored text reaches the same
+    context that decides which tools to call, with which arguments. An
+    unconstrained `output_path` therefore turns "attacker writes a string into
+    a honeypot" into a candidate arbitrary-file-write with attacker-chosen
+    content, without the attacker ever authenticating to anything.
+
+    Confining writes to one directory removes that primitive regardless of
+    whether any given injection attempt succeeds.
+    """
+    from pathlib import Path
+
+    from honeypot_mcp.config import get_settings
+
+    root = get_settings().reports_dir.resolve()
+    if not output_path:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        return root / f"{prefix}-{stamp}.{extension}"
+
+    candidate = Path(output_path).expanduser()
+    # A bare filename is the common, intended case.
+    dest = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    if dest != root and root not in dest.parents:
+        return (
+            f"Refusing to write outside the reports directory ({root}). "
+            f"Pass a filename, or a path inside that directory, instead of {output_path!r}."
+        )
+    return dest
+
+
 def write_artifact(
     content: str,
     *,
@@ -146,15 +184,9 @@ def write_artifact(
 
     Returns the path plus size metadata, or an `error` key if the write failed.
     """
-    from pathlib import Path
-
-    from honeypot_mcp.config import get_settings
-
-    if output_path:
-        dest = Path(output_path).expanduser()
-    else:
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        dest = get_settings().reports_dir / f"{prefix}-{stamp}.{extension}"
+    dest = resolve_artifact_path(output_path, prefix=prefix, extension=extension)
+    if isinstance(dest, str):
+        return {"error": dest}
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
@@ -166,6 +198,28 @@ def write_artifact(
         "bytes": len(content.encode("utf-8")),
         "lines": content.count("\n") + 1,
     }
+
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_honeypot_name(name: str) -> str | None:
+    """Return an error message if `name` is unsafe, else None.
+
+    Honeypot names are not just labels: they become filesystem paths
+    (`tls/<name>/server.key`) and Docker container names. A name containing a
+    path separator or `..` therefore escapes the intended directory, so this is
+    a traversal guard rather than a formatting preference. The character set
+    also matches Docker's own container-name rules, so a name that passes here
+    cannot fail later at `docker run`.
+    """
+    if not name or not _NAME_RE.match(name):
+        return (
+            f"Invalid honeypot name {name!r}. Use 1-64 characters: letters, digits, "
+            f"dot, dash or underscore, starting with a letter or digit. Names become "
+            f"directory and container names, so separators and '..' are not allowed."
+        )
+    return None
 
 
 def validate_ip(ip: str) -> str | None:

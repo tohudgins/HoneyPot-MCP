@@ -13,6 +13,20 @@ import pytest
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
 
+@pytest.fixture
+def reports_dir(tmp_path, monkeypatch):
+    """Point the artifact directory at a temp dir.
+
+    Export tools confine writes to `reports_dir` (a security boundary — see
+    tests/unit/test_security_boundaries.py), so tests move the directory rather
+    than writing outside it.
+    """
+    from honeypot_mcp.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
+    return tmp_path
+
+
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage.database import close_db, init_db
@@ -262,12 +276,12 @@ async def test_audit_records_failed_actions_too():
 
 
 @pytest.mark.asyncio
-async def test_generate_report_writes_a_file_with_headline_figures(tmp_path):
+async def test_generate_report_writes_a_file_with_headline_figures(reports_dir):
     from honeypot_mcp.tools.analysis import generate_report
 
     await _seed(count=5, severity="high")
-    dest = tmp_path / "r.md"
-    result = await generate_report(format="markdown", output_path=str(dest))
+    dest = reports_dir / "r.md"
+    result = await generate_report(format="markdown", output_path="r.md")
 
     assert result["path"] == str(dest)
     assert result["alerts_analysed"] == 5

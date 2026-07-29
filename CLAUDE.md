@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (404 unit tests covering security-critical paths)
+# Tests (434 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -647,3 +647,33 @@ reinforcement, never colour alone. Re-run the palette validator if these change.
 Grafana still owns historical dashboards and the geo map; the console answers
 the three questions someone walking up to a screen has — is everything up, is
 anything on fire, what just happened.
+
+### Security boundaries
+
+A security review found two crossable boundaries; both are now enforced and
+pinned by `tests/unit/test_security_boundaries.py`. The threat model that makes
+them matter is unusual and worth holding in mind when adding tools:
+
+**The control plane is driven by a model that reads attacker-authored data.**
+Captured usernames, paths, commands and User-Agents are attacker-chosen strings
+that reach the same context deciding which tools to call with which arguments.
+So a tool parameter that reaches the filesystem is reachable, in principle, by
+someone who never authenticated. "The caller is trusted" is not sufficient
+reasoning for this codebase.
+
+- **Artifact writes are confined to `reports_dir`** via
+  `_format.resolve_artifact_path()`. Exports embed captured payloads, so an
+  unconstrained `output_path` was an arbitrary-file-write primitive with
+  attacker-chosen content. Any new tool that writes a file must route through
+  that helper rather than taking a `Path` directly.
+- **Honeypot names cannot become paths.** `_format.validate_honeypot_name()`
+  restricts them to a Docker-compatible character set; `tls._cert_dir()`
+  re-checks at the point a name becomes a path, because reconciliation and
+  cloning also reach it.
+
+Already verified sound, so don't re-litigate without new evidence: HMAC
+comparisons use `compare_digest`; there is no `eval`/`exec`/`pickle`/`yaml.load`
+anywhere; SQL goes through SQLAlchemy parameter binding (the one raw `text()`
+uses bound parameters); the console escapes every interpolation of
+attacker-controlled data before it reaches the DOM; `/cloud-event` refuses all
+requests until `CLOUD_EVENT_HMAC_SECRET` is set.

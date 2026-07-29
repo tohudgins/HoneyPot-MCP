@@ -15,6 +15,20 @@ import pytest
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
 
+@pytest.fixture
+def reports_dir(tmp_path, monkeypatch):
+    """Point the artifact directory at a temp dir.
+
+    Export tools confine writes to `reports_dir` (a security boundary — see
+    tests/unit/test_security_boundaries.py), so tests must move the directory
+    rather than write outside it.
+    """
+    from honeypot_mcp.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
+    return tmp_path
+
+
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage.database import close_db, init_db
@@ -244,15 +258,15 @@ async def test_alerts_search_reports_no_matches_helpfully():
 
 
 @pytest.mark.asyncio
-async def test_alerts_export_writes_a_file_and_returns_a_path(tmp_path):
+async def test_alerts_export_writes_a_file_and_returns_a_path(reports_dir):
     """Export must never return bulk content inline — a 5k-alert export of real
     HTTP capture is tens of megabytes."""
     from honeypot_mcp.tools.alerts import alerts_export
 
     await _seed_alert(payload=_fat_http_payload())
-    dest = tmp_path / "out.json"
+    dest = reports_dir / "out.json"
 
-    result = await alerts_export(format="json", output_path=str(dest))
+    result = await alerts_export(format="json", output_path="out.json")
 
     assert result["path"] == str(dest)
     assert result["alerts_exported"] == 1
@@ -264,25 +278,24 @@ async def test_alerts_export_writes_a_file_and_returns_a_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_alerts_export_csv_has_a_header(tmp_path):
+async def test_alerts_export_csv_has_a_header(reports_dir):
     from honeypot_mcp.tools.alerts import alerts_export
 
     await _seed_alert()
-    dest = tmp_path / "out.csv"
-    await alerts_export(format="csv", output_path=str(dest))
+    dest = reports_dir / "out.csv"
+    await alerts_export(format="csv", output_path="out.csv")
 
     assert dest.read_text().splitlines()[0].startswith("id,honeypot_id,source_ip")
 
 
 @pytest.mark.asyncio
-async def test_alerts_export_severity_filter(tmp_path):
+async def test_alerts_export_severity_filter(reports_dir):
     from honeypot_mcp.tools.alerts import alerts_export
 
     await _seed_alert(severity="critical")
     await _seed_alert(severity="low")
 
-    dest = tmp_path / "crit.json"
-    result = await alerts_export(severity="critical", output_path=str(dest))
+    result = await alerts_export(severity="critical", output_path="crit.json")
     assert result["alerts_exported"] == 1
 
 

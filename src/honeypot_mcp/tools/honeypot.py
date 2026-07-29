@@ -14,6 +14,7 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
 from honeypot_mcp.tools._audit import record_action
+from honeypot_mcp.tools._format import validate_honeypot_name
 
 
 @mcp.tool
@@ -69,6 +70,9 @@ async def honeypot_deploy(
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"
     resolved_config = config or {}
+
+    if err := validate_honeypot_name(resolved_name):
+        return {"error": err}
 
     if not 1 <= resolved_port <= 65535:
         return {"error": f"Port {resolved_port} is out of range — must be between 1 and 65535."}

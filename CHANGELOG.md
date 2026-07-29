@@ -4,6 +4,47 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Security review — two crossable boundaries, closed
+
+A security review of the codebase, framed around a threat model that is
+specific to this design and worth stating plainly: **the control plane is
+driven by a language model that reads attacker-authored data.** Captured
+usernames, request paths, shell commands and User-Agent strings are
+attacker-chosen strings, and they reach the same context that decides which
+tools to call with which arguments. An attacker who never authenticates to
+anything can therefore put text in front of the decision-making component just
+by attacking a honeypot — which is the entire point of the product. "The caller
+is trusted" is not sufficient reasoning here.
+
+- **HIGH — arbitrary file write with attacker-influenced content.** The
+  `output_path` parameter added to the four export tools in an earlier pass was
+  unconstrained. Confirmed by writing an alert payload into a file outside the
+  project, both by absolute path and by `../` traversal. Because exports embed
+  captured payloads, this was a primitive for writing attacker-chosen content
+  to any path the process could reach. Writes are now resolved through
+  `_format.resolve_artifact_path()` and confined to `reports_dir`; ordinary
+  filenames and subdirectories still work.
+- **MEDIUM — path traversal via honeypot name.** `honeypot_deploy` performed no
+  validation on `name`, and the name becomes a filesystem path
+  (`tls/<name>/server.key`) and a Docker container name. A name of `../../etc`
+  attempted to create a directory outside the tree. Names are now restricted to
+  a Docker-compatible character set at the tool layer, and `tls._cert_dir()`
+  re-checks at the point the name becomes a path, since reconciliation and
+  cloning also reach it.
+
+28 regression tests cover both, plus the boundaries that were already sound.
+
+Verified and deliberately left alone, having found no defect: HMAC comparisons
+use `compare_digest`; there is no `eval`/`exec`/`pickle`/`yaml.load` anywhere;
+SQL goes through SQLAlchemy parameter binding; the console escapes every
+interpolation of attacker-controlled data before it reaches the DOM (tested with
+`"><img src=x onerror=...>` in the source IP, username, path and command
+fields); and `/cloud-event` refuses every request until its HMAC secret is
+configured.
+
+SECURITY.md now documents the model-in-the-loop threat model explicitly, so the
+reasoning survives for the next person adding a tool.
+
 ## Ship-readiness pass — PostgreSQL was broken the whole time
 
 - **The documented production database never worked.** The docs offer swapping

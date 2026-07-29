@@ -25,6 +25,37 @@ be a defect elsewhere:
   material with no access to anything.
 - **Engines return believable-but-false data** to keep an attacker engaged.
 
+## The threat model that is specific to this design
+
+Worth stating plainly, because it is unusual: **the control plane is driven by
+a language model that reads attacker-authored data.**
+
+Captured usernames, request paths, shell commands and User-Agent strings are
+attacker-chosen strings. They are shown to an analyst through a model, which
+means they reach the same context that decides which tools to call and with
+which arguments. An attacker who never authenticates to anything can therefore
+put text in front of the decision-making component simply by attacking a
+honeypot — which is the entire point of the product.
+
+The mitigation is not to hope the model resists persuasion. It is to make sure
+that a tool call the attacker *wanted* is still harmless:
+
+- **Bulk writes are confined to the reports directory.** Export tools take an
+  `output_path`, and exports embed captured payloads; an unconstrained path
+  would turn "attacker writes a string into a honeypot" into an arbitrary file
+  write with attacker-chosen content. Paths that resolve outside are refused.
+- **Honeypot names cannot become paths.** Names are used as directory and
+  container names, and are restricted to a conservative character set, checked
+  both at the tool layer and again where a name becomes a path.
+- **Destructive actions are audited** so an unexpected prune or a stopped
+  sensor is attributable after the fact, with credential-shaped arguments
+  redacted before they are stored.
+- **The console cannot change anything** — it registers GET routes only.
+
+If you find a tool parameter that reaches the filesystem, the network, or a
+subprocess without an equivalent constraint, that is a vulnerability worth
+reporting even though "the caller is trusted" on paper.
+
 ## What would be a real vulnerability
 
 Roughly, anything that lets an attacker escape the deception boundary or reach

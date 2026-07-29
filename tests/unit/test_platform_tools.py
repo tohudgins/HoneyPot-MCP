@@ -13,6 +13,20 @@ import pytest
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
 
+@pytest.fixture
+def reports_dir(tmp_path, monkeypatch):
+    """Point the artifact directory at a temp dir.
+
+    Export tools confine writes to `reports_dir` (a security boundary — see
+    tests/unit/test_security_boundaries.py), so tests move the directory rather
+    than writing outside it.
+    """
+    from honeypot_mcp.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
+    return tmp_path
+
+
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage.database import close_db, init_db
@@ -43,7 +57,7 @@ async def _seed_alerts(ip: str, count: int, hours_ago: int = 1):
 
 
 @pytest.mark.asyncio
-async def test_export_blocklist_plain_format(tmp_path):
+async def test_export_blocklist_plain_format(reports_dir):
     """Blocklists are written to disk, not returned inline — the content is
     destined for a firewall and grows a line per offending IP."""
     from honeypot_mcp.tools.analysis import export_blocklist
@@ -51,8 +65,8 @@ async def test_export_blocklist_plain_format(tmp_path):
     await _seed_alerts("8.8.8.8", count=10)
     await _seed_alerts("9.9.9.9", count=2)  # Below threshold
 
-    dest = tmp_path / "bl.txt"
-    result = await export_blocklist(format="plain", hours=24, min_hits=5, output_path=str(dest))
+    dest = reports_dir / "bl.txt"
+    result = await export_blocklist(format="plain", hours=24, min_hits=5, output_path="bl.txt")
     assert result["ip_count"] == 1
     assert result["path"] == str(dest)
 
@@ -62,24 +76,24 @@ async def test_export_blocklist_plain_format(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_export_blocklist_iptables_format(tmp_path):
+async def test_export_blocklist_iptables_format(reports_dir):
     from honeypot_mcp.tools.analysis import export_blocklist
 
     await _seed_alerts("1.2.3.4", count=10)
-    dest = tmp_path / "bl.rules"
-    await export_blocklist(format="iptables", hours=24, min_hits=5, output_path=str(dest))
+    dest = reports_dir / "bl.rules"
+    await export_blocklist(format="iptables", hours=24, min_hits=5, output_path="bl.rules")
     assert "iptables -A INPUT -s 1.2.3.4 -j DROP" in dest.read_text()
 
 
 @pytest.mark.asyncio
-async def test_export_stix_emits_valid_bundle(tmp_path):
+async def test_export_stix_emits_valid_bundle(reports_dir):
     """STIX goes to a file: a few hundred alerts exceed 100 KB of JSON, and the
     bundle is meant for a TIP rather than for reading back."""
     from honeypot_mcp.tools.analysis import export_stix
 
     await _seed_alerts("4.4.4.4", count=3)
-    dest = tmp_path / "stix.json"
-    result = await export_stix(hours=24, min_hits=1, output_path=str(dest))
+    dest = reports_dir / "stix.json"
+    result = await export_stix(hours=24, min_hits=1, output_path="stix.json")
     assert result["indicator_count"] >= 1
     assert result["path"] == str(dest)
     bundle = json.loads(dest.read_text())

@@ -22,7 +22,17 @@ log = logging.getLogger(__name__)
 
 
 def _cert_dir(honeypot_name: str) -> Path:
-    p = Path("tls") / honeypot_name
+    """Per-honeypot cert directory, confined to `tls/`.
+
+    Defence in depth: `honeypot_deploy` already rejects unsafe names, but this
+    is the point where a name becomes a filesystem path, and it has other
+    callers (restart reconciliation, cloning). A name like `../../etc` would
+    otherwise write a private key outside the intended tree.
+    """
+    root = Path("tls").resolve()
+    p = (root / honeypot_name).resolve()
+    if p != root and root not in p.parents:
+        raise ValueError(f"Unsafe honeypot name for a certificate directory: {honeypot_name!r}")
     p.mkdir(parents=True, exist_ok=True)
     return p
 

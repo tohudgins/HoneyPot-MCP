@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-409%20passing-brightgreen)](tests/unit)
+[![Tests](https://img.shields.io/badge/tests-439%20passing-brightgreen)](tests/unit)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 14
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -146,7 +146,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-404 unit tests plus 5 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+434 unit tests plus 5 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -395,7 +395,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 404 unit tests
+uv run pytest tests/unit/ -v     # 434 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

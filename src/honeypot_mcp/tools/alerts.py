@@ -13,7 +13,11 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertDisposition, AlertSeverity
 from honeypot_mcp.tools._audit import record_action
-from honeypot_mcp.tools._format import digest_payload, truncate_payload
+from honeypot_mcp.tools._format import (
+    digest_payload,
+    resolve_artifact_path,
+    truncate_payload,
+)
 
 
 @mcp.tool
@@ -374,10 +378,6 @@ async def alerts_export(
         output_path: Where to write. Defaults to
               `reports/alerts-<timestamp>.<format>` under the project root.
     """
-    from pathlib import Path
-
-    from honeypot_mcp.config import get_settings
-
     limit = max(1, min(limit, 50_000))
     sev = AlertSeverity(severity) if severity else None
     since = None
@@ -414,12 +414,9 @@ async def alerts_export(
             writer.writerows(rows)
         content = buf.getvalue()
 
-    if output_path:
-        dest = Path(output_path).expanduser()
-    else:
-        settings = get_settings()
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        dest = settings.reports_dir / f"alerts-{stamp}.{format}"
+    dest = resolve_artifact_path(output_path, prefix="alerts", extension=format)
+    if isinstance(dest, str):
+        return {"error": dest}
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
