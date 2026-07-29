@@ -135,6 +135,29 @@ The persona is passed to Cowrie via `COWRIE_*` env vars built by
 (`COWRIE_HONEYPOT_HOSTNAME`) naming conventions are set so the persona takes
 effect regardless of Cowrie version.
 
+**`cowrie_env_vars()` also carries the three settings that make capture work
+at all** — do not treat them as cosmetic:
+
+```
+COWRIE_HONEYPOT_LOGTYPE=plain
+COWRIE_OUTPUT_JSONLOG_ENABLED=true
+COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1
+```
+
+`_ingest_logs` reads `container.logs()` and `json.loads` each line. Cowrie's
+stdout is Twisted's *text* log, so on image defaults every line fails to parse
+and the honeypot records nothing while running, answering SSH, and passing
+health checks — the failure is completely silent. `logtype` matters as much as
+the path: the default `rotating` wraps the file in Twisted's `LogFile`, which
+seeks on open and dies with "Illegal seek" on a pipe, disabling the jsonlog
+plugin entirely. `plain` uses a bare `open(path, "w")`.
+
+The same three variables are set on the `cowrie-ssh` service in
+`docker/docker-compose.yml`, which had the identical problem.
+`tests/integration/test_ssh_capture.py` (Docker-gated, `RUN_DOCKER_TESTS=1`)
+is the only test that can catch a regression here — unit tests feed synthetic
+JSON to the parser and pass either way.
+
 User escape hatch: explicit `fake_hostname` / `fake_kernel` keys in config
 override the persona-chosen values. The `cowrie.cfg` defaults are the baseline
 those env vars override.

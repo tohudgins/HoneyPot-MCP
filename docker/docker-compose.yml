@@ -136,6 +136,13 @@ services:
       - "${DEFAULT_SSH_PORT:-2222}:2222"
     environment:
       - COWRIE_HOSTNAME=ubuntu-server
+      # Cowrie's JSON event stream has to reach stdout for the MCP server to
+      # ingest it — see the note in engines/ssh_personas.py:cowrie_env_vars.
+      # `plain` is required alongside the path: the default `rotating` logtype
+      # seeks on open, which a pipe rejects.
+      - COWRIE_HONEYPOT_LOGTYPE=plain
+      - COWRIE_OUTPUT_JSONLOG_ENABLED=true
+      - COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1
     volumes:
       - cowrie-logs:/cowrie/var/log/cowrie
     networks:

@@ -115,4 +115,18 @@ def cowrie_env_vars(persona: SSHPersona, hostname: str) -> dict[str, str]:
         "COWRIE_HONEYPOT_HARDWARE_PLATFORM": persona.hardware_platform,
         "COWRIE_HONEYPOT_OPERATING_SYSTEM": persona.operating_system,
         "COWRIE_SSH_VERSION": persona.ssh_version_string,
+        # ── Route Cowrie's JSON event stream to stdout ──────────────────
+        # `SSHEngine._ingest_logs` reads `docker logs` and parses each line as
+        # JSON. Cowrie's stdout is Twisted's *text* log, so without these the
+        # parser rejects every line and the honeypot captures nothing while
+        # looking perfectly healthy.
+        #
+        # `logtype` matters as much as the path. The image default is
+        # `rotating`, which wraps the file in Twisted's LogFile — that seeks
+        # on open and dies with EBADF/"Illegal seek" against a pipe, taking
+        # the whole jsonlog plugin down with it. `plain` uses a bare
+        # `open(path, "w")`, which a pipe accepts.
+        "COWRIE_HONEYPOT_LOGTYPE": "plain",
+        "COWRIE_OUTPUT_JSONLOG_ENABLED": "true",
+        "COWRIE_OUTPUT_JSONLOG_LOGFILE": "/proc/self/fd/1",
     }
