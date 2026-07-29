@@ -175,8 +175,18 @@ def reset_for_tests() -> None:
     Each pytest-asyncio test gets its own event loop. asyncio.Queue is bound to
     the loop it was created in, so a singleton built in test A breaks in test B
     with `Queue is bound to a different event loop`. Tests that use the buffer
-    must call this in their setUp."""
+    must call this in their setUp.
+
+    The running flusher is cancelled rather than merely dropped. Abandoning it
+    leaves a task that may be mid-write when the fixture disposes the
+    connection pool a moment later, which surfaces as
+    `KeyError: 'connection'` from SQLAlchemy's pool — an intermittent teardown
+    failure that lands on whichever engine test loses the race that run.
+    """
     global _buffer
+    if _buffer is not None and _buffer._task is not None and not _buffer._task.done():
+        _buffer._task.cancel()
+        _buffer._task = None
     _buffer = None
 
 
