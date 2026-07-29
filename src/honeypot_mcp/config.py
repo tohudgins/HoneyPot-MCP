@@ -137,6 +137,12 @@ class Settings(BaseSettings):
     # more, smaller transactions. The test suite drops this so assertions
     # don't race a 1-second flush.
     event_flush_interval_seconds: float = 1.0
+    # How long shutdown waits for the event buffer to drain. Anything still
+    # queued when this expires is discarded — captured attack data, gone — so
+    # the buffer logs the count at ERROR rather than losing it quietly.
+    # Measured drain is ~1,550 events/sec on SQLite; raise this for a slow or
+    # remote database, where the same backlog takes proportionally longer.
+    shutdown_drain_seconds: float = 5.0
 
     # Live operations console — a read-only wall display served by the server
     # itself (see console/). Bound to localhost by default: it exposes every

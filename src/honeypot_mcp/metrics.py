@@ -148,6 +148,22 @@ async def _gather_metrics() -> str:
         out.append("# TYPE honeypot_webhook_failures_total counter\n")
         out.append(_line("honeypot_webhook_failures_total", None, failed or 0))
 
+    # Ingest backlog. Outside the session block because it reads in-process
+    # state, not the database.
+    #
+    # This is the leading indicator for the one way captured data gets lost:
+    # the queue is unbounded, so events are never dropped on the way in, but a
+    # backlog that outlives the shutdown drain is discarded. Depth normally
+    # sits at roughly one flush interval's worth of traffic (200 at 200
+    # events/sec); a number that climbs instead of oscillating means ingest is
+    # outrunning the database, and it is visible here long before a restart
+    # turns it into loss.
+    from honeypot_mcp.storage.event_buffer import get_buffer
+
+    out.append("# HELP honeypot_event_queue_depth Events awaiting commit in the ingest buffer.\n")
+    out.append("# TYPE honeypot_event_queue_depth gauge\n")
+    out.append(_line("honeypot_event_queue_depth", None, get_buffer().qsize()))
+
     return "".join(out)
 
 

@@ -845,6 +845,34 @@ running from the repo root hides the bug entirely.
 Version lives in two places (`pyproject.toml` and `__init__.py`); a test
 asserts they agree and the release workflow refuses a mismatched git tag.
 
+### Ingest throughput and the one way data is lost
+
+Measured, not estimated (SQLite, batch=50, flush_interval=1.0):
+
+| | |
+|---|---|
+| Sustained commit rate | ~1,550 events/sec |
+| 20,000-event burst | zero loss, drains in 12.9s |
+| 200 events/sec sustained | zero loss, queue depth stays at ~200 |
+| Storage | 477 bytes/event |
+
+The queue is **unbounded**, so nothing is ever dropped on the way in and
+`submit_event` never blocks — enqueue benchmarks around 149k/sec and that
+number means nothing. Commit rate is the real ceiling.
+
+That leaves exactly one path where a captured event disappears: `stop()` drains
+for `shutdown_drain_seconds` (default 5) and discards whatever is still queued.
+A load test queued 50,000 events and lost 40,850 that way while logging only
+"flusher did not exit cleanly" — no count, no cause. It now logs at ERROR with
+the number discarded and names the setting that fixes it, and
+`honeypot_event_queue_depth` exposes the backlog as a Prometheus gauge so the
+condition is visible before a restart converts it into loss. Depth should
+oscillate around one flush interval's worth of traffic; a number that climbs
+means ingest is outrunning the database.
+
+Raise `shutdown_drain_seconds` for a slow or remote database — the same backlog
+takes proportionally longer there.
+
 ### Test timing
 
 `tests/conftest.py` sets `EVENT_FLUSH_INTERVAL_SECONDS=0.05`. This is not
