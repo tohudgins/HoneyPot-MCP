@@ -105,6 +105,11 @@ services:
       METRICS_PORT: "9090"
       CANARY_CALLBACK_HOST: 0.0.0.0
       CANARY_CALLBACK_PORT: "8888"
+      # Live operations console. Binds 0.0.0.0 *inside* the container; the
+      # published port below keeps it on the host's loopback, because the
+      # console shows every captured attack.
+      CONSOLE_HOST: 0.0.0.0
+      CONSOLE_PORT: "8090"
       GEOIP_DB_PATH: /app/geoip/GeoLite2-City.mmdb
       # Optional second database: origin AS number + org — the key pivot for
       # spotting hosting/VPN/botnet networks. Same MaxMind account, same drop
@@ -113,6 +118,7 @@ services:
       GEOIP_ASN_DB_PATH: /app/geoip/GeoLite2-ASN.mmdb
     ports:
       - "8888:8888"   # Canary callback server (publicly reachable)
+      - "127.0.0.1:8090:8090"   # Live console — localhost only
       - "127.0.0.1:9090:9090"   # Prometheus /metrics — bound to localhost only
     networks:
       - honeypot-net

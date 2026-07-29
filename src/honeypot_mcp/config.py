@@ -125,6 +125,15 @@ class Settings(BaseSettings):
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"
 
+    # Live operations console — a read-only wall display served by the server
+    # itself (see console/). Bound to localhost by default: it exposes every
+    # captured attack, so putting it on 0.0.0.0 is an explicit choice.
+    # 0 disables it entirely.
+    # 8090, not 8080 — 8080 is `default_http_port`, so the console would
+    # collide with the first HTTP honeypot anyone deploys.
+    console_host: str = "127.0.0.1"
+    console_port: int = 8090
+
     # Where generated artifacts land (alert exports, HTML/Markdown reports).
     # Tools write here instead of returning bulk content inline — a full export
     # is far too large to put in an MCP response. The Docker image pre-creates

@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 
 from honeypot_mcp.canary import start_canary_server
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.console import start_console_server
 from honeypot_mcp.metrics import start_metrics_server
 from honeypot_mcp.reconcile import reconcile_running_honeypots
 from honeypot_mcp.storage import queries
@@ -45,6 +46,9 @@ async def lifespan(app: FastMCP):
     metrics_runner = None
     if settings.metrics_port > 0:
         metrics_runner = await start_metrics_server(settings.metrics_host, settings.metrics_port)
+    console_runner = None
+    if settings.console_port > 0:
+        console_runner = await start_console_server(settings.console_host, settings.console_port)
     # Re-establish honeypots the previous process left RUNNING — must happen
     # before the watchdog starts, or it races us to mark them dead.
     try:
@@ -61,6 +65,8 @@ async def lifespan(app: FastMCP):
             await canary_runner.cleanup()
         if metrics_runner is not None:
             await metrics_runner.cleanup()
+        if console_runner is not None:
+            await console_runner.cleanup()
         await buffer.stop()
         await delivery.stop()
         await close_db()

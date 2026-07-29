@@ -21,6 +21,8 @@ GRAFANA_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-honeypot}"
 WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
 
+CONSOLE_URL="${CONSOLE_URL:-http://host.docker.internal:8090/}"
+
 # dashboard-uid:output-filename
 DASHBOARDS=(
   "honeypot-overview:overview.png"
@@ -98,6 +100,28 @@ for entry in "${DASHBOARDS[@]}"; do
     exit 1
   fi
 done
+
+# The console is served by the MCP container itself, so it renders through the
+# same headless Chromium — no Grafana involved.
+echo "==> Rendering the operations console"
+if curl -sf -o /dev/null "http://localhost:8090/" 2>/dev/null; then
+  compose exec -T renderer sh -c 'true' 2>/dev/null || true
+  curl -sf -H "X-Auth-Token: ${RENDER_TOKEN:-}" --get \
+    --data-urlencode "url=$CONSOLE_URL" \
+    --data-urlencode "width=$WIDTH" \
+    --data-urlencode "height=1020" \
+    --data-urlencode "deviceScaleFactor=2" \
+    --data-urlencode "renderKey=console" \
+    --data-urlencode "domain=host.docker.internal" \
+    --data-urlencode "timeout=40" \
+    -o "$OUT_DIR/console.png" \
+    "http://localhost:8081/render" \
+    && file "$OUT_DIR/console.png" | grep -q PNG \
+    && echo "    -> docs/screenshots/console.png" \
+    || echo "    !! console render skipped (renderer not reachable on :8081)"
+else
+  echo "    !! console not reachable on :8090 — skipped"
+fi
 
 echo
 echo "==> Done. Wrote:"

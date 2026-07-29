@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HoneyPot MCP — Console</title>
+<style>
+/* Dark by commitment: this is a wall display in a room with the lights down.
+   Palette steps are the validated dark-surface set — two well-separated hues
+   for the only split that drives a decision (routine vs acted-on), a single
+   hue for magnitude bars, and reserved status colors that never appear
+   without their text label beside them. */
+:root {
+  --plane:      #0d0d0c;
+  --surface:    #12120f;
+  --surface-2:  #171714;
+  --ink:        #ffffff;
+  --ink-2:      #c3c2b7;
+  --muted:      #898781;
+  --grid:       #24241f;
+  --rule:       rgba(255,255,255,0.08);
+
+  --routine:    #3987e5;   /* low + medium  */
+  --serious:    #e66767;   /* high + critical */
+  --magnitude:  #3987e5;
+
+  --st-good:     #0ca30c;
+  --st-warning:  #fab219;
+  --st-serious:  #ec835a;
+  --st-critical: #d03b3b;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--plane);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; }
+
+/* ── Chrome ─────────────────────────────────────────────────────────── */
+header {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--surface);
+  position: sticky; top: 0; z-index: 10;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: .01em; }
+.brand .sub { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+
+.live { display: flex; align-items: center; gap: 7px; color: var(--ink-2); font-size: 12px; }
+.pulse {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--st-good);
+  box-shadow: 0 0 0 0 rgba(12,163,12,.55); animation: pulse 2.4s infinite;
+}
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(12,163,12,.5); }
+  70%  { box-shadow: 0 0 0 7px rgba(12,163,12,0); }
+  100% { box-shadow: 0 0 0 0 rgba(12,163,12,0); }
+}
+.stale .pulse { background: var(--st-critical); animation: none; }
+
+.spacer { flex: 1; }
+.ranges { display: flex; gap: 4px; }
+.ranges button {
+  font: inherit; font-size: 12px; font-family: var(--mono);
+  color: var(--ink-2); background: transparent;
+  border: 1px solid var(--rule); border-radius: 6px;
+  padding: 5px 11px; cursor: pointer;
+}
+.ranges button:hover { background: var(--surface-2); color: var(--ink); }
+.ranges button[aria-pressed="true"] {
+  background: var(--surface-2); color: var(--ink); border-color: rgba(255,255,255,.22);
+}
+.ranges button:focus-visible { outline: 2px solid var(--routine); outline-offset: 2px; }
+
+main { padding: 18px 22px 40px; display: grid; gap: 16px; max-width: 1680px; margin: 0 auto; }
+
+/* ── Panels ─────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 12px; padding: 16px 18px; min-width: 0;
+}
+.panel h2 {
+  font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--muted); margin: 0 0 14px;
+}
+
+/* ── Stat tiles ─────────────────────────────────────────────────────── */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 14px 16px; }
+.tile .label {
+  font-size: 10.5px; letter-spacing: .085em; text-transform: uppercase;
+  color: var(--muted); display: flex; align-items: center; gap: 6px;
+}
+.tile .value { font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; margin-top: 5px; }
+.tile .foot { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.dot.critical { background: var(--st-critical); }
+.dot.high     { background: var(--st-serious); }
+.dot.medium   { background: var(--st-warning); }
+.dot.low      { background: var(--st-good); }
+.dot.routine  { background: var(--routine); }
+.dot.serious  { background: var(--serious); }
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+.row-main { align-items: start; display: grid; grid-template-columns: minmax(0,2.1fr) minmax(0,1fr); gap: 16px; }
+.row-bottom { align-items: start; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr) minmax(0,1.5fr); gap: 16px; }
+@media (max-width: 1100px) { .row-main, .row-bottom { grid-template-columns: 1fr; } }
+
+/* ── Chart ──────────────────────────────────────────────────────────── */
+.legend { display: flex; gap: 16px; margin-bottom: 10px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.chart-wrap { position: relative; overflow-x: auto; }
+svg { display: block; width: 100%; height: auto; }
+.axis text { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.bar-routine { fill: var(--routine); }
+.bar-serious { fill: var(--serious); }
+.hitbox { fill: transparent; cursor: crosshair; }
+.hitbox:hover ~ .hover-band, .hitbox:focus ~ .hover-band { opacity: 1; }
+
+.tooltip {
+  position: fixed; pointer-events: none; z-index: 50;
+  background: #000; border: 1px solid rgba(255,255,255,.16); border-radius: 8px;
+  padding: 8px 11px; font-size: 12px; font-family: var(--mono); color: var(--ink);
+  box-shadow: 0 8px 24px rgba(0,0,0,.6); opacity: 0; transition: opacity .1s;
+  white-space: nowrap;
+}
+.tooltip .k { color: var(--muted); }
+
+/* ── Bars (magnitude) ───────────────────────────────────────────────── */
+.rank { display: grid; gap: 9px; }
+.rank-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; font-size: 12.5px; }
+.rank-row .name { font-family: var(--mono); color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rank-row .n { font-variant-numeric: tabular-nums; color: var(--ink); font-family: var(--mono); }
+.rank-bar { grid-column: 1 / -1; height: 5px; border-radius: 3px; background: var(--grid); overflow: hidden; margin-top: -4px; }
+.rank-bar i { display: block; height: 100%; border-radius: 3px; background: var(--magnitude); }
+
+/* ── Honeypot grid ──────────────────────────────────────────────────── */
+.pots { display: grid; gap: 8px; }
+.pot {
+  display: grid; grid-template-columns: 10px 1fr auto; gap: 10px; align-items: center;
+  padding: 8px 10px; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface-2);
+  font-size: 12.5px;
+}
+.pot .nm { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pot .nm em { color: var(--muted); font-style: normal; }
+.pot .hits { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.state { width: 10px; height: 10px; border-radius: 50%; }
+.state.running { background: var(--st-good); }
+.state.error   { background: var(--st-critical); }
+.state.stopped, .state.paused { background: var(--muted); }
+
+/* ── Feed ───────────────────────────────────────────────────────────── */
+.feed { display: flex; flex-direction: column; gap: 2px; max-height: 460px; overflow-y: auto; }
+.ev {
+  display: grid; grid-template-columns: 62px 38px 132px 1fr; gap: 10px; align-items: baseline;
+  padding: 7px 9px; border-radius: 7px; font-size: 12.5px; font-family: var(--mono);
+  border-left: 2px solid transparent;
+}
+.ev:nth-child(odd) { background: var(--surface-2); }
+.ev.sev-critical { border-left-color: var(--st-critical); }
+.ev.sev-high     { border-left-color: var(--st-serious); }
+.ev.sev-medium   { border-left-color: var(--st-warning); }
+.ev.sev-low      { border-left-color: var(--st-good); }
+.ev .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.ev .ip   { color: var(--ink); }
+.ev .body { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev .body b { color: var(--ink); font-weight: 600; }
+.ev .sev-label {
+  font-size: 9.5px; letter-spacing: .05em; font-weight: 600;
+  padding: 1px 0; border-radius: 4px; text-align: center; color: var(--ink-2);
+}
+.ev .sev-label.sev-critical { color: var(--st-critical); }
+.ev .sev-label.sev-high     { color: var(--st-serious); }
+.ev .sev-label.sev-medium   { color: var(--st-warning); }
+.ev .sev-label.sev-low      { color: var(--muted); }
+.new { animation: flash 1.1s ease-out; }
+@keyframes flash { from { background: rgba(57,135,229,.20); } to { background: transparent; } }
+
+.empty { color: var(--muted); font-size: 13px; padding: 22px 0; text-align: center; }
+.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+table.data { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--mono); }
+table.data th, table.data td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--rule); }
+table.data th { color: var(--muted); font-weight: 500; }
+details.tableview { margin-top: 12px; }
+details.tableview summary { color: var(--muted); font-size: 11.5px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>HoneyPot MCP</h1>
+    <span class="sub">operations console</span>
+  </div>
+  <div class="live" id="live"><span class="pulse"></span><span id="live-text">connecting…</span></div>
+  <div class="spacer"></div>
+  <div class="ranges" role="group" aria-label="Time range">
+    <button data-h="1">1h</button>
+    <button data-h="6">6h</button>
+    <button data-h="24" aria-pressed="true">24h</button>
+    <button data-h="168">7d</button>
+  </div>
+</header>
+
+<main>
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="row-main">
+    <div class="panel">
+      <h2>Attack volume</h2>
+      <div class="legend">
+        <span><i class="dot routine"></i> Low &amp; medium</span>
+        <span><i class="dot serious"></i> High &amp; critical</span>
+      </div>
+      <div class="chart-wrap"><svg id="chart" viewBox="0 0 900 240" preserveAspectRatio="none" role="img" aria-labelledby="chart-desc"></svg></div>
+      <p id="chart-desc" class="sr">Stacked attack volume over the selected window, split into routine and serious severity.</p>
+      <details class="tableview"><summary>View as table</summary><div id="chart-table"></div></details>
+    </div>
+
+    <div class="panel">
+      <h2>Honeypots</h2>
+      <div class="pots" id="pots"></div>
+    </div>
+  </section>
+
+  <section class="row-bottom">
+    <div class="panel">
+      <h2>Top attackers</h2>
+      <div class="rank" id="attackers"></div>
+    </div>
+    <div class="panel">
+      <h2>Origin</h2>
+      <div class="rank" id="countries"></div>
+    </div>
+    <div class="panel">
+      <h2>Live activity</h2>
+      <div class="feed" id="feed" aria-live="polite"></div>
+    </div>
+  </section>
+</main>
+
+<div class="tooltip" id="tip" role="status"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const tip = $("tip");
+let hours = 24, seen = new Set(), first = true, timer = null;
+
+const SEV_LABEL = { critical: "CRIT", high: "HIGH", medium: "MED", low: "LOW" };
+const fmt = (n) => n.toLocaleString();
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function clock(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
+/* ── Tiles ─────────────────────────────────────────────────────────── */
+function renderTiles(s) {
+  const potFoot = s.honeypots_error
+    ? `${s.honeypots_error} in error`
+    : `${s.honeypots_total} deployed`;
+  const tiles = [
+    { label: "Events", value: fmt(s.events), foot: `${fmt(s.untriaged)} untriaged` },
+    { label: "Unique attackers", value: fmt(s.unique_ips), foot: "distinct source IPs" },
+    { label: "Critical", value: fmt(s.critical), foot: `${fmt(s.high)} high`, dot: "critical" },
+    { label: "Sensors up", value: `${s.honeypots_running}`, foot: potFoot,
+      dot: s.honeypots_error ? "critical" : "low" },
+    { label: "Tokens triggered", value: fmt(s.tokens_triggered), foot: `${fmt(s.tokens_active)} planted` },
+  ];
+  $("tiles").innerHTML = tiles.map((t) => `
+    <div class="tile">
+      <div class="label">${t.dot ? `<i class="dot ${t.dot}"></i>` : ""}${esc(t.label)}</div>
+      <div class="value">${esc(t.value)}</div>
+      <div class="foot">${esc(t.foot)}</div>
+    </div>`).join("");
+}
+
+/* ── Chart ─────────────────────────────────────────────────────────── */
+function renderChart(series) {
+  const pts = series.points, svg = $("chart");
+  const W = 900, H = 240, padL = 40, padB = 24, padT = 8, padR = 6;
+  const plotW = W - padL - padR, plotH = H - padB - padT;
+  const max = Math.max(1, ...pts.map((p) => p.routine + p.serious));
+  const step = plotW / Math.max(pts.length, 1);
+  const bw = Math.max(1, step - 2);          // 2px surface gap between bars
+  const y = (v) => padT + plotH - (v / max) * plotH;
+
+  const ticks = [0, Math.round(max / 2), max];
+  let out = ticks.map((t) =>
+    `<line class="gridline" x1="${padL}" x2="${W - padR}" y1="${y(t)}" y2="${y(t)}"/>
+     <text class="axis" x="${padL - 7}" y="${y(t) + 3.5}" text-anchor="end">${t}</text>`).join("");
+
+  pts.forEach((p, i) => {
+    const x = padL + i * step;
+    const total = p.routine + p.serious;
+    if (total > 0) {
+      const hSer = (p.serious / max) * plotH;
+      const hRou = (p.routine / max) * plotH;
+      // Serious sits on top of routine, with a 2px gap between the two fills.
+      const yRou = padT + plotH - hRou;
+      const yTop = yRou - hSer - (hSer > 0 && hRou > 0 ? 2 : 0);
+      if (hRou > 0) out += `<rect class="bar-routine" x="${x}" y="${yRou}" width="${bw}" height="${hRou}" rx="2"/>`;
+      if (hSer > 0) out += `<rect class="bar-serious" x="${x}" y="${Math.max(padT, yTop)}" width="${bw}" height="${hSer}" rx="2"/>`;
+    }
+    out += `<rect class="hitbox" x="${x}" y="${padT}" width="${step}" height="${plotH}"
+             data-i="${i}" tabindex="-1"></rect>`;
+  });
+
+  const labelEvery = Math.max(1, Math.ceil(pts.length / 8));
+  pts.forEach((p, i) => {
+    if (i % labelEvery) return;
+    const x = padL + i * step + bw / 2;
+    out += `<text class="axis" x="${x}" y="${H - 7}" text-anchor="middle">${clock(p.t).slice(0, 5)}</text>`;
+  });
+
+  svg.innerHTML = out;
+  svg.querySelectorAll(".hitbox").forEach((el) => {
+    el.addEventListener("mousemove", (e) => {
+      const p = pts[+el.dataset.i];
+      tip.innerHTML =
+        `<div>${clock(p.t)}</div>
+         <div><span class="k">low+med</span> ${p.routine}</div>
+         <div><span class="k">high+crit</span> ${p.serious}</div>`;
+      tip.style.opacity = 1;
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - 160) + "px";
+      tip.style.top = e.clientY - 10 + "px";
+    });
+    el.addEventListener("mouseleave", () => (tip.style.opacity = 0));
+  });
+
+  $("chart-table").innerHTML =
+    `<table class="data"><thead><tr><th>Time</th><th>Low &amp; medium</th><th>High &amp; critical</th></tr></thead><tbody>` +
+    pts.filter((p) => p.routine + p.serious > 0)
+       .map((p) => `<tr><td>${clock(p.t)}</td><td>${p.routine}</td><td>${p.serious}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+/* ── Ranked bars ───────────────────────────────────────────────────── */
+function renderRank(el, rows, nameKey, valKey, emptyMsg) {
+  if (!rows.length) { el.innerHTML = `<div class="empty">${esc(emptyMsg)}</div>`; return; }
+  const max = Math.max(...rows.map((r) => r[valKey]));
+  el.innerHTML = rows.map((r) => {
+    const label = r.country && nameKey === "ip" ? `${r[nameKey]} · ${r.country}` : r[nameKey];
+    return `<div class="rank-row"><span class="name" title="${esc(label)}">${esc(label)}</span>
+              <span class="n">${fmt(r[valKey])}</span></div>
+            <div class="rank-bar"><i style="width:${(r[valKey] / max) * 100}%"></i></div>`;
+  }).join("");
+}
+
+/* ── Honeypots ─────────────────────────────────────────────────────── */
+function renderPots(pots) {
+  if (!pots.length) { $("pots").innerHTML = `<div class="empty">No honeypots deployed yet.</div>`; return; }
+  $("pots").innerHTML = pots.map((p) => `
+    <div class="pot">
+      <span class="state ${esc(p.status)}" title="${esc(p.status)}"></span>
+      <span class="nm">${esc(p.name)} <em>${esc(p.type)}:${esc(p.port)}</em></span>
+      <span class="hits">${fmt(p.hits)}</span>
+    </div>`).join("");
+}
+
+/* ── Feed ──────────────────────────────────────────────────────────── */
+function describe(d) {
+  if (!d || !Object.keys(d).length) return "";
+  const bits = [];
+  if (d.username) bits.push(`<b>${esc(d.username)}</b>${d.password ? " / " + esc(d.password) : ""}`);
+  if (d.path) bits.push(esc(d.path));
+  if (d.command) bits.push(esc(d.command));
+  if (d.exploit_categories) bits.push(esc([].concat(d.exploit_categories).join(", ")));
+  if (d.country && !bits.length) bits.push(esc(d.country));
+  return bits.slice(0, 2).join(" · ");
+}
+function renderFeed(feed) {
+  if (!feed.length) { $("feed").innerHTML = `<div class="empty">No activity in this window.</div>`; return; }
+  $("feed").innerHTML = feed
+    .map((e) => {
+      const fresh = !first && !seen.has(e.id);
+      seen.add(e.id);
+      return `<div class="ev sev-${esc(e.severity)}${fresh ? " new" : ""}">
+        <span class="time">${clock(e.t)}</span>
+        <span class="sev-label sev-${esc(e.severity)}">${esc(SEV_LABEL[e.severity] || e.severity)}</span>
+        <span class="ip">${esc(e.ip)}</span>
+        <span class="body">${esc(e.event_type)}${describe(e.digest) ? " — " + describe(e.digest) : ""}</span>
+      </div>`;
+    }).join("");
+  first = false;
+}
+
+/* ── Poll ──────────────────────────────────────────────────────────── */
+async function refresh() {
+  try {
+    const r = await fetch(`api/overview?hours=${hours}`, { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    renderTiles(d.stats);
+    renderChart(d.series);
+    renderRank($("attackers"), d.top_attackers, "ip", "hits", "No attackers in this window.");
+    renderRank($("countries"), d.top_countries, "country", "hits", "No geo data — set GEOIP_DB_PATH.");
+    renderPots(d.honeypots);
+    renderFeed(d.feed);
+    $("live").classList.remove("stale");
+    $("live-text").textContent = "live · " + clock(d.generated_at);
+  } catch (e) {
+    $("live").classList.add("stale");
+    $("live-text").textContent = "connection lost — retrying";
+  }
+}
+function setRange(h, btn) {
+  hours = h; first = true; seen.clear();
+  document.querySelectorAll(".ranges button").forEach((b) => b.setAttribute("aria-pressed", b === btn));
+  refresh();
+}
+document.querySelectorAll(".ranges button").forEach((b) =>
+  b.addEventListener("click", () => setRange(+b.dataset.h, b)));
+
+refresh();
+timer = setInterval(refresh, 5000);
+document.addEventListener("visibilitychange", () => {
+  // Don't hammer the database from a backgrounded wall display.
+  clearInterval(timer);
+  if (!document.hidden) { refresh(); timer = setInterval(refresh, 5000); }
+});
+</script>
+</body>
+</html>

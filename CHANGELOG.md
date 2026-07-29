@@ -4,6 +4,39 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Operations console — the product gets a face
+
+Everything visual belonged to Grafana: a third-party tool with generic styling,
+a provisioning step, and a login. The product itself had no interface, which is
+a strange gap for something whose whole job is to show you what is attacking
+you. `console/` closes it — a read-only dashboard served by the same process as
+the honeypots, on `127.0.0.1:8090` by default, no extra container and nothing to
+provision.
+
+It answers the three questions someone walking up to a screen actually has:
+*is everything up, is anything on fire, what just happened.* Live attack feed
+with the captured credentials and paths inline, sensor health, volume by
+severity over any window, top attackers and origins. It refreshes every five
+seconds and stops polling when the tab is hidden.
+
+Design decisions worth recording, because they were forced rather than chosen:
+
+- **Read-only by construction.** The page has no authentication, so it registers
+  GET routes only and a test asserts no other method ever appears. Deploying and
+  stopping honeypots stays on the MCP control plane.
+- **Two series, not four severity bands.** A green→amber→orange→red ramp fails
+  both the colour-vision and normal-vision separation floors however it is
+  stepped — adjacent warm hues are simply not distinguishable as stacked marks.
+  The chart splits routine (low+medium) from serious (high+critical), which is
+  also the only split that drives a decision. Per-event severity is carried by a
+  text label with colour as reinforcement, never colour alone.
+- **The feed ships digests, not payloads.** At a five-second poll, full captures
+  would move megabytes a minute to show the viewer nothing extra.
+- **Port 8090, not 8080** — 8080 is `default_http_port` and would collide with
+  the first HTTP honeypot deployed.
+
+Grafana keeps the historical dashboards and the geo map. 8 new tests (404 total).
+
 ## Analysis-quality pass — ATT&CK mapping and risk scoring
 
 Previous passes asked whether features existed and whether the wire protocols

@@ -74,6 +74,9 @@ honeypot-mcp = "honeypot_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/honeypot_mcp"]
+# The console's HTML asset is data, not a module — hatch would otherwise skip it
+# and the wheel would serve a 500 for the dashboard.
+artifacts = ["src/honeypot_mcp/console/static/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

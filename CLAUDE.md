@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (396 unit tests covering security-critical paths)
+# Tests (404 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -600,3 +600,35 @@ Volume is deliberately weighted low — one determined scanner produces thousand
 of events, and ranking by noise buries the dangerous attacker. Retune the
 weights freely; the tests assert ordering and band reachability, not exact
 numbers.
+
+### Operations console
+
+`console/` serves a read-only web dashboard (default `127.0.0.1:8090`, set
+`CONSOLE_PORT=0` to disable) from the same process as the honeypots: one HTML
+file plus a `/api/overview` JSON endpoint the page polls every 5s. Started from
+`lifespan` alongside canary and metrics; a bind failure is logged, never fatal.
+
+Three constraints shape it:
+
+1. **Read-only, structurally.** The page has no authentication, so it must not
+   be a second control plane — the router registers GET routes only and
+   `test_console_is_read_only` asserts that no other method ever appears.
+   Deploying and stopping stays on the MCP interface.
+2. **The feed ships digests, not payloads.** At a 5-second poll, sending full
+   captures would move megabytes a minute to tell the viewer nothing extra; it
+   reuses `tools/_format.digest_payload`.
+3. **Port 8090, not 8080.** 8080 is `default_http_port`, so the console would
+   collide with the first HTTP honeypot anyone deploys.
+
+Chart colours are not free choices. The severity split is **two** series
+(routine = low+medium, serious = high+critical) rather than four bands, because
+four adjacent stacked marks cannot be told apart reliably — a green→amber→
+orange→red ramp fails both the CVD and normal-vision separation floors no
+matter how it is stepped. Two well-separated hues (`#3987e5` / `#e66767`) pass
+on the console's dark surface; magnitude bars use a single hue. Severity per
+event is carried by a **text label** (`LOW`/`MED`/`HIGH`/`CRIT`) with colour as
+reinforcement, never colour alone. Re-run the palette validator if these change.
+
+Grafana still owns historical dashboards and the geo map; the console answers
+the three questions someone walking up to a screen has — is everything up, is
+anything on fire, what just happened.

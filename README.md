@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-396%20passing-brightgreen)](tests/unit)
+[![Tests](https://img.shields.io/badge/tests-404%20passing-brightgreen)](tests/unit)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 14
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -16,7 +16,9 @@ window, a terminal, or a systemd unit.
 > Export an iptables blocklist for anyone with 10+ hits.
 ```
 
-![Overview dashboard](docs/screenshots/overview.png)
+![HoneyPot MCP operations console](docs/screenshots/console.png)
+<p align="center"><em>The built-in operations console — live attack feed, sensor health,
+volume by severity. No login, no query language, no Grafana required.</em></p>
 
 ---
 
@@ -54,9 +56,15 @@ docker compose exec honeypot-mcp python scripts/seed_demo_data.py
 open http://localhost:3000        # Grafana — admin / honeypot
 ```
 
+```
+http://localhost:8090   ← the operations console (above)
+http://localhost:3000   ← Grafana, for historical dashboards
+```
+
 That brings up the server, a live Cowrie SSH honeypot on `:2222`, an HTTP honeypot on
 `:8080`, Prometheus, and three provisioned Grafana dashboards. The honeypots are real —
-SSH into `localhost:2222` with any password and watch your own session show up.
+SSH into `localhost:2222` with any password and watch your own session appear in the
+console within seconds.
 
 <table>
 <tr>
@@ -133,10 +141,12 @@ Three design decisions worth calling out:
 <tr><td><b>Analysis</b></td><td>MITRE ATT&CK mapping, attacker profiling + risk score, SSH session reconstruction, cross-honeypot kill-chain timelines, campaign correlation, XSS-safe HTML/Markdown reports</td></tr>
 <tr><td><b>SIEM delivery</b></td><td>JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, RFC 5424 syslog, Grafana Loki, Datadog — per-subscription severity thresholds and delivery health stats</td></tr>
 <tr><td><b>Response</b></td><td>Blocklist push to Cloudflare / pfSense / AWS WAFv2, iptables/fail2ban/CIDR export, STIX 2.1 bundles, AbuseIPDB reporting</td></tr>
+<tr><td><b>Console</b></td><td>Built-in read-only web dashboard on <code>:8090</code> — live attack feed with captured credentials and paths, sensor health, volume by severity, top attackers and origins. Served by the server itself; no extra container</td></tr>
+<tr><td><b>Triage</b></td><td>Bulk acknowledge by filter with a disposition (true/false positive, benign, duplicate), note and analyst; append-only audit log of every control-plane action</td></tr>
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-396 unit tests cover the security-critical paths; ruff and mypy are blocking in CI
+404 unit tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -385,7 +395,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 396 tests
+uv run pytest tests/unit/ -v     # 404 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
