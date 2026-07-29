@@ -7,6 +7,8 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import Any
 
+from honeypot_mcp import self_probe
+
 
 async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) -> dict[str, Any]:
     """Default health-check primitive: open a TCP connection and immediately close.
@@ -17,6 +19,10 @@ async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) ->
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=timeout
         )
+        # The engine on the other end logs this connection as an attack — it
+        # cannot tell us apart from a real peer. Claim our own socket address
+        # so `submit_event` drops that one event. See `self_probe`.
+        self_probe.register(writer.get_extra_info("sockname"))
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()

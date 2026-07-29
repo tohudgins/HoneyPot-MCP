@@ -28,6 +28,7 @@ import logging
 import secrets
 from typing import Any
 
+from honeypot_mcp import self_probe
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -235,6 +236,9 @@ class DNSEngine(HoneypotEngine):
             probe_transport, _ = await loop.create_datagram_endpoint(
                 lambda: proto, remote_addr=("127.0.0.1", port)
             )
+            # Same reason as the TCP probe in `engines/base.py`: the server
+            # logs this query as attacker traffic unless we claim it.
+            self_probe.register(probe_transport.get_extra_info("sockname"))
             probe_transport.sendto(dnslib.DNSRecord.question("health.probe").pack())
             try:
                 await asyncio.wait_for(proto.received.wait(), timeout=2.0)

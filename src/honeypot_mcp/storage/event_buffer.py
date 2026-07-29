@@ -203,7 +203,13 @@ async def submit_event(event: PendingEvent) -> None:
 
     Imports are lazy to avoid a cycle (event_buffer ⇄ suppression ⇄
     credential_match)."""
-    from honeypot_mcp import credential_match, suppression, token_matchers
+    from honeypot_mcp import credential_match, self_probe, suppression, token_matchers
+
+    # Ahead of suppression: the watchdog's own health probes reach the engines
+    # as ordinary connections and would otherwise be recorded as attacks. This
+    # drops only the exact socket a probe used, never a class of traffic.
+    if self_probe.claim(event.source_ip, event.source_port):
+        return
 
     suppress, rule_id = await suppression.should_suppress(event)
     if suppress:

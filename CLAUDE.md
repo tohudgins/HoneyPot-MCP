@@ -343,6 +343,18 @@ The `_reported_dead` set prevents alert spam: a dead honeypot generates exactly
 one alert. If it later recovers (becomes alive again), the entry is cleared, so
 a subsequent failure will alert again.
 
+**Probes must not become attack data.** Ten in-process engines log a bare
+`<proto>_connection` event on TCP connect, and a health probe is
+indistinguishable from a real peer at the engine. `self_probe.py` closes that
+loop: `tcp_probe` (and the DNS UDP probe) calls `self_probe.register()` with
+the local `(ip, port)` the kernel gave the probe socket, and `submit_event`
+drops the single event arriving from exactly that address. Matching the full
+socket tuple — rather than suppressing `*_connection` from loopback — is
+deliberate: loopback traffic to a honeypot is a genuine signal (container
+escape, malicious process on the host) and must keep alerting. Any new probe
+that opens a connection to an engine needs the same `register()` call, or it
+will show up as an attacker.
+
 The watchdog also hosts the **retention sweep** (`_maybe_prune`): opt-in via
 `retention_days > 0` (default 0 = off), it deletes alerts + attacker_events
 older than the cutoff at most once per `retention_sweep_interval_hours`
