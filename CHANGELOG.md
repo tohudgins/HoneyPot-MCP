@@ -4,6 +4,52 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Protocol-fidelity audit — real clients and `nmap -sV`
+
+Pointed the actual client software (redis-py, pymongo, psycopg) and
+`nmap -sV --version-intensity 9` at every in-process engine. Before this pass
+nmap could not identify five of them; an engine a scanner fingerprints stops
+receiving the attack traffic it exists to collect, so these were detection
+failures rather than cosmetic ones. All findings are pinned by
+`tests/unit/test_protocol_fidelity.py`, which quotes the nmap signature each
+check encodes.
+
+- **The persona system was defeated by one malformed request.** aiohttp rejects
+  protocol-level errors inside `handle_error`, before any middleware runs, so
+  those `400`s carried `Server: Python/3.x aiohttp/3.y.z` no matter which
+  Apache/IIS/nginx persona the HTTP honeypot was wearing. The same banner
+  appeared on the *internet-facing* canary callback server, which exists to
+  return a bare `200 OK` precisely so token callbacks can't be fingerprinted,
+  and on Elasticsearch, whose flawless ES 8.11.3 JSON was served under an
+  aiohttp banner nmap duly reported. New `http_identity.py` pins the header on
+  application responses and neutralises aiohttp's default for the error path
+  that middleware cannot reach.
+- **Redis rejected `HELLO`** while advertising 7.0.5 — a version that requires
+  it. Every modern client (redis-py, ioredis, go-redis) opens with `HELLO`, so
+  connections failed at the handshake and no attack was ever captured. Now
+  answers both RESP2 and RESP3, captures credentials passed via `HELLO AUTH`,
+  and hands out increasing per-connection ids.
+- **MSSQL's PRELOGIN was structurally wrong**: 2 of the 4 options real SQL
+  Server always sends, yielding a 0x1a-byte packet when every signature expects
+  0x25–0x2b. Now identified as "Microsoft SQL Server 2019 15.00.2000".
+- **PostgreSQL closed silently on malformed input.** The FATAL ErrorResponse it
+  should send is exactly how scanners identify PostgreSQL; error frames now also
+  carry the `V` field modern servers include.
+- **MongoDB claimed 5.0.14 while negotiating wire version 8** (that's 4.0),
+  answered `serverStatus` with a bare `{ok: 1.0}`, and reported `localTime: 0`
+  (1970-01-01 in any client). Now self-consistent and identified as
+  "MongoDB 5.0.14".
+- **SMB did not echo the client's TID/PID/UID/MID** — a protocol requirement
+  for request/response correlation, not just a fingerprint — always selected
+  dialect index 0 (the client's first offer, typically the 1987-era "PC NETWORK
+  PROGRAM 1.0"), and sent `SystemTime: 0` (1601-01-01). Now identified as
+  microsoft-ds.
+
+Residual, documented in KNOWN_LIMITATIONS.md: malformed requests to an HTTP
+honeypot answer with a generic `nginx` banner rather than the deployed persona,
+because that path is unreachable from application code. No implementation
+detail leaks, and scanner version detection still keys off the persona.
+
 ## Tool-layer audit — response shaping, time windows, validation
 
 The MCP tool layer is this project's entire user interface, so it got the same

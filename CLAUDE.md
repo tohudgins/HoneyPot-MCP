@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (320 unit tests covering security-critical paths)
+# Tests (358 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -389,6 +389,53 @@ TTLs: VT 30 min, AbuseIPDB 15 min, GeoIP 24 h.
 ### MITRE ATT&CK
 
 `intel/mitre.py` ships built-in regex mappings keyed by event-type/payload patterns. `_load_stix_index()` is `lru_cache`d and returns `{technique_id: stix_object}` — the index is built once, not on every `map_to_attack` call. If `config/mitre_attack.json` exists, technique descriptions are added; otherwise the built-in mappings still produce technique IDs and tactics.
+
+### Protocol fidelity
+
+An engine that accepts connections but is distinguishable from the software it
+impersonates is broken, not merely imperfect: a scanner that fingerprints the
+decoy stops sending the attack traffic the honeypot exists to collect. So
+engines are validated against **real clients** (redis-py, pymongo, psycopg) and
+against `nmap -sV --version-intensity 9`, not just unit tests.
+
+`tests/unit/test_protocol_fidelity.py` pins every finding and quotes the nmap
+signature each check encodes, so a change that breaks identification fails
+loudly. Re-run the sweep after touching any engine's wire format.
+
+Recurring failure modes found this way, worth checking in new engines:
+
+- **Missing handshake commands.** Redis advertised 7.0.5 but never implemented
+  `HELLO`, so every modern client failed at connect and captured nothing.
+- **Self-inconsistent version claims.** MongoDB reported 5.0.14 in `buildInfo`
+  while negotiating wire version 8 (that's 4.0). Keep one constant per engine
+  (`_REDIS_VERSION`, `_MONGO_VERSION`, `_SQL_VERSION`) and derive everything.
+- **Structurally thin responses.** MSSQL's PRELOGIN carried 2 of the 4 options
+  real SQL Server always sends, producing a packet length no signature matches.
+- **Silence where the real service speaks.** PostgreSQL closed mutely on a
+  malformed startup packet; the FATAL ErrorResponse it *should* send is
+  precisely how scanners identify PostgreSQL.
+- **Not echoing correlation fields.** SMB must echo the client's TID/PID/UID/MID
+  — a protocol requirement, and its absence broke nmap's signature.
+- **Zero/epoch placeholder values.** SMB `SystemTime` of 0 is 1601-01-01;
+  MongoDB `localTime` of 0 is 1970-01-01. Both render in any real client.
+
+### aiohttp server identity
+
+`http_identity.py` controls the `Server` header for every aiohttp server in the
+process (HTTP engine, Elasticsearch engine, canary callback). Two mechanisms,
+because one is not enough:
+
+1. `server_identity_middleware(server, extra)` pins the header on application
+   responses — used for the HTTP persona, Elasticsearch, and the canary.
+2. A module-import side effect rebinds `aiohttp.web_response.SERVER_SOFTWARE`.
+   Middleware **cannot** reach protocol-level errors: a malformed request line
+   is rejected in `RequestHandler.handle_error` without ever entering the app,
+   and that response would otherwise carry `Server: Python/3.x aiohttp/3.y.z`.
+   One junk request thereby exposed the stack behind every persona. aiohttp
+   offers no supported hook, so rebinding the default is the available fix; it
+   only changes the fallback, and explicit headers still win.
+
+Any new aiohttp server must import `http_identity` and set its own identity.
 
 ### Tool response shaping
 

@@ -96,6 +96,29 @@ functional" below for the caveat.
 
 ---
 
+## Verified against real clients and scanners
+
+The in-process engines are periodically driven with the actual client software
+and with `nmap -sV --version-intensity 9`, because "it accepts a connection" and
+"it is indistinguishable from the real service" are very different bars. The
+regression tests in `tests/unit/test_protocol_fidelity.py` pin each finding,
+quoting the nmap signature involved so a future change can tell what it breaks.
+
+As of the last sweep, `nmap -sV` identifies SSH, FTP (ProFTPD 1.3.5), SMTP
+(Postfix), MySQL (8.0.36), PostgreSQL, MSSQL (SQL Server 2019 15.00.2000),
+MongoDB (5.0.14), Redis (7.0.5), VNC (RFB 3.8), RDP, SMB (microsoft-ds) and
+HTTP (the deployed persona) as the software they impersonate.
+
+**Residual, honestly stated:** aiohttp answers protocol-level malformed
+requests — an unparseable method, non-HTTP bytes on an HTTP port — inside its
+own `handle_error` path, before any application middleware runs. Those replies
+carry a generic `Server: nginx` banner rather than the deployed persona, so an
+HTTP honeypot wearing an Apache or IIS persona answers a *malformed* request as
+nginx. No implementation detail leaks (the aiohttp/Python banner is gone), and
+scanner version detection keys off well-formed responses, so the persona still
+determines identification — but an expert who deliberately diffs malformed and
+well-formed responses can spot the mismatch.
+
 ## What is partially functional
 
 **Credential tokens.** The match-and-escalate pipeline (see above) fires when

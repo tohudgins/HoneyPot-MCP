@@ -26,6 +26,7 @@ import asyncio
 import logging
 import secrets
 import struct
+from datetime import UTC, datetime
 from typing import Any
 
 from honeypot_mcp.config import get_settings
@@ -40,6 +41,14 @@ log = logging.getLogger(__name__)
 
 _OP_REPLY = 1
 _OP_QUERY = 2004
+
+# Advertised server build. The wire version must match the release — MongoDB
+# 5.0 speaks wire version 13, and a server claiming 5.0.14 in buildInfo while
+# negotiating wire version 8 (that's 4.0) is self-inconsistent, which is
+# exactly the kind of mismatch the persona systems exist to prevent.
+_MONGO_VERSION = "5.0.14"
+_MONGO_VERSION_ARRAY = (5, 0, 14, 0)
+_MONGO_WIRE_VERSION = 13
 _OP_MSG = 2013
 
 _DESTRUCTIVE = {"dropdatabase", "drop", "delete"}
@@ -57,6 +66,12 @@ def _bson_encode(doc: dict[str, Any]) -> bytes:
         name = key.encode() + b"\x00"
         if isinstance(value, bool):
             out += b"\x08" + name + (b"\x01" if value else b"\x00")
+        elif isinstance(value, datetime):
+            # BSON UTC datetime: int64 milliseconds since the epoch. Real
+            # servers stamp localTime on every isMaster/hello; returning 0
+            # renders as 1970-01-01 in any client, which is unmistakable.
+            ms = int(value.timestamp() * 1000)
+            out += b"\x09" + name + struct.pack("<q", ms)
         elif isinstance(value, int):
             out += b"\x12" + name + struct.pack("<q", value)
         elif isinstance(value, float):
@@ -171,10 +186,36 @@ def _ismaster_reply() -> dict[str, Any]:
         "maxBsonObjectSize": 16777216,
         "maxMessageSizeBytes": 48000000,
         "maxWriteBatchSize": 100000,
-        "localTime": 0,
-        "maxWireVersion": 8,
+        "localTime": datetime.now(UTC),
+        "logicalSessionTimeoutMinutes": 30,
+        "connectionId": 17,
+        "maxWireVersion": _MONGO_WIRE_VERSION,
         "minWireVersion": 0,
         "readOnly": False,
+        "ok": 1.0,
+    }
+
+
+def _server_status_reply() -> dict[str, Any]:
+    """Answer `serverStatus` with a plausible subset of a real mongod's output.
+
+    This is the command nmap's MongoDB service probe sends, and its generic
+    signature keys off the `version` field. Falling through to a bare
+    `{ok: 1.0}` left the port reported as an unidentified service — conspicuous
+    for a database whose whole appeal to an attacker is being trivially
+    identifiable and unauthenticated.
+    """
+    return {
+        "host": "mongo-prod-01:27017",
+        "version": _MONGO_VERSION,
+        "process": "mongod",
+        "pid": 1,
+        "uptime": 84231.0,
+        "uptimeMillis": 84231000,
+        "uptimeEstimate": 84231,
+        "localTime": datetime.now(UTC),
+        "connections": {"current": 1, "available": 838859, "totalCreated": 42},
+        "network": {"bytesIn": 1874, "bytesOut": 29184, "numRequests": 12},
         "ok": 1.0,
     }
 
@@ -183,8 +224,16 @@ def _build_reply(command: str, request_id: int, response_to: int, opcode: int) -
     cmd = command.lower()
     if cmd in ("ismaster", "hello"):
         body = _ismaster_reply()
+    elif cmd == "serverstatus":
+        body = _server_status_reply()
     elif cmd == "buildinfo":
-        body = {"version": "5.0.14", "gitVersion": "1b3b0073a0b436a8a502b612e", "ok": 1.0}
+        body = {
+            "version": _MONGO_VERSION,
+            "gitVersion": "1b3b0073a0b436a8a502b612e",
+            "versionArray": list(_MONGO_VERSION_ARRAY),
+            "maxBsonObjectSize": 16777216,
+            "ok": 1.0,
+        }
     elif cmd == "listdatabases":
         body = {
             "databases": [

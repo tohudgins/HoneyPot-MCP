@@ -37,6 +37,7 @@ import contextlib
 import logging
 import secrets
 import struct
+from datetime import UTC, datetime
 from typing import Any
 
 from honeypot_mcp.config import get_settings
@@ -182,10 +183,45 @@ async def _read_frame(reader: asyncio.StreamReader, timeout: float) -> bytes | N
         return None
 
 
-def _build_smb1_negotiate_response() -> bytes:
+def _filetime_now() -> int:
+    """Current time as a Windows FILETIME (100ns ticks since 1601-01-01 UTC)."""
+    unix_seconds = datetime.now(UTC).timestamp()
+    return int((unix_seconds + 11644473600) * 10_000_000)
+
+
+def _select_dialect_index(dialects: list[str]) -> int:
+    """Pick the index of NT LM 0.12 from the client's offered dialect list.
+
+    A real server answers with the index of the dialect it chose. Always
+    replying 0 selects whatever the client listed first — for most scanners
+    that's the 1987-era "PC NETWORK PROGRAM 1.0" — which no modern server would
+    ever negotiate, and which nmap rejects outright (its SMB signatures require
+    an index of 1-7).
+    """
+    for i, name in enumerate(dialects):
+        if name.strip() == "NT LM 0.12":
+            return i
+    # Fall back to the last offered dialect: servers pick the most capable one
+    # they understand, and it is never index 0 in a real exchange.
+    return max(len(dialects) - 1, 1)
+
+
+def _build_smb1_negotiate_response(request: bytes, dialects: list[str]) -> bytes:
     """A believable SMB1 Negotiate Response selecting NT LM 0.12 and demanding
     challenge/response auth. Enough to make an exploit tool proceed to its
-    session-setup / exploit packet."""
+    session-setup / exploit packet.
+
+    TID/PID/UID/MID are echoed from the request: SMB clients use them to
+    correlate a response with the request that produced it, so inventing
+    values is a protocol error as well as a fingerprint.
+    """
+    # Echo the request's correlation fields when the header is complete
+    # (32-byte SMB1 header); fall back to values a real client would send.
+    if len(request) >= 32:
+        tid, pid_low, uid, mid = struct.unpack_from("<HHHH", request, 24)
+    else:
+        tid, pid_low, uid, mid = 0, 0x0640, 0, 1
+
     # SMB header (32 bytes).
     header = (
         _SMB1_MAGIC
@@ -196,16 +232,16 @@ def _build_smb1_negotiate_response() -> bytes:
         + struct.pack("<H", 0)  # PIDHigh
         + b"\x00" * 8  # security signature
         + struct.pack("<H", 0)  # reserved
-        + struct.pack("<H", 0)  # TID
-        + struct.pack("<H", 0xFEFF)  # PIDLow
-        + struct.pack("<H", 0)  # UID
-        + struct.pack("<H", 0)  # MID
+        + struct.pack("<H", tid)
+        + struct.pack("<H", pid_low)
+        + struct.pack("<H", uid)
+        + struct.pack("<H", mid)
     )
     challenge = secrets.token_bytes(8)
     # Negotiate response parameters (WordCount = 17).
     params = struct.pack(
         "<HBHHIIIIQhB",
-        0,  # DialectIndex = 0 (first offered; scanners offer NT LM 0.12)
+        _select_dialect_index(dialects),
         0x03,  # SecurityMode: user-level + challenge/response
         50,  # MaxMpxCount
         1,  # MaxNumberVcs
@@ -213,7 +249,7 @@ def _build_smb1_negotiate_response() -> bytes:
         65535,  # MaxRawSize
         0,  # SessionKey
         0x8000_00FD & 0xFFFFFFFF,  # Capabilities (NT SMBs etc.)
-        0,  # SystemTime (0 is accepted)
+        _filetime_now(),  # SystemTime — 0 renders as 1601-01-01 in any client
         0,  # ServerTimeZone
         len(challenge),  # ChallengeLength
     )
@@ -269,7 +305,7 @@ async def _handle_smb_client(
     # negotiate response is a much larger surface.)
     if info.get("smb_version") == "SMB1":
         with contextlib.suppress(Exception):
-            writer.write(_build_smb1_negotiate_response())
+            writer.write(_build_smb1_negotiate_response(first, info.get("dialects") or []))
             await writer.drain()
 
         # Read up to a few follow-up packets looking for the exploit/backdoor

@@ -60,12 +60,17 @@ from honeypot_mcp.storage.models import AlertSeverity
 log = logging.getLogger(__name__)
 
 
+# Single source of truth for the advertised version. HELLO and INFO must agree
+# — a server reporting 7.0.5 in INFO while behaving like a pre-6.0 server is
+# itself a fingerprint, which is exactly what the persona systems exist to avoid.
+_REDIS_VERSION = "7.0.5"
+
 # Synthesised INFO response. Real Redis 7.x emits ~150 fields; we ship the
 # section headers + a curated subset that scanners look at for version
 # pinning. Build matches a stock Debian package install.
 _INFO_RESPONSE = (
     "# Server\r\n"
-    "redis_version:7.0.5\r\n"
+    f"redis_version:{_REDIS_VERSION}\r\n"
     "redis_git_sha1:00000000\r\n"
     "redis_git_dirty:0\r\n"
     "redis_build_id:abcdef0123456789\r\n"
@@ -124,6 +129,37 @@ def _integer(n: int) -> bytes:
 
 def _empty_array() -> bytes:
     return b"*0\r\n"
+
+
+def _next_client_id() -> int:
+    """Connection ids increase for the life of the server, as in real Redis."""
+    global _CLIENT_ID_SEQ
+    _CLIENT_ID_SEQ += 1
+    return _CLIENT_ID_SEQ
+
+
+_CLIENT_ID_SEQ = 3  # real servers have handled a few internal connections already
+
+
+def _hello_reply(proto: int, client_id: int) -> bytes:
+    """Build the HELLO handshake reply real Redis 6+ sends.
+
+    Seven server fields, encoded as a flat array under RESP2 and as a map under
+    RESP3. Every modern client (redis-py, ioredis, go-redis, redis-cli) opens a
+    connection with HELLO, so without this they error out on connect and we
+    capture nothing — the attack never reaches the commands we care about.
+    """
+    pairs: list[tuple[bytes, bytes]] = [
+        (_bulk_string("server"), _bulk_string("redis")),
+        (_bulk_string("version"), _bulk_string(_REDIS_VERSION)),
+        (_bulk_string("proto"), _integer(proto)),
+        (_bulk_string("id"), _integer(client_id)),
+        (_bulk_string("mode"), _bulk_string("standalone")),
+        (_bulk_string("role"), _bulk_string("master")),
+        (_bulk_string("modules"), _empty_array()),
+    ]
+    header = f"%{len(pairs)}\r\n" if proto >= 3 else f"*{len(pairs) * 2}\r\n"
+    return header.encode() + b"".join(k + v for k, v in pairs)
 
 
 def _null_bulk() -> bytes:
@@ -248,6 +284,15 @@ class _RedisProtocol(asyncio.Protocol):
         self._store: dict[str, str] = {}
         self._config: dict[str, str] = {}
         self._save_reported = False
+        # RESP protocol version negotiated via HELLO (2 = legacy, 3 = Redis 6+).
+        # Every reply we emit is wire-identical across both, so tracking it is
+        # only needed to answer HELLO consistently if it's sent twice.
+        self._proto = 2
+        self._client_name: str | None = None
+        # Real Redis assigns each connection a monotonically increasing id and
+        # reports it in HELLO and CLIENT INFO. A server that always says id:1
+        # is trivially distinguishable from a real one.
+        self._client_id = _next_client_id()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -289,6 +334,10 @@ class _RedisProtocol(asyncio.Protocol):
             # An empty array is wrong but acceptable for a "limited mode"
             # server and most clients tolerate it.
             t.write(_empty_array())
+            return
+
+        if verb == "HELLO":
+            self._handle_hello(args, t)
             return
 
         if verb == "AUTH":
@@ -486,6 +535,48 @@ class _RedisProtocol(asyncio.Protocol):
                     },
                 )
             )
+
+    def _handle_hello(self, args: list[str], t: asyncio.Transport) -> None:
+        """`HELLO [proto [AUTH user pass] [SETNAME name]]` — the Redis 6+ handshake.
+
+        Clients that pass credentials do so here rather than via AUTH, so this
+        is a credential-capture path too, not just a handshake.
+        """
+        proto = 2
+        if len(args) > 1:
+            try:
+                proto = int(args[1])
+            except ValueError:
+                t.write(
+                    _error(
+                        "NOPROTO unsupported protocol version"
+                        if args[1].isdigit()
+                        else "ERR Protocol version is not an integer or out of range"
+                    )
+                )
+                return
+            if proto not in (2, 3):
+                t.write(_error("NOPROTO unsupported protocol version"))
+                return
+
+        # Optional AUTH / SETNAME clauses, in any order after the version.
+        i = 2
+        while i < len(args):
+            option = args[i].upper()
+            if option == "AUTH" and i + 2 < len(args):
+                user, pwd = args[i + 1], args[i + 2]
+                # Real Redis fails the whole HELLO on bad credentials.
+                t.write(_error("WRONGPASS invalid username-password pair or user is disabled."))
+                asyncio.create_task(self._record_auth_attempt(user, pwd))
+                return
+            if option == "SETNAME" and i + 1 < len(args):
+                self._client_name = args[i + 1]
+                i += 2
+                continue
+            i += 1
+
+        self._proto = proto
+        t.write(_hello_reply(proto, self._client_id))
 
     def _handle_config(self, args: list[str], t: asyncio.Transport) -> None:
         if len(args) < 2:

@@ -53,8 +53,13 @@ _TDS_RESPONSE = 0x04
 # PRELOGIN option tokens.
 _PL_VERSION = 0x00
 _PL_ENCRYPTION = 0x01
+_PL_INSTOPT = 0x02
+_PL_THREADID = 0x03
 _PL_TERMINATOR = 0xFF
 _ENCRYPT_NOT_SUP = 0x02
+
+# Advertised server build: SQL Server 2019 RTM (15.0.2000).
+_SQL_VERSION = (15, 0, 2000, 0)
 
 
 def _tds_packet(pkt_type: int, payload: bytes) -> bytes:
@@ -66,19 +71,39 @@ def _tds_packet(pkt_type: int, payload: bytes) -> bytes:
 
 def _build_prelogin_response() -> bytes:
     """PRELOGIN response advertising a version and ENCRYPT_NOT_SUP, so the
-    client proceeds to send Login7 in the clear."""
-    version_data = struct.pack(">BBHH", 15, 0, 2000, 0)  # SQL Server 2019-ish
+    client proceeds to send Login7 in the clear.
+
+    Real SQL Server always answers with four options — VERSION, ENCRYPTION,
+    INSTOPT and THREADID — producing a 0x25-byte packet. Every `ms-sql-s`
+    signature in nmap's database, from SQL Server 2000 through 2012, shares
+    that exact layout, and nmap's generic softmatch keys off the resulting
+    length (`\\x04\\x01\\x00[\\x25-\\x2b]`). Emitting only VERSION and
+    ENCRYPTION produced a 0x1a-byte packet that matched nothing, so scanners
+    reported the port as an unidentified service — a strong tell, since a real
+    SQL Server is one of the most reliably fingerprinted services there is.
+    """
+    version_data = struct.pack(">BBHH", *_SQL_VERSION)
     enc_data = bytes([_ENCRYPT_NOT_SUP])
+    instopt_data = b"\x00"  # default (unnamed) instance
+    threadid_data = b""  # servers send this option with zero length
+
+    options = [
+        (_PL_VERSION, version_data),
+        (_PL_ENCRYPTION, enc_data),
+        (_PL_INSTOPT, instopt_data),
+        (_PL_THREADID, threadid_data),
+    ]
     # Option headers: token(1) + offset(2 BE) + length(2 BE), then terminator.
-    headers_len = 5 + 5 + 1  # VERSION + ENCRYPTION + TERMINATOR
-    version_off = headers_len
-    enc_off = version_off + len(version_data)
-    headers = (
-        struct.pack(">BHH", _PL_VERSION, version_off, len(version_data))
-        + struct.pack(">BHH", _PL_ENCRYPTION, enc_off, len(enc_data))
-        + bytes([_PL_TERMINATOR])
-    )
-    return _tds_packet(_TDS_RESPONSE, headers + version_data + enc_data)
+    headers_len = len(options) * 5 + 1
+    headers = b""
+    offset = headers_len
+    for token, data in options:
+        headers += struct.pack(">BHH", token, offset, len(data))
+        offset += len(data)
+    headers += bytes([_PL_TERMINATOR])
+
+    body = b"".join(data for _token, data in options)
+    return _tds_packet(_TDS_RESPONSE, headers + body)
 
 
 def _decode_tds_password(raw: bytes) -> str:

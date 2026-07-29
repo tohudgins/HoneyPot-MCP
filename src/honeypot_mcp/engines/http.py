@@ -53,6 +53,7 @@ from honeypot_mcp.engines.http_personas import (
     pick_random_persona_id,
 )
 from honeypot_mcp.engines.http_templates import get_template
+from honeypot_mcp.http_identity import server_identity_middleware
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -425,11 +426,6 @@ class HTTPEngine(HoneypotEngine):
             ep["path"]: ep.get("template", "generic_login") for ep in endpoints if "path" in ep
         }
 
-        app = web.Application()
-        # Per-honeypot in-memory session store. Keyed by session_id (cookie
-        # value). Two honeypots don't share state.
-        sessions: dict[str, dict[str, Any]] = {}
-
         def _persona_headers() -> dict[str, str]:
             h = {"Server": persona.server_header}
             if persona.x_powered_by:
@@ -437,6 +433,18 @@ class HTTPEngine(HoneypotEngine):
             for k, v in persona.extra_headers:
                 h[k] = v
             return h
+
+        # Apply the persona to *every* response, not just the ones whose handler
+        # remembers to call `_persona_headers()`. Anything that slips through —
+        # an aiohttp-generated 404 or 405, a future handler — would otherwise
+        # fall back to aiohttp's own `Server` banner and expose the stack.
+        _persona_extra = {k: v for k, v in _persona_headers().items() if k != "Server"}
+        app = web.Application(
+            middlewares=[server_identity_middleware(persona.server_header, _persona_extra)]
+        )
+        # Per-honeypot in-memory session store. Keyed by session_id (cookie
+        # value). Two honeypots don't share state.
+        sessions: dict[str, dict[str, Any]] = {}
 
         def _get_or_create_session(request: web.Request) -> tuple[str, dict[str, Any], bool]:
             """Return `(session_id, session_dict, is_new)`. Prunes expired

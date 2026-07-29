@@ -73,9 +73,18 @@ def _auth_cleartext_request() -> bytes:
 
 
 def _error_response(severity: str, code: str, message: str) -> bytes:
-    # 'E' + Int32 len + [field-type byte + string\0]... + \0
+    """Build an ErrorResponse in modern PostgreSQL's field order.
+
+    'E' + Int32 len + [field-type byte + string\\0]... + \\0. Real servers since
+    9.6 send both S (localised severity) and V (non-localised) before the
+    SQLSTATE and message; the pair is what identifies a genuine PostgreSQL
+    error frame to a scanner.
+    """
     fields = (
         b"S"
+        + severity.encode()
+        + b"\x00"
+        + b"V"
         + severity.encode()
         + b"\x00"
         + b"C"
@@ -194,6 +203,16 @@ class _PGProtocol(asyncio.Protocol):
                     return
                 length = struct.unpack("!I", self._buf[:4])[0]
                 if length < 8 or length > 65535:
+                    # Real PostgreSQL answers a malformed startup packet with a
+                    # FATAL ErrorResponse rather than hanging up silently, and
+                    # that reply is precisely how scanners identify the service
+                    # — an HTTP probe's "GET " reads as a 1.2-billion-byte
+                    # length and lands here. Closing mutely left the port
+                    # unidentifiable, which is itself conspicuous.
+                    if self._transport is not None:
+                        self._transport.write(
+                            _error_response("FATAL", "08P01", "invalid length of startup packet")
+                        )
                     self._close()
                     return
                 if len(self._buf) < length:
@@ -239,7 +258,16 @@ class _PGProtocol(asyncio.Protocol):
             )
             t.write(_auth_cleartext_request())
             return
-        # Unknown startup code — reject.
+        # Unknown startup code — real PostgreSQL names the version it got and
+        # the range it supports before closing.
+        major, minor = code >> 16, code & 0xFFFF
+        t.write(
+            _error_response(
+                "FATAL",
+                "0A000",
+                f"unsupported frontend protocol {major}.{minor}: server supports 3.0 to 3.0",
+            )
+        )
         self._close()
 
     def _handle_message(self, msg_type: bytes, payload: bytes) -> None:

@@ -33,6 +33,7 @@ from typing import Any
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.http_identity import NGINX_BANNER, server_identity_middleware
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -126,13 +127,18 @@ class ElasticsearchEngine(HoneypotEngine):
             "Elasticsearch honeypot is in-process — events are stored directly in the database."
         ]
 
+    @staticmethod
+    def _identity_headers() -> dict[str, str]:
+        """Headers that make a response look like it came from Elasticsearch."""
+        return dict(_ELASTIC_HEADERS)
+
     def _build_app(
         self,
         honeypot_name: str,
         hp_id: int | None,
         identity: dict[str, str],
     ) -> web.Application:
-        app = web.Application()
+        app = web.Application(middlewares=[_elastic_headers])
 
         async def _record(
             request: web.Request,
@@ -339,3 +345,18 @@ class ElasticsearchEngine(HoneypotEngine):
 # Avoid lint complaints about unused import (we keep json in case future
 # variants want to render custom error envelopes)
 _ = json
+
+
+# Real Elasticsearch runs on Netty and sends no `Server` header, but does stamp
+# every 8.x response with `X-elastic-product` — clients check that header to
+# confirm they're talking to genuine Elasticsearch rather than a compatible
+# fork, so its absence is itself a tell.
+_ELASTIC_HEADERS = {
+    "X-elastic-product": "Elasticsearch",
+}
+
+# Bare Elasticsearch sends no `Server` header, but aiohttp always emits one and
+# an empty value is its own anomaly. Internet-exposed Elasticsearch is almost
+# always behind a reverse proxy, so `nginx` is both plausible and consistent
+# with the banner the protocol-level error path emits.
+_elastic_headers = server_identity_middleware(NGINX_BANNER, _ELASTIC_HEADERS)

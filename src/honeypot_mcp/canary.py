@@ -23,6 +23,7 @@ from aiohttp import web
 from sqlalchemy import select
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.http_identity import NGINX_BANNER, server_identity_middleware
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
@@ -326,7 +327,11 @@ async def _trigger_cloud(token: Honeytoken, request: web.Request, event: dict, s
 
 
 def build_app() -> web.Application:
-    app = web.Application()
+    # The whole point of the bare `200 OK` responses below is that a triggered
+    # token looks like an ordinary web resource. aiohttp's default
+    # `Server: Python/3.x aiohttp/3.y.z` banner defeats that on its own, so
+    # this server presents as stock nginx instead.
+    app = web.Application(middlewares=[server_identity_middleware(NGINX_BANNER)])
     app.router.add_get("/", _handle_root)
     app.router.add_get("/t/{token_id}", _handle_token)
     # Slack-shaped webhook path. Real Slack uses
