@@ -42,7 +42,7 @@ uv run mypy src/
 Engines do NOT write to the DB directly. The path is:
 
 ```
-Engine (SSH/HTTP/SMTP/FTP/DNS/RDP)
+Engine (any of the 25 — see deception/capabilities.py)
   → submit_event(PendingEvent)             # storage/event_buffer.py
   → suppression.should_suppress(event)     # in-memory rules, dropped here are gone
   → credential_match.match(event)          # planted creds → CRITICAL + honeytoken_id tag
@@ -70,6 +70,9 @@ Current tool modules:
 - `tools/alerts.py` — recent/get/search/stats/acknowledge/export/prune
 - `tools/analysis.py` — enrich, profile, session reconstruction, `analyze_attacker_journey` (cross-honeypot kill-chain timeline), campaign correlation, MITRE mapping, reports, blocklist + STIX exports
 - `tools/integrations.py` — webhook subscriptions, suppression rules
+- `tools/blocklist_push.py` — push blocked IPs to Cloudflare / AWS WAF / pfSense
+- `tools/deception.py` — the intent-level tools: `deception_plan`,
+  `deception_deploy_plan`, `deception_coverage`, `soc_brief`, `deception_profiles`
 
 The `@mcp.tool` decorator returns the original function unchanged, so tools are directly callable in tests (no `.fn` accessor needed).
 

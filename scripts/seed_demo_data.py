@@ -103,6 +103,119 @@ _EVENT_PROFILES: dict[str, list[tuple[str, str, int]]] = {
         ("rdp_handshake", "high", 20),
         ("rdp_invalid_probe", "low", 15),
     ],
+    # The rest of the catalogue. Weights follow what a public IP actually
+    # sees — brute force and scanning dominate, exploitation is rare — so the
+    # dashboards show a believable distribution rather than an even split.
+    "telnet": [
+        ("telnet_login_failed", "medium", 60),
+        ("telnet_session_connect", "low", 30),
+        ("telnet_login_success", "high", 5),
+        ("telnet_command_input", "high", 6),
+        ("telnet_file_download", "critical", 2),
+    ],
+    "smb": [
+        ("smb_connection", "low", 30),
+        ("smb_negotiate", "low", 20),
+        ("smb_session_setup", "high", 8),
+        ("smb_exploit_attempt", "critical", 3),
+    ],
+    "vnc": [
+        ("vnc_connection", "low", 20),
+        ("vnc_handshake", "low", 12),
+        ("vnc_auth_attempt", "high", 10),
+    ],
+    "mysql": [
+        ("mysql_connection", "low", 20),
+        ("mysql_login_attempt", "high", 15),
+        ("mysql_recon_query", "medium", 5),
+        ("mysql_outfile_write", "critical", 1),
+    ],
+    "postgresql": [
+        ("postgresql_connection", "low", 20),
+        ("postgresql_login_attempt", "high", 12),
+        ("postgresql_copy_program_rce", "critical", 1),
+    ],
+    "mssql": [
+        ("mssql_connection", "low", 18),
+        ("mssql_login_attempt", "high", 12),
+    ],
+    "mongodb": [
+        ("mongodb_connection", "low", 15),
+        ("mongodb_command", "medium", 8),
+        ("mongodb_destructive", "critical", 1),
+        ("mongodb_ransom_note", "critical", 1),
+    ],
+    "redis": [
+        ("redis_connection", "low", 20),
+        ("redis_command", "medium", 12),
+        ("redis_auth_attempt", "high", 8),
+        ("redis_config_set", "critical", 2),
+    ],
+    "elasticsearch": [
+        ("elasticsearch_recon_probe", "medium", 15),
+        ("elasticsearch_query_probe", "medium", 8),
+        ("elasticsearch_data_access", "high", 4),
+    ],
+    "dns": [
+        ("dns_query", "low", 30),
+        ("dns_any_query", "medium", 8),
+        ("dns_version_probe", "medium", 5),
+        ("dns_zone_transfer", "high", 2),
+        ("dns_tunneling_suspected", "high", 1),
+    ],
+    "memcached": [
+        ("memcached_connection", "low", 15),
+        ("memcached_stats_probe", "medium", 12),
+        ("memcached_amplification_attempt", "critical", 2),
+    ],
+    "snmp": [
+        ("snmp_default_community", "high", 15),
+        ("snmp_community_attempt", "medium", 20),
+        ("snmp_bulk_request", "high", 4),
+    ],
+    "ldap": [
+        ("ldap_connection", "low", 15),
+        ("ldap_bind_attempt", "high", 12),
+        ("ldap_search", "medium", 6),
+        ("ldap_jndi_lookup", "critical", 2),
+    ],
+    "docker_api": [
+        ("docker_api_recon", "medium", 12),
+        ("docker_api_enumerate", "medium", 6),
+        ("docker_api_image_pull", "critical", 2),
+        ("docker_api_container_escape", "critical", 1),
+    ],
+    "kubernetes": [
+        ("kubernetes_recon", "medium", 12),
+        ("kubernetes_enumerate", "high", 6),
+        ("kubernetes_secret_access", "critical", 2),
+        ("kubernetes_pod_escape", "critical", 1),
+    ],
+    "imap": [
+        ("imap_connection", "low", 20),
+        ("imap_login_attempt", "high", 35),
+        ("imap_capability_probe", "low", 10),
+    ],
+    "pop3": [
+        ("pop3_connection", "low", 18),
+        ("pop3_login_attempt", "high", 30),
+    ],
+    "sip": [
+        ("sip_scan", "medium", 30),
+        ("sip_extension_probe", "medium", 20),
+        ("sip_register_attempt", "high", 10),
+        ("sip_toll_fraud_attempt", "critical", 3),
+    ],
+    "rsync": [
+        ("rsync_connection", "low", 12),
+        ("rsync_module_enumeration", "high", 8),
+        ("rsync_anonymous_access", "critical", 2),
+    ],
+    "nfs": [
+        ("nfs_connection", "low", 12),
+        ("nfs_export_enumeration", "high", 8),
+        ("nfs_mount_attempt", "critical", 2),
+    ],
 }
 
 _USERNAMES = [
@@ -184,6 +297,26 @@ async def main() -> None:
         ("demo-smtp", HoneypotType.SMTP, 2525),
         ("demo-ftp", HoneypotType.FTP, 2121),
         ("demo-rdp", HoneypotType.RDP, 3389),
+        ("demo-telnet", HoneypotType.TELNET, 2323),
+        ("demo-smb", HoneypotType.SMB, 445),
+        ("demo-vnc", HoneypotType.VNC, 5900),
+        ("demo-mysql", HoneypotType.MYSQL, 3306),
+        ("demo-postgresql", HoneypotType.POSTGRESQL, 5432),
+        ("demo-mssql", HoneypotType.MSSQL, 1433),
+        ("demo-mongodb", HoneypotType.MONGODB, 27017),
+        ("demo-redis", HoneypotType.REDIS, 6379),
+        ("demo-elasticsearch", HoneypotType.ELASTICSEARCH, 9200),
+        ("demo-dns", HoneypotType.DNS, 5353),
+        ("demo-memcached", HoneypotType.MEMCACHED, 11211),
+        ("demo-snmp", HoneypotType.SNMP, 1161),
+        ("demo-ldap", HoneypotType.LDAP, 1389),
+        ("demo-docker-api", HoneypotType.DOCKER_API, 2375),
+        ("demo-kubernetes", HoneypotType.KUBERNETES, 6443),
+        ("demo-imap", HoneypotType.IMAP, 1143),
+        ("demo-pop3", HoneypotType.POP3, 1110),
+        ("demo-sip", HoneypotType.SIP, 5060),
+        ("demo-rsync", HoneypotType.RSYNC, 8873),
+        ("demo-nfs", HoneypotType.NFS, 2049),
     ]
 
     honeypot_ids: dict[str, int] = {}

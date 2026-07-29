@@ -83,7 +83,7 @@ so they can't drift from what the dashboards actually render.
 
 Engines never touch the database. Everything funnels through one ingestion path, which
 is what makes suppression, honeytoken correlation, and SIEM fan-out uniform across all
-14 protocols:
+25 protocols:
 
 ```mermaid
 flowchart TD
@@ -147,7 +147,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-437 unit tests plus 5 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+599 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -418,7 +418,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 437 unit tests
+uv run pytest tests/unit/ -v     # 599 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
