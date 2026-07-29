@@ -260,7 +260,7 @@ async def test_snmp_answers_default_communities_and_ignores_others():
         # so a blocking `socket.recv` starves it: the datagram is only handled
         # after the client has already timed out, and the engine looks broken
         # when it is the test that is stalling it.
-        async def query(community: str) -> bytes:
+        async def query(community: str, timeout: float) -> bytes:
             loop = asyncio.get_running_loop()
             received: asyncio.Future[bytes] = loop.create_future()
 
@@ -269,19 +269,31 @@ async def test_snmp_answers_default_communities_and_ignores_others():
                     if not received.done():
                         received.set_result(data)
 
-            transport, _ = await loop.create_datagram_endpoint(
-                _Client, remote_addr=("127.0.0.1", port)
-            )
+            # Bound, not connected. `remote_addr` connects the socket, which
+            # then drops any datagram whose source address does not match
+            # exactly — and the engine is bound to 0.0.0.0, so the kernel picks
+            # the reply's source address. That made this pass on some
+            # platforms and fail on others for reasons unrelated to SNMP.
+            transport, _ = await loop.create_datagram_endpoint(_Client, local_addr=("127.0.0.1", 0))
             try:
-                transport.sendto(build_get_request("1.3.6.1.2.1.1.1.0", community))
+                transport.sendto(
+                    build_get_request("1.3.6.1.2.1.1.1.0", community), ("127.0.0.1", port)
+                )
                 with contextlib.suppress(TimeoutError):
-                    return await asyncio.wait_for(received, timeout=2.0)
+                    return await asyncio.wait_for(received, timeout=timeout)
                 return b""
             finally:
                 transport.close()
 
-        good = await query("public")
-        bad = await query("wrongcommunity")
+        good = b""
+        for _ in range(5):
+            good = await query("public", timeout=2.0)
+            if good:
+                break
+        # A wrong community must produce silence, so this one has to wait out
+        # the full timeout rather than retry.
+        bad = await query("wrongcommunity", timeout=2.0)
+
         await asyncio.sleep(0.5)
     finally:
         await engine.stop(cid)
