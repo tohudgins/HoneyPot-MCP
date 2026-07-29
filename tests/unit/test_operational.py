@@ -359,3 +359,45 @@ def test_build_auth_verifier_for_networked_token(monkeypatch):
         assert type(auth).__name__ == "StaticTokenVerifier"
     finally:
         monkeypatch.setattr(config, "_settings", None)  # don't leak to other tests
+
+
+# ── Packaging ────────────────────────────────────────────────────────────────
+
+
+def test_bundled_presets_load_from_the_installed_package():
+    """Presets must resolve through package resources, not the repo layout.
+
+    They previously lived in `config/suppression_presets/` beside the source
+    tree, with a fallback that resolved to a path inside site-packages which
+    never exists. A pip-installed user therefore saw zero bundled presets from
+    a feature the README advertises and DEPLOY.md tells you to use before going
+    live — and nothing failed loudly, the list was simply empty.
+    """
+    from honeypot_mcp.tools.integrations import _list_available_presets, _read_preset
+
+    available = set(_list_available_presets())
+    assert {"shodan", "censys", "internal-rfc1918"} <= available, available
+
+    for name in ("shodan", "censys", "internal-rfc1918"):
+        text = _read_preset(name)
+        assert text and "rules:" in text, f"{name} preset did not load"
+
+
+def test_console_asset_ships_with_the_package():
+    """The console serves a 500 if its HTML is not packaged."""
+    from importlib.resources import files
+
+    page = files("honeypot_mcp") / "console" / "static" / "index.html"
+    assert page.is_file()
+    assert "HoneyPot MCP" in page.read_text(encoding="utf-8")
+
+
+def test_declared_version_is_parseable_and_matches_dunder():
+    from importlib.metadata import version
+
+    import honeypot_mcp
+
+    installed = version("honeypot-mcp")
+    assert installed == honeypot_mcp.__version__, (
+        f"pyproject version {installed} != __init__ {honeypot_mcp.__version__}"
+    )

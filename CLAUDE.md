@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (434 unit tests covering security-critical paths)
+# Tests (437 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -677,3 +677,26 @@ anywhere; SQL goes through SQLAlchemy parameter binding (the one raw `text()`
 uses bound parameters); the console escapes every interpolation of
 attacker-controlled data before it reaches the DOM; `/cloud-event` refuses all
 requests until `CLOUD_EVENT_HMAC_SECRET` is set.
+
+### Packaging
+
+Non-Python assets must be declared in `pyproject.toml`'s
+`tool.hatch.build.targets.wheel.artifacts` **and** loaded through
+`importlib.resources`, never by walking up from `__file__`. Two things live
+inside the package for this reason:
+
+- `console/static/index.html` — the console 500s without it.
+- `presets/*.yaml` — bundled suppression presets. These previously sat in
+  `config/suppression_presets/` beside the source tree with a fallback that
+  resolved to a path inside site-packages that never exists, so a pip-installed
+  user saw an empty preset list for a feature the README advertises. Nothing
+  failed loudly; the list was just empty.
+
+The failure mode is identical in both cases: the wheel builds, installs and
+imports cleanly, then misbehaves at runtime. `tests/unit/test_operational.py`
+asserts both resources resolve, and the release workflow installs the wheel
+into a clean environment *outside the source tree* and checks them again —
+running from the repo root hides the bug entirely.
+
+Version lives in two places (`pyproject.toml` and `__init__.py`); a test
+asserts they agree and the release workflow refuses a mismatched git tag.

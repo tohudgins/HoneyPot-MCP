@@ -87,3 +87,38 @@ If you're fixing a bug, add the test that would have caught it first.
 
 Please don't file vulnerabilities as public issues — see
 [SECURITY.md](SECURITY.md).
+
+## Releasing
+
+Publishing is tag-driven and deliberately manual — a PyPI version number can
+never be reused, and a container tag is public the moment it lands.
+
+1. Bump `version` in `pyproject.toml` **and** `__version__` in
+   `src/honeypot_mcp/__init__.py`. A test asserts they match; the release
+   workflow additionally refuses to publish if the git tag disagrees.
+2. Update `CHANGELOG.md`.
+3. Tag and push:
+
+   ```bash
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+`.github/workflows/release.yml` then builds the sdist and wheel, runs
+`twine check --strict`, **installs the wheel into a clean environment outside
+the source tree and asserts the bundled presets and console asset are present**,
+publishes to PyPI via trusted publishing, and pushes a multi-arch
+(amd64 + arm64) image to GHCR.
+
+That smoke test exists because a wheel that omits its data files installs
+perfectly and then fails at runtime: the console returns 500 and the bundled
+suppression presets silently disappear. Both have happened.
+
+**One-time setup** before the first release:
+
+- PyPI: configure a [trusted publisher](https://pypi.org/manage/account/publishing/)
+  for this repository and the `pypi` environment (no API token is stored).
+- GitHub: create a `pypi` environment under Settings → Environments if you want
+  a manual approval gate on publishes.
+
+Use `workflow_dispatch` with `publish_pypi` off for a dry run — it builds and
+verifies everything without publishing.

@@ -4,6 +4,35 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## 0.2.0 — installable
+
+The project was only usable by cloning it. This pass makes
+`pip install honeypot-mcp` and `docker run ghcr.io/...` real, which is the
+difference between a repository people read and software people run.
+
+- **The wheel was incomplete, and silently so.** Installing it into a clean
+  environment and running from outside the source tree — the first time that
+  had ever been tried — showed the bundled suppression presets missing
+  entirely. They lived in `config/suppression_presets/` beside the source, with
+  a pip fallback that resolved to a path inside site-packages which never
+  exists. The README advertises those presets and DEPLOY.md tells you to load
+  them before going live; for anyone installing from a wheel the feature simply
+  returned an empty list, with no error. They now ship inside the package and
+  load through `importlib.resources`, with an operator-supplied
+  `config/suppression_presets/` still taking precedence.
+- **Release workflow** (`.github/workflows/release.yml`), tag-driven and
+  manual, because a PyPI version can never be reused and a container tag is
+  public on landing. It builds sdist + wheel, runs `twine check --strict`,
+  installs the wheel into a clean environment *outside the source tree* and
+  asserts the presets and console asset resolve, publishes to PyPI via trusted
+  publishing (no stored token), and pushes a multi-arch amd64 + arm64 image to
+  GHCR — arm64 because the cheap VPSes this runs on increasingly are.
+- **Version drift is now impossible to ship.** The version lives in
+  `pyproject.toml` and `__init__.py`; a new test caught them already
+  disagreeing, and the release job refuses a git tag that doesn't match.
+- Full PyPI metadata: keywords, classifiers, and project URLs for the
+  changelog, issues, security policy and known limitations.
+
 ## Security review — two crossable boundaries, closed
 
 A security review of the codebase, framed around a threat model that is

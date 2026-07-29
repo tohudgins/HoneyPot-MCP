@@ -1,0 +1,152 @@
+name: Release
+
+# Publishing is deliberately manual and tag-driven: pushing to PyPI cannot be
+# undone (a version number is burned forever), and a container tag is public
+# the moment it lands. Nothing here runs on a normal push to main.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: "Publish to PyPI (leave off for a dry run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Refuse to publish a tag that doesn't match the version in pyproject.toml —
+  # a mismatch means the artifact would be labelled differently from what the
+  # repository says it is.
+  check-version:
+    name: tag matches pyproject version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          VERSION=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pyproject version: $VERSION"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$VERSION" ]; then
+              echo "::error::tag v$TAG does not match pyproject version $VERSION"
+              exit 1
+            fi
+            echo "tag matches"
+          fi
+
+  build:
+    name: build + verify distributions
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check metadata renders on PyPI
+        run: twine check --strict dist/*
+
+      # A wheel that builds but omits its data files installs cleanly and then
+      # fails at runtime — the console 500s and the bundled suppression presets
+      # vanish. Verify the installed package from outside the source tree.
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet dist/*.whl
+          mkdir -p /tmp/elsewhere && cd /tmp/elsewhere
+          /tmp/smoke/bin/python - <<'PY'
+          import asyncio, os
+          os.environ["DATABASE_URL"] = "sqlite+aiosqlite:////tmp/elsewhere/smoke.db"
+
+          async def main():
+              from honeypot_mcp.storage.database import init_db, close_db
+              await init_db()
+
+              from honeypot_mcp.tools.integrations import suppression_list_presets
+              presets = await suppression_list_presets()
+              assert {"shodan", "censys", "internal-rfc1918"} <= set(presets), presets
+
+              from honeypot_mcp.console.server import _handle_index
+              page = await _handle_index(None)
+              assert page.status == 200 and "HoneyPot MCP" in page.text
+
+              await close_db()
+              print("wheel is complete:", presets)
+
+          asyncio.run(main())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    name: publish to PyPI
+    needs: build
+    if: github.event_name == 'push' || inputs.publish_pypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing — no long-lived API token stored in the repo.
+      # Configure the publisher once at https://pypi.org/manage/account/publishing/
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  container:
+    name: publish container to GHCR
+    needs: check-version
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/honeypot-mcp
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      # arm64 as well as amd64: the cheap VPSes people actually run this on are
+      # increasingly ARM, and so are most development machines.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.mcp
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

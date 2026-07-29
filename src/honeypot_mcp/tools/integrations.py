@@ -9,8 +9,10 @@ Subscriptions and rules are stored in the DB and survive restarts.
 
 from __future__ import annotations
 
+import contextlib
 import secrets
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -310,32 +312,15 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     Args:
         preset_name: Filename stem of the preset (without `.yaml`).
     """
-    from pathlib import Path
-
     import yaml
 
-    preset_path = Path("config") / "suppression_presets" / f"{preset_name}.yaml"
-    if not preset_path.exists():
-        # Look in the package install dir too, for pip-installed scenarios
-        # where cwd isn't the repo root.
-        alt = (
-            Path(__file__).resolve().parent.parent.parent.parent
-            / "config"
-            / "suppression_presets"
-            / f"{preset_name}.yaml"
-        )
-        if alt.exists():
-            preset_path = alt
-        else:
-            return {
-                "error": (
-                    f"Preset '{preset_name}' not found. Looked at: "
-                    f"{preset_path.absolute()} and {alt.absolute()}. "
-                    f"Available: {_list_available_presets()}"
-                )
-            }
+    preset_text = _read_preset(preset_name)
+    if preset_text is None:
+        return {
+            "error": (f"Preset '{preset_name}' not found. Available: {_list_available_presets()}")
+        }
 
-    raw = yaml.safe_load(preset_path.read_text())
+    raw = yaml.safe_load(preset_text)
     preset_rules = raw.get("rules") or []
     if not preset_rules:
         return {"error": f"Preset '{preset_name}' contains no rules."}
@@ -385,17 +370,42 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     }
 
 
-def _list_available_presets() -> list[str]:
-    from pathlib import Path
+# Operator-supplied presets, relative to wherever the server was launched.
+# Bundled presets ship inside the package instead, so they survive a pip
+# install — an earlier version looked for them next to the repo root, which
+# resolves to a non-existent path in site-packages and made every bundled
+# preset silently invisible to anyone who installed from a wheel.
+_LOCAL_PRESET_DIR = Path("config") / "suppression_presets"
 
+
+def _bundled_presets():  # type: ignore[no-untyped-def]
+    from importlib.resources import files
+
+    return files("honeypot_mcp") / "presets"
+
+
+def _read_preset(name: str) -> str | None:
+    """Return a preset's YAML, preferring an operator override on disk."""
+    local = _LOCAL_PRESET_DIR / f"{name}.yaml"
+    if local.is_file():
+        return local.read_text()
+    with contextlib.suppress(FileNotFoundError, ModuleNotFoundError):
+        resource = _bundled_presets() / f"{name}.yaml"
+        if resource.is_file():
+            return resource.read_text(encoding="utf-8")
+    return None
+
+
+def _list_available_presets() -> list[str]:
     presets: list[str] = []
-    for d in (
-        Path("config") / "suppression_presets",
-        Path(__file__).resolve().parent.parent.parent.parent / "config" / "suppression_presets",
-    ):
-        if d.is_dir():
-            for f in d.glob("*.yaml"):
-                presets.append(f.stem)
+    with contextlib.suppress(FileNotFoundError, ModuleNotFoundError):
+        presets.extend(
+            r.name.removesuffix(".yaml")
+            for r in _bundled_presets().iterdir()
+            if r.name.endswith(".yaml")
+        )
+    if _LOCAL_PRESET_DIR.is_dir():
+        presets.extend(f.stem for f in _LOCAL_PRESET_DIR.glob("*.yaml"))
     return sorted(set(presets))
 
 

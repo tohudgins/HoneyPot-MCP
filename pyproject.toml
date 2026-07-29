@@ -4,13 +4,28 @@ build-backend = "hatchling.build"
 
 [project]
 name = "honeypot-mcp"
-version = "0.1.0"
-description = "MCP server for deploying and managing honeypots, honeytokens, and attack analysis"
+version = "0.2.0"
+description = "Deception infrastructure you drive by talking to it — 14-protocol honeypots, honeytokens and attacker analysis over MCP"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = { file = "LICENSE" }
 authors = [{ name = "tohudgins" }]
+keywords = [
+    "honeypot",
+    "honeytoken",
+    "deception",
+    "security",
+    "threat-intelligence",
+    "mcp",
+    "model-context-protocol",
+    "soc",
+    "blue-team",
+    "mitre-attack",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -19,7 +34,10 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
     "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+    "Typing :: Typed",
 ]
+
 dependencies = [
     # MCP
     "fastmcp>=2.0.0",
@@ -77,6 +95,14 @@ dev = [
     "asyncpg>=0.29.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/tohudgins/HoneyPot-MCP"
+Repository = "https://github.com/tohudgins/HoneyPot-MCP"
+Changelog = "https://github.com/tohudgins/HoneyPot-MCP/blob/main/CHANGELOG.md"
+Issues = "https://github.com/tohudgins/HoneyPot-MCP/issues"
+"Known Limitations" = "https://github.com/tohudgins/HoneyPot-MCP/blob/main/KNOWN_LIMITATIONS.md"
+Security = "https://github.com/tohudgins/HoneyPot-MCP/blob/main/SECURITY.md"
+
 [project.scripts]
 honeypot-mcp = "honeypot_mcp.server:main"
 
@@ -84,7 +110,10 @@ honeypot-mcp = "honeypot_mcp.server:main"
 packages = ["src/honeypot_mcp"]
 # The console's HTML asset is data, not a module — hatch would otherwise skip it
 # and the wheel would serve a 500 for the dashboard.
-artifacts = ["src/honeypot_mcp/console/static/*"]
+artifacts = [
+    "src/honeypot_mcp/console/static/*",
+    "src/honeypot_mcp/presets/*.yaml",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
