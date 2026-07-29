@@ -69,9 +69,14 @@ async def test_pdf_token_contains_open_action_uri(tmp_path, monkeypatch):
     assert b"/URI" in pdf_bytes, "PDF missing /URI action type"
 
     # The canary URL itself must be in the bytes — both the OpenAction and
-    # the linkAbsolute click annotation point at it.
-    canary_url = f"http://{meta['dns_canary']}/t/{token_uid}.png"
-    assert canary_url.encode() in pdf_bytes, f"PDF doesn't reference the canary URL {canary_url!r}"
+    # the linkAbsolute click annotation point at it. It must be the address
+    # the canary server actually answers on; this assertion used to rebuild
+    # a `<uid>.canary.<host>` URL that nothing resolved, so it confirmed the
+    # PDF was self-consistent rather than that the token could ever fire.
+    assert meta["tracking_url"].endswith(f"/t/{token_uid}.png")
+    assert meta["tracking_url"].encode() in pdf_bytes, (
+        f"PDF doesn't reference the canary URL {meta['tracking_url']!r}"
+    )
 
 
 @pytest.mark.asyncio

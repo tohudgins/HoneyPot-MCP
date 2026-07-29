@@ -1,4 +1,11 @@
-"""File-based honeytoken provider — PDF/DOCX documents with DNS callback tracking."""
+"""File-based honeytoken provider — PDF/DOCX documents with an HTTP callback.
+
+Opening the document makes the reader fetch a per-token URL on the canary
+server (`CANARY_PUBLIC_URL/t/<uid>.png`), which fires a CRITICAL alert. PDFs
+carry an `/OpenAction` URI plus a full-page link annotation; DOCX carries an
+External-mode image relationship. See `plant_instructions` for the caveats
+each reader imposes.
+"""
 
 from __future__ import annotations
 
@@ -19,12 +26,25 @@ class FileTokenProvider(HoneytokenProvider):
         file_type = options.get("file_type", "pdf")
         title = options.get("document_title", "Confidential Report")
 
-        # DNS canary subdomain: {token_uid}.canary.<domain>
-        # We use the callback host's domain (or localhost for testing)
-        callback_base = (
+        # The URL embedded in the document must point at the canary server that
+        # actually answers. `canary_public_url` is that address, port included.
+        #
+        # This previously built `{token_uid}.canary.<host>` with the port
+        # stripped, which cannot resolve in any default or documented
+        # deployment: it needs a wildcard `*.canary.<domain>` DNS record nobody
+        # is told to create, and dropping the port sent the fetch to :80 while
+        # the callback server listens on 8888. Every PDF and DOCX token was
+        # therefore inert, even though the server-side `/t/<uid>.png` route
+        # works correctly.
+        callback_url = settings.canary_public_url.rstrip("/")
+        tracking_url = f"{callback_url}/t/{token_uid}.png"
+
+        # Kept as an *optional* extra for operators who do run wildcard DNS and
+        # a DNS honeypot — surfaced in plant_instructions, never embedded.
+        callback_host = (
             settings.canary_public_url.replace("http://", "").replace("https://", "").split(":")[0]
         )
-        dns_canary = f"{token_uid}.canary.{callback_base}"
+        dns_canary = f"{token_uid}.canary.{callback_host}"
 
         output_dir = Path("reports/generated")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -32,11 +52,11 @@ class FileTokenProvider(HoneytokenProvider):
 
         if file_type == "pdf":
             output_path = await _create_pdf(
-                str(output_path), title, dns_canary, token_uid, settings
+                str(output_path), title, tracking_url, token_uid, settings
             )
         elif file_type == "docx":
             output_path = await _create_docx(
-                str(output_path), title, dns_canary, token_uid, settings
+                str(output_path), title, tracking_url, token_uid, settings
             )
 
         meta = {
@@ -44,28 +64,32 @@ class FileTokenProvider(HoneytokenProvider):
             "file_path": str(output_path),
             "document_title": title,
             "dns_canary": dns_canary,
+            "tracking_url": tracking_url,
             "token_uid": token_uid,
         }
         return token_uid, meta
 
     def plant_instructions(self, token_value: str, metadata: dict[str, Any]) -> str:
         file_path = metadata.get("file_path", "reports/generated/<token>.pdf")
-        dns_canary = metadata.get("dns_canary", "")
+        tracking_url = metadata.get("tracking_url", "")
         return (
             f"File honeytoken created at: {file_path}\n\n"
-            f"DNS canary domain: {dns_canary}\n\n"
             f"Plant this file where an attacker might open it:\n"
             f"  - Shared network drive as 'Passwords.pdf' or 'Internal_Credentials.docx'\n"
             f"  - Email attachment in a spear-phishing simulation\n"
             f"  - USB drop scenario\n"
             f"  - Backup directory on a honeypot server\n\n"
-            f"When the file is opened, it makes a DNS lookup to {dns_canary}.\n"
-            f"The DNS honeypot captures this and triggers an alert."
+            f"Opening the file fetches {tracking_url}, which fires a CRITICAL alert.\n\n"
+            f"IMPORTANT: that URL must be reachable from wherever the file gets\n"
+            f"opened. It is built from CANARY_PUBLIC_URL, so set that to a public\n"
+            f"address (a domain, or an ngrok / Cloudflare Tunnel endpoint) before\n"
+            f"planting anything outside your own network — the default\n"
+            f"http://localhost:8888 only works on the host itself."
         )
 
 
 async def _create_pdf(
-    path: str, title: str, dns_canary: str, token_uid: str, settings: Any
+    path: str, title: str, tracking_url: str, token_uid: str, settings: Any
 ) -> Path:
     """Build a planted-decoy PDF that pings the canary URL when opened.
 
@@ -84,7 +108,6 @@ async def _create_pdf(
     open time, and was effectively inert in Acrobat (sandboxed) and
     Preview (silently ignored).
     """
-    tracking_url = f"http://{dns_canary}/t/{token_uid}.png"
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas
@@ -246,7 +269,7 @@ def _write_minimal_pdf_with_uri_action(path: str, title: str, url: str) -> None:
 
 
 async def _create_docx(
-    path: str, title: str, dns_canary: str, token_uid: str, settings: Any
+    path: str, title: str, tracking_url: str, token_uid: str, settings: Any
 ) -> Path:
     """Generate a DOCX with an External-mode image relationship pointing at
     the canary URL. Word fetches external images when opening — that fetch
@@ -273,7 +296,6 @@ async def _create_docx(
         doc.add_paragraph("Please refer to the appendix for technical details.")
         doc.save(path)
 
-        tracking_url = f"http://{dns_canary}/t/{token_uid}.png"
         _inject_external_image_rel(path, tracking_url)
     except ImportError:
         Path(path).write_bytes(b"PK\x03\x04")  # Minimal ZIP stub

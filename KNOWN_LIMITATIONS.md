@@ -65,10 +65,17 @@ or a real domain) and these fire from the internet.
 **DOCX file tokens.** `tokens/file_token.py` injects an External-mode image
 relationship into `word/_rels/document.xml.rels` and references it from a
 `<w:drawing>` in the document body. When Word opens the file it fetches the
-external image — that fetch hits the canary callback and triggers an alert.
-Word's Protected View can block the first fetch (user must click "Enable
-Editing"); enterprise deployments with Protected View disabled or auto-trust
-on certain locations skip the prompt entirely.
+external image — that fetch hits `CANARY_PUBLIC_URL/t/<uid>.png` on the
+canary server and triggers an alert. Word's Protected View can block the
+first fetch (user must click "Enable Editing"); enterprise deployments with
+Protected View disabled or auto-trust on certain locations skip the prompt
+entirely.
+
+Both file types embed `CANARY_PUBLIC_URL` verbatim, so that setting must be
+an address the target machine can actually reach — the default
+`http://localhost:8888` only ever fires if the document is opened on the
+honeypot host itself. This is the single most common reason a planted file
+token stays silent.
 
 **HTTP recon endpoint decoys.** Probes for `/.env`, `/config.json`,
 `/wp-config.php`, `/.aws/credentials`, `/.kube/config` get plausible bait
@@ -84,9 +91,13 @@ delay on top of the persona's existing jitter. A scanner that submits the
 same creds twice and diffs the responses can no longer confirm "no real
 auth backend present" from response bytes or response time.
 
-**DNS as canary infrastructure.** The DNS honeypot isn't designed to look
-discoverable — it's the callback path for file-token DNS lookups. Returning
-NXDOMAIN for everything is correct behaviour for that role.
+**DNS honeypot.** Not designed to look discoverable — it exists to catch
+resolver abuse and record who probes it. Returning NXDOMAIN for everything
+is correct behaviour for that role. It is *not* the callback path for file
+tokens; those fire over HTTP against the canary server (see above). File
+tokens do publish a `dns_canary` name in their metadata for operators who
+run a wildcard `*.canary.<domain>` record and want a second, DNS-based
+signal, but nothing is embedded in the document for it.
 
 **Credential token cross-reference (post-fix).** If you plant fake creds via
 `honeytoken_generate_credentials` and an attacker tries them on one of your

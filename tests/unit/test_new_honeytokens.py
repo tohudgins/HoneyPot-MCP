@@ -339,8 +339,11 @@ async def test_docx_token_injects_external_image_relationship():
         body_xml = z.read("word/document.xml").decode("utf-8")
 
     # Must contain an External-mode image relationship to the canary URL.
+    # Assert the *tracking* URL, not `dns_canary` — this used to check the
+    # latter, which is how a DOCX pointing at an unresolvable wildcard
+    # subdomain passed the suite while never firing in the field.
     assert 'TargetMode="External"' in rels_xml
-    assert meta["dns_canary"] in rels_xml
+    assert meta["tracking_url"] in rels_xml
     # The body must reference the same rel id via r:link (NOT r:embed).
     assert "r:link=" in body_xml
     # And the relationship type must be image (not hyperlink etc).
