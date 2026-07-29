@@ -360,97 +360,32 @@ async def honeypot_logs(name: str, lines: int = 50) -> dict[str, Any]:
 
 @mcp.tool
 async def honeypot_templates() -> list[dict[str, Any]]:
-    """List pre-built honeypot profiles, one per protocol type.
+    """List every deployable sensor type with its default port and what it captures.
 
-    Each entry shows the protocol, its default port, what that engine captures,
-    and whether it needs Docker. Call this before `honeypot_deploy` to pick the
-    right protocol for what someone wants to catch, or to check default ports.
+    Call this before `honeypot_deploy` to pick the right protocol, or to check a
+    default port. For designing a whole environment rather than picking one
+    sensor, use `deception_plan` instead.
+
+    Reads from the engine capability registry, so it cannot drift from what is
+    actually deployable — this list previously described fourteen types after
+    five more had shipped, and nothing errored.
     """
+    from honeypot_mcp.deception.capabilities import all_capabilities
+
     return [
         {
-            "type": "ssh",
-            "description": "SSH/Telnet honeypot using Cowrie. Captures credentials, commands, and file uploads.",
-            "default_port": 2222,
-            "config_options": ["fake_hostname", "fake_kernel", "max_sessions"],
-        },
-        {
-            "type": "http",
-            "description": "HTTP honeypot with configurable fake endpoints (admin panel, phpMyAdmin, .env, WordPress).",
-            "default_port": 8080,
-            "config_options": ["endpoints", "fake_server_header", "enable_ssl"],
-        },
-        {
-            "type": "smtp",
-            "description": "SMTP honeypot that captures spam/relay attempts and credential brute-force.",
-            "default_port": 2525,
-            "config_options": ["fake_banner", "fake_domain"],
-        },
-        {
-            "type": "ftp",
-            "description": "FTP honeypot capturing login attempts and file transfer activity.",
-            "default_port": 2121,
-            "config_options": ["fake_banner", "fake_users"],
-        },
-        {
-            "type": "dns",
-            "description": "DNS honeypot logging all queries — useful for detecting C2 callbacks.",
-            "default_port": 5353,
-            "config_options": ["fake_records"],
-        },
-        {
-            "type": "rdp",
-            "description": "RDP honeypot: X.224 handshake parsing (leaks the mstshash username) plus TLS-upgraded MCS client fingerprinting. Catches RDP brute-force scanners.",
-            "default_port": 3389,
-            "config_options": [],
-        },
-        {
-            "type": "vnc",
-            "description": "VNC honeypot speaking the RFB handshake — captures client version and auth challenge/response pairs from brute-force tools.",
-            "default_port": 5900,
-            "config_options": [],
-        },
-        {
-            "type": "redis",
-            "description": "Unauthenticated-looking Redis (RESP) honeypot. Detects the CONFIG SET dropper and SLAVEOF rogue-replica exploit patterns; AUTH attempts are credential-matched.",
-            "default_port": 6379,
-            "config_options": [],
-        },
-        {
-            "type": "mysql",
-            "description": "MySQL honeypot: serves a real handshake, captures login usernames + auth responses, rejects with access-denied.",
-            "default_port": 3306,
-            "config_options": [],
-        },
-        {
-            "type": "elasticsearch",
-            "description": "Elasticsearch honeypot: realistic cluster identity with fake indices — detects recon probes and data-exfil query patterns (_search, _bulk, …).",
-            "default_port": 9200,
-            "config_options": [],
-        },
-        {
-            "type": "smb",
-            "description": "SMB/445 honeypot: captures negotiate + session setup and flags EternalBlue / DoublePulsar exploit signatures. The most-scanned Windows attack surface (ransomware initial access).",
-            "default_port": 445,
-            "config_options": [],
-        },
-        {
-            "type": "postgresql",
-            "description": "PostgreSQL honeypot: captures the login username, target database, and password via the v3 auth flow, then rejects. Credentials are cross-referenced against planted honeytokens.",
-            "default_port": 5432,
-            "config_options": [],
-        },
-        {
-            "type": "mongodb",
-            "description": "MongoDB honeypot: speaks the wire protocol, answers isMaster/hello, and captures unauth commands — flags dropDatabase and ransom-note inserts (the classic Mongo data-ransom pattern).",
-            "default_port": 27017,
-            "config_options": [],
-        },
-        {
-            "type": "mssql",
-            "description": "Microsoft SQL Server honeypot: TDS pre-login + Login7 parsing captures the username and de-obfuscated password (plus hostname/app). A heavy brute-force + ransomware target.",
-            "default_port": 1433,
-            "config_options": [],
-        },
+            "type": c.type,
+            "display_name": c.display_name,
+            "description": c.summary,
+            "default_port": c.default_port,
+            "real_world_port": c.real_world_port,
+            "os_family": c.os_family,
+            "roles": list(c.roles),
+            "config_options": list(c.config_options),
+            "requires_docker": c.requires_docker,
+            "captures_credentials_as": c.captures_credentials_as,
+        }
+        for c in all_capabilities()
     ]
 
 

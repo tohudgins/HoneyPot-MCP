@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (437 unit tests covering security-critical paths)
+# Tests (543 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -557,6 +557,42 @@ because one is not enough:
    only changes the fallback, and explicit headers still win.
 
 Any new aiohttp server must import `http_identity` and set its own identity.
+
+### Intent-level tools (`deception/`)
+
+Most tools map one-to-one onto an operation — deploy this, list that. Three do
+not, and they are the reason a natural-language interface beats a thinner
+wrapper over the same API:
+
+- `deception_plan` — an environment description becomes a coherent set of
+  sensors and tokens. The division of labour is deliberate: the *model* reads
+  "a customer portal and a Postgres warehouse behind it" perfectly well, so the
+  planner supplies only what the model cannot know — which ports are taken,
+  which identities have to agree, which tokens would be inert. It deploys
+  nothing; answering a question must not open listeners.
+- `deception_coverage` — sensors and tokens mapped to ATT&CK. Computed by
+  pushing each engine's real `signature_events` through `intel.mitre`, so it
+  cannot drift from what the alerts actually say. An engine whose events are
+  unmapped shows up as missing coverage, which is correct — it is invisible on
+  the dashboard too.
+- `soc_brief` — separates untriaged CRITICAL/HIGH, token trips and dead sensors
+  from the volume that makes up most honeypot traffic.
+
+`deception/capabilities.py` is the single source of truth for what an engine
+is: port, OS family, roles, the `service` label its credentials carry, and its
+signature events. `honeypot_templates`, the planner and the coverage map all
+read from it. They previously each held a copy, and `honeypot_templates` had
+already drifted — still describing fourteen types after five more shipped, with
+nothing erroring. A test asserts the registry matches `HoneypotType` exactly.
+
+**Coherence checking is the differentiating logic.** Hand-built deception fails
+on mismatched detail more often than on missing detail: an attacker who touches
+two decoys and finds they disagree has learned more than one who finds nothing.
+`check_coherence` flags a directory server with no Windows services behind it,
+RDP with no SMB, and — as an *error* rather than a warning — a credential token
+targeting a service no deployed sensor captures, which can never fire and fails
+silently. `test_planned_tokens_always_target_a_deployed_service` asserts the
+planner never emits that for its own output.
 
 ### Tool response shaping
 

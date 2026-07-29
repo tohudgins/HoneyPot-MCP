@@ -299,6 +299,10 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 
 | Tool | Description |
 |---|---|
+| `deception_plan` | **Describe an environment, get a coherent deployment plan** — conflict-free ports, consistent identities, tokens tied to sensors that can detect them |
+| `deception_deploy_plan` | Bring a plan up atomically, rolling back everything on failure |
+| `deception_coverage` | What the live deployment detects per ATT&CK tactic, and the ranked blind spots |
+| `soc_brief` | Shift handover — what needs a human, separated from the background radiation |
 | `honeypot_deploy` | Deploy any of the 19 engine types |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
 | `honeypot_stop` / `honeypot_pause` / `honeypot_resume` | Lifecycle control |
