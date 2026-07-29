@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (374 unit tests covering security-critical paths)
+# Tests (396 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -567,3 +567,36 @@ Currently audited: `honeypot_deploy` (success and failure), `honeypot_stop`,
 `record_action` call to any new tool that changes state. Reads are not audited —
 they are high-volume and low-consequence. The table is append-only and the
 retention sweep does not touch it.
+
+### ATT&CK mapping and risk scoring
+
+Both are analyst-facing outputs where being *wrong* is worse than being absent,
+because SOC analysts know ATT&CK and will check the numbers.
+
+**`intel/mitre.py`** — tactics follow ATT&CK Enterprise exactly. Brute Force
+(T1110) is **Credential Access**, not Initial Access; an earlier revision filed
+the SSH/FTP/RDP variants under Initial Access while filing the identical
+technique under Credential Access three entries later. Coverage is aligned to
+what the engines actually emit — grep the engines for `event_type=` and make
+sure every high-value one maps, because an unmapped capture is invisible in the
+ATT&CK dashboard and the kill-chain timeline. Patterns are ordered
+most-specific-first and all matches are collected, so a generic rule must never
+be the only hit. Watch for cross-category false positives: `smb_exploit_attempt`
+contains "attempt" and previously matched the brute-force rule, inflating
+Credential Access while hiding the Lateral Movement finding.
+
+**`analysis/profiler.py:_calculate_risk`** — weighted toward what was observed
+locally, not what a feed says. Two properties the tests pin:
+
+- *Direct observation alone can reach CRITICAL.* VirusTotal and AbuseIPDB are
+  optional; they previously supplied 60 of ~90 attainable points, so with no
+  API keys (the default) an attacker who ran a full RCE chain and tripped a
+  planted credential could not exceed 30 — MEDIUM. For a deception platform
+  that is backwards: our own capture outranks a reputation lookup.
+- *A triggered honeytoken dominates.* It is the highest-fidelity signal the
+  platform produces and previously contributed nothing beyond its severity.
+
+Volume is deliberately weighted low — one determined scanner produces thousands
+of events, and ranking by noise buries the dangerous attacker. Retune the
+weights freely; the tests assert ordering and band reachability, not exact
+numbers.

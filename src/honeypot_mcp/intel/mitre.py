@@ -10,53 +10,99 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# Keyword → (technique_id, technique_name, tactic)
-# Covers the most common honeypot-observable techniques
+# Observed-behaviour keyword → (technique_id, technique_name, tactic).
+#
+# Tactics follow MITRE ATT&CK Enterprise exactly. This matters more than it
+# might seem: SOC analysts know the framework, and a technique filed under the
+# wrong tactic discredits every other number on the page. Brute Force (T1110)
+# in particular is **Credential Access** — an earlier revision of this table
+# filed the SSH/FTP/RDP variants under Initial Access while filing the
+# identical technique under Credential Access three entries later.
+#
+# Coverage is deliberately aligned to what the engines actually capture: every
+# high-value event type they emit should map to something, because an
+# unmapped capture is invisible in the ATT&CK dashboard and the kill-chain
+# timeline. Ordering is longest/most-specific first, since all matches are
+# collected and a generic pattern should never be the only hit.
 _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
-    # Initial Access
+    # ── Impact ───────────────────────────────────────────────────────────────
+    # Ransom notes and database wipes are the highest-severity thing a
+    # honeypot sees; they must never fall through to a generic mapping.
     (
-        re.compile(r"ssh.*(brute|login|fail|attempt)", re.I),
+        re.compile(r"(ransom|bitcoin|btc.address|recover.your.data|encrypted)", re.I),
+        "T1486",
+        "Data Encrypted for Impact",
+        "Impact",
+    ),
+    (
+        re.compile(r"(destructive|dropdatabase|drop.database|deletemany|wipe)", re.I),
+        "T1485",
+        "Data Destruction",
+        "Impact",
+    ),
+    # ── Execution ────────────────────────────────────────────────────────────
+    (
+        re.compile(
+            r"(copy.program|from.program|to.program|udf.rce|module.load|"
+            r"redis.eval|rce.dropper|rogue.replica)",
+            re.I,
+        ),
+        "T1059",
+        "Command and Scripting Interpreter",
+        "Execution",
+    ),
+    (
+        re.compile(r"(command.input|ssh.command|shell.exec|/bin/(ba)?sh|cmd.exe)", re.I),
+        "T1059.004",
+        "Command and Scripting Interpreter: Unix Shell",
+        "Execution",
+    ),
+    # ── Persistence ──────────────────────────────────────────────────────────
+    (
+        re.compile(r"(authorized.keys|ssh.key|authorized_keys)", re.I),
+        "T1098.004",
+        "Account Manipulation: SSH Authorized Keys",
+        "Persistence",
+    ),
+    (
+        re.compile(r"(crontab|cron\.d|backdoor|scheduled.task)", re.I),
+        "T1053",
+        "Scheduled Task/Job",
+        "Persistence",
+    ),
+    (
+        re.compile(r"(outfile.write|into.outfile|webshell|web.shell|\.php.*upload)", re.I),
+        "T1505.003",
+        "Server Software Component: Web Shell",
+        "Persistence",
+    ),
+    # ── Lateral Movement ─────────────────────────────────────────────────────
+    (
+        re.compile(r"(eternalblue|doublepulsar|smb.exploit|ms17.010)", re.I),
+        "T1210",
+        "Exploitation of Remote Services",
+        "Lateral Movement",
+    ),
+    (
+        re.compile(r"rdp.*(handshake|mcs|connection)", re.I),
+        "T1021.001",
+        "Remote Services: Remote Desktop Protocol",
+        "Lateral Movement",
+    ),
+    # ── Credential Access ────────────────────────────────────────────────────
+    # T1110 is Credential Access in ATT&CK, for every protocol.
+    (
+        # The negative lookahead keeps `smb_exploit_attempt` out: an exploit is
+        # not a password guess, and mislabelling it inflates Credential Access
+        # while hiding the Lateral Movement finding that actually matters.
+        re.compile(
+            r"^(?!.*exploit)"
+            r"(ssh|ftp|rdp|smtp|vnc|redis|mysql|mssql|postgresql|smb|telnet)"
+            r".*(brute|login|auth|fail|session.setup)",
+            re.I,
+        ),
         "T1110.001",
         "Brute Force: Password Guessing",
-        "Initial Access",
-    ),
-    (re.compile(r"ssh.*login.*success", re.I), "T1078", "Valid Accounts", "Initial Access"),
-    (
-        re.compile(r"ftp.*(login|auth|brute)", re.I),
-        "T1110.001",
-        "Brute Force: Password Guessing",
-        "Initial Access",
-    ),
-    (
-        re.compile(r"rdp.*(login|brute|attempt)", re.I),
-        "T1110.001",
-        "Brute Force: Password Guessing",
-        "Initial Access",
-    ),
-    # Discovery
-    (
-        re.compile(r"(port.scan|nmap|masscan|zmap)", re.I),
-        "T1046",
-        "Network Service Discovery",
-        "Discovery",
-    ),
-    (
-        re.compile(r"(web.scan|nikto|dirb|gobuster|wfuzz)", re.I),
-        "T1595.003",
-        "Active Scanning: Wordlist Scanning",
-        "Reconnaissance",
-    ),
-    (
-        re.compile(r"dns.query", re.I),
-        "T1590.002",
-        "Gather Victim Network Information: DNS",
-        "Reconnaissance",
-    ),
-    # Credential Access
-    (
-        re.compile(r"(credential|password|passwd|shadow)", re.I),
-        "T1555",
-        "Credentials from Password Stores",
         "Credential Access",
     ),
     (
@@ -71,68 +117,44 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Brute Force: Password Guessing",
         "Credential Access",
     ),
-    # Command & Control
     (
-        re.compile(r"(dns.canary|dns.*callback|beacon)", re.I),
-        "T1071.004",
-        "Application Layer Protocol: DNS",
-        "Command and Control",
+        re.compile(r"(/etc/shadow|/etc/passwd|pg_shadow|pg_authid|sam.hive|ntds)", re.I),
+        "T1003",
+        "OS Credential Dumping",
+        "Credential Access",
     ),
     (
-        re.compile(r"(http.canary|url.trigger|canary.url)", re.I),
-        "T1071.001",
-        "Application Layer Protocol: Web Protocols",
-        "Command and Control",
+        re.compile(r"(\.env|\.aws/credentials|wp-config|config\.json|credentials.file)", re.I),
+        "T1552.001",
+        "Unsecured Credentials: Credentials In Files",
+        "Credential Access",
     ),
     (
-        re.compile(r"(c2|command.and.control|reverse.shell)", re.I),
-        "T1105",
-        "Ingress Tool Transfer",
-        "Command and Control",
-    ),
-    # Execution
-    (
-        re.compile(r"(command.input|ssh.command|shell.exec)", re.I),
-        "T1059",
-        "Command and Scripting Interpreter",
-        "Execution",
-    ),
-    (
-        re.compile(r"(wget|curl|download).*(payload|script|sh|exe)", re.I),
-        "T1105",
-        "Ingress Tool Transfer",
-        "Command and Control",
-    ),
-    # Exfiltration
-    (
-        re.compile(r"(file.download|sftp|scp)", re.I),
-        "T1041",
-        "Exfiltration Over C2 Channel",
-        "Exfiltration",
-    ),
-    # Persistence
-    (
-        re.compile(r"(crontab|authorized.keys|ssh.key|backdoor)", re.I),
-        "T1098",
-        "Account Manipulation",
-        "Persistence",
-    ),
-    # AWS / Cloud
-    (
-        re.compile(r"(aws.key|access.key.id|secret.access)", re.I),
+        re.compile(r"(aws.key|access.key.id|secret.access|bearer.token)", re.I),
         "T1528",
         "Steal Application Access Token",
         "Credential Access",
     ),
     (
-        re.compile(r"(iam|s3|ec2|lambda).*(access|enumerat)", re.I),
-        "T1526",
-        "Cloud Service Discovery",
-        "Discovery",
+        re.compile(r"(credential|password|passwd)", re.I),
+        "T1555",
+        "Credentials from Password Stores",
+        "Credential Access",
     ),
-    # Exploit
+    # ── Initial Access ───────────────────────────────────────────────────────
+    # A planted credential being used is the strongest signal the platform
+    # produces: someone is replaying secrets they should never have had.
     (
-        re.compile(r"(exploit|shellshock|heartbleed|log4j|log4shell)", re.I),
+        re.compile(r"(honeytoken.triggered|valid.account|login.success)", re.I),
+        "T1078",
+        "Valid Accounts",
+        "Initial Access",
+    ),
+    (
+        re.compile(
+            r"(exploit|shellshock|heartbleed|log4j|log4shell|jndi:|struts|ognl|spring4shell)",
+            re.I,
+        ),
         "T1190",
         "Exploit Public-Facing Application",
         "Initial Access",
@@ -144,10 +166,105 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Initial Access",
     ),
     (
-        re.compile(r"(path.travers|lfi|rfi|../)", re.I),
+        re.compile(r"(path.travers|lfi|rfi|\.\./)", re.I),
         "T1190",
         "Exploit Public-Facing Application",
         "Initial Access",
+    ),
+    # ── Collection ───────────────────────────────────────────────────────────
+    (
+        re.compile(r"(elasticsearch.data|_search|_bulk|data.access|dump)", re.I),
+        "T1213",
+        "Data from Information Repositories",
+        "Collection",
+    ),
+    (
+        re.compile(r"(file.read|file.access|pg_read_file|lo_import|load_file)", re.I),
+        "T1005",
+        "Data from Local System",
+        "Collection",
+    ),
+    # ── Command and Control ──────────────────────────────────────────────────
+    (
+        re.compile(r"(dns.tunnel|dns.exfil|dns.canary|dns.*callback|beacon)", re.I),
+        "T1071.004",
+        "Application Layer Protocol: DNS",
+        "Command and Control",
+    ),
+    (
+        re.compile(r"(http.canary|url.trigger|canary.url|token.callback)", re.I),
+        "T1071.001",
+        "Application Layer Protocol: Web Protocols",
+        "Command and Control",
+    ),
+    (
+        re.compile(r"(open.relay|smtp.relay|mail.relay)", re.I),
+        "T1071.003",
+        "Application Layer Protocol: Mail Protocols",
+        "Command and Control",
+    ),
+    (
+        re.compile(r"(c2|command.and.control|reverse.shell)", re.I),
+        "T1105",
+        "Ingress Tool Transfer",
+        "Command and Control",
+    ),
+    (
+        re.compile(r"(file.upload|wget|curl|tftp|(download).*(payload|script|sh|exe))", re.I),
+        "T1105",
+        "Ingress Tool Transfer",
+        "Command and Control",
+    ),
+    # ── Exfiltration ─────────────────────────────────────────────────────────
+    (
+        re.compile(r"(file.download|sftp|scp|lo_export|outfile.*/tmp)", re.I),
+        "T1041",
+        "Exfiltration Over C2 Channel",
+        "Exfiltration",
+    ),
+    # ── Discovery ────────────────────────────────────────────────────────────
+    (
+        re.compile(r"(port.scan|nmap|masscan|zmap|smb.negotiate|smb.version)", re.I),
+        "T1046",
+        "Network Service Discovery",
+        "Discovery",
+    ),
+    (
+        re.compile(
+            r"(recon.query|info.probe|version\(\)|buildinfo|servetstatus|"
+            r"server.status|health.probe|current_user|version.probe)",
+            re.I,
+        ),
+        "T1082",
+        "System Information Discovery",
+        "Discovery",
+    ),
+    (
+        re.compile(r"(listdatabases|show.databases|information_schema|_cat/indices)", re.I),
+        "T1083",
+        "File and Directory Discovery",
+        "Discovery",
+    ),
+    (
+        re.compile(
+            r"(iam|s3|ec2|lambda|metadata\.google|169\.254\.169\.254).*(access|enumerat|)", re.I
+        ),
+        "T1526",
+        "Cloud Service Discovery",
+        "Discovery",
+    ),
+    # ── Reconnaissance ───────────────────────────────────────────────────────
+    (
+        re.compile(r"(web.scan|nikto|dirb|gobuster|wfuzz|active.recon)", re.I),
+        "T1595.003",
+        "Active Scanning: Wordlist Scanning",
+        "Reconnaissance",
+    ),
+    (
+        re.compile(r"(zone.transfer|axfr|dns.any|dns.query)", re.I),
+        "T1590.002",
+        "Gather Victim Network Information: DNS",
+        "Reconnaissance",
     ),
 ]
 

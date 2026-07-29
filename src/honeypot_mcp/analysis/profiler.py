@@ -39,7 +39,9 @@ async def build_profile(
     last_seen = max(all_timestamps).isoformat() if all_timestamps else None
 
     # Risk score: 0-100
-    risk_score = _calculate_risk(vt, abuse, ttps, sev_counts, len(alerts))
+    risk_score = _calculate_risk(
+        vt, abuse, ttps, sev_counts, len(alerts), event_types=dict(event_counts)
+    )
 
     return {
         "ip": ip,
@@ -77,33 +79,69 @@ async def build_profile(
     }
 
 
+# Tactics that mean the attacker got past probing and did something to the
+# decoy. Observing these directly is far stronger evidence than any third-party
+# reputation score.
+_HANDS_ON_TACTICS = frozenset({"Execution", "Impact", "Persistence", "Lateral Movement"})
+
+
 def _calculate_risk(
     vt: dict,
     abuse: dict,
     ttps: list[dict],
     sev: dict[str, int],
     event_count: int,
+    event_types: dict[str, int] | None = None,
 ) -> int:
+    """Score 0-100, weighted toward what we observed rather than what a feed says.
+
+    Two properties this has to hold, and an earlier revision did not:
+
+    1. **Direct observation alone can reach CRITICAL.** VirusTotal and
+       AbuseIPDB are optional integrations, and previously supplied 60 of the
+       ~90 attainable points. With no API keys — the default — an attacker who
+       ran a full RCE chain against a decoy and tripped a planted credential
+       could not score above 30, i.e. MEDIUM. For a deception platform that is
+       backwards: our own capture is higher-confidence evidence than a
+       reputation lookup, not lower.
+
+    2. **A triggered honeytoken dominates.** It is the highest-fidelity signal
+       the platform can produce — a planted secret being replayed means someone
+       is using credentials they could only have obtained by compromising
+       something. It previously contributed nothing beyond its severity.
+    """
+    events = event_types or {}
     score = 0
 
-    # VT reputation (max 30 pts)
+    # ── Observed behaviour (max 85) ──────────────────────────────────────────
+    # A honeytoken trigger is near-conclusive on its own.
+    if any(name.startswith("honeytoken_triggered") for name in events):
+        score += 45
+
+    score += min(30, sev.get("critical", 0) * 15)
+    score += min(12, sev.get("high", 0) * 3)
+    score += min(5, sev.get("medium", 0))
+
+    # Breadth of technique, and whether any of it was hands-on-decoy rather
+    # than scanning.
+    score += min(8, len(ttps) * 2)
+    if any(t.get("tactic") in _HANDS_ON_TACTICS for t in ttps):
+        score += 20
+
+    # Sustained volume is weak evidence by itself — one determined scanner
+    # produces thousands of events — so it is capped low deliberately.
+    if event_count >= 100:
+        score += 5
+    elif event_count >= 20:
+        score += 2
+
+    # ── External corroboration (max 30) ──────────────────────────────────────
+    # Additive confirmation, never the backbone of the score.
     rep = vt.get("reputation", 0) or 0
     if rep < 0:
-        score += min(20, abs(rep))
-    mal_votes = vt.get("malicious_votes", 0) or 0
-    score += min(10, mal_votes * 2)
-
-    # AbuseIPDB confidence score (max 30 pts — directly maps 0-100 → 0-30)
-    abuse_score = abuse.get("abuse_confidence_score", 0) or 0
-    score += int(abuse_score * 0.30)
-
-    # Severity (max 20 pts)
-    score += min(10, sev.get("critical", 0) * 5)
-    score += min(6, sev.get("high", 0) * 3)
-    score += min(4, sev.get("medium", 0))
-
-    # MITRE technique coverage (max 10 pts)
-    score += min(10, len(ttps) * 2)
+        score += min(8, abs(rep) // 2)
+    score += min(7, (vt.get("malicious_votes", 0) or 0))
+    score += int((abuse.get("abuse_confidence_score", 0) or 0) * 0.15)
 
     return min(100, score)
 

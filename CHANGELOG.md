@@ -4,6 +4,52 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Analysis-quality pass — ATT&CK mapping and risk scoring
+
+Previous passes asked whether features existed and whether the wire protocols
+were convincing. This one asks whether the analyst-facing *outputs* are any
+good. Two were not, in ways that matter more than a missing feature would:
+being wrong in front of a SOC analyst costs more credibility than being absent.
+
+- **ATT&CK tactics were factually wrong in places.** Brute Force (T1110) was
+  filed under Initial Access for SSH/FTP/RDP while the identical technique was
+  filed under Credential Access three entries later. T1110 is Credential Access
+  in ATT&CK Enterprise, for every protocol. Analysts know this cold.
+- **Half the platform's headline captures mapped to nothing.** The Redis
+  unauth-RCE dropper chain, MongoDB ransom notes and `dropDatabase`, DNS
+  tunnelling, MySQL `INTO OUTFILE` webshell drops, PostgreSQL
+  `COPY … FROM PROGRAM`, SMTP open relay, Elasticsearch data exfil and RDP
+  handshakes all returned no technique — meaning they were invisible in the
+  ATT&CK dashboard and the kill-chain timeline the README advertises. The
+  mapping table is now aligned to the event types the engines actually emit,
+  covering Impact, Execution, Persistence, Lateral Movement and Collection,
+  which had almost no representation before. `smb_exploit_attempt` also
+  matched the brute-force rule (it contains "attempt"), inflating Credential
+  Access while hiding the Lateral Movement finding; a negative lookahead fixes
+  it.
+- **The risk score could not flag a serious attacker without API keys.**
+  VirusTotal and AbuseIPDB are optional integrations but supplied 60 of the
+  ~90 attainable points, so on a default install an attacker who ran a full
+  RCE chain against a decoy *and* tripped a planted credential topped out at
+  30/100 — MEDIUM. That is backwards for a deception platform: a first-hand
+  capture is stronger evidence than a third-party reputation lookup. Scoring is
+  now weighted toward observed behaviour, external intel corroborates rather
+  than carries it, and a triggered honeytoken — the highest-fidelity signal the
+  platform produces, previously worth nothing beyond its severity — dominates.
+  Sustained volume stays weighted low so the ranking is not led by whoever is
+  noisiest. Measured on the same scenarios: an RCE chain now scores 52/HIGH
+  with no API keys (was 30/MEDIUM at best), a honeytoken trigger 64/HIGH, and
+  the two together 100/CRITICAL, while a 200-event scanner sweep stays LOW.
+
+22 new tests pin both, written as ordering and band-reachability assertions so
+the weights can be retuned without churn (396 total).
+
+Also verified and left alone, having found no defect: all 11 honeytoken types
+produce valid artifacts (the JWT decodes with matching `jti`, the kubeconfig's
+`current-context` and user references resolve, the GCP service account carries
+a real parseable RSA-2048 key); CEF and RFC 5424 syslog resist log-injection
+via attacker-controlled payload values; ECS carries the required fields.
+
 ## SOC workflow pass — triage, audit trail, and the rest of the tool sweep
 
 Audited all 49 MCP tools for the defect classes the previous pass turned up,
