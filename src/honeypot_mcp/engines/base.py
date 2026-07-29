@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -14,23 +15,38 @@ async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) ->
     """Default health-check primitive: open a TCP connection and immediately close.
     Confirms the OS is actually accepting connections on the port — catches
     cases where a server crashed but the engine's internal state still says
-    'running'."""
+    'running'.
+
+    The engine on the other end records this connection as an attack; it cannot
+    tell us apart from a real peer. We bind the source port ourselves and claim
+    it via `self_probe` *before* connecting, so `submit_event` can drop the
+    resulting event.
+
+    Ordering is the whole trick. Registering after the connect returns loses a
+    race against any engine that records in `connection_made` — that callback
+    runs as soon as the kernel completes the handshake, which is before
+    `connect()` hands control back to us. FTP and SMTP do exactly that, and
+    kept logging probes as attacks until the claim moved ahead of the connect.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
-        # The engine on the other end logs this connection as an attack — it
-        # cannot tell us apart from a real peer. Claim our own socket address
-        # so `submit_event` drops that one event. See `self_probe`.
-        self_probe.register(writer.get_extra_info("sockname"))
-        writer.close()
-        with contextlib.suppress(Exception):
-            await writer.wait_closed()
+        sock.setblocking(False)
+        # Only valid when the target is a local address, which is the only way
+        # the watchdog uses this. Anywhere else the bind fails harmlessly and
+        # we simply probe without a claim.
+        with contextlib.suppress(OSError):
+            sock.bind((host, 0))
+            self_probe.register(sock.getsockname())
+
+        loop = asyncio.get_running_loop()
+        await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=timeout)
         return {"alive": True, "detail": "TCP port responsive", "method": "tcp"}
     except TimeoutError:
         return {"alive": False, "detail": f"TCP probe timed out after {timeout}s", "method": "tcp"}
     except (ConnectionRefusedError, OSError) as e:
         return {"alive": False, "detail": f"TCP probe failed: {e}", "method": "tcp"}
+    finally:
+        sock.close()
 
 
 class HoneypotEngine(ABC):

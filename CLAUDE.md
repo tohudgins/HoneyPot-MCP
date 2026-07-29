@@ -422,6 +422,31 @@ Note: `SSHEngine` holds strong references to ingestion tasks in
 `self._ingest_tasks` — asyncio only weakly references tasks, so an unreferenced
 one can be GC'd mid-run, silently stopping capture.
 
+**Container adoption.** `adopt_labelled_containers()` runs straight after
+reconciliation. A Cowrie container only produces alerts if something tails its
+logs, and that only happens for containers with a `Honeypot` row pointing at
+them — so anything started outside this process (the compose stack's
+`cowrie-ssh`, above all) captured attacks into its own logs and raised nothing,
+while `docker ps` and the port both looked healthy. Adoption claims containers
+labelled `honeypot-mcp=true`, creating or re-pointing the row and attaching
+ingestion. It matches on the published host port, skips containers with no
+published port (unreachable, so registering one would be a lie), and re-adopts
+rows stuck in ERROR rather than skipping on container id alone.
+
+**SSH health checks probe twice.** `port` is the *host* published port, which
+is only on loopback when the server runs on the host. In the compose stack the
+server is a container and Cowrie is a sibling, so `127.0.0.1:2222` there is the
+server's own empty loopback — probing only that marked a working honeypot dead
+every 30s. On failure the check falls back to the container's own IP on
+`COWRIE_INTERNAL_PORT`.
+
+**The watchdog sweeps ERROR honeypots too, not just RUNNING.** Watching only
+RUNNING made ERROR a one-way door: the first failed probe set ERROR, and ERROR
+rows were excluded from every later sweep, so a honeypot that recovered stayed
+marked dead forever and was never checked again. A honeypot that answers again
+is flipped back to RUNNING (`_mark_recovered`), with no alert — recovery is
+good news, and alerting on it would make a flapping honeypot noisy.
+
 ### Canary callback server
 
 `canary.py` runs an aiohttp server on `canary_callback_host:canary_callback_port` (default `0.0.0.0:8888`). Started/stopped from `lifespan` alongside the DB.

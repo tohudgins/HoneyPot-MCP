@@ -67,8 +67,14 @@ async def test_watchdog_probe_does_not_become_an_alert():
     buf = event_buffer.get_buffer()
     await buf.start()
     try:
-        result = await tcp_probe(port)
-        assert result["alive"] is True
+        # FTP records in `connection_made`, which fires the moment the kernel
+        # completes the handshake — before `connect()` returns. A claim made
+        # after connecting loses that race, and did so consistently in a
+        # container while passing on the developer's machine. Twenty probes
+        # make the ordering bug reproducible rather than a coin flip.
+        for _ in range(20):
+            result = await tcp_probe(port)
+            assert result["alive"] is True
         await asyncio.sleep(0.5)
 
         async with get_session() as session:
@@ -87,6 +93,48 @@ async def test_watchdog_probe_does_not_become_an_alert():
     finally:
         await buf.stop()
         await engine.stop(container_id)
+
+
+async def test_probe_is_claimed_before_the_server_sees_it(monkeypatch):
+    """The claim must be registered before the connection is made.
+
+    This is the invariant, and it cannot be tested by timing: whether the
+    server's `connection_made` runs before or after `connect()` returns is up
+    to the event loop, so the original post-connect registration passed on
+    macOS and failed in a container. Observing the *order of calls* instead is
+    deterministic — with the claim ahead of `sock_connect` the server cannot
+    possibly be first, because the syscall has not been issued yet.
+    """
+    import honeypot_mcp.self_probe as self_probe_mod
+    from honeypot_mcp.engines.base import tcp_probe
+
+    order: list[str] = []
+    real_register = self_probe_mod.register
+
+    def spy(sockname):
+        order.append("claimed")
+        real_register(sockname)
+
+    monkeypatch.setattr(self_probe_mod, "register", spy)
+
+    class _Server(asyncio.Protocol):
+        def connection_made(self, transport):
+            order.append("server_saw_connection")
+            transport.close()
+
+    loop = asyncio.get_running_loop()
+    server = await loop.create_server(_Server, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert (await tcp_probe(port))["alive"] is True
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            if "server_saw_connection" in order:
+                break
+        assert order[0] == "claimed", f"probe was visible before it was claimed: {order}"
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 async def test_claim_is_one_shot():

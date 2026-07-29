@@ -16,7 +16,7 @@ from honeypot_mcp.canary import start_canary_server
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.console import start_console_server
 from honeypot_mcp.metrics import start_metrics_server
-from honeypot_mcp.reconcile import reconcile_running_honeypots
+from honeypot_mcp.reconcile import adopt_labelled_containers, reconcile_running_honeypots
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import close_db, get_session, init_db
 from honeypot_mcp.storage.event_buffer import get_buffer
@@ -53,6 +53,10 @@ async def lifespan(app: FastMCP):
     # before the watchdog starts, or it races us to mark them dead.
     try:
         await reconcile_running_honeypots()
+        # Then pick up honeypot containers started outside this process (the
+        # compose stack's cowrie-ssh, most importantly) — without this they
+        # capture attacks into their own logs and never raise an alert.
+        await adopt_labelled_containers()
     except Exception:
         log.exception("Startup reconciliation failed — continuing anyway.")
     await watchdog.start()

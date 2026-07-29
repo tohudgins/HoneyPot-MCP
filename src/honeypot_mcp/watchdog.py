@@ -105,8 +105,15 @@ class HoneypotWatchdog:
             )
 
     async def _check_all(self) -> None:
+        # ERROR honeypots are swept too, not just RUNNING ones. Watching only
+        # RUNNING made the status a one-way door: the first failed probe set
+        # ERROR, and ERROR rows were then excluded from every later sweep, so a
+        # honeypot that came back stayed marked dead forever and was never
+        # health-checked again. Transient failures — a container restart, a
+        # daemon hiccup — became permanent.
         async with get_session() as session:
             honeypots = await queries.list_honeypots(session, status=HoneypotStatus.RUNNING)
+            honeypots += await queries.list_honeypots(session, status=HoneypotStatus.ERROR)
 
         for hp in honeypots:
             if hp.container_id is None:
@@ -120,12 +127,26 @@ class HoneypotWatchdog:
 
             if health.get("alive"):
                 self._reported_dead.discard(hp.id)
+                if hp.status is HoneypotStatus.ERROR:
+                    await self._mark_recovered(hp.id, hp.name)
                 continue
 
             if hp.id in self._reported_dead:
                 continue
             self._reported_dead.add(hp.id)
             await self._mark_dead(hp.id, hp.name, health)
+
+    async def _mark_recovered(self, hp_id: int, hp_name: str) -> None:
+        """Flip a honeypot that is answering again back to RUNNING.
+
+        No alert is emitted: recovery is good news, and a honeypot that flaps
+        would otherwise generate an alert on every transition.
+        """
+        log.info("Honeypot %r is responding again — status restored to RUNNING.", hp_name)
+        async with get_session() as session:
+            await session.execute(
+                update(Honeypot).where(Honeypot.id == hp_id).values(status=HoneypotStatus.RUNNING)
+            )
 
     async def _mark_dead(self, hp_id: int, hp_name: str, health: dict) -> None:
         log.warning("Honeypot %r flagged unhealthy: %s", hp_name, health.get("detail"))

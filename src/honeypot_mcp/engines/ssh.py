@@ -19,6 +19,8 @@ from honeypot_mcp.storage.models import AlertSeverity
 log = logging.getLogger(__name__)
 
 COWRIE_IMAGE = "cowrie/cowrie:latest"
+# Port Cowrie listens on inside the container, before any host publishing.
+COWRIE_INTERNAL_PORT = 2222
 
 # Cowrie JSON log patterns we care about
 _EVENT_MAP = {
@@ -111,7 +113,7 @@ class SSHEngine(HoneypotEngine):
         # volume on a public IP.
         telnet_enabled = bool(config.get("telnet_enabled")) or "telnet_port" in config
         telnet_port = int(config.get("telnet_port", 23))
-        port_map: dict[str, int] = {"2222/tcp": port}
+        port_map: dict[str, int] = {f"{COWRIE_INTERNAL_PORT}/tcp": port}
         if telnet_enabled:
             port_map["2223/tcp"] = telnet_port
             env["COWRIE_TELNET_ENABLED"] = "yes"
@@ -202,7 +204,18 @@ class SSHEngine(HoneypotEngine):
 
     async def health_check(self, container_id: str, port: int) -> dict[str, Any]:
         """SSH health: container is running AND the port is responsive.
-        Catches Cowrie crashing inside an otherwise-running container."""
+        Catches Cowrie crashing inside an otherwise-running container.
+
+        The port is probed twice, because "the port" means different things
+        depending on where this process runs. `port` is the *host* published
+        port, reachable on loopback only when the server runs on the host. In
+        the compose stack the server is itself a container and Cowrie is a
+        sibling: `127.0.0.1:2222` there is the server's own empty loopback, and
+        probing it declared a perfectly healthy honeypot dead every 30s —
+        ERROR status plus a CRITICAL alert, while the honeypot went on
+        capturing attacks. The fallback probes the container's own address on
+        Cowrie's internal port, which is what a sibling can actually reach.
+        """
         if not self._client:
             return {"alive": False, "detail": "Docker not available", "method": "docker"}
 
@@ -211,9 +224,15 @@ class SSHEngine(HoneypotEngine):
         def _docker_state() -> dict[str, Any]:
             try:
                 c = self._client.containers.get(container_id)
-                return {"docker_status": c.status, "running": c.status == "running"}
+                networks = (c.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
+                ips = [n.get("IPAddress") for n in networks.values() if n.get("IPAddress")]
+                return {
+                    "docker_status": c.status,
+                    "running": c.status == "running",
+                    "container_ips": ips,
+                }
             except docker.errors.NotFound:
-                return {"docker_status": "not_found", "running": False}
+                return {"docker_status": "not_found", "running": False, "container_ips": []}
 
         state = await loop.run_in_executor(None, _docker_state)
         if not state["running"]:
@@ -227,6 +246,12 @@ class SSHEngine(HoneypotEngine):
         from honeypot_mcp.engines.base import tcp_probe
 
         tcp = await tcp_probe(port)
+        if not tcp["alive"]:
+            for ip in state["container_ips"]:
+                tcp = await tcp_probe(COWRIE_INTERNAL_PORT, host=ip)
+                if tcp["alive"]:
+                    break
+
         return {
             "alive": tcp["alive"],
             "detail": "container running, port responsive"
