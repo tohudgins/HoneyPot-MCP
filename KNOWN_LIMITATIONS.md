@@ -130,6 +130,28 @@ scanner version detection keys off well-formed responses, so the persona still
 determines identification — but an expert who deliberately diffs malformed and
 well-formed responses can spot the mismatch.
 
+**Memcached and SNMP deliberately never amplify.** Both are reflection
+vectors, and both engines are built to watch the reconnaissance rather than
+take part in it. `memcached` speaks TCP only — UDP/11211 is where reflection
+actually happens, and a UDP listener that answered spoofed traffic would enlist
+the honeypot in someone else's DDoS. SNMP answers `GetBulkRequest` with the
+same single-varbind shape as a `Get` rather than the large multi-varbind reply
+a real agent sends, for the same reason. Both still record the probe, and both
+report a measured amplification factor, so the intent is captured; what is
+withheld is the traffic. This is a design decision, not an omission.
+
+**The Docker API engine is identified as `nginx` by `nmap -sV`, not Docker.**
+Every real response carries `Server: Docker/24.0.7 (linux)` and the correct
+`Api-Version` headers, so the campaigns that actually hunt port 2375 — which
+open with `GET /version` or `GET /containers/json` — see a faithful daemon. But
+aiohttp answers *malformed* requests inside `RequestHandler.handle_error`,
+below any middleware, and that response falls back to the process-wide
+`SERVER_SOFTWARE` (see `http_identity.py`), which is `nginx`. aiohttp exposes
+no per-server override, so one process-global has to serve every aiohttp
+listener here. nmap's version probes include malformed requests, so it matches
+nginx first. A real daemon returns no `Server` header at all on a bad request.
+The same limitation applies to the HTTP persona engine's Apache/IIS personas.
+
 ## What is partially functional
 
 **Credential tokens.** The match-and-escalate pipeline (see above) fires when

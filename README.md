@@ -92,6 +92,7 @@ flowchart TD
         E1["SSH · Telnet<br/><i>Cowrie, Docker</i>"]
         E2["HTTP/S · SMB · RDP<br/>FTP · SMTP · DNS · VNC"]
         E3["MySQL · PostgreSQL · MSSQL<br/>MongoDB · Redis · Elasticsearch"]
+        E4["Docker API · LDAP<br/>SNMP · Memcached"]
     end
 
     E --> SUB["submit_event()"]
@@ -134,7 +135,7 @@ Three design decisions worth calling out:
 ## Capabilities
 
 <table>
-<tr><td><b>14 protocols</b></td><td>SSH/Telnet (Cowrie), HTTP/S, SMB, RDP, FTP, SMTP, DNS, VNC, MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch</td></tr>
+<tr><td><b>19 protocols</b></td><td>SSH, Telnet (Cowrie), HTTP/S, SMB, RDP, FTP, SMTP, DNS, VNC, MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch, <b>Docker API</b>, <b>LDAP</b>, <b>SNMP</b>, <b>Memcached</b></td></tr>
 <tr><td><b>Anti-fingerprinting</b></td><td>Per-deploy SSH + HTTP personas (coherent banner/kernel/header bundles), response jitter, per-honeypot self-signed TLS, realistic <code>robots.txt</code>/<code>favicon.ico</code>/<code>security.txt</code></td></tr>
 <tr><td><b>Honeytokens</b></td><td>AWS/Azure/GCP keys, canary URLs, credential pairs, PDF/DOCX trackers, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks</td></tr>
 <tr><td><b>Credential correlation</b></td><td>Planted creds auto-match on any honeypot login and escalate to CRITICAL — including MySQL and VNC, where the plaintext never crosses the wire (the engine recomputes the scramble/DES response)</td></tr>
@@ -298,7 +299,7 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 
 | Tool | Description |
 |---|---|
-| `honeypot_deploy` | Deploy any of the 14 engine types |
+| `honeypot_deploy` | Deploy any of the 19 engine types |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
 | `honeypot_stop` / `honeypot_pause` / `honeypot_resume` | Lifecycle control |
 | `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |

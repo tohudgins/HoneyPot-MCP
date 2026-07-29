@@ -35,12 +35,54 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Impact",
     ),
     (
-        re.compile(r"(destructive|dropdatabase|drop.database|deletemany|wipe)", re.I),
+        re.compile(r"(destructive|dropdatabase|drop.database|deletemany|wipe|flush_all)", re.I),
         "T1485",
         "Data Destruction",
         "Impact",
     ),
+    (
+        # Memcached and SNMP are two of the highest-factor reflectors on the
+        # internet. Measuring one (`stats`, GetBulk) and staging a payload in
+        # it are steps of the same operation, so they share a technique.
+        re.compile(
+            r"(amplification|reflection|memcached_(stats_probe|large_set)|snmp_bulk_request)",
+            re.I,
+        ),
+        "T1498.002",
+        "Network Denial of Service: Reflection Amplification",
+        "Impact",
+    ),
+    (
+        # Cryptomining is the overwhelmingly common outcome of an exposed
+        # container runtime.
+        re.compile(r"(xmrig|minerd|cpuminer|kinsing|kdevtmpfsi|stratum\+tcp|coinhive)", re.I),
+        "T1496",
+        "Resource Hijacking",
+        "Impact",
+    ),
+    (
+        # An SNMP write reconfigures the device rather than reading it.
+        re.compile(r"snmp_set_request", re.I),
+        "T1565",
+        "Data Manipulation",
+        "Impact",
+    ),
     # ── Execution ────────────────────────────────────────────────────────────
+    # ATT&CK's Containers matrix covers an exposed runtime precisely, and using
+    # the generic Execution techniques here would lose that. Ordered before the
+    # generic shell rules so the container-specific finding is the headline.
+    (
+        re.compile(r"docker_api_(container_create|container_start|image_pull)", re.I),
+        "T1610",
+        "Deploy Container",
+        "Execution",
+    ),
+    (
+        re.compile(r"docker_api_exec", re.I),
+        "T1609",
+        "Container Administration Command",
+        "Execution",
+    ),
     (
         re.compile(
             r"(copy.program|from.program|to.program|udf.rce|module.load|"
@@ -56,6 +98,17 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "T1059.004",
         "Command and Scripting Interpreter: Unix Shell",
         "Execution",
+    ),
+    # ── Privilege Escalation ─────────────────────────────────────────────────
+    (
+        # A container-create that binds the host filesystem, runs privileged,
+        # or shares the host PID namespace is a break-out attempt, and ATT&CK
+        # names it. This is the single most consequential thing the Docker API
+        # engine can observe, so it must not fall through to Deploy Container.
+        re.compile(r"(container_escape|escape.to.host|privileged.container|host.namespace)", re.I),
+        "T1611",
+        "Escape to Host",
+        "Privilege Escalation",
     ),
     # ── Persistence ──────────────────────────────────────────────────────────
     (
@@ -101,6 +154,24 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
             r".*(brute|login|auth|fail|session.setup)",
             re.I,
         ),
+        "T1110.001",
+        "Brute Force: Password Guessing",
+        "Credential Access",
+    ),
+    (
+        # An LDAP simple bind carries the DN and password in the clear, so a
+        # failed bind is a password guess like any other. Kept separate from
+        # the rule above because `ldap_search` must NOT be swept in — that is
+        # Discovery, and conflating them hides the enumeration.
+        re.compile(r"ldap_bind_attempt", re.I),
+        "T1110.001",
+        "Brute Force: Password Guessing",
+        "Credential Access",
+    ),
+    (
+        # An SNMP community string is a shared secret; guessing it is the same
+        # activity, and `public`/`private` are the default-credential case.
+        re.compile(r"snmp_(community_attempt|default_community)", re.I),
         "T1110.001",
         "Brute Force: Password Guessing",
         "Credential Access",
@@ -152,7 +223,11 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     ),
     (
         re.compile(
-            r"(exploit|shellshock|heartbleed|log4j|log4shell|jndi:|struts|ognl|spring4shell)",
+            # `jndi` rather than `jndi:` — the HTTP engine sees the payload
+            # string `${jndi:ldap://…}`, but the LDAP engine sees the *second
+            # stage* and names it `ldap_jndi_lookup`, with no colon. Requiring
+            # one left the more serious of the two events unmapped.
+            r"(exploit|shellshock|heartbleed|log4j|log4shell|jndi|struts|ognl|spring4shell)",
             re.I,
         ),
         "T1190",
@@ -173,9 +248,23 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     ),
     # ── Collection ───────────────────────────────────────────────────────────
     (
-        re.compile(r"(elasticsearch.data|_search|_bulk|data.access|dump)", re.I),
+        # The endpoint alternatives are anchored to a leading `/` because they
+        # are URL paths. Bare `_search` / `_bulk` also matched `ldap_search`
+        # and `snmp_bulk_request`, filing an LDAP directory enumeration and an
+        # SNMP amplification probe under Elasticsearch data access — the same
+        # cross-category contamination that once put `smb_exploit_attempt`
+        # under brute force.
+        re.compile(r"(elasticsearch[._]|/_search|/_msearch|/_bulk|data.access|dump)", re.I),
         "T1213",
         "Data from Information Repositories",
+        "Collection",
+    ),
+    (
+        # SNMP GET/GETNEXT walks are the textbook way to pull a device's
+        # running configuration; ATT&CK names this case explicitly.
+        re.compile(r"snmp_(default_community|community_attempt|walk|get)", re.I),
+        "T1602.001",
+        "Data from Configuration Repository: SNMP (MIB Dump)",
         "Collection",
     ),
     (
@@ -225,7 +314,10 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     # generic rule, and `file.download` was removed from it, because all
     # matches are collected and both would otherwise fire.
     (
-        re.compile(r"(ssh|telnet)_file_(download|upload)", re.I),
+        # A JNDI lookup exists to make the victim fetch and load a remote Java
+        # class, so it is an ingress transfer as well as an exploitation
+        # attempt — both matter, and all matches are collected.
+        re.compile(r"((ssh|telnet)_file_(download|upload)|ldap_jndi_lookup)", re.I),
         "T1105",
         "Ingress Tool Transfer",
         "Command and Control",
@@ -239,9 +331,28 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     ),
     # ── Discovery ────────────────────────────────────────────────────────────
     (
-        re.compile(r"(port.scan|nmap|masscan|zmap|smb.negotiate|smb.version)", re.I),
+        re.compile(
+            r"(port.scan|nmap|masscan|zmap|smb.negotiate|smb.version|docker_api_recon)", re.I
+        ),
         "T1046",
         "Network Service Discovery",
+        "Discovery",
+    ),
+    (
+        # ATT&CK's Containers matrix names this exactly — listing containers
+        # and images on a runtime you do not own.
+        re.compile(r"docker_api_(enumerate|list)", re.I),
+        "T1613",
+        "Container and Resource Discovery",
+        "Discovery",
+    ),
+    (
+        # An LDAP search against a directory is account/domain enumeration,
+        # which is more specific — and more useful to an analyst — than
+        # "data from information repositories".
+        re.compile(r"ldap_(search|anonymous_bind)", re.I),
+        "T1087.002",
+        "Account Discovery: Domain Account",
         "Discovery",
     ),
     (

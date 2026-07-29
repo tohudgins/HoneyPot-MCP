@@ -97,6 +97,9 @@ async def _load_index() -> None:
 _SERVICE_PREFIXES = {
     "ssh_": "ssh",
     "telnet_": "telnet",
+    "snmp_": "snmp",
+    "ldap_": "ldap",
+    "memcached_": "memcached",
     "http_": "http",
     "ftp_": "ftp",
     "smtp_": "smtp",

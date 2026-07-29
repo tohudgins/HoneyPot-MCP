@@ -66,6 +66,26 @@ def get_engine(hp_type: HoneypotType) -> HoneypotEngine:
             from honeypot_mcp.engines.mssql import MSSQLEngine
 
             _engines[hp_type] = MSSQLEngine()
+        elif hp_type == HoneypotType.TELNET:
+            from honeypot_mcp.engines.telnet import TelnetEngine
+
+            _engines[hp_type] = TelnetEngine()
+        elif hp_type == HoneypotType.MEMCACHED:
+            from honeypot_mcp.engines.memcached import MemcachedEngine
+
+            _engines[hp_type] = MemcachedEngine()
+        elif hp_type == HoneypotType.SNMP:
+            from honeypot_mcp.engines.snmp import SNMPEngine
+
+            _engines[hp_type] = SNMPEngine()
+        elif hp_type == HoneypotType.LDAP:
+            from honeypot_mcp.engines.ldap import LDAPEngine
+
+            _engines[hp_type] = LDAPEngine()
+        elif hp_type == HoneypotType.DOCKER_API:
+            from honeypot_mcp.engines.docker_api import DockerAPIEngine
+
+            _engines[hp_type] = DockerAPIEngine()
         else:
             raise ValueError(f"No engine registered for type: {hp_type}")
     return _engines[hp_type]

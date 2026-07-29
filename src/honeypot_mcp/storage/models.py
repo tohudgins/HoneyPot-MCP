@@ -29,6 +29,11 @@ class HoneypotType(str, enum.Enum):
     POSTGRESQL = "postgresql"
     MONGODB = "mongodb"
     MSSQL = "mssql"
+    TELNET = "telnet"
+    MEMCACHED = "memcached"
+    SNMP = "snmp"
+    LDAP = "ldap"
+    DOCKER_API = "docker_api"
 
 
 class HoneypotStatus(str, enum.Enum):

@@ -34,6 +34,11 @@ async def honeypot_deploy(
         "postgresql",
         "mongodb",
         "mssql",
+        "telnet",
+        "memcached",
+        "snmp",
+        "ldap",
+        "docker_api",
     ],
     port: int | None = None,
     name: str | None = None,
@@ -42,8 +47,9 @@ async def honeypot_deploy(
     """Deploy a new honeypot container.
 
     Args:
-        type: Protocol type — ssh, http, smtp, ftp, dns, rdp, vnc, redis,
-              mysql, elasticsearch, smb, postgresql, mongodb, or mssql.
+        type: Protocol type — ssh, telnet, http, smtp, ftp, dns, rdp, vnc,
+              redis, mysql, elasticsearch, smb, postgresql, mongodb, mssql,
+              memcached, snmp, ldap, or docker_api.
         port: Host port to bind (defaults to the configured default for each type).
         name: Unique name for this honeypot (auto-generated if omitted).
         config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
@@ -66,6 +72,11 @@ async def honeypot_deploy(
         "postgresql": settings.default_postgresql_port,
         "mongodb": settings.default_mongodb_port,
         "mssql": settings.default_mssql_port,
+        "telnet": settings.default_telnet_port,
+        "memcached": settings.default_memcached_port,
+        "snmp": settings.default_snmp_port,
+        "ldap": settings.default_ldap_port,
+        "docker_api": settings.default_docker_api_port,
     }
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"

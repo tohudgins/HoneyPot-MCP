@@ -20,8 +20,9 @@ from honeypot_mcp.storage.models import AlertSeverity
 log = logging.getLogger(__name__)
 
 COWRIE_IMAGE = "cowrie/cowrie:latest"
-# Port Cowrie listens on inside the container, before any host publishing.
+# Ports Cowrie listens on inside the container, before any host publishing.
 COWRIE_INTERNAL_PORT = 2222
+COWRIE_TELNET_PORT = 2223
 
 # Cowrie JSON log patterns we care about
 _EVENT_MAP = {
@@ -62,6 +63,14 @@ def _retag_for_protocol(event_type: str, protocol: str | None) -> str:
 
 
 class SSHEngine(HoneypotEngine):
+    # Which of Cowrie's two listeners this engine publishes as its primary
+    # service. `TelnetEngine` flips it to 2223 rather than duplicating the
+    # whole container-launch path — one image serves both protocols, and the
+    # only real differences are which port is mapped and whether Cowrie's
+    # telnet listener is switched on.
+    _PRIMARY_CONTAINER_PORT = COWRIE_INTERNAL_PORT
+    _PRIMARY_IS_TELNET = False
+
     def __init__(self) -> None:
         try:
             self._client = docker.from_env()  # type: ignore[attr-defined]
@@ -135,12 +144,17 @@ class SSHEngine(HoneypotEngine):
         # in config exposes Cowrie's Telnet listener too. Telnet on 23 catches
         # the Mirai-class population that ignores SSH entirely — very high
         # volume on a public IP.
-        telnet_enabled = bool(config.get("telnet_enabled")) or "telnet_port" in config
-        telnet_port = int(config.get("telnet_port", 23))
-        port_map: dict[str, int] = {f"{COWRIE_INTERNAL_PORT}/tcp": port}
+        telnet_enabled = (
+            self._PRIMARY_IS_TELNET or bool(config.get("telnet_enabled")) or "telnet_port" in config
+        )
+        port_map: dict[str, int] = {f"{self._PRIMARY_CONTAINER_PORT}/tcp": port}
         if telnet_enabled:
-            port_map["2223/tcp"] = telnet_port
             env["COWRIE_TELNET_ENABLED"] = "yes"
+        # On a Telnet honeypot the primary mapping already is the telnet
+        # listener; only add a second mapping when SSH is primary and telnet
+        # was requested as an extra.
+        if telnet_enabled and not self._PRIMARY_IS_TELNET:
+            port_map[f"{COWRIE_TELNET_PORT}/tcp"] = int(config.get("telnet_port", 23))
 
         loop = asyncio.get_event_loop()
 
@@ -272,7 +286,7 @@ class SSHEngine(HoneypotEngine):
         tcp = await tcp_probe(port)
         if not tcp["alive"]:
             for ip in state["container_ips"]:
-                tcp = await tcp_probe(COWRIE_INTERNAL_PORT, host=ip)
+                tcp = await tcp_probe(self._PRIMARY_CONTAINER_PORT, host=ip)
                 if tcp["alive"]:
                     break
 

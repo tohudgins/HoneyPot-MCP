@@ -316,6 +316,52 @@ password is captured it ACCEPTS the login (AuthenticationOk + ParameterStatus +
 ReadyForQuery) and classifies simple-query traffic — `COPY … FROM/TO PROGRAM`
 (CRITICAL RCE), UDF loads, `pg_read_file`/`lo_export` (HIGH), recon (MEDIUM).
 
+### Telnet / Memcached / SNMP / LDAP / Docker API engines
+
+Five additions aimed at surfaces the original catalogue missed entirely.
+
+- `engines/telnet.py` — a ~10-line subclass of `SSHEngine`. One Cowrie
+  container serves SSH on 2222 and Telnet on 2223; `_PRIMARY_CONTAINER_PORT`
+  and `_PRIMARY_IS_TELNET` decide which one gets published and whether Cowrie's
+  telnet listener is switched on. Telnet was previously reachable only as
+  `config={"telnet_enabled": True}` on an SSH honeypot, so `honeypot_deploy(
+  type="telnet")` failed and captures were filed under type `ssh` — for an
+  NL-driven system, a capability that cannot be asked for barely exists.
+  Retagging to `telnet_*` happens in `ssh.py:_retag_for_protocol`.
+- `engines/memcached.py` — tcp/11211 text protocol. The point is not cache
+  data, it is amplification: `stats` measures the reflector, a large `set`
+  stages a payload, and a `get` of that key reflects it. The stage-then-fetch
+  *sequence* is what raises `memcached_amplification_attempt` (CRITICAL) with a
+  measured amplification factor; either half alone is ordinary traffic.
+- `engines/snmp.py` — udp/161, BER by hand. v1/v2c put the community string in
+  the clear, so every request is a credential capture (`service: "snmp"`, so
+  planted community strings cross-reference). Only `public`/`private` are
+  answered — a real agent is silent on a wrong community, and answering
+  everything would fingerprint the sensor in one packet.
+- `engines/ldap.py` — tcp/389, BER by hand. Two populations: simple binds carry
+  the DN and password in the clear (invalidCredentials keeps brute-forcers
+  cycling), and Log4Shell's second stage arrives here as a searchRequest.
+  `looks_like_jndi()` separates the two — a JNDI base object is an opaque token
+  from the payload URL with no `dc=`/`cn=`/`ou=` components, or it asks for
+  `javaClassName`/`javaCodeBase`.
+- `engines/docker_api.py` — tcp/2375, aiohttp. An unauthenticated daemon is
+  host compromise, not a foothold. `analyse_container_create()` inspects the
+  create body and returns *named* reasons (host root bind, privileged, host PID
+  namespace, dangerous caps, miner image, payload command); any hit makes it
+  `docker_api_container_escape` (CRITICAL) rather than
+  `docker_api_container_create` (HIGH). "Someone POSTed to /containers/create"
+  is not actionable; "mounts host / at /mnt and runs chroot" is.
+
+**Neither memcached nor SNMP ever amplifies.** Both are reflection vectors with
+trivially spoofed sources, so a faithful large reply would enlist the honeypot
+in someone else's DDoS. Both record the reconnaissance and answer minimally.
+
+Adding a type touches five places: `HoneypotType` in `storage/models.py`, the
+default port in `config.py`, the `Literal` and `default_ports` dict in
+`tools/honeypot.py`, `engines/__init__.py:get_engine()`, and an Alembic
+migration (`Enum(...)` is a native PostgreSQL type — `ALTER TYPE … ADD VALUE`,
+one statement per value; see `0012_add_five_types`).
+
 ### HTTP realistic endpoints + sessions
 
 `engines/http_endpoints.py` serves `/robots.txt`, `/favicon.ico`,

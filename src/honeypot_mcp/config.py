@@ -119,6 +119,15 @@ class Settings(BaseSettings):
     default_postgresql_port: int = 5432
     default_mongodb_port: int = 27017
     default_mssql_port: int = 1433
+    # Telnet, SNMP and LDAP live on privileged ports in the wild (23/161/389).
+    # These follow the same convention as ssh/ftp/smtp/dns above and default to
+    # an unprivileged equivalent, so the server never needs root; publish the
+    # real port with a container mapping or a firewall redirect.
+    default_telnet_port: int = 2323
+    default_snmp_port: int = 1161
+    default_ldap_port: int = 1389
+    default_memcached_port: int = 11211
+    default_docker_api_port: int = 2375
 
     # MITRE ATT&CK data path
     mitre_data_path: Path = _PROJECT_ROOT / "config" / "mitre_attack.json"
