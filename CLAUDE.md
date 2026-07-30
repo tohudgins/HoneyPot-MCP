@@ -73,6 +73,7 @@ Current tool modules:
 - `tools/blocklist_push.py` — push blocked IPs to Cloudflare / AWS WAF / pfSense
 - `tools/deception.py` — the intent-level tools: `deception_plan`,
   `deception_deploy_plan`, `deception_coverage`, `soc_brief`, `deception_profiles`
+- `tools/pcap.py` — `pcap_status`, `pcap_extract`, `pcap_files`, `pcap_control`
 
 The `@mcp.tool` decorator returns the original function unchanged, so tools are directly callable in tests (no `.fn` accessor needed).
 
@@ -359,7 +360,8 @@ Five additions aimed at surfaces the original catalogue missed entirely.
 trivially spoofed sources, so a faithful large reply would enlist the honeypot
 in someone else's DDoS. Both record the reconnaissance and answer minimally.
 
-Adding a type touches five places: `HoneypotType` in `storage/models.py`, the
+Adding a type touches six places (`transport` on the capability entry is the
+sixth if it isn't TCP — the pcap filter derives from it): `HoneypotType` in `storage/models.py`, the
 default port in `config.py`, the `Literal` and `default_ports` dict in
 `tools/honeypot.py`, `engines/__init__.py:get_engine()`, and an Alembic
 migration (`Enum(...)` is a native PostgreSQL type — `ALTER TYPE … ADD VALUE`,
@@ -487,6 +489,83 @@ Note the split that makes this safe to reason about: renderers operate on
 aware. The naive-datetime problem was confined to values read back from the
 database (see `UTCDateTime`), so webhook `rt=`/`time`/`@timestamp` were never
 affected.
+
+### Human notification channels
+
+`slack`, `teams` and `email` are subscription formats like the SIEM ones, but the
+failure mode is different and drives every design choice. A SIEM that receives a
+slightly-wrong document still stores it and an analyst finds it later; a
+notification that is malformed, or that arrives four thousand times, is simply not
+read — and the operator believes they have alerting either way.
+
+- **Slack** sets `text` as well as `blocks`. Slack uses `text` for the mobile push
+  and tab preview, so a blocks-only message arrives on a phone as "This content
+  can't be displayed" — useless for the case notification exists to serve. Sections
+  are capped at 8 of 10 allowed fields; Slack rejects the *whole message* above 10.
+- **Teams** emits a MessageCard, not an Adaptive Card. Adaptive Cards over an
+  incoming webhook need the Power Automate Workflows connector, while MessageCard
+  renders on both that and the classic O365 connector — and the operator only pastes
+  a URL, so we cannot tell which they have. `summary` is mandatory (Teams 400s
+  without it, an easy way to ship a notifier that never posts). `themeColor` is a
+  bare hex triplet; a leading `#` silently renders grey.
+- **Email** goes over SMTP via `asyncio.to_thread` (smtplib blocks, and blocking the
+  delivery worker stalls every other subscription). The URL carries everything:
+  `smtp://user:pw@host:587/?from=…&to=a@x,b@y&tls=starttls|implicit|none`.
+  `smtps://` defaults to 465, `smtp://` to 587. Body is **plain text on purpose** —
+  the content is attacker-controlled and HTML would be an injection surface for no
+  benefit. `_parse_smtp_url` is called at *subscribe* time too, so a typo fails
+  immediately rather than at first delivery.
+
+**`_NotifyThrottle` is what makes these usable.** One scanner produces thousands of
+events an hour; relaying them one-to-one gets the channel muted, leaving an
+integration strictly worse than none because everyone believes they are covered. A
+given `(subscription, event_type, source_ip)` fires at most once per
+`notify_throttle_seconds`, and the suppressed count rides on the next message that
+does go out — throttling must never hide volume, only stop volume being the delivery
+mechanism. **CRITICAL is exempt**: it is rare by construction (honeytoken trip,
+container escape, ransom note) and is exactly what someone must see immediately.
+Throttled events return `(True, None)` from dispatch, not an error — the event is
+stored and queryable, we simply declined to interrupt a human twice.
+
+### Packet capture
+
+`pcap.py` runs one `tcpdump` ring buffer over the deployed honeypot ports. It exists
+because per-event payloads record what the engines *understood*, and three jobs need
+the wire bytes: carving a dropper's second stage, replaying through Suricata/Zeek,
+and producing an artefact rather than an assertion by our own code.
+
+Shelling out to tcpdump rather than sniffing in-process is deliberate — raw sockets
+need the same privileges either way, and BPF filtering, rotation and file format are
+all things a hand-rolled sniffer reimplements worse.
+
+- **`probe_capability()` reports why capture is off**, as a value, not an exception.
+  "Packet capture is silently not running" is the state an operator must never be
+  in: they discover it when they go looking for evidence, which is always after the
+  incident. The check runs `tcpdump -L` — the cheapest operation that actually
+  exercises the permission — and the message names the fix (`setcap
+  cap_net_raw,cap_net_admin=eip`).
+- **Disk is the hazard, so the ring is bounded by construction.** `pcap_file_mb ×
+  pcap_files` is a ceiling tcpdump enforces itself. A full disk stops the database,
+  which ends collection entirely — much worse than having no pcap.
+- **The filter comes from the deployed port set**, via `capabilities.transport_for`
+  rather than a private list of "the UDP ones" (that duplication is what drifted
+  twice already). `honeypot_deploy`/`honeypot_stop` call `refresh_capture()`, which
+  is a silent no-op when disabled. An empty port set never becomes a
+  capture-everything filter — that would record the operator's own SSH session.
+- **`pcap_extract(source_ip)` is the point.** A 1 GB ring is not an answer to "what
+  did this IP send". Filtering runs through tcpdump's own BPF because link framing
+  varies by interface (`any` yields Linux SLL, not Ethernet) and hand-parsing it
+  wrong would silently return zero packets. Merging is hand-written rather than
+  `mergecap`, which ships with Wireshark and is far less likely to be installed;
+  safe because every ring file shares a link type. A merge with no input writes a
+  valid empty pcap — a 0-byte file reads as *corrupt* in Wireshark, which looks like
+  a bug rather than an honest "no matching packets". A truncated trailing record is
+  kept-up-to, since tcpdump may be mid-write on the live file and those are the most
+  recent packets.
+
+Capture needs `NET_ADMIN`+`NET_RAW` and host networking in Docker; `-U`
+(packet-buffered) is set so an extract run moments after an attack does not miss the
+packets being asked about.
 
 ### Watchdog
 

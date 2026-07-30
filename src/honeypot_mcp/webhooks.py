@@ -54,6 +54,7 @@ import httpx
 from sqlalchemy import select, update
 
 from honeypot_mcp import __version__
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent
 from honeypot_mcp.storage.models import AlertSeverity, Subscription
@@ -571,6 +572,264 @@ def render_syslog(event: PendingEvent, sub: Subscription) -> bytes:
     return line.encode("utf-8")
 
 
+# Channels that interrupt a person rather than filling an index. Only these
+# are throttled — a SIEM wants every event, and silently dropping one would
+# corrupt the record it exists to keep.
+_HUMAN_CHANNELS = frozenset({"slack", "teams", "email"})
+
+
+class _NotifyThrottle:
+    """Per-subscription coalescing for human-facing channels.
+
+    A single scanner produces thousands of events an hour. Relaying those
+    one-to-one into a Slack channel makes it unreadable within a minute, and
+    the predictable human response is to mute the channel — at which point the
+    honeypot has an alerting integration that is strictly worse than none,
+    because everyone believes they are covered.
+
+    So a given (subscription, event_type, source_ip) fires at most once per
+    window. The suppressed count rides along on the next message that does go
+    out, so volume is still visible; it just is not the delivery mechanism.
+
+    CRITICAL is deliberately exempt. It is rare by construction — a triggered
+    honeytoken, a container escape, a ransom note — and those are precisely
+    the events someone must see immediately even if the same IP already fired
+    something a minute ago.
+    """
+
+    def __init__(self, window_seconds: float = 300.0, max_keys: int = 4096) -> None:
+        self._window = window_seconds
+        self._max_keys = max_keys
+        self._last_sent: dict[tuple[int, str, str], float] = {}
+        self._suppressed: dict[tuple[int, str, str], int] = {}
+
+    def check(self, sub_id: int, event: PendingEvent) -> tuple[bool, int]:
+        """Returns (should_send, suppressed_since_last_send)."""
+        if event.severity is AlertSeverity.CRITICAL:
+            return True, 0
+        key = (sub_id, event.event_type, event.source_ip or "")
+        now = time.monotonic()
+        last = self._last_sent.get(key)
+        if last is not None and now - last < self._window:
+            self._suppressed[key] = self._suppressed.get(key, 0) + 1
+            return False, 0
+        # Unbounded growth would be a slow leak on a host seeing a wide IP
+        # spread, so drop the oldest entries once the map gets large.
+        if len(self._last_sent) >= self._max_keys:
+            oldest = sorted(self._last_sent, key=lambda k: self._last_sent[k])[
+                : self._max_keys // 4
+            ]
+            for stale in oldest:
+                self._last_sent.pop(stale, None)
+                self._suppressed.pop(stale, None)
+        self._last_sent[key] = now
+        return True, self._suppressed.pop(key, 0)
+
+
+# ── Human notification channels ─────────────────────────────────────────────
+#
+# Distinct from the SIEM formats above, and the difference drives every design
+# choice here. A SIEM ingests everything and lets an analyst query later; a chat
+# channel or inbox interrupts a person. So these renderers optimise for
+# *decidability at a glance* — can the reader tell in two seconds whether to get
+# up? — and the delivery path throttles them (see `_NotifyThrottle`), because a
+# notifier that fires four thousand times is worse than no notifier at all.
+
+# Chat accent colours. Deliberately the same four the console reserves for
+# status, so a CRITICAL looks like a CRITICAL wherever someone sees it.
+_NOTIFY_COLOUR = {
+    AlertSeverity.CRITICAL: "#d03b3b",
+    AlertSeverity.HIGH: "#ec835a",
+    AlertSeverity.MEDIUM: "#fab219",
+    AlertSeverity.LOW: "#0ca30c",
+}
+_NOTIFY_EMOJI = {
+    AlertSeverity.CRITICAL: "🚨",
+    AlertSeverity.HIGH: "⚠️",
+    AlertSeverity.MEDIUM: "🔸",
+    AlertSeverity.LOW: "ℹ️",
+}
+# Payload keys worth putting in front of a human, in the order they answer
+# "what happened and how bad is it". Everything else stays in the platform —
+# a notification is a pointer, not a record.
+_NOTIFY_FIELDS = (
+    ("username", "Username"),
+    ("password", "Password"),
+    ("command", "Command"),
+    ("path", "Path"),
+    ("method", "Method"),
+    ("exploit_categories", "Exploit"),
+    ("reasons", "Indicators"),
+    ("country", "Country"),
+    ("asn_org", "Network"),
+    ("abuse_score", "AbuseIPDB"),
+    ("vt_malicious", "VirusTotal"),
+    ("user_agent", "User-Agent"),
+)
+
+
+def _notify_facts(event: PendingEvent) -> list[tuple[str, str]]:
+    """The handful of payload fields a human should see, clipped for chat."""
+    payload = event.payload or {}
+    facts: list[tuple[str, str]] = []
+    for key, label in _NOTIFY_FIELDS:
+        value = payload.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        text = str(value)
+        facts.append((label, text[:180] + ("…" if len(text) > 180 else "")))
+    return facts
+
+
+def _notify_title(event: PendingEvent) -> str:
+    return f"{event.severity.value.upper()} · {_humanize_event_type(event.event_type)}"
+
+
+def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Slack incoming webhook, Block Kit.
+
+    `text` is set as well as `blocks` because Slack uses it for the mobile
+    push notification and the browser-tab preview; a blocks-only message
+    arrives on a phone as "This content can't be displayed", which defeats the
+    purpose of alerting someone who is away from their desk.
+    """
+    facts = _notify_facts(event)
+    fallback = f"{_NOTIFY_EMOJI[event.severity]} {_notify_title(event)} from {event.source_ip}"
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"{_NOTIFY_EMOJI[event.severity]} {_notify_title(event)}",
+                "emoji": True,
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Source IP*\n`{event.source_ip}`"},
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Time*\n{event.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                },
+            ],
+        },
+    ]
+    if facts:
+        # Slack caps a section at 10 fields and silently rejects the whole
+        # message above that, so the slice is load-bearing, not cosmetic.
+        blocks.append(
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*{label}*\n`{value}`"}
+                    for label, value in facts[:8]
+                ],
+            }
+        )
+    if event.honeytoken_id is not None:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"🍯 *Honeytoken {event.honeytoken_id} triggered* — "
+                            "a planted credential was used. This is the highest-fidelity "
+                            "signal the platform produces."
+                        ),
+                    }
+                ],
+            }
+        )
+
+    payload = {
+        "text": fallback,
+        "attachments": [{"color": _NOTIFY_COLOUR[event.severity], "blocks": blocks}],
+    }
+    body = json.dumps(payload, default=str).encode("utf-8")
+    return body, {"Content-Type": "application/json", "User-Agent": "HoneyPot-MCP/1.0"}
+
+
+def render_teams(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+    """Microsoft Teams incoming webhook.
+
+    Emits a MessageCard rather than an Adaptive Card. Adaptive Cards are the
+    newer format, but over an *incoming webhook* they require the Power
+    Automate "Workflows" connector, whereas MessageCard works on both the
+    classic Office 365 connector and the Workflows compatibility path. Since
+    the operator only pastes a URL and cannot tell us which they created,
+    MessageCard is the one that renders in both places.
+
+    `summary` is mandatory — Teams rejects a card without it (HTTP 400,
+    "Summary or Text is required"), which is an easy way to ship a notifier
+    that silently never posts.
+    """
+    facts = [{"name": label, "value": value} for label, value in _notify_facts(event)]
+    facts.insert(0, {"name": "Source IP", "value": event.source_ip})
+    facts.insert(1, {"name": "Time", "value": f"{event.timestamp.isoformat()}"})
+    if event.honeytoken_id is not None:
+        facts.append({"name": "Honeytoken", "value": f"#{event.honeytoken_id} triggered"})
+
+    card = {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": _notify_title(event),
+        "themeColor": _NOTIFY_COLOUR[event.severity].lstrip("#"),
+        "title": f"{_NOTIFY_EMOJI[event.severity]} {_notify_title(event)}",
+        "sections": [
+            {
+                "activityTitle": f"Attacker `{event.source_ip}`",
+                "activitySubtitle": f"honeypot #{event.honeypot_id}",
+                "facts": facts,
+                "markdown": True,
+            }
+        ],
+    }
+    body = json.dumps(card, default=str).encode("utf-8")
+    return body, {"Content-Type": "application/json", "User-Agent": "HoneyPot-MCP/1.0"}
+
+
+def render_email(event: PendingEvent, sub: Subscription) -> tuple[str, str]:
+    """(subject, body) for an SMTP notification.
+
+    Plain text on purpose. These land in mail clients, ticketing systems and
+    phone lock screens with wildly different HTML support, and the content is
+    attacker-controlled — rendering it as HTML would be an injection surface
+    for no benefit a honeypot alert actually needs.
+    """
+    subject = f"[HoneyPot {event.severity.value.upper()}] {_humanize_event_type(event.event_type)} from {event.source_ip}"
+    lines = [
+        _notify_title(event),
+        "",
+        f"Source IP   : {event.source_ip}"
+        + (f":{event.source_port}" if event.source_port is not None else ""),
+        f"Event type  : {event.event_type}",
+        f"Severity    : {event.severity.value}",
+        f"Time (UTC)  : {event.timestamp.isoformat()}",
+        f"Honeypot ID : {event.honeypot_id}",
+    ]
+    if event.honeytoken_id is not None:
+        lines += [
+            f"Honeytoken  : #{event.honeytoken_id} TRIGGERED — a planted credential was used.",
+        ]
+    facts = _notify_facts(event)
+    if facts:
+        lines += ["", "Captured details:"]
+        lines += [f"  {label:<12}: {value}" for label, value in facts]
+    lines += [
+        "",
+        "--",
+        "HoneyPot MCP. Use `alerts_get` for the full payload and "
+        "`analyze_attacker` to profile this source.",
+    ]
+    return subject, "\n".join(lines)
+
+
 # ── Transports ──────────────────────────────────────────────────────────────
 
 
@@ -592,6 +851,94 @@ async def _post_with_retry(
         if attempt < len(_RETRY_DELAYS) - 1:
             await asyncio.sleep(delay)
     return False, last_err
+
+
+def _parse_smtp_url(url: str) -> dict[str, Any]:
+    """`smtp://user:pass@host:587/?from=a@b&to=c@d,e@f&tls=starttls` → kwargs.
+
+    Everything rides in the URL because `Subscription` has exactly one string
+    field for a destination, and adding columns for one channel would make the
+    schema lopsided. Recipients are comma-separated in the `to` query param.
+
+    Raises ValueError with a message an operator can act on — a mistyped
+    notification target that fails silently is the reason nobody trusts alerts.
+    """
+    from urllib.parse import parse_qs
+
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("smtp", "smtps"):
+        raise ValueError(f"email URL must use smtp:// or smtps:// (got {scheme or 'none'!r})")
+    if not parsed.hostname:
+        raise ValueError("email URL is missing a host")
+
+    query = parse_qs(parsed.query)
+    recipients = [addr.strip() for addr in ",".join(query.get("to", [])).split(",") if addr.strip()]
+    if not recipients:
+        raise ValueError("email URL needs at least one recipient: ...?to=soc@example.com")
+    sender = (query.get("from") or [""])[0].strip() or (parsed.username or "honeypot-mcp")
+    if "@" not in sender:
+        sender = f"{sender}@{parsed.hostname}"
+
+    # smtps:// means implicit TLS on connect (usually 465); smtp:// upgrades
+    # with STARTTLS unless explicitly disabled for a local relay that has none.
+    mode = (query.get("tls") or ["starttls" if scheme == "smtp" else "implicit"])[0].lower()
+    default_port = 465 if mode == "implicit" else 587
+    return {
+        "host": parsed.hostname,
+        "port": parsed.port or default_port,
+        "username": parsed.username,
+        "password": parsed.password,
+        "sender": sender,
+        "recipients": recipients,
+        "tls": mode,
+    }
+
+
+def _send_email_blocking(cfg: dict[str, Any], subject: str, body: str) -> None:
+    """Synchronous SMTP send. Run via `asyncio.to_thread` — `smtplib` blocks,
+    and blocking the delivery worker stalls every other subscription."""
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = cfg["sender"]
+    message["To"] = ", ".join(cfg["recipients"])
+    # Lets a mail client thread a repeat offender's alerts together instead of
+    # scattering them, without us inventing Message-IDs.
+    message["X-HoneyPot-MCP"] = __version__
+    message.set_content(body)
+
+    context = ssl.create_default_context()
+    if cfg["tls"] == "implicit":
+        server: smtplib.SMTP = smtplib.SMTP_SSL(
+            cfg["host"], cfg["port"], timeout=15, context=context
+        )
+    else:
+        server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=15)
+    try:
+        if cfg["tls"] == "starttls":
+            server.starttls(context=context)
+        if cfg["username"]:
+            server.login(cfg["username"], cfg["password"] or "")
+        server.send_message(message)
+    finally:
+        with contextlib.suppress(Exception):
+            server.quit()
+
+
+async def _send_email(sub: Subscription, subject: str, body: str) -> tuple[bool, str | None]:
+    try:
+        cfg = _parse_smtp_url(sub.url)
+    except ValueError as e:
+        return False, str(e)[:200]
+    try:
+        await asyncio.to_thread(_send_email_blocking, cfg, subject, body)
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"[:200]
 
 
 class _SyslogUDPProtocol(asyncio.DatagramProtocol):
@@ -675,6 +1022,9 @@ class WebhookDelivery:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._client: httpx.AsyncClient | None = None
+        self._throttle = _NotifyThrottle(
+            window_seconds=get_settings().notify_throttle_seconds,
+        )
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -735,6 +1085,16 @@ class WebhookDelivery:
         if fmt == "syslog":
             return await self._dispatch_syslog(event, sub)
 
+        if fmt in _HUMAN_CHANNELS:
+            send, suppressed = self._throttle.check(sub.id, event)
+            if not send:
+                # Not a failure: the event is stored, indexed and queryable —
+                # we simply declined to interrupt a human twice for the same
+                # thing. Recording it as an error would make a healthy
+                # subscription look broken.
+                return True, None
+            return await self._dispatch_human(event, sub, fmt, suppressed)
+
         # HTTP-shaped formats
         if fmt == "json":
             body, headers = render_json(event, sub)
@@ -754,6 +1114,43 @@ class WebhookDelivery:
         if self._client is None:
             return False, "delivery client not started"
         return await _post_with_retry(self._client, sub.url, body, headers)
+
+    async def _dispatch_human(
+        self, event: PendingEvent, sub: Subscription, fmt: str, suppressed: int
+    ) -> tuple[bool, str | None]:
+        """Slack / Teams / email. Carries the suppressed-since-last count so
+        throttling never hides volume, it only stops volume being the delivery
+        mechanism."""
+        note = (
+            f"+{suppressed} similar event(s) suppressed since the last notification"
+            if suppressed
+            else ""
+        )
+
+        if fmt == "email":
+            subject, body = render_email(event, sub)
+            if note:
+                body = f"{body}\n\n({note}.)"
+            return await _send_email(sub, subject, body)
+
+        if fmt == "slack":
+            payload_bytes, headers = render_slack(event, sub)
+            if note:
+                doc = json.loads(payload_bytes)
+                doc["attachments"][0]["blocks"].append(
+                    {"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}
+                )
+                payload_bytes = json.dumps(doc).encode("utf-8")
+        else:  # teams
+            payload_bytes, headers = render_teams(event, sub)
+            if note:
+                doc = json.loads(payload_bytes)
+                doc["sections"][0]["facts"].append({"name": "Suppressed", "value": note})
+                payload_bytes = json.dumps(doc).encode("utf-8")
+
+        if self._client is None:
+            return False, "delivery client not started"
+        return await _post_with_retry(self._client, sub.url, payload_bytes, headers)
 
     async def _dispatch_syslog(
         self, event: PendingEvent, sub: Subscription

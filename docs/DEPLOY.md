@@ -31,8 +31,18 @@ anticipate. Concrete rules:
 - **Move the real admin SSH port off 22** before you start the honeypot.
   If you forget this step you're locking yourself out the moment the
   honeypot starts.
-- **Set up alerts before traffic arrives**, not after. Webhook a Slack or
-  Discord channel so you see CRITICAL events the moment they fire.
+- **Set up alerts before traffic arrives**, not after. Slack, Teams and email
+  are first-class formats — `alert_subscribe(url=..., format="slack",
+  severity_threshold="high")`. Use `high` or `critical`; at `medium` a single
+  scanner will bury the channel. (Repeats are coalesced automatically per
+  `NOTIFY_THROTTLE_SECONDS`, and CRITICAL is never held back.)
+- **Decide about packet capture before you need it.** `PCAP_ENABLED=true` plus
+  `sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)` gives you full
+  pcap for malware carving, Suricata/Zeek replay and evidence. It only records
+  from the moment you turn it on, so switching it on after an interesting
+  attack is too late. Check `PCAP_FILE_MB × PCAP_FILES` (default 1 GB) against
+  free disk — a full disk stops the database and ends collection entirely.
+  Capture is scoped to honeypot ports, so your own admin SSH is never recorded.
 
 ---
 

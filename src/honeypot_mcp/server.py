@@ -63,12 +63,26 @@ async def lifespan(app: FastMCP):
         await adopt_labelled_containers()
     except Exception:
         log.exception("Startup reconciliation failed — continuing anyway.")
+    # After reconciliation, so the filter is built from the honeypots that are
+    # actually up. No-op unless PCAP_ENABLED — it needs elevated privileges and
+    # writes continuously, so it is never on by accident.
+    if settings.pcap_enabled:
+        from honeypot_mcp.pcap import start_capture_for_running_honeypots
+
+        result = await start_capture_for_running_honeypots()
+        if not result.get("started"):
+            log.warning("Packet capture not started: %s", result.get("reason"))
+
     await watchdog.start()
     try:
         yield
     finally:
         log.info("HoneyPot MCP shutting down…")
         await watchdog.stop()
+        if settings.pcap_enabled:
+            from honeypot_mcp.pcap import get_capture
+
+            await get_capture().stop()
         if canary_runner is not None:
             await canary_runner.cleanup()
         if metrics_runner is not None:
@@ -120,6 +134,7 @@ import honeypot_mcp.tools.deception  # noqa: E402, F401
 import honeypot_mcp.tools.honeypot  # noqa: E402, F401
 import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
 import honeypot_mcp.tools.integrations  # noqa: E402, F401
+import honeypot_mcp.tools.pcap  # noqa: E402, F401
 
 # ── Built-in diagnostic tools ─────────────────────────────────────────────────
 

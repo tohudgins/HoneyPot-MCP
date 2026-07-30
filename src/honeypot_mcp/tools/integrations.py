@@ -32,7 +32,16 @@ async def alert_subscribe(
     severity_threshold: Literal["low", "medium", "high", "critical"] = "medium",
     hmac_secret: str | None = None,
     format: Literal[
-        "json", "splunk_hec", "elastic_ecs", "cef", "syslog", "loki", "datadog"
+        "json",
+        "splunk_hec",
+        "elastic_ecs",
+        "cef",
+        "syslog",
+        "loki",
+        "datadog",
+        "slack",
+        "teams",
+        "email",
     ] = "json",
 ) -> dict[str, Any]:
     """Register a URL to receive real-time alert deliveries in a SIEM-native format.
@@ -61,8 +70,29 @@ async def alert_subscribe(
       regional equivalent). Pass your DD API key via `hmac_secret` — it's
       sent as `DD-API-KEY: <key>`.
 
+    Human-facing channels, which notify a person rather than fill an index:
+
+    * `slack` — Slack incoming webhook (`https://hooks.slack.com/services/...`).
+      Formatted Block Kit message: severity-coloured, source IP and captured
+      credentials/command/path up front, honeytoken trips called out.
+    * `teams` — Microsoft Teams incoming webhook. MessageCard, which renders
+      on both the classic Office 365 connector and the newer Workflows path.
+    * `email` — SMTP. The URL carries everything:
+      `smtp://user:pass@smtp.example.com:587/?from=honeypot@example.com&to=soc@example.com`
+      Comma-separate multiple recipients. `smtps://` for implicit TLS (465);
+      `smtp://` upgrades via STARTTLS unless you add `&tls=none` for a local
+      relay that has none.
+
+    These three are **coalesced**: the same (event_type, source_ip) notifies at
+    most once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed
+    count carried on the next message. CRITICAL always goes through. One
+    scanner produces thousands of events an hour, and a channel that relays
+    them one-to-one gets muted — which is worse than no integration, because
+    everyone then believes they are covered. Set `severity_threshold="high"`
+    or `"critical"` for these unless you want a busy channel.
+
     Args:
-        url: Webhook URL (or `udp://` / `tcp://` for syslog).
+        url: Webhook URL (`udp://`/`tcp://` for syslog, `smtp://` for email).
         label: Human-readable label (e.g. 'splunk-prod', 'qradar-cef').
         severity_threshold: Minimum severity to deliver — events below are skipped.
         hmac_secret: Auth secret. JSON: HMAC key. Splunk HEC: HEC token.
@@ -76,7 +106,12 @@ async def alert_subscribe(
     parsed = urlparse(url)
     if not parsed.hostname:
         return {"error": f"URL {url!r} has no host."}
-    allowed_schemes = {"udp", "tcp"} if format == "syslog" else {"http", "https"}
+    if format == "syslog":
+        allowed_schemes = {"udp", "tcp"}
+    elif format == "email":
+        allowed_schemes = {"smtp", "smtps"}
+    else:
+        allowed_schemes = {"http", "https"}
     if parsed.scheme.lower() not in allowed_schemes:
         return {
             "error": (
@@ -84,6 +119,16 @@ async def alert_subscribe(
                 f"got {parsed.scheme!r}."
             )
         }
+    if format == "email":
+        # Parse now rather than at first delivery. An address typo that only
+        # surfaces as a silently failing subscription is exactly how people end
+        # up believing they have alerting when they do not.
+        from honeypot_mcp.webhooks import _parse_smtp_url
+
+        try:
+            _parse_smtp_url(url)
+        except ValueError as e:
+            return {"error": str(e)}
 
     if hmac_secret == "":
         hmac_secret = secrets.token_urlsafe(32)

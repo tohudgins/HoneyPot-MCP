@@ -165,6 +165,12 @@ async def honeypot_deploy(
         arguments={"type": type, "port": resolved_port, "name": resolved_name},
         target=resolved_name,
     )
+    # The packet-capture filter is built from the deployed port set, so a new
+    # sensor is invisible to it until the filter is rebuilt. Silent no-op when
+    # capture is disabled, which is the default.
+    from honeypot_mcp.pcap import refresh_capture
+
+    await refresh_capture()
     return {
         "id": hp_id,
         "name": resolved_name,
@@ -342,6 +348,11 @@ async def honeypot_stop(
         outcome="error" if failed else "success",
         error="; ".join(f["error"] for f in failed) if failed else None,
     )
+    # Narrow the capture filter to what is still running — otherwise it keeps
+    # recording a port nothing listens on, which is pure disk cost.
+    from honeypot_mcp.pcap import refresh_capture
+
+    await refresh_capture()
     return {
         "action": "removed" if remove else "stopped",
         "stopped": stopped,

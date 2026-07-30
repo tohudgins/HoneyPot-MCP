@@ -163,6 +163,34 @@ class Settings(BaseSettings):
     # remote database, where the same backlog takes proportionally longer.
     shutdown_drain_seconds: float = 5.0
 
+    # Coalescing window for human-facing notification channels (Slack, Teams,
+    # email). The same (event_type, source_ip) notifies at most once per
+    # window; the suppressed count rides on the next message that goes out, so
+    # volume stays visible without being the delivery mechanism. CRITICAL is
+    # always exempt.
+    #
+    # This is not a nicety. One scanner produces thousands of events an hour,
+    # and a channel that relays them one-to-one gets muted within a minute —
+    # leaving an alerting integration that is worse than none, because
+    # everyone believes they are covered. 0 disables coalescing.
+    notify_throttle_seconds: float = 300.0
+
+    # ── Packet capture ──────────────────────────────────────────────────────
+    # Off by default: it needs elevated privileges, and on a public IP it
+    # writes continuously. Enable deliberately.
+    pcap_enabled: bool = False
+    # Interface to capture on. "any" works on Linux; a VPS is usually eth0.
+    pcap_interface: str = "any"
+    # Ring buffer. tcpdump rotates at `pcap_file_mb` and keeps `pcap_files`
+    # of them, so the ceiling is the product — bounded by construction, which
+    # matters because a filled disk stops the database and ends collection.
+    pcap_file_mb: int = 100
+    pcap_files: int = 10
+    # Bytes per packet. 0 = whole packet, which is what you want for malware
+    # carving and Suricata replay; lower it to headers-only if disk is tight.
+    pcap_snaplen: int = 0
+    pcap_dir: Path = _PROJECT_ROOT / "pcap"
+
     # Live operations console — a read-only wall display served by the server
     # itself (see console/). Bound to localhost by default: it exposes every
     # captured attack, so putting it on 0.0.0.0 is an explicit choice.

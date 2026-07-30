@@ -116,6 +116,14 @@ services:
       # into ./geoip. Must be set explicitly: inside the container the code's
       # default path resolves relative to the installed package, not /app.
       GEOIP_ASN_DB_PATH: /app/geoip/GeoLite2-ASN.mmdb
+      # Packet capture. Off here on purpose: inside this compose network the
+      # container sees only bridge traffic, so a capture would record the
+      # NAT'd view rather than the attacker's real source addresses. To use it,
+      # run the server on the host (deploy/honeypot-mcp.service) where the
+      # interface is the real one — or add `network_mode: host` plus
+      # `cap_add: [NET_ADMIN, NET_RAW]` to this service and set PCAP_ENABLED
+      # here. tcpdump is already in the image.
+      PCAP_ENABLED: "${PCAP_ENABLED:-false}"
     ports:
       - "8888:8888"   # Canary callback server (publicly reachable)
       - "127.0.0.1:8090:8090"   # Live console — localhost only

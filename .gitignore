@@ -64,6 +64,11 @@ reports/*
 # Keys are private; certs are deployment-specific.
 tls/
 
+# Packet captures — attacker traffic, potentially large, never committed.
+pcap/
+*.pcap
+*.pcap[0-9]*
+
 # Generated honeytoken artifacts — contain unique tracker UIDs that would let
 # attackers fingerprint your callbacks if the repo were public.
 reports/generated/

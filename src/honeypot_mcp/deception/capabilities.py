@@ -30,6 +30,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 OSFamily = Literal["windows", "linux", "network", "neutral"]
+# Wire transport. Needed wherever something outside the engine has to name the
+# protocol — a BPF capture filter, a firewall rule, a port-scan expectation —
+# and recorded here so those callers derive it instead of keeping their own
+# list of "the UDP ones", which is the duplication that always drifts.
+Transport = Literal["tcp", "udp", "both"]
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,7 @@ class EngineCapability:
     roles: tuple[str, ...]
     summary: str
     signature_events: tuple[str, ...]
+    transport: Transport = "tcp"
     config_options: tuple[str, ...] = ()
     requires_docker: bool = False
     captures_credentials_as: str | None = None
@@ -154,6 +160,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         display_name="DNS",
         default_port=5353,
         real_world_port=53,
+        transport="udp",
         os_family="network",
         roles=("infrastructure",),
         summary=(
@@ -349,6 +356,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         display_name="SNMP",
         default_port=1161,
         real_world_port=161,
+        transport="udp",
         os_family="network",
         roles=("infrastructure", "network_device"),
         summary=(
@@ -408,6 +416,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         display_name="SIP / VoIP",
         default_port=5060,
         real_world_port=5060,
+        transport="both",
         os_family="neutral",
         roles=("voip", "public_facing"),
         summary=(
@@ -518,6 +527,18 @@ def by_role(role: str) -> list[EngineCapability]:
 def credential_services() -> dict[str, str]:
     """`{engine type: service label a planted credential must use}`."""
     return {c.type: c.captures_credentials_as for c in _CAPABILITIES if c.captures_credentials_as}
+
+
+def transport_for(engine_type: str) -> Transport:
+    """Wire transport for an engine type, defaulting to TCP for unknowns.
+
+    Defaulting rather than raising is deliberate: the caller is usually
+    building a capture or firewall filter, and a filter that covers TCP for an
+    unrecognised type is far better than one that fails to build at all and
+    records nothing.
+    """
+    capability = BY_TYPE.get(engine_type.lower() if isinstance(engine_type, str) else engine_type)
+    return capability.transport if capability else "tcp"
 
 
 @dataclass(frozen=True)

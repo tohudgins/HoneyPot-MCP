@@ -394,9 +394,53 @@ uv run python scripts/attack_report.py --days 30 --format markdown
   )
 ```
 
-For Slack / Discord / PagerDuty / SOAR, use the default `json` format — passing
+**Slack, Teams and email are first-class formats**, not raw JSON you have to shape
+yourself — severity-coloured, with the captured credentials, command or exploit
+category up front and honeytoken trips called out:
+
+```
+> alert_subscribe(url="https://hooks.slack.com/services/...",
+                  label="soc-slack", format="slack", severity_threshold="high")
+
+> alert_subscribe(url="smtp://user:pw@smtp.example.com:587/?from=hp@example.com&to=soc@example.com",
+                  label="soc-mail", format="email", severity_threshold="critical")
+```
+
+These three are **coalesced**: the same (event_type, source_ip) notifies at most
+once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed count carried
+on the next message. CRITICAL always goes through. One scanner produces thousands of
+events an hour, and a channel that relays them one-to-one gets muted — which is worse
+than no integration, because everyone then believes they are covered.
+
+For Discord / PagerDuty / SOAR, use the default `json` format — passing
 `hmac_secret=""` generates and returns a 32-byte signing secret. Check delivery health
 any time with `alert_subscriptions_list`.
+
+---
+
+## Packet capture (optional)
+
+Per-event payloads capture what the engines *understood*. Three jobs need the bytes
+on the wire: carving a dropper's second stage out of a TCP stream, replaying real
+attacker traffic through Suricata or Zeek, and producing an artefact rather than an
+assertion by our own code when IR asks.
+
+```bash
+PCAP_ENABLED=true
+sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # or run as root
+```
+
+```
+> pcap_status                                  # running? why not? disk used?
+> pcap_extract source_ip=203.0.113.44          # that attacker's packets, as one file
+> pcap_files                                   # how far back the ring reaches
+```
+
+`pcap_extract` is the point — a 1 GB ring buffer is not an answer to "what did this
+IP send". The capture filter is built from the deployed honeypot ports (so your own
+admin SSH session is never recorded) and refreshes automatically on deploy/stop.
+Disk is bounded by construction: `PCAP_FILE_MB × PCAP_FILES` is a ceiling tcpdump
+enforces itself.
 
 ---
 

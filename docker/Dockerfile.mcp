@@ -47,8 +47,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LOG_FORMAT=json
 
 # `curl` is needed only for the HEALTHCHECK. ~4 MB; keep it.
+# `tcpdump` backs the optional packet capture (PCAP_ENABLED). Installed
+# unconditionally — ~2 MB — because the alternative is an operator turning
+# capture on and getting "tcpdump is not installed" from inside a container
+# they cannot easily add packages to. It captures nothing unless enabled, and
+# still needs NET_ADMIN/NET_RAW plus host networking to do anything.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends curl tcpdump \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 honeypot \
  && useradd  --system --uid 10001 --gid honeypot --home /app --shell /sbin/nologin honeypot
