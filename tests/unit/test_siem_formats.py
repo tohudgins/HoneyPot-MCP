@@ -146,8 +146,12 @@ def test_elastic_ecs_renderer_remaps_to_ecs_fields():
     assert doc["event"]["dataset"] == "honeypot.mcp"
     # event.category should classify ssh_login_failed as authentication
     assert "authentication" in doc["event"]["category"]
-    # Native payload preserved in event.original
-    original = json.loads(doc["event.original"])
+    # Native payload preserved under event.original — *nested*, not as a dotted
+    # top-level key sitting beside the `event` object. Elasticsearch expands
+    # dots at index time so the old shape usually survived there, but it is
+    # ambiguous on every other ECS consumer (Logstash, OpenSearch, Vector).
+    assert "event.original" not in doc
+    original = json.loads(doc["event"]["original"])
     assert original["payload"]["username"] == "root"
 
 
@@ -160,11 +164,18 @@ def test_elastic_ecs_critical_uses_severity_9():
 
 def test_cef_renderer_emits_pipe_delimited_header_and_extensions():
     """CEF:0|Vendor|Product|Version|EventID|EventName|Severity|extension"""
+    from honeypot_mcp import __version__
     from honeypot_mcp.webhooks import render_cef
 
     body, headers = render_cef(_make_event(), _make_sub(fmt="cef"))
     text = body.decode("utf-8")
-    assert text.startswith("CEF:0|HoneyPotMCP|server|1.0|ssh_login_failed|ssh_login_failed|")
+    # Device product is what an ArcSight operator sees in the device list; it
+    # used to be the literal string "server", which identifies nothing. The
+    # signature ID stays the raw event_type (rules key on it) while the event
+    # *name* is humanised for the console.
+    assert text.startswith(
+        f"CEF:0|HoneyPotMCP|HoneyPot-MCP|{__version__}|ssh_login_failed|SSH Login Failed|"
+    )
     # Extension fields after the 7th pipe
     parts = text.split("|", 7)
     ext = parts[7]
@@ -225,7 +236,7 @@ def test_syslog_renderer_emits_rfc5424_framed_message():
 
 def test_loki_renderer_envelope_uses_string_nanoseconds():
     """Loki silently 400s if the timestamp is a number — must be a string of
-    nanoseconds. Stream labels carry severity, event_type, source_ip."""
+    nanoseconds. Stream labels stay low-cardinality: job, severity, event_type."""
     from honeypot_mcp.webhooks import render_loki
 
     body, headers = render_loki(_make_event(severity="critical"), _make_sub(fmt="loki"))
@@ -236,7 +247,8 @@ def test_loki_renderer_envelope_uses_string_nanoseconds():
     assert stream["stream"]["job"] == "honeypot-mcp"
     assert stream["stream"]["severity"] == "critical"
     assert stream["stream"]["event_type"] == "ssh_login_failed"
-    assert stream["stream"]["source_ip"] == "203.0.113.7"
+    # source_ip must NOT be a label — see test_loki_labels_are_low_cardinality.
+    assert "source_ip" not in stream["stream"]
     # Values: [[<ns string>, <payload string>], ...]
     assert len(stream["values"]) == 1
     ts_ns, payload_line = stream["values"][0]
@@ -526,7 +538,7 @@ async def test_webhook_delivery_dispatches_cef_format():
 
     assert len(captures) == 1
     text = captures[0]["body"].decode("utf-8")
-    assert text.startswith("CEF:0|HoneyPotMCP|server|")
+    assert text.startswith("CEF:0|HoneyPotMCP|HoneyPot-MCP|")
 
 
 @pytest.mark.asyncio
@@ -712,7 +724,7 @@ def test_enrichment_survives_ecs_event_original():
     body, _ = render_elastic_ecs(_enriched_event(), _make_sub(fmt="elastic_ecs"))
     doc = json.loads(body)
     # ECS stashes the full native payload (incl. enrichment) under event.original.
-    original = json.loads(doc["event.original"])
+    original = json.loads(doc["event"]["original"])
     assert original["payload"]["enrichment"]["geoip"]["as_org"] == "Hetzner"
     assert doc["event"]["action"] == "redis_rce_dropper"
 
@@ -760,3 +772,152 @@ async def test_subscription_cache_avoids_requery_and_honours_invalidation():
     subs = await webhooks._active_subscriptions()
     assert len(subs) == 1
     assert subs[0].url == "http://x/y"
+
+
+# ── SIEM conformance pins (2026-07-29 audit) ───────────────────────────────
+#
+# These pin defects found by rendering a real event and reading the output,
+# not by reading the renderers. Each names the consumer behaviour it protects:
+# "the field is present" is not the point — the point is that a specific
+# panel, correlation rule or query works in someone else's SIEM.
+
+
+def _ecs_doc(event_type: str = "ssh_login_attempt", payload: dict | None = None) -> dict:
+    from honeypot_mcp.storage.event_buffer import PendingEvent
+    from honeypot_mcp.storage.models import AlertSeverity
+    from honeypot_mcp.webhooks import render_elastic_ecs
+
+    event = PendingEvent(
+        honeypot_id=7,
+        source_ip="203.0.113.44",
+        source_port=51234,
+        event_type=event_type,
+        payload={"username": "root", "password": "hunter2"} if payload is None else payload,
+        severity=AlertSeverity.CRITICAL,
+        timestamp=datetime(2026, 5, 20, 12, 0, 0, tzinfo=UTC),
+    )
+    body, _ = render_elastic_ecs(event, _make_sub(fmt="elastic_ecs"))
+    return json.loads(body)
+
+
+def test_ecs_outcome_is_not_hardcoded_success():
+    """`event.outcome` drives Kibana Security's authentication panels. It was
+    pinned to "success", so a hundred thousand *rejected* brute-force attempts
+    rendered as a hundred thousand successful logins."""
+    assert _ecs_doc("ssh_login_attempt")["event"]["outcome"] == "failure"
+    assert _ecs_doc("ssh_login_failed")["event"]["outcome"] == "failure"
+    assert _ecs_doc("ssh_login_success")["event"]["outcome"] == "success"
+
+
+def test_ecs_outcome_is_unknown_when_genuinely_unknown():
+    """`unknown` is a valid ECS value, and honest. Guessing is worse."""
+    assert _ecs_doc("http_request")["event"]["outcome"] == "unknown"
+
+
+def test_ecs_carries_user_name_for_credential_events():
+    """ "Which hosts tried `root`?" is a first-move SIEM query and it runs
+    against `user.name`. Burying the username in an escaped JSON string inside
+    event.original leaves it technically present and practically unsearchable."""
+    assert _ecs_doc()["user"] == {"name": "root"}
+
+
+def test_ecs_populates_related_fields():
+    """`related.*` is how the Elastic Security app pivots across indices — the
+    click-an-IP-see-everything behaviour. Without it these events are an island
+    the built-in views cannot correlate."""
+    doc = _ecs_doc()
+    assert doc["related"]["ip"] == ["203.0.113.44"]
+    assert doc["related"]["user"] == ["root"]
+
+
+def test_ecs_declares_its_version():
+    """Required by the spec; consumers gate compatibility handling on it."""
+    assert _ecs_doc()["ecs"]["version"]
+
+
+def test_ecs_omits_user_when_no_username_was_captured():
+    """An empty user.name is worse than no field — it pollutes aggregations."""
+    doc = _ecs_doc("http_request", payload={"path": "/admin"})
+    assert "user" not in doc
+    assert "user" not in doc.get("related", {})
+
+
+def _cef_line(event_type: str = "ssh_login_attempt", payload: dict | None = None) -> str:
+    from honeypot_mcp.storage.event_buffer import PendingEvent
+    from honeypot_mcp.storage.models import AlertSeverity
+    from honeypot_mcp.webhooks import render_cef
+
+    event = PendingEvent(
+        honeypot_id=7,
+        source_ip="203.0.113.44",
+        source_port=51234,
+        event_type=event_type,
+        payload={"username": "root", "password": "hunter2"} if payload is None else payload,
+        severity=AlertSeverity.CRITICAL,
+        timestamp=datetime(2026, 5, 20, 12, 0, 0, tzinfo=UTC),
+    )
+    body, _ = render_cef(event, _make_sub(fmt="cef"))
+    return body.decode()
+
+
+def test_cef_header_identifies_the_product():
+    """Device vendor/product are what an ArcSight operator sees in the device
+    list and writes correlation rules against. Product was literally "server"."""
+    from honeypot_mcp import __version__
+
+    fields = _cef_line().split("|")
+    assert fields[0] == "CEF:0"
+    assert fields[1] == "HoneyPotMCP"
+    assert fields[2] == "HoneyPot-MCP"
+    assert fields[3] == __version__, "device version must be real, so rules can gate on it"
+
+
+def test_cef_event_name_is_human_readable_with_correct_acronyms():
+    """A plain .title() yields "Ssh Login Attempt", which reads as amateur in a
+    console an analyst stares at all day."""
+    assert _cef_line().split("|")[5] == "SSH Login Attempt"
+    assert _cef_line("mysql_query_executed").split("|")[5] == "MySQL Query Executed"
+    assert _cef_line("http_exploit_attempt").split("|")[5] == "HTTP Exploit Attempt"
+
+
+def test_cef_signature_id_stays_machine_stable():
+    """The human name may be prettified; the signature ID must not, or every
+    correlation rule keyed on it breaks."""
+    assert _cef_line().split("|")[4] == "ssh_login_attempt"
+
+
+def test_cef_uses_the_standard_suser_slot():
+    """`suser` is the CEF standard field for the acting username; correlation
+    rules read it. It was only ever inside the cs4 JSON blob."""
+    assert " suser=root " in _cef_line()
+
+
+def test_cef_escapes_attacker_controlled_usernames():
+    """Usernames are attacker-chosen. An unescaped `=` breaks the extension
+    parse and could forge fields in the receiving SIEM."""
+    line = _cef_line(payload={"username": "ad min=x", "password": "p"})
+    assert "suser=ad min\\=x" in line
+    assert line.split("|")[0] == "CEF:0"
+
+
+def test_loki_labels_are_low_cardinality():
+    """Every distinct label-value set is a Loki stream. An internet-facing
+    honeypot sees tens of thousands of unique source IPs a day, so a source_ip
+    label blows past max_streams_per_user and degrades the whole Loki tenant —
+    not just this data source. Grafana's own docs call this out by name."""
+    from honeypot_mcp.webhooks import render_loki
+
+    body, _ = render_loki(_make_event(), _make_sub(fmt="loki"))
+    labels = json.loads(body)["streams"][0]["stream"]
+    assert "source_ip" not in labels
+    assert set(labels) <= {"job", "severity", "event_type"}
+
+
+def test_loki_keeps_the_ip_queryable_in_the_line():
+    """Dropping the label must not lose the data: LogQL parses it out of the
+    line with `| json | source_ip="..."`, which is the idiomatic pattern."""
+    from honeypot_mcp.webhooks import render_loki
+
+    body, _ = render_loki(_make_event(), _make_sub(fmt="loki"))
+    line = json.loads(body)["streams"][0]["values"][0][1]
+    assert json.loads(line)["source_ip"] == "203.0.113.7"

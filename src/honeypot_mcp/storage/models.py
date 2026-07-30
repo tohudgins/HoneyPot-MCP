@@ -1,13 +1,57 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 # Store enum values (lowercase) not names in the DB
 _ev = lambda e: [m.value for m in e]  # noqa: E731
+
+
+class UTCDateTime(TypeDecorator):
+    """A `DateTime(timezone=True)` that actually returns aware UTC datetimes.
+
+    PostgreSQL stores TIMESTAMPTZ and hands back aware datetimes; SQLite has no
+    timezone storage and hands back naive ones. Every column here was declared
+    `timezone=True`, so the two dialects silently disagreed — and since SQLite
+    is the default, the naive branch is what almost everyone runs.
+
+    A naive datetime's `.isoformat()` has no offset, and **that string is not
+    ambiguous, it is wrong**: JavaScript's `new Date()` reads an offset-less
+    date-time as *local* time per the ES spec. The console rendered its header
+    clock from an aware timestamp and its event feed from naive ones, so on a
+    UTC-4 host the newest event displayed four hours in the *future* relative
+    to "live · now". An operations console that disagrees with itself about
+    what time it is has no credibility, and the same strings go out in every
+    MCP tool response an analyst might paste into a ticket.
+
+    Normalising on the way in and re-attaching UTC on the way out makes SQLite
+    behave the way the column declaration already claimed, so callers can treat
+    every timestamp as aware regardless of backend.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Any) -> datetime | None:
+        if value is None:
+            return None
+        # Naive input is taken as UTC — everything in this codebase that
+        # constructs a timestamp uses datetime.now(UTC).
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def process_result_value(self, value: datetime | None, dialect: Any) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class Base(DeclarativeBase):
@@ -108,9 +152,9 @@ class Honeypot(Base):
     )
     container_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     config: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        UTCDateTime, server_default=func.now(), onupdate=func.now()
     )
 
     alerts: Mapped[list[Alert]] = relationship("Alert", back_populates="honeypot")
@@ -148,10 +192,8 @@ class Alert(Base):
     )
     triage_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     triaged_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    triaged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), index=True
-    )
+    triaged_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now(), index=True)
 
     honeypot: Mapped[Honeypot | None] = relationship("Honeypot", back_populates="alerts")
 
@@ -169,8 +211,8 @@ class Honeytoken(Base):
         Enum(HoneytokenStatus, values_callable=_ev), default=HoneytokenStatus.ACTIVE, nullable=False
     )
     token_meta: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())
+    triggered_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     trigger_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
 
     trigger_events: Mapped[list[AttackerEvent]] = relationship(
@@ -191,9 +233,7 @@ class AttackerEvent(Base):
         Integer, ForeignKey("honeytokens.id", ondelete="SET NULL"), nullable=True
     )
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
-    timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), index=True
-    )
+    timestamp: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now(), index=True)
 
     honeytoken: Mapped[Honeytoken | None] = relationship(
         "Honeytoken", back_populates="trigger_events"
@@ -227,11 +267,9 @@ class Subscription(Base):
     active: Mapped[bool] = mapped_column(default=True)
     failure_count: Mapped[int] = mapped_column(Integer, default=0)
     delivery_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_delivery_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_delivery_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())
 
 
 class SuppressionRule(Base):
@@ -253,8 +291,8 @@ class SuppressionRule(Base):
     rate_limit_window_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     active: Mapped[bool] = mapped_column(default=True)
     suppressed_count: Mapped[int] = mapped_column(Integer, default=0)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())
 
 
 class AttackerProfile(Base):
@@ -270,10 +308,10 @@ class AttackerProfile(Base):
     vt_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mitre_techniques: Mapped[list] = mapped_column(JSON, default=list)
     event_count: Mapped[int] = mapped_column(Integer, default=0)
-    first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    last_seen: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        UTCDateTime, server_default=func.now(), onupdate=func.now()
     )
 
 
@@ -303,6 +341,4 @@ class AuditLog(Base):
     # What the action touched, so an operator can filter to one honeypot/token.
     target: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), index=True
-    )
+    timestamp: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now(), index=True)

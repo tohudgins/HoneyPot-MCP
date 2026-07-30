@@ -368,3 +368,80 @@ async def test_brief_digests_payloads_rather_than_returning_them_whole():
     payload = brief["needs_attention"][0]["payload"]
     assert "raw_body_b64" not in payload
     assert payload.get("path") == "/admin"
+
+
+async def test_brief_headline_reports_real_totals_not_the_display_cap():
+    """The worst possible error in a shift handover.
+
+    `needs_attention` is capped at `max_highlights`, and the headline counted
+    that list — so a queue of 841 untriaged CRITICAL/HIGH alerts was announced
+    as "8 untriaged high-severity alert(s)". An analyst reads that as a quiet
+    night and moves on.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.deception import soc_brief
+
+    recent = datetime.now(UTC) - timedelta(minutes=5)
+    async with get_session() as session:
+        for i in range(30):
+            session.add(
+                Alert(
+                    source_ip=f"203.0.113.{i}",
+                    event_type="ssh_login_failed",
+                    payload={},
+                    severity=AlertSeverity.HIGH,
+                    acknowledged=False,
+                    timestamp=recent,
+                )
+            )
+        for i in range(3):
+            session.add(
+                Alert(
+                    source_ip=f"198.51.100.{i}",
+                    event_type="honeytoken_triggered_credential_via_ssh",
+                    payload={},
+                    severity=AlertSeverity.CRITICAL,
+                    acknowledged=False,
+                    timestamp=recent,
+                )
+            )
+
+    brief = await soc_brief(since_hours=12, max_highlights=5)
+
+    assert brief["needs_attention_showing"] == 5
+    assert brief["needs_attention_total"] == 33
+    assert brief["untriaged_by_severity"] == {"critical": 3, "high": 30}
+
+    joined = " ".join(brief["headline"])
+    assert "3 untriaged CRITICAL" in joined, "CRITICAL must be called out on its own"
+    assert "30 untriaged HIGH" in joined, "the headline must state the real total"
+    assert "5 untriaged" not in joined, "the display cap must never be reported as the total"
+    assert "showing 5 of 33" in brief["note"]
+
+
+async def test_brief_note_does_not_claim_truncation_when_nothing_was_cut():
+    """A permanent "there may be more" hedge trains people to ignore it."""
+    from datetime import UTC, datetime, timedelta
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.deception import soc_brief
+
+    async with get_session() as session:
+        session.add(
+            Alert(
+                source_ip="203.0.113.1",
+                event_type="ssh_login_failed",
+                payload={},
+                severity=AlertSeverity.HIGH,
+                acknowledged=False,
+                timestamp=datetime.now(UTC) - timedelta(minutes=1),
+            )
+        )
+
+    brief = await soc_brief(since_hours=12, max_highlights=8)
+    assert brief["needs_attention_total"] == brief["needs_attention_showing"] == 1
+    assert "raise `max_highlights`" not in brief["note"]

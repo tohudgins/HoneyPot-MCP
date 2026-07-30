@@ -400,6 +400,24 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                 )
             )
         ).scalar() or 0
+        # The true size of the queue `needs_attention` samples from. Counting
+        # the returned list instead reports the `max_highlights` cap as if it
+        # were the total — "8 untriaged high-severity alerts" when there are
+        # 841 — which is the worst possible error in a shift handover.
+        urgent_counts: dict[AlertSeverity, int] = {
+            severity: count
+            for severity, count in (
+                await session.execute(
+                    select(Alert.severity, func.count(Alert.id))
+                    .where(
+                        Alert.timestamp >= cutoff,
+                        Alert.severity.in_([AlertSeverity.CRITICAL, AlertSeverity.HIGH]),
+                        Alert.acknowledged.is_(False),
+                    )
+                    .group_by(Alert.severity)
+                )
+            ).all()
+        }
 
     counts = {severity.value: n for severity, n in totals}
     total_events = sum(counts.values())
@@ -421,6 +439,10 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         for alert in urgent
     ]
 
+    untriaged_critical = urgent_counts.get(AlertSeverity.CRITICAL, 0)
+    untriaged_high = urgent_counts.get(AlertSeverity.HIGH, 0)
+    urgent_total = untriaged_critical + untriaged_high
+
     headline: list[str] = []
     if unhealthy:
         headline.append(f"{len(unhealthy)} sensor(s) in ERROR — collection may be interrupted.")
@@ -428,8 +450,13 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         headline.append(
             f"{len(token_trips)} honeytoken(s) triggered — the highest-fidelity signal here."
         )
-    if needs_attention:
-        headline.append(f"{len(needs_attention)} untriaged high-severity alert(s).")
+    # CRITICAL is called out on its own line. Folding it into a combined
+    # "high-severity" figure is how the one alert that mattered gets read as
+    # part of a big number nobody has time to work through.
+    if untriaged_critical:
+        headline.append(f"{untriaged_critical} untriaged CRITICAL alert(s) — triage these first.")
+    if untriaged_high:
+        headline.append(f"{untriaged_high} untriaged HIGH alert(s).")
     if not headline:
         headline.append(
             f"Nothing needs a decision. {total_events} events from {unique_ips} addresses, "
@@ -446,6 +473,11 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
             "untriaged": untriaged_total,
         },
         "needs_attention": needs_attention,
+        # Explicit, so neither a model nor a human can mistake the sample for
+        # the queue. `showing` equals `total` when nothing was cut.
+        "needs_attention_total": urgent_total,
+        "needs_attention_showing": len(needs_attention),
+        "untriaged_by_severity": {"critical": untriaged_critical, "high": untriaged_high},
         "triggered_tokens": [
             {
                 "id": t.id,
@@ -462,8 +494,14 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         },
         "busiest_sources": [{"source_ip": ip, "events": n} for ip, n in busiest],
         "note": (
-            "`needs_attention` is untriaged CRITICAL/HIGH only. Use `alerts_get` for the "
-            "full payload of any item, `analyze_attacker` to profile a source, and "
-            "`alerts_acknowledge` to record a disposition once handled."
+            f"`needs_attention` is untriaged CRITICAL/HIGH only, showing "
+            f"{len(needs_attention)} of {urgent_total}"
+            + (
+                " — raise `max_highlights` or use `alerts_search` to work the rest. "
+                if urgent_total > len(needs_attention)
+                else ". "
+            )
+            + "Use `alerts_get` for the full payload of any item, `analyze_attacker` to "
+            "profile a source, and `alerts_acknowledge` to record a disposition once handled."
         ),
     }

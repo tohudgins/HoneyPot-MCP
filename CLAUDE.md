@@ -454,6 +454,40 @@ Failure tracking is per subscription: `delivery_count`, `failure_count`, `last_e
 
 Active subscriptions are cached in-process (`_active_subscriptions`, 30s TTL) so delivery doesn't issue a `SELECT … WHERE active` per event on the ingest hot path — the same pattern as the suppression-rule cache. The cache is invalidated on `alert_subscribe`/`alert_unsubscribe` and on worker `start()`. Rows are `expunge_all`'d from the loading session so the per-delivery stat UPDATEs (`_record_outcome`) never interact with the cache. If a test inserts a `Subscription` directly (not via the tool), call `invalidate_subscription_cache()` or start a fresh delivery worker to pick it up.
 
+**The output formats are someone else's detection content, so conformance is
+correctness, not polish.** A regression here is invisible locally and breaks a
+consumer you can't see. `tests/unit/test_siem_formats.py` pins each rule to the
+consumer behaviour it protects; all of these were found by rendering a real
+event and reading the output, never by reading the renderers:
+
+- **`event.outcome` must not be guessed.** It was hardcoded `"success"`, so
+  rejected brute-force attempts arrived in Kibana's Security app as successful
+  logins. `_ecs_outcome()` infers from the event type and returns `unknown` —
+  a valid ECS value — where it genuinely cannot tell.
+- **`user.name` and `related.*` decide whether these events are first-class in
+  Elastic.** `related.ip`/`related.user` drive the click-an-IP-see-everything
+  pivot; without them the data is an island the built-in views can't correlate.
+  A username only inside `event.original` is present but unsearchable.
+- **Never mix a dotted key with its object.** `event.original` sat beside an
+  `event` object; Elasticsearch expands dots at index time so it usually
+  survived, but Logstash/OpenSearch/Vector are ambiguous. Nest it.
+- **CEF standard slots beat custom ones.** `suser` is what correlation rules
+  read; the username was only in a `cs4` JSON blob. Device product was the
+  literal string `"server"`. The signature ID stays the raw `event_type` (rules
+  key on it) while the event *name* is humanised via `_humanize_event_type`,
+  which knows protocol acronyms — `SSH Login Attempt`, not `Ssh Login Attempt`.
+- **Loki stream labels must stay low-cardinality.** `source_ip` was a label,
+  which creates one stream per attacker; an internet-facing honeypot sees tens
+  of thousands a day, blows past `max_streams_per_user` and degrades the whole
+  tenant. The IP lives in the line and LogQL parses it out — the idiomatic
+  pattern, and free at ingest.
+
+Note the split that makes this safe to reason about: renderers operate on
+`PendingEvent`, whose timestamp is always `datetime.now(UTC)` and therefore
+aware. The naive-datetime problem was confined to values read back from the
+database (see `UTCDateTime`), so webhook `rt=`/`time`/`@timestamp` were never
+affected.
+
 ### Watchdog
 
 `watchdog.py` runs every 30s. For each `RUNNING` honeypot, calls
@@ -650,7 +684,14 @@ wrapper over the same API:
   unmapped shows up as missing coverage, which is correct — it is invisible on
   the dashboard too.
 - `soc_brief` — separates untriaged CRITICAL/HIGH, token trips and dead sensors
-  from the volume that makes up most honeypot traffic.
+  from the volume that makes up most honeypot traffic. **The headline counts
+  come from their own aggregate query, never from `len(needs_attention)`** —
+  that list is capped at `max_highlights`, so counting it announced a queue of
+  841 untriaged alerts as "8 untriaged high-severity alert(s)", which reads as
+  a quiet shift. CRITICAL gets its own headline line rather than being folded
+  into a combined figure, and `needs_attention_total` / `_showing` make the cap
+  explicit. This is the list-tool truncation rule from "Tool response shaping"
+  applied to the tool where being wrong costs the most.
 
 `deception/capabilities.py` is the single source of truth for what an engine
 is: port, OS family, roles, the `service` label its credentials carry, and its
@@ -848,6 +889,34 @@ most-specific-first and all matches are collected, so a generic rule must never
 be the only hit. Watch for cross-category false positives: `smb_exploit_attempt`
 contains "attempt" and previously matched the brute-force rule, inflating
 Credential Access while hiding the Lateral Movement finding.
+
+**The Grafana ATT&CK dashboard is generated, not hand-written.** SQL cannot call
+Python, so `03-mitre-coverage.json` used to carry its own CASE-expression copy of
+the event-type → tactic mapping — and it drifted exactly the way a duplicated
+table always does, re-introducing both bugs above (SSH/FTP/RDP brute force under
+Initial Access, `ssh_file_download` under Exfiltration) after `intel/mitre.py`
+had fixed them. It also predated most of the 25 engines, so `docker_api`,
+`kubernetes`, `sip` and the rest fell through to "Uncategorised" on the one
+dashboard whose entire job is showing what you can detect.
+
+`scripts/generate_mitre_dashboard.py` now derives the SQL by pushing every
+`signature_events` entry through `map_to_attack`, and
+`tests/unit/test_mitre_dashboard.py` regenerates and diffs, so drift fails CI.
+Re-run the generator after touching mappings or adding an engine. Tactic IDs
+(`TACTIC_IDS`) live in `intel/mitre.py` for the same single-source reason.
+Multi-tactic events count under *every* tactic they map to — hence UNION ALL
+rather than CASE, which can only bucket a row once and would under-report the
+later tactic.
+
+**Timestamps are aware everywhere** (`storage/models.py:UTCDateTime`). The
+columns were declared `DateTime(timezone=True)`, which PostgreSQL honours and
+SQLite — the default — silently does not, so DB reads came back naive. A naive
+`.isoformat()` has no offset, and JavaScript reads an offset-less date-time as
+*local*: the console rendered its header clock from an aware timestamp and its
+feed from naive ones, showing the newest event four hours in the future on a
+UTC-4 host. `UTCDateTime` normalises on bind and re-attaches UTC on load. The
+stored SQLite string format is unchanged, so Grafana's `datetime()` comparisons
+and existing databases are unaffected.
 
 **`analysis/profiler.py:_calculate_risk`** — weighted toward what was observed
 locally, not what a feed says. Two properties the tests pin:

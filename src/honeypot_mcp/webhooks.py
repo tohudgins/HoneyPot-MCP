@@ -20,8 +20,10 @@ appropriate transport. Seven formats are supported:
   the transport — `udp://host:514` for UDP datagrams,
   `tcp://host:514` for TCP-framed delivery.
 * `loki` — Grafana Loki push API. Body is `{"streams": [...]}` with
-  nanosecond string timestamps. Stream labels carry severity / event_type /
-  source_ip. Auth via `Authorization: Basic <pre-encoded>` if
+  nanosecond string timestamps. Stream labels are deliberately
+  low-cardinality (job / severity / event_type only — never source_ip, which
+  would create a stream per attacker); the IP stays queryable in the line via
+  `| json | source_ip="…"`. Auth via `Authorization: Basic <pre-encoded>` if
   `hmac_secret` is set (operator pre-encodes `userid:token` for Grafana Cloud).
 * `datadog` — Datadog Logs API. Body is a single-element JSON list per
   the v2 logs intake. `DD-API-KEY: <hmac_secret>` carries the API key.
@@ -51,6 +53,7 @@ from urllib.parse import urlparse
 import httpx
 from sqlalchemy import select, update
 
+from honeypot_mcp import __version__
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent
 from honeypot_mcp.storage.models import AlertSeverity, Subscription
@@ -93,6 +96,14 @@ _SYSLOG_FACILITY = 16
 
 _RETRY_DELAYS = (1.0, 5.0, 30.0)
 _HOSTNAME = "honeypot-mcp"
+# ECS release these documents claim conformance to. Bump only alongside an
+# actual field review — consumers use it to decide how to read the document.
+_ECS_VERSION = "8.11.0"
+# CEF header identity. Vendor and product are what an ArcSight/QRadar operator
+# sees in the device list and writes correlation rules against, so "server"
+# (the previous product value) was actively unhelpful — it identified nothing.
+_CEF_VENDOR = "HoneyPotMCP"
+_CEF_PRODUCT = "HoneyPot-MCP"
 
 # Active-subscription cache. Delivery previously issued one `SELECT … WHERE
 # active` per event — a DB round-trip on the ingest hot path, even in the
@@ -198,6 +209,60 @@ def render_splunk_hec(event: PendingEvent, sub: Subscription) -> tuple[bytes, di
     return body, headers
 
 
+# Payload keys engines use for the attacker-supplied username, most specific
+# first. Both ECS (`user.name`) and CEF (`suser`) have a first-class field for
+# this, and an analyst filters on it constantly — "show me every host that
+# tried `root`" is a first-move query in any SIEM. Leaving it buried in a JSON
+# blob inside a custom string field means it is technically present and
+# practically unsearchable.
+_ACTOR_KEYS = ("username", "user", "login", "email", "account", "dn", "community")
+
+
+def _extract_actor(payload: dict[str, Any]) -> str | None:
+    """Best-effort attacker username from an event payload."""
+    for key in _ACTOR_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value[:256]
+    # HTTP form posts arrive nested; check one level down for the same keys.
+    nested = payload.get("post_data")
+    if isinstance(nested, dict):
+        for key in _ACTOR_KEYS:
+            value = nested.get(key)
+            if isinstance(value, str) and value.strip():
+                return value[:256]
+    return None
+
+
+# Explicit outcome markers in event_type. Ordered failure-first because
+# "login_failed" contains neither marker in the success list but several
+# event types contain both words in other combinations.
+_OUTCOME_FAILURE = ("_failed", "_invalid", "_denied", "_rejected", "_refused")
+_OUTCOME_SUCCESS = ("_success", "_triggered", "_granted", "_accepted")
+
+
+def _ecs_outcome(event_type: str) -> str:
+    """ECS `event.outcome` for a honeypot event — `unknown` unless we know.
+
+    This was hardcoded to `"success"`, which is wrong in the common case and
+    actively misleading: `event.outcome` drives the authentication panels in
+    Kibana's Security app, so a hundred thousand rejected brute-force attempts
+    rendered as a hundred thousand *successful* logins. `unknown` is a valid
+    ECS value and the honest one where we genuinely cannot tell.
+    """
+    et = event_type.lower()
+    if any(marker in et for marker in _OUTCOME_FAILURE):
+        return "failure"
+    if any(marker in et for marker in _OUTCOME_SUCCESS):
+        return "success"
+    # Every engine that emits `*_login_attempt` / `*_auth_attempt` captures the
+    # credential and then rejects it (MSSQL returns error 18456, PostgreSQL
+    # returns 28P01, and so on), so from the attacker's side these did fail.
+    if et.endswith("_login_attempt") or et.endswith("_auth_attempt"):
+        return "failure"
+    return "unknown"
+
+
 def _ecs_event_category(event_type: str, honeytoken_id: int | None) -> list[str]:
     """Map honeypot event types into ECS `event.category` taxonomy.
 
@@ -225,8 +290,12 @@ def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, d
     Compatible with Filebeat HTTP input, Logstash http input, and the
     Elasticsearch Bulk API (each line is a self-contained ECS document).
     """
+    actor = _extract_actor(event.payload or {})
     doc: dict[str, Any] = {
         "@timestamp": event.timestamp.isoformat(),
+        # Required by the ECS spec, and consumers key compatibility handling
+        # off it. Its absence marks a document as non-conformant.
+        "ecs": {"version": _ECS_VERSION},
         "event": {
             "action": event.event_type,
             "category": _ecs_event_category(event.event_type, event.honeytoken_id),
@@ -234,7 +303,12 @@ def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, d
             "severity": _ECS_SEVERITY[event.severity],
             "dataset": "honeypot.mcp",
             "module": "honeypot-mcp",
-            "outcome": "success",
+            "outcome": _ecs_outcome(event.event_type),
+            # Nested, not a dotted "event.original" key alongside this object.
+            # Elasticsearch expands dots at index time so the old form usually
+            # survived, but it is ambiguous on every other ECS consumer
+            # (Logstash, OpenSearch, Vector) and trivially avoidable.
+            "original": json.dumps(_base_event_dict(event), default=str),
         },
         "host": {"name": _HOSTNAME, "type": "honeypot"},
         "message": f"{event.event_type} from {event.source_ip}",
@@ -243,14 +317,24 @@ def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, d
             "id": event.honeypot_id,
             "token_id": event.honeytoken_id,
         },
-        # Stash the full native payload under event.original — ECS-blessed
-        # field for the raw event so SIEM analysts can dig into details.
-        "event.original": json.dumps(_base_event_dict(event), default=str),
     }
     if event.source_ip:
         doc["source"] = {"ip": event.source_ip}
         if event.source_port is not None:
             doc["source"]["port"] = event.source_port
+    if actor:
+        doc["user"] = {"name": actor}
+    # `related.*` is how the Elastic Security app pivots across indices — an
+    # analyst clicks an IP and every document that mentions it anywhere comes
+    # back. Populating it is what makes these events first-class in that UI
+    # rather than a separate island the built-in views cannot correlate.
+    related: dict[str, list[str]] = {}
+    if event.source_ip:
+        related["ip"] = [event.source_ip]
+    if actor:
+        related["user"] = [actor]
+    if related:
+        doc["related"] = related
 
     body = json.dumps(doc, default=str).encode("utf-8")
     headers = {
@@ -275,6 +359,56 @@ def _cef_ext_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("=", "\\=").replace("\n", "\\n")
 
 
+# Protocol names a plain `.title()` mangles. "Ssh Login Attempt" in an ArcSight
+# console is the kind of detail that tells an analyst the integration was
+# written by someone who doesn't work in one.
+_ACRONYMS = {
+    "ssh": "SSH",
+    "ftp": "FTP",
+    "smtp": "SMTP",
+    "http": "HTTP",
+    "https": "HTTPS",
+    "smb": "SMB",
+    "rdp": "RDP",
+    "vnc": "VNC",
+    "dns": "DNS",
+    "ldap": "LDAP",
+    "snmp": "SNMP",
+    "imap": "IMAP",
+    "pop3": "POP3",
+    "sip": "SIP",
+    "nfs": "NFS",
+    "mssql": "MSSQL",
+    "mysql": "MySQL",
+    "postgresql": "PostgreSQL",
+    "mongodb": "MongoDB",
+    "api": "API",
+    "jndi": "JNDI",
+    "tds": "TDS",
+    "rsync": "rsync",
+    "memcached": "Memcached",
+    "telnet": "Telnet",
+    "docker": "Docker",
+    "kubernetes": "Kubernetes",
+    "elasticsearch": "Elasticsearch",
+    "redis": "Redis",
+    "ip": "IP",
+    "url": "URL",
+    "aws": "AWS",
+    "rce": "RCE",
+    "sqli": "SQLi",
+    "xss": "XSS",
+    "lfi": "LFI",
+    "rfi": "RFI",
+    "ssrf": "SSRF",
+}
+
+
+def _humanize_event_type(event_type: str) -> str:
+    """`ssh_login_attempt` → `SSH Login Attempt`."""
+    return " ".join(_ACRONYMS.get(word, word.title()) for word in event_type.split("_"))
+
+
 def render_cef(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
     """ArcSight Common Event Format (CEF 0).
 
@@ -289,11 +423,11 @@ def render_cef(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str,
     event_type_safe = _cef_escape(event.event_type)
     parts = [
         "CEF:0",
-        "HoneyPotMCP",  # device vendor
-        "server",  # device product
-        "1.0",  # device version
-        event_type_safe,  # signature/event ID
-        event_type_safe,  # event name (humanized)
+        _CEF_VENDOR,  # device vendor
+        _CEF_PRODUCT,  # device product
+        __version__,  # device version — real, so rules can gate on it
+        event_type_safe,  # signature/event ID (stable, machine-facing)
+        _cef_escape(_humanize_event_type(event.event_type)),  # human name
         str(_CEF_SEVERITY[event.severity]),
     ]
     header = "|".join(parts)
@@ -304,6 +438,16 @@ def render_cef(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str,
     ]
     if event.source_port is not None:
         ext_pairs.append(f"spt={event.source_port}")
+    # No `dpt`: the honeypot's own port isn't carried on the event, and the
+    # service is already identifiable from the event_type prefix and cs1
+    # (honeypot_id). Emitting a wrong or invented value would be worse.
+    #
+    # `suser` is the CEF standard slot for the acting username. It was only
+    # ever present inside the cs4 JSON blob, which no correlation rule reads.
+    actor = _extract_actor(event.payload or {})
+    if actor:
+        ext_pairs.append(f"suser={_cef_ext_escape(actor)}")
+    ext_pairs.append(f"outcome={_ecs_outcome(event.event_type)}")
     if event.honeypot_id is not None:
         ext_pairs.append(f"cs1={event.honeypot_id}")
         ext_pairs.append("cs1Label=honeypot_id")
@@ -343,9 +487,19 @@ def render_loki(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str
     Spec: https://grafana.com/docs/loki/latest/reference/api/#push-log-entries-to-loki
 
     Timestamp **must** be a string of nanoseconds. Loki silently rejects
-    integer timestamps with a 400. Stream labels are bounded to the
-    high-cardinality fields most useful for SOC slicing — source_ip is
-    intentionally label-side because Loki indexes by labels.
+    integer timestamps with a 400.
+
+    **Stream labels are deliberately low-cardinality.** `source_ip` used to be
+    a label, on the reasoning that Loki indexes by labels and an analyst wants
+    to slice by attacker. That is precisely the documented Loki anti-pattern:
+    every distinct label-value combination creates a separate stream, and an
+    internet-facing honeypot sees tens of thousands of unique source IPs in a
+    day — enough to blow past `max_streams_per_user`, balloon the index, and
+    degrade the whole Loki tenant, not just this data source.
+
+    The IP is still fully queryable, because it is in the log line and LogQL
+    parses it there: `{job="honeypot-mcp"} | json | source_ip="203.0.113.44"`.
+    That is the idiomatic pattern and costs nothing at ingest.
     """
     ts_ns = str(int(event.timestamp.timestamp() * 1_000_000_000))
     payload_line = json.dumps(_base_event_dict(event), default=str)
@@ -353,7 +507,6 @@ def render_loki(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str
         "job": "honeypot-mcp",
         "severity": event.severity.value,
         "event_type": event.event_type,
-        "source_ip": event.source_ip or "unknown",
     }
     envelope = {"streams": [{"stream": stream, "values": [[ts_ns, payload_line]]}]}
     body = json.dumps(envelope, default=str).encode("utf-8")

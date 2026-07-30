@@ -498,6 +498,44 @@ def _load_stix_index() -> dict[str, dict]:
     return by_id
 
 
+# Canonical ATT&CK Enterprise tactic identifiers, in kill-chain order.
+#
+# These live here rather than in whatever happens to need them, because the
+# Grafana MITRE dashboard previously re-implemented the whole event-type →
+# tactic mapping by hand in SQL and drifted from this module: it filed SSH/FTP
+# brute force under Initial Access (T1110 is Credential Access) and
+# `ssh_file_download` under Exfiltration (Cowrie means *ingress*, T1105) —
+# both errors this module had already fixed. The dashboard SQL is now
+# generated from these mappings by `scripts/generate_mitre_dashboard.py`,
+# so the two cannot disagree again.
+TACTIC_IDS: dict[str, str] = {
+    "Reconnaissance": "TA0043",
+    "Resource Development": "TA0042",
+    "Initial Access": "TA0001",
+    "Execution": "TA0002",
+    "Persistence": "TA0003",
+    "Privilege Escalation": "TA0004",
+    "Defense Evasion": "TA0005",
+    "Credential Access": "TA0006",
+    "Discovery": "TA0007",
+    "Lateral Movement": "TA0008",
+    "Collection": "TA0009",
+    "Command and Control": "TA0011",
+    "Exfiltration": "TA0010",
+    "Impact": "TA0040",
+}
+
+# Kill-chain ordering for display. `TACTIC_IDS` is already in this order, so
+# derive it rather than maintaining a second list that can fall out of step.
+TACTIC_ORDER: tuple[str, ...] = tuple(TACTIC_IDS)
+
+
+def tactic_label(tactic: str) -> str:
+    """`Credential Access` → `Credential Access (TA0006)`."""
+    tid = TACTIC_IDS.get(tactic)
+    return f"{tactic} ({tid})" if tid else tactic
+
+
 async def map_to_attack(terms: list[str]) -> list[dict[str, Any]]:
     """Map a list of observed event strings to MITRE ATT&CK techniques.
 
