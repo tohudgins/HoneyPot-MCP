@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -157,3 +158,67 @@ def test_dashboard_query_fields_agree(dashboard_file: str):
                 f"{dashboard_file} / {panel.get('title')}: query fields disagree "
                 f"({sorted(present)}) — the executed query is not the one shown"
             )
+
+
+# ── Time bucketing scales with the selected window ─────────────────────────
+
+
+def _timeseries_queries() -> list[tuple[str, str, str]]:
+    """(dashboard, panel title, SQL) for every timeseries panel."""
+    found = []
+    for name in ("01-overview.json", "02-threat-map.json", "03-mitre-coverage.json"):
+        dashboard = json.loads((ROOT / "docker" / "grafana" / "dashboards" / name).read_text())
+        for panel in dashboard.get("panels", []):
+            if panel.get("type") != "timeseries":
+                continue
+            for target in panel.get("targets", []):
+                sql = target.get("queryText") or target.get("rawQueryText") or ""
+                if sql:
+                    found.append((name, panel.get("title", "?"), sql))
+    return found
+
+
+def test_timeseries_panels_bucket_relative_to_the_window():
+    """A hardcoded bucket width is wrong in both directions.
+
+    The severity panel grouped by `strftime('%Y-%m-%dT%H:%M')` — a fixed minute
+    — regardless of the range the viewer selected. Over 24h that is up to 1,440
+    points per series, which renders; over 30 days it is 43,200 per series
+    across four series, which does not. The opposite failure is just as real: an
+    hourly bucket over a five-minute window is a single column.
+
+    The bucket must therefore be derived from $__from/$__to, not written into
+    the query. The console already sizes buckets this way (`_bucket_size`).
+    """
+    offenders = []
+    for dashboard, title, sql in _timeseries_queries():
+        derives_bucket = "$__to" in sql and "$__from" in sql and "240000" in sql
+        # A GROUP BY on a literal strftime pattern is the fixed-width form.
+        fixed_width = re.search(r"GROUP BY strftime\('%[^']*'", sql) is not None
+        if fixed_width or not derives_bucket:
+            offenders.append(f"{dashboard} / {title}")
+    assert not offenders, "timeseries panels with a hardcoded bucket width: " + ", ".join(offenders)
+
+
+def test_timeseries_panels_emit_utc_marked_timestamps():
+    """An offset-less date-time is read as *local* by JavaScript, which is what
+    put the console's feed four hours ahead of its own clock. Grafana is no
+    different, so every time column ships an explicit Z."""
+    for dashboard, title, sql in _timeseries_queries():
+        assert "Z'" in sql, f"{dashboard} / {title}: time column is not UTC-marked"
+
+
+def test_table_panels_format_timestamps_rather_than_returning_raw_columns():
+    """`MAX(timestamp) AS last_seen` returns SQLite's raw storage string —
+    `2026-07-30 20:22:10.632767`: no T, no offset, microsecond noise. It renders
+    as an ambiguous string in a table whose every other time is formatted, and
+    cannot be shown in the viewer's timezone."""
+    dashboard = json.loads(
+        (ROOT / "docker" / "grafana" / "dashboards" / "01-overview.json").read_text()
+    )
+    for panel in dashboard.get("panels", []):
+        for target in panel.get("targets", []):
+            sql = target.get("queryText") or ""
+            assert not re.search(
+                r"(?<!strftime\(')(?:MAX|MIN)\(\s*timestamp\s*\)\s+AS", sql, re.I
+            ), f"{panel.get('title')}: selects a raw timestamp column"

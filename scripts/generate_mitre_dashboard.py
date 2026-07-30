@@ -77,17 +77,27 @@ def build_observed_tactics_sql(by_tactic: dict[str, list[str]]) -> str:
     return "\n  UNION ALL\n".join(selects) + "\n  ORDER BY count DESC"
 
 
+# ~240 buckets across whatever window the viewer selected, floored at 60s.
+# Derived from $__from/$__to (epoch milliseconds) rather than $__interval_ms so
+# it depends only on the macros these dashboards already prove are interpolated.
+# A fixed bucket width is wrong in both directions: hourly over a year is 8,760
+# points per series, and hourly over a five-minute window is a single column.
+_BUCKET = "MAX((($__to) - ($__from)) / 240000, 60)"
+
+
 def build_tactic_timeline_sql(by_tactic: dict[str, list[str]]) -> str:
-    """Timeseries: one column per tactic, bucketed hourly."""
+    """Timeseries: one column per tactic, bucketed to fit the selected window."""
     columns = [
         f'SUM(CASE WHEN event_type IN ({_in_list(events)}) THEN 1 ELSE 0 END) AS "{tactic}"'
         for tactic, events in by_tactic.items()
     ]
+    bucket = f"CAST(strftime('%s', timestamp) / ({_BUCKET}) AS INTEGER)"
     return (
-        "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS time,\n  "
+        f"SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime({bucket} * ({_BUCKET}), "
+        "'unixepoch')) AS time,\n  "
         + ",\n  ".join(columns)
         + f"\nFROM alerts WHERE {_WINDOW}"
-        + "\nGROUP BY strftime('%Y-%m-%dT%H', timestamp) ORDER BY time"
+        + f"\nGROUP BY {bucket} ORDER BY time"
     )
 
 

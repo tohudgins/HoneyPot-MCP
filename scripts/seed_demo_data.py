@@ -67,6 +67,45 @@ _COUNTRIES: list[tuple[str, str, float, float, str, int]] = [
     ("Mexico", "MX", 23.63, -102.55, "187.188", 2),
 ]
 
+# Share of generated events per engine, roughly tracking what an internet-facing
+# sensor actually sees: SSH and Telnet dominate (credential botnets), HTTP close
+# behind, and the long tail of database/management surfaces gets scanned steadily
+# but far less often.
+#
+# Every engine with an event profile appears here. The budget previously named
+# only five, so twenty honeypots were created and fed nothing — the demo data
+# that exists to show the platform off implied it covered five protocols, and
+# the ATT&CK coverage dashboard rendered a fraction of the tactics it can detect.
+# `_check_engine_mix` keeps the two in step.
+_ENGINE_MIX: dict[str, float] = {
+    "ssh": 0.30,
+    "http": 0.15,
+    "telnet": 0.08,
+    "rdp": 0.08,
+    "smb": 0.05,
+    "smtp": 0.035,
+    "ftp": 0.035,
+    "mysql": 0.03,
+    "vnc": 0.025,
+    "redis": 0.025,
+    "imap": 0.02,
+    "sip": 0.02,
+    "mssql": 0.02,
+    "postgresql": 0.02,
+    "elasticsearch": 0.02,
+    "dns": 0.02,
+    "mongodb": 0.015,
+    "ldap": 0.015,
+    "pop3": 0.015,
+    "docker_api": 0.012,
+    "kubernetes": 0.012,
+    "memcached": 0.01,
+    "snmp": 0.01,
+    "rsync": 0.008,
+    "nfs": 0.008,
+}
+
+
 # (event_type, severity, weight) per honeypot engine.
 _EVENT_PROFILES: dict[str, list[tuple[str, str, int]]] = {
     "ssh": [
@@ -218,6 +257,26 @@ _EVENT_PROFILES: dict[str, list[tuple[str, str, int]]] = {
     ],
 }
 
+
+def _check_engine_mix() -> None:
+    """Fail loudly if the traffic mix and the event profiles disagree.
+
+    An engine present in one and absent from the other is silent otherwise: a
+    missing weight means a honeypot that never emits an event, and a missing
+    profile means a KeyError only for whoever runs the seed next.
+    """
+    missing_weight = set(_EVENT_PROFILES) - set(_ENGINE_MIX)
+    missing_profile = set(_ENGINE_MIX) - set(_EVENT_PROFILES)
+    if missing_weight or missing_profile:
+        raise SystemExit(
+            "seed engine mix is out of step with the event profiles:\n"
+            f"  no traffic weight: {sorted(missing_weight)}\n"
+            f"  no event profile:  {sorted(missing_profile)}"
+        )
+
+
+_check_engine_mix()
+
 _USERNAMES = [
     "root",
     "admin",
@@ -319,6 +378,10 @@ async def main() -> None:
         ("demo-nfs", HoneypotType.NFS, 2049),
     ]
 
+    # Keyed by HoneypotType value, not display name: `docker_api` is deployed as
+    # `demo-docker-api` because Docker object names disallow underscores, so
+    # keying by name silently divorces the lookup from the engine identity that
+    # `_EVENT_PROFILES` and `_ENGINE_MIX` both use.
     honeypot_ids: dict[str, int] = {}
     async with get_session() as session:
         from sqlalchemy import delete, select
@@ -338,9 +401,9 @@ async def main() -> None:
                 )
                 session.add(hp)
                 await session.flush()
-                honeypot_ids[name] = hp.id
+                honeypot_ids[hp_type.value] = hp.id
             else:
-                honeypot_ids[name] = existing.id
+                honeypot_ids[hp_type.value] = existing.id
 
         # Clear prior demo alerts so the script is idempotent. We match by
         # honeypot_id rather than payload contents because SQLite's JSON
@@ -372,12 +435,26 @@ async def main() -> None:
             # Sprinkle reputation data on ~30% of attackers so the table cells
             # have content to compare against.
             "abuseipdb": (
-                {"abuse_confidence_score": random.randint(40, 100), "available": True}
+                {
+                    "available": True,
+                    "abuse_confidence_score": random.randint(40, 100),
+                    "total_reports": random.randint(5, 5000),
+                }
                 if random.random() < 0.3
                 else {"available": False}
             ),
+            # Keys must match what `intel.virustotal` really returns, or the
+            # demo data exercises a shape no live lookup ever produces. This
+            # said `malicious`, the same wrong key `digest_payload` read, so
+            # the two agreed with each other and disagreed with reality.
             "virustotal": (
-                {"malicious": random.randint(1, 25), "available": True}
+                {
+                    "available": True,
+                    "malicious_votes": (_vt_hits := random.randint(1, 25)),
+                    "suspicious_votes": random.randint(0, 4),
+                    "total_engines": 94,
+                    "detection_ratio": f"{_vt_hits}/94",
+                }
                 if random.random() < 0.2
                 else {"available": False}
             ),
@@ -388,21 +465,17 @@ async def main() -> None:
     now = datetime.now(UTC)
     target_events = 5000
     events_per_engine = {
-        "ssh": int(target_events * 0.55),  # SSH is the loudest in real traffic
-        "http": int(target_events * 0.20),
-        "smtp": int(target_events * 0.05),
-        "ftp": int(target_events * 0.05),
-        "rdp": int(target_events * 0.15),
+        engine: max(1, int(target_events * share)) for engine, share in _ENGINE_MIX.items()
     }
 
-    print("Event budget by engine: " + ", ".join(f"{k}={v}" for k, v in events_per_engine.items()))
+    print(f"Event budget across {len(events_per_engine)} engines, {target_events} events")
 
     alerts_to_insert: list[Alert] = []
     for engine, count in events_per_engine.items():
         profile = _EVENT_PROFILES[engine]
         event_choices = [(e[0], e[1]) for e in profile]
         event_weights = [e[2] for e in profile]
-        hp_id = honeypot_ids[f"demo-{engine}"]
+        hp_id = honeypot_ids[engine]
 
         for _ in range(count):
             event_type, severity_str = random.choices(event_choices, weights=event_weights, k=1)[0]

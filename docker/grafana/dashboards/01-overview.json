@@ -241,12 +241,12 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT strftime('%Y-%m-%dT%H:%M:00Z', timestamp) AS time, SUM(CASE WHEN severity='low' THEN 1 ELSE 0 END) AS low, SUM(CASE WHEN severity='medium' THEN 1 ELSE 0 END) AS medium, SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) AS high, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H:%M', timestamp) ORDER BY time",
+          "queryText": "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime(CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) * (MAX((($__to) - ($__from)) / 240000, 60)), 'unixepoch')) AS time, SUM(CASE WHEN severity='low' THEN 1 ELSE 0 END) AS low, SUM(CASE WHEN severity='medium' THEN 1 ELSE 0 END) AS medium, SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) AS high, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) ORDER BY time",
           "queryType": "time series",
           "timeColumns": [
             "time"
           ],
-          "rawQueryText": "SELECT strftime('%Y-%m-%dT%H:%M:00Z', timestamp) AS time, SUM(CASE WHEN severity='low' THEN 1 ELSE 0 END) AS low, SUM(CASE WHEN severity='medium' THEN 1 ELSE 0 END) AS medium, SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) AS high, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H:%M', timestamp) ORDER BY time"
+          "rawQueryText": "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime(CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) * (MAX((($__to) - ($__from)) / 240000, 60)), 'unixepoch')) AS time, SUM(CASE WHEN severity='low' THEN 1 ELSE 0 END) AS low, SUM(CASE WHEN severity='medium' THEN 1 ELSE 0 END) AS medium, SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) AS high, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) ORDER BY time"
         }
       ],
       "fieldConfig": {
@@ -401,10 +401,12 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, MAX(timestamp) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10",
+          "queryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, strftime('%Y-%m-%dT%H:%M:%SZ', MAX(timestamp)) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10",
           "queryType": "table",
-          "timeColumns": [],
-          "rawQueryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, MAX(timestamp) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10"
+          "timeColumns": [
+            "last_seen"
+          ],
+          "rawQueryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, strftime('%Y-%m-%dT%H:%M:%SZ', MAX(timestamp)) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10"
         }
       ],
       "fieldConfig": {

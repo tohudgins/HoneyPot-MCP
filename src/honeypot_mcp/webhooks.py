@@ -300,6 +300,133 @@ def _ecs_event_category(event_type: str, honeytoken_id: int | None) -> list[str]
     return ["intrusion_detection"]
 
 
+def _confidence_band(score: int) -> str:
+    """AbuseIPDB's 0-100 score → the ECS `threat.indicator.confidence` vocabulary."""
+    if score >= 75:
+        return "High"
+    if score >= 40:
+        return "Medium"
+    if score > 0:
+        return "Low"
+    return "None"
+
+
+def _vt_confidence_band(malicious: int) -> str:
+    """VirusTotal detection count → the same ECS confidence vocabulary.
+
+    Banded on the absolute count, not the share of engines: most of the ~94
+    engines VT polls do not score IP reputation at all, so the denominator is
+    close to meaningless and a ratio buries a real finding. 11 engines calling
+    an address malicious is 11/94 — 12%, which any ratio-based band reads as
+    "Low" while an analyst reads it as "block this".
+    """
+    if malicious >= 10:
+        return "High"
+    if malicious >= 4:
+        return "Medium"
+    if malicious > 0:
+        return "Low"
+    return "None"
+
+
+def _ecs_enrichment(doc: dict[str, Any], event: PendingEvent) -> None:
+    """Lift `payload.enrichment` into the ECS fields consumers actually query.
+
+    Auto-enrichment already resolves geo, ASN and reputation for every CRITICAL
+    event, but all of it only ever reached the wire inside `event.original` —
+    a JSON string. Elastic cannot search, aggregate or map a field it cannot
+    see, so the Security app's network map stayed empty while the coordinates
+    that would populate it sat in the same document. Same defect the `user.name`
+    fix addressed: present, but not as a field.
+    """
+    enrichment = (event.payload or {}).get("enrichment")
+    if not isinstance(enrichment, dict):
+        return
+
+    source = doc.setdefault("source", {})
+
+    geo_src = enrichment.get("geoip")
+    if isinstance(geo_src, dict) and geo_src.get("available"):
+        geo: dict[str, Any] = {}
+        for ecs_key, our_key in (
+            ("country_name", "country"),
+            ("country_iso_code", "country_code"),
+            ("city_name", "city"),
+            ("timezone", "timezone"),
+        ):
+            if value := geo_src.get(our_key):
+                geo[ecs_key] = value
+        lat, lon = geo_src.get("latitude"), geo_src.get("longitude")
+        if lat is not None and lon is not None:
+            # ECS `geo.location` is a geo_point; the object form with `lat`/`lon`
+            # is what the default index template maps. A [lon, lat] array is also
+            # legal but silently reverses if a consumer guesses the order.
+            geo["location"] = {"lat": lat, "lon": lon}
+        if geo:
+            source["geo"] = geo
+
+        autonomous: dict[str, Any] = {}
+        if (asn := geo_src.get("asn")) is not None:
+            autonomous["number"] = asn
+        if as_org := geo_src.get("as_org"):
+            autonomous["organization"] = {"name": as_org}
+        if autonomous:
+            source["as"] = autonomous
+
+    # Reputation is an enrichment *of* this event, not a threat-intel document
+    # about the indicator, so it belongs under `threat.enrichments[]` — the
+    # shape Elastic's own indicator-match rules produce and its UI renders.
+    enrichments: list[dict[str, Any]] = []
+    abuse = enrichment.get("abuseipdb")
+    if isinstance(abuse, dict) and abuse.get("available"):
+        score = abuse.get("abuse_confidence_score") or 0
+        indicator: dict[str, Any] = {
+            "ip": event.source_ip,
+            "type": "ipv4-addr",
+            "provider": "AbuseIPDB",
+            "confidence": _confidence_band(int(score)),
+        }
+        if (reports := abuse.get("total_reports")) is not None:
+            indicator["sightings"] = reports
+        enrichments.append(
+            {
+                "indicator": indicator,
+                "matched": {
+                    "atomic": event.source_ip,
+                    "field": "source.ip",
+                    "type": "indicator_match_rule",
+                },
+            }
+        )
+    vt = enrichment.get("virustotal")
+    if isinstance(vt, dict) and vt.get("available"):
+        malicious = int(vt.get("malicious_votes") or 0)
+        indicator = {
+            "ip": event.source_ip,
+            "type": "ipv4-addr",
+            "provider": "VirusTotal",
+            "confidence": _vt_confidence_band(malicious),
+            "sightings": malicious,
+        }
+        if ratio := vt.get("detection_ratio"):
+            indicator["description"] = f"VirusTotal detections: {ratio}"
+        enrichments.append(
+            {
+                "indicator": indicator,
+                "matched": {
+                    "atomic": event.source_ip,
+                    "field": "source.ip",
+                    "type": "indicator_match_rule",
+                },
+            }
+        )
+    if enrichments:
+        doc["threat"] = {"enrichments": enrichments}
+
+    if not source:
+        doc.pop("source", None)
+
+
 def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
     """Elastic Common Schema field-renamed JSON.
 
@@ -351,6 +478,7 @@ def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, d
         related["user"] = [actor]
     if related:
         doc["related"] = related
+    _ecs_enrichment(doc, event)
 
     body = json.dumps(doc, default=str).encode("utf-8")
     headers = {

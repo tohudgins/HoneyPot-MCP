@@ -79,7 +79,10 @@ def _fat_http_payload() -> dict:
         "raw_body_b64": "QUFBQQ==" * 4000,
         "enrichment": {
             "geoip": {"country": "China", "as_org": "Chinanet", "latitude": 35.0},
-            "virustotal": {"malicious": 12, "available": True},
+            # `malicious_votes` is what `intel.virustotal` returns. This fixture
+            # said `malicious`, matching the bug in the digest it was testing,
+            # so the assertion below passed on a code path that never fired.
+            "virustotal": {"malicious_votes": 12, "available": True},
         },
     }
 

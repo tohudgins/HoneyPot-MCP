@@ -921,3 +921,156 @@ def test_loki_keeps_the_ip_queryable_in_the_line():
     body, _ = render_loki(_make_event(), _make_sub(fmt="loki"))
     line = json.loads(body)["streams"][0]["values"][0][1]
     assert json.loads(line)["source_ip"] == "203.0.113.7"
+
+
+# ── Enrichment reaches structured fields ───────────────────────────────────
+
+
+def _intel_enriched_event() -> Any:
+    """An event carrying the enrichment auto-lookup attaches to CRITICALs."""
+    from honeypot_mcp.storage.event_buffer import PendingEvent
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    return PendingEvent(
+        honeypot_id=42,
+        source_ip="203.0.113.7",
+        source_port=54321,
+        event_type="ssh_login_failed",
+        payload={
+            "username": "root",
+            "enrichment": {
+                "geoip": {
+                    "available": True,
+                    "country": "Vietnam",
+                    "country_code": "VN",
+                    "city": "Hanoi",
+                    "latitude": 21.0245,
+                    "longitude": 105.8412,
+                    "asn": 18403,
+                    "as_org": "FPT Telecom",
+                },
+                "abuseipdb": {
+                    "available": True,
+                    "abuse_confidence_score": 100,
+                    "total_reports": 4213,
+                },
+                "virustotal": {
+                    "available": True,
+                    "malicious_votes": 11,
+                    "total_engines": 94,
+                    "detection_ratio": "11/94",
+                },
+            },
+        },
+        severity=AlertSeverity.CRITICAL,
+        timestamp=datetime.now(UTC),
+    )
+
+
+def test_ecs_maps_geo_to_source_geo_location():
+    """Elastic Security's network map plots `source.geo.location` and nothing
+    else. Auto-enrichment already resolves the coordinates, but they only ever
+    reached the wire inside the `event.original` JSON string — present in the
+    document, invisible to every map, aggregation and filter. Same defect the
+    `user.name` fix addressed."""
+    from honeypot_mcp.webhooks import render_elastic_ecs
+
+    body, _ = render_elastic_ecs(_intel_enriched_event(), _make_sub(fmt="elastic_ecs"))
+    geo = json.loads(body)["source"]["geo"]
+
+    assert geo["location"] == {"lat": 21.0245, "lon": 105.8412}
+    assert geo["country_iso_code"] == "VN"
+    assert geo["country_name"] == "Vietnam"
+    assert geo["city_name"] == "Hanoi"
+
+
+def test_ecs_maps_asn_to_source_as():
+    """`source.as.organization.name` is how an analyst pivots from one address
+    to the rest of a bulletproof host's range."""
+    from honeypot_mcp.webhooks import render_elastic_ecs
+
+    body, _ = render_elastic_ecs(_intel_enriched_event(), _make_sub(fmt="elastic_ecs"))
+    autonomous = json.loads(body)["source"]["as"]
+
+    assert autonomous["number"] == 18403
+    assert autonomous["organization"]["name"] == "FPT Telecom"
+
+
+def test_ecs_reputation_uses_threat_enrichments():
+    """Reputation is an enrichment *of this event*, not a threat-intel document
+    about the indicator, so ECS puts it under `threat.enrichments[]` — the shape
+    Elastic's indicator-match rules emit and its UI knows how to render."""
+    from honeypot_mcp.webhooks import render_elastic_ecs
+
+    body, _ = render_elastic_ecs(_intel_enriched_event(), _make_sub(fmt="elastic_ecs"))
+    enrichments = json.loads(body)["threat"]["enrichments"]
+
+    providers = {e["indicator"]["provider"] for e in enrichments}
+    assert providers == {"AbuseIPDB", "VirusTotal"}
+    for entry in enrichments:
+        assert entry["matched"]["field"] == "source.ip"
+        assert entry["matched"]["atomic"] == "203.0.113.7"
+        # ECS constrains confidence to this vocabulary.
+        assert entry["indicator"]["confidence"] in {"None", "Low", "Medium", "High"}
+
+
+def test_vt_confidence_bands_on_count_not_ratio():
+    """VirusTotal polls ~94 engines and most do not score IP reputation at all,
+    so the denominator is close to meaningless. 11 detections is 12% — any
+    ratio-based band calls that "Low" while an analyst calls it "block"."""
+    from honeypot_mcp.webhooks import _vt_confidence_band
+
+    assert _vt_confidence_band(11) == "High"
+    assert _vt_confidence_band(5) == "Medium"
+    assert _vt_confidence_band(1) == "Low"
+    assert _vt_confidence_band(0) == "None"
+
+
+def test_ecs_omits_enrichment_fields_when_lookup_unavailable():
+    """No API key is the default, so the unenriched path is the common one and
+    must not emit half-populated field groups."""
+    from honeypot_mcp.webhooks import render_elastic_ecs
+
+    doc = json.loads(render_elastic_ecs(_make_event(), _make_sub(fmt="elastic_ecs"))[0])
+
+    assert "geo" not in doc.get("source", {})
+    assert "as" not in doc.get("source", {})
+    assert "threat" not in doc
+    # The address itself is still there — only the enrichment is absent.
+    assert doc["source"]["ip"] == "203.0.113.7"
+
+
+def test_digest_surfaces_the_virustotal_key_the_module_returns():
+    """`digest_payload` read `vt["malicious"]`; `intel.virustotal` returns
+    `malicious_votes`. The guard is a truthiness check, so the wrong key was
+    indistinguishable from "no detections" and every triage view — alerts_recent,
+    alerts_search, the console feed — silently dropped the VT verdict."""
+    from honeypot_mcp.tools._format import digest_payload
+
+    digest = digest_payload(
+        {
+            "username": "root",
+            "enrichment": {
+                "virustotal": {"available": True, "malicious_votes": 11},
+                "abuseipdb": {"available": True, "abuse_confidence_score": 100},
+                "geoip": {"available": True, "country": "Vietnam"},
+            },
+        }
+    )
+
+    assert digest["vt_malicious"] == 11
+    assert digest["abuse_score"] == 100
+    assert digest["country"] == "Vietnam"
+
+
+def test_digest_enrichment_keys_match_the_intel_modules():
+    """Pins the digest against the real lookup shapes rather than a hand-copied
+    guess — the drift that hid the bug above was the seed script and the digest
+    agreeing with each other and disagreeing with the module."""
+    import inspect
+
+    from honeypot_mcp.intel import virustotal
+
+    source = inspect.getsource(virustotal)
+    assert '"malicious_votes"' in source
+    assert '"malicious":' not in source

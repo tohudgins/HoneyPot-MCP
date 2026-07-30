@@ -110,9 +110,13 @@ def digest_payload(payload: Any) -> dict[str, Any]:
                 digest["country"] = country
             if as_org := geo.get("as_org"):
                 digest["as_org"] = as_org
+        # `malicious_votes` is the key `intel.virustotal` actually returns.
+        # This read `malicious`, which that dict never contains, so a VT
+        # verdict was silently absent from every digest — the guard is a
+        # truthiness check, so a wrong key looks exactly like "no detections".
         vt = enrichment.get("virustotal")
-        if isinstance(vt, dict) and vt.get("malicious"):
-            digest["vt_malicious"] = vt["malicious"]
+        if isinstance(vt, dict) and vt.get("malicious_votes"):
+            digest["vt_malicious"] = vt["malicious_votes"]
         abuse = enrichment.get("abuseipdb")
         if isinstance(abuse, dict) and abuse.get("abuse_confidence_score"):
             digest["abuse_score"] = abuse["abuse_confidence_score"]

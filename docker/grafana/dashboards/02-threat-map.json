@@ -156,7 +156,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Unique attacker IPs per hour",
+      "title": "Unique attacker IPs over time",
       "gridPos": {
         "h": 10,
         "w": 12,
@@ -170,12 +170,12 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS time, COUNT(DISTINCT source_ip) AS unique_ips FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H', timestamp) ORDER BY time",
+          "queryText": "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime(CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) * (MAX((($__to) - ($__from)) / 240000, 60)), 'unixepoch')) AS time, COUNT(DISTINCT source_ip) AS unique_ips FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) ORDER BY time",
           "queryType": "time series",
           "timeColumns": [
             "time"
           ],
-          "rawQueryText": "SELECT strftime('%Y-%m-%dT%H:00:00Z', timestamp) AS time, COUNT(DISTINCT source_ip) AS unique_ips FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY strftime('%Y-%m-%dT%H', timestamp) ORDER BY time"
+          "rawQueryText": "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime(CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) * (MAX((($__to) - ($__from)) / 240000, 60)), 'unixepoch')) AS time, COUNT(DISTINCT source_ip) AS unique_ips FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY CAST(strftime('%s', timestamp) / (MAX((($__to) - ($__from)) / 240000, 60)) AS INTEGER) ORDER BY time"
         }
       ],
       "fieldConfig": {

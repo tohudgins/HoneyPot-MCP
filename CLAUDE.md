@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (709 unit tests covering security-critical paths)
+# Tests (719 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -483,6 +483,21 @@ event and reading the output, never by reading the renderers:
   of thousands a day, blows past `max_streams_per_user` and degrades the whole
   tenant. The IP lives in the line and LogQL parses it out — the idiomatic
   pattern, and free at ingest.
+- **Enrichment must reach ECS fields, not just ride in `event.original`.**
+  Auto-enrichment resolves geo, ASN and reputation for every CRITICAL event, and
+  all of it used to reach the wire only inside the `event.original` JSON string.
+  Elastic cannot map, aggregate or filter what it cannot see as a field, so
+  Security's network map stayed empty while the coordinates that would populate
+  it sat in the same document — the `user.name` defect again, one layer out.
+  `_ecs_enrichment()` writes `source.geo.*` (with `location` as a `{lat, lon}`
+  geo_point, the form the default index template maps), `source.as.*`, and
+  reputation as `threat.enrichments[]` — the shape Elastic's own indicator-match
+  rules emit, rather than `threat.indicator.*`, which describes a threat-intel
+  document *about* an indicator instead of an enrichment *of* this event.
+  VirusTotal confidence bands on the **absolute** detection count, not the share
+  of engines: VT polls ~94 engines and most do not score IP reputation at all,
+  so 11 detections is 12% — which every ratio-based band calls "Low" and every
+  analyst calls "block".
 
 Note the split that makes this safe to reason about: renderers operate on
 `PendingEvent`, whose timestamp is always `datetime.now(UTC)` and therefore
@@ -986,6 +1001,31 @@ Re-run the generator after touching mappings or adding an engine. Tactic IDs
 Multi-tactic events count under *every* tactic they map to — hence UNION ALL
 rather than CASE, which can only bucket a row once and would under-report the
 later tactic.
+
+**Timeseries panels derive their bucket width from the window, never hardcode
+it.** Every Grafana timeseries query buckets on
+`MAX((($__to) - ($__from)) / 240000, 60)` — about 240 points across whatever
+range the viewer picked, floored at 60s — and `$__from`/`$__to` are used rather
+than `$__interval_ms` because those two are already proven to interpolate in
+these dashboards. A fixed width is wrong in both directions: the severity panel
+grouped by a literal `strftime('%Y-%m-%dT%H:%M')`, which is 1,440 points per
+series over 24h and 43,200 over 30 days across four series, while an hourly
+bucket over a five-minute window is a single column. `console/server.py`'s
+`_bucket_size` already did this correctly, so the two halves of the same product
+disagreed. Table panels have the matching rule: never `SELECT MAX(timestamp)`
+raw — that returns SQLite's storage string (`2026-07-30 20:22:10.632767`, no
+`T`, no offset), which renders as an ambiguous string and cannot be shown in the
+viewer's timezone. Format with `strftime('%Y-%m-%dT%H:%M:%SZ', …)` and declare
+the column in the target's `timeColumns`.
+
+**`scripts/seed_demo_data.py` must feed every engine it deploys.** Its budget
+named five while it created twenty-five, so the demo data that exists to show
+the platform off implied a five-protocol tool and left the ATT&CK dashboard
+showing a fraction of the tactics the sensors detect. `_ENGINE_MIX` now carries
+a weight per engine and `_check_engine_mix()` fails the run if it and
+`_EVENT_PROFILES` disagree. Honeypot ids are keyed by `HoneypotType.value`, not
+display name — `docker_api` deploys as `demo-docker-api` because Docker object
+names disallow underscores.
 
 **Timestamps are aware everywhere** (`storage/models.py:UTCDateTime`). The
 columns were declared `DateTime(timezone=True)`, which PostgreSQL honours and
