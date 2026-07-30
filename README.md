@@ -3,9 +3,9 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-437%20unit%20%2B%205%20e2e-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-709%20unit%20%2B%206%20e2e-brightgreen)](tests/)
 
-**Deception infrastructure you drive by talking to it.** Deploy honeypots across 14
+**Deception infrastructure you drive by talking to it.** Deploy honeypots across 25
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
 window, a terminal, or a systemd unit.
 
@@ -106,7 +106,7 @@ flowchart TD
     DB --> ENR["Auto-enrichment<br/><i>VirusTotal · AbuseIPDB · GeoIP</i>"]
     ENR --> DB
     DB --> WH["Webhook worker"]
-    WH --> SIEM["Splunk · Elastic · Loki<br/>Datadog · CEF · syslog"]
+    WH --> SIEM["Splunk · Elastic · Loki · Datadog<br/>CEF · syslog · Slack · Teams · email"]
     DB --> MCP["MCP tools + resources"]
     MCP --> CLIENT["Claude / any MCP client"]
 
@@ -141,13 +141,15 @@ Three design decisions worth calling out:
 <tr><td><b>Credential correlation</b></td><td>Planted creds auto-match on any honeypot login and escalate to CRITICAL — including MySQL and VNC, where the plaintext never crosses the wire (the engine recomputes the scramble/DES response)</td></tr>
 <tr><td><b>Analysis</b></td><td>MITRE ATT&CK mapping, attacker profiling + risk score, SSH session reconstruction, cross-honeypot kill-chain timelines, campaign correlation, XSS-safe HTML/Markdown reports</td></tr>
 <tr><td><b>SIEM delivery</b></td><td>JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, RFC 5424 syslog, Grafana Loki, Datadog — per-subscription severity thresholds and delivery health stats</td></tr>
+<tr><td><b>Human notifications</b></td><td>Slack (Block Kit), Microsoft Teams (MessageCard), email (SMTP/STARTTLS) — severity-coloured with captured credentials up front, and coalesced so one scanner can't bury the channel. CRITICAL is never held back</td></tr>
+<tr><td><b>Packet capture</b></td><td>Optional tcpdump ring buffer scoped to the deployed honeypot ports, with <code>pcap_extract</code> pulling a single attacker's packets out for Wireshark, Suricata or Zeek. Disk bounded by construction</td></tr>
 <tr><td><b>Response</b></td><td>Blocklist push to Cloudflare / pfSense / AWS WAFv2, iptables/fail2ban/CIDR export, STIX 2.1 bundles, AbuseIPDB reporting</td></tr>
 <tr><td><b>Console</b></td><td>Built-in read-only web dashboard on <code>:8090</code> — live attack feed with captured credentials and paths, sensor health, volume by severity, top attackers and origins. Served by the server itself; no extra container</td></tr>
 <tr><td><b>Triage</b></td><td>Bulk acknowledge by filter with a disposition (true/false positive, benign, duplicate), note and analyst; append-only audit log of every control-plane action</td></tr>
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-636 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+709 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -360,10 +362,22 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 
 | Tool | Description |
 |---|---|
-| `alert_subscribe` / `alert_unsubscribe` / `alert_subscriptions_list` | SIEM/webhook delivery with health stats |
+| `alert_subscribe` / `alert_unsubscribe` / `alert_subscriptions_list` | SIEM, Slack, Teams and email delivery with health stats |
 | `suppression_add` / `suppression_remove` / `suppression_list` | Drop or rate-limit noise (exact IP / CIDR / event-type glob) |
 | `suppression_load_preset` / `suppression_list_presets` | Bundled presets: shodan, censys, internal-rfc1918 |
 | `blocklist_push_cloudflare` / `blocklist_push_pfsense` / `blocklist_push_aws_waf` | Push offenders to live appliances (idempotent, `dry_run`) |
+
+</details>
+
+<details>
+<summary><b>Packet capture</b> — optional, off by default</summary>
+
+| Tool | Description |
+|---|---|
+| `pcap_extract` | **One attacker's packets as a single file** — for Wireshark, or replay through Suricata/Zeek |
+| `pcap_status` | Running? Disk used? And if it isn't running, the actual reason plus the fix |
+| `pcap_files` | Ring contents and how far back the capture reaches |
+| `pcap_control` | Start / stop / restart (deploy and stop refresh the filter automatically) |
 
 </details>
 
@@ -464,7 +478,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 636 unit tests
+uv run pytest tests/unit/ -v     # 709 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
@@ -489,7 +503,9 @@ uv run alembic revision --autogenerate -m "what changed"   # review before commi
 src/honeypot_mcp/
 ├── server.py            — FastMCP app, lifespan, transports, MCP resources
 ├── canary.py            — Callback server: canary URLs, PDF trackers, /cloud-event
-├── webhooks.py          — Outbound SIEM delivery worker (HMAC, retries)
+├── webhooks.py          — SIEM + Slack/Teams/email delivery worker (HMAC, retries,
+│                         coalescing for the human-facing channels)
+├── pcap.py              — Optional tcpdump ring buffer + per-attacker extract
 ├── suppression.py       — Drop / rate-limit rule engine
 ├── credential_match.py  — Planted-credential cross-reference (auto-CRITICAL)
 ├── credential_verify.py — Hashed-auth verification (MySQL scramble, VNC DES)

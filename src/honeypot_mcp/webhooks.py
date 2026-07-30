@@ -2,7 +2,10 @@
 
 Every flushed alert that meets a subscription's severity threshold is
 serialised into the subscription's chosen `format` and delivered via the
-appropriate transport. Seven formats are supported:
+appropriate transport. Ten formats are supported, in two groups.
+
+**SIEM formats** fill an index and are never throttled — dropping an event
+would corrupt the record they exist to keep:
 
 * `json` — raw JSON envelope, optionally HMAC-signed via
   `X-HoneyPot-Signature: sha256=<hex>` (consumer verifies with the same
@@ -27,6 +30,18 @@ appropriate transport. Seven formats are supported:
   `hmac_secret` is set (operator pre-encodes `userid:token` for Grafana Cloud).
 * `datadog` — Datadog Logs API. Body is a single-element JSON list per
   the v2 logs intake. `DD-API-KEY: <hmac_secret>` carries the API key.
+
+**Human channels** interrupt a person, so their scarce resource is attention
+rather than storage. All three are coalesced by `_NotifyThrottle` (CRITICAL
+exempt) — a channel that relays a scanner one-to-one gets muted, which is worse
+than no integration because everyone then believes they are covered:
+
+* `slack` — incoming webhook, Block Kit. Sets `text` as well as `blocks`, or
+  the mobile push arrives as "This content can't be displayed".
+* `teams` — incoming webhook, MessageCard (renders on both the classic O365
+  connector and the Workflows path; Adaptive Cards only work on the latter).
+* `email` — SMTP via `asyncio.to_thread`. The URL carries everything:
+  `smtp://user:pw@host:587/?from=…&to=a@x,b@y&tls=starttls|implicit|none`.
 
 Delivery runs in a background asyncio task drained from a queue so slow
 webhook endpoints can never back-pressure the honeypot data path. HTTP
