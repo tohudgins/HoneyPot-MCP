@@ -103,7 +103,7 @@ async def test_readyz_fails_on_a_runaway_ingest_backlog():
     from honeypot_mcp.storage.models import AlertSeverity
 
     buffer = event_buffer.get_buffer()  # never started, so nothing drains
-    for i in range(50_001):
+    for _ in range(50_001):
         buffer._queue.put_nowait(
             PendingEvent(
                 honeypot_id=None,
