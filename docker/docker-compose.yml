@@ -134,6 +134,24 @@ services:
       - honeypot-net
     labels:
       - "honeypot-mcp=server"
+    # Readiness, not liveness. A honeypot whose database has gone away keeps
+    # answering attackers perfectly — the listeners are in-process and do not
+    # need the DB — while every captured event silently fails to persist. Only
+    # a probe that actually queries a table can tell "running" from
+    # "collecting", and collecting is the only thing that matters for a sensor.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen(
+              "http://127.0.0.1:9090/readyz", timeout=5).status == 200 else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     security_opt:
       - no-new-privileges:true
 

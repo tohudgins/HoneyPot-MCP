@@ -376,3 +376,102 @@ After 7 days on a typical $5 VPS you should expect, roughly:
   intended username in the `Cookie: mstshash=` field
 
 If you see substantially less, check the firewall and the self-test.
+
+---
+
+## Running it in production
+
+The sections above get a sensor collecting. These are the things that decide
+whether it keeps collecting, and whether you can prove what it collected.
+
+### Health checks: liveness is not readiness
+
+Two endpoints on the metrics port (default `9090`, localhost-only):
+
+| Endpoint | Answers | Use for |
+|---|---|---|
+| `GET /healthz` | Is the process alive? | restart policy / liveness probe |
+| `GET /readyz` | Is it actually *collecting*? | alerting, load-balancer readiness |
+
+The distinction is not academic. Every in-process engine keeps accepting
+connections and answering attackers whether or not the database is reachable —
+the listeners never touch it. Remove the database underneath a running server
+and the honeypots carry on perfectly while nothing is persisted; a liveness
+probe sees a healthy process the entire time. `/readyz` runs a real query
+against a real table and returns **503** when it cannot, which is the only
+signal that distinguishes "running" from "collecting".
+
+It also fails on a runaway ingest backlog. The event queue is unbounded, so a
+database that cannot keep up becomes a memory problem before it becomes a
+data-loss one, and `honeypot_event_queue_depth` in `/metrics` shows the trend.
+
+**Alert on `/readyz`, not `/healthz`.** A honeypot that has silently stopped
+recording is worse than one that is obviously down.
+
+```bash
+curl -s localhost:9090/readyz | jq
+```
+
+The compose stack already wires the container healthcheck to `/readyz`.
+
+### Backups — the database is the evidence
+
+Everything else can be rebuilt from the repo. Captured attack data cannot, and
+neither can honeytoken values: a token whose secret is lost can never be
+attributed if it fires later.
+
+```bash
+./scripts/backup.sh /var/backups/honeypot     # database + TLS certs + reports + .env
+./scripts/restore.sh /var/backups/honeypot/honeypot-20260730T013016Z
+```
+
+Two details the script exists to get right:
+
+- **It uses SQLite's `.backup`, never `cp`.** The server runs in WAL mode, so
+  copying the `.db` file while a write is in flight produces a file that opens
+  cleanly and is quietly missing recent transactions — the worst way for a
+  backup to fail. Verified: a `.backup` of a 5,000-row uncheckpointed database
+  restores all 5,000.
+- **The backup contains secrets** — `.env`, honeytoken values, captured
+  credentials. It is written mode 600 and should be stored wherever you keep
+  the `.env` itself.
+
+`restore.sh` refuses to run while the server is up. Restoring underneath a
+running process leaves it holding an open handle to the replaced file: it keeps
+working, keeps reporting success, and writes into a database nobody will read
+again.
+
+Schedule it:
+
+```
+0 3 * * *  cd /opt/honeypot-mcp && ./scripts/backup.sh /var/backups/honeypot
+```
+
+### Upgrades
+
+Migrations run automatically at startup, so the procedure is:
+
+```bash
+./scripts/backup.sh /var/backups/honeypot   # 1. always, before anything
+git pull && uv sync --extra dev             # 2. update
+docker compose -f docker/docker-compose.yml up -d --build   # 3. restart
+curl -s localhost:9090/readyz               # 4. confirm it came back collecting
+```
+
+Step 4 matters: a failed migration falls back to `create_all()` so the server
+still starts, which means a broken upgrade can look like a successful one.
+`/readyz` and the startup logs are how you tell.
+
+### File permissions
+
+`.env` holds the MCP bearer token, threat-intel API keys and webhook HMAC
+secrets. A default umask produces mode 0644, so `cp .env.example .env` leaves
+it world-readable — on a shared host that hands the control plane to any local
+account, and the control plane can deploy honeypots and read every captured
+credential.
+
+```bash
+chmod 600 .env
+```
+
+The server warns at startup if the mode is wrong.

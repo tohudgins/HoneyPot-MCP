@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -9,6 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # work no matter what cwd the server was launched from (e.g. Claude Desktop
 # launches MCP servers from C:\WINDOWS\system32, where relative paths fail).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+log = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -224,6 +227,37 @@ class Settings(BaseSettings):
 
 
 _settings: Settings | None = None
+
+
+def warn_on_world_readable_env(env_path: Path | None = None) -> str | None:
+    """Warn if the `.env` file is readable by anyone but its owner.
+
+    It holds the MCP bearer token, VirusTotal and AbuseIPDB keys, and the
+    webhook HMAC secrets. The default umask on most systems produces 0644, so
+    a file created by an ordinary `cp .env.example .env` is world-readable —
+    on a shared or multi-tenant host that hands the control-plane token to any
+    local account. The control plane can deploy honeypots and read every
+    captured credential, so this is not a theoretical exposure.
+
+    Returns the warning text (for tests) or None when the mode is fine.
+    """
+    path = env_path or (_PROJECT_ROOT / ".env")
+    try:
+        if not path.is_file():
+            return None
+        mode = path.stat().st_mode
+    except OSError:
+        return None
+
+    # Anything set in the group or other triads.
+    if not mode & 0o077:
+        return None
+    message = (
+        f"{path} is mode {oct(mode & 0o777)} — readable beyond its owner. It holds the "
+        "MCP auth token and API keys. Run: chmod 600 " + str(path)
+    )
+    log.warning("%s", message)
+    return message
 
 
 def get_settings() -> Settings:

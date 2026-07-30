@@ -147,7 +147,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-625 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+636 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -420,7 +420,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 625 unit tests
+uv run pytest tests/unit/ -v     # 636 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

@@ -23,6 +23,7 @@ independently of the honeypot ports.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from aiohttp import web
 from sqlalchemy import func, select
@@ -179,9 +180,61 @@ async def _handle_metrics(_request: web.Request) -> web.Response:
     return web.Response(text=body, content_type="text/plain", charset="utf-8")
 
 
+async def _handle_healthz(_request: web.Request) -> web.Response:
+    """Liveness: the process is up and the event loop is turning."""
+    return web.json_response({"status": "ok"})
+
+
+async def _handle_readyz(_request: web.Request) -> web.Response:
+    """Readiness: the pieces that must work for collection to be real.
+
+    Liveness alone is not enough here. A honeypot whose database has gone away
+    keeps accepting connections and answering attackers perfectly — the
+    listeners are in-process and do not need the DB — while every captured
+    event silently fails to persist. Deleting the database file underneath a
+    running server reproduces exactly that: engines keep serving, a deploy even
+    reports success, and nothing is stored. A liveness probe sees a healthy
+    process throughout.
+
+    So readiness actually queries a real table. That distinguishes "running"
+    from "collecting", which is the only distinction that matters for a sensor.
+    """
+    from sqlalchemy import func, select
+
+    from honeypot_mcp.storage.event_buffer import get_buffer
+
+    checks: dict[str, Any] = {}
+    ready = True
+    try:
+        async with get_session() as session:
+            # A real query against a real table — not `SELECT 1`, which passes
+            # against an empty database file that lost its schema.
+            await session.execute(select(func.count(Honeypot.id)))
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"unavailable: {type(e).__name__}: {e}"
+        ready = False
+
+    depth = get_buffer().qsize()
+    checks["event_queue_depth"] = depth
+    # A backlog this size means ingest has been outrunning the database for a
+    # while; the queue is unbounded, so it is a memory problem before it is a
+    # data-loss one.
+    if depth > 50_000:
+        checks["event_queue"] = "backlog — ingest is outrunning the database"
+        ready = False
+
+    return web.json_response(
+        {"status": "ready" if ready else "not ready", "checks": checks},
+        status=200 if ready else 503,
+    )
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/metrics", _handle_metrics)
+    app.router.add_get("/healthz", _handle_healthz)
+    app.router.add_get("/readyz", _handle_readyz)
     return app
 
 

@@ -13,7 +13,7 @@ from typing import Any, Literal, cast
 from fastmcp import FastMCP
 
 from honeypot_mcp.canary import start_canary_server
-from honeypot_mcp.config import get_settings
+from honeypot_mcp.config import get_settings, warn_on_world_readable_env
 from honeypot_mcp.console import start_console_server
 from honeypot_mcp.metrics import start_metrics_server
 from honeypot_mcp.reconcile import adopt_labelled_containers, reconcile_running_honeypots
@@ -47,6 +47,10 @@ async def lifespan(app: FastMCP):
     if settings.metrics_port > 0:
         metrics_runner = await start_metrics_server(settings.metrics_host, settings.metrics_port)
     console_runner = None
+    # Surfaced at startup because the usual cause is `cp .env.example .env`
+    # inheriting a 0644 umask, which nobody thinks to check.
+    warn_on_world_readable_env()
+
     if settings.console_port > 0:
         console_runner = await start_console_server(settings.console_host, settings.console_port)
     # Re-establish honeypots the previous process left RUNNING — must happen

@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (625 unit tests covering security-critical paths)
+# Tests (636 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -896,6 +896,30 @@ reinforcement, never colour alone. Re-run the palette validator if these change.
 Grafana still owns historical dashboards and the geo map; the console answers
 the three questions someone walking up to a screen has — is everything up, is
 anything on fire, what just happened.
+
+### Production operations
+
+`/healthz` and `/readyz` on the metrics port answer different questions, and
+the difference is the whole point. Every in-process engine keeps serving
+attackers whether or not the database is reachable — the listeners never touch
+it — so removing the database underneath a running server leaves the honeypots
+working perfectly while nothing persists, and a liveness probe sees a healthy
+process throughout. Chaos testing found exactly that: engines kept answering
+and a deploy still returned success. `/readyz` runs a real query against a real
+table, so it is the only signal that separates "running" from "collecting".
+Alert on it, not on `/healthz`. It also 503s on a runaway ingest backlog, since
+the unbounded queue becomes a memory problem before a data-loss one.
+
+`scripts/backup.sh` uses SQLite's `.backup`, never `cp`: the server runs in WAL
+mode, so a file copy taken mid-write opens cleanly and is quietly missing
+recent transactions. `restore.sh` refuses to run while the server is up,
+because restoring underneath a live process leaves it writing into a replaced
+file it still holds open.
+
+`config.warn_on_world_readable_env()` fires at startup when `.env` is readable
+beyond its owner. A default umask makes `cp .env.example .env` mode 0644, which
+on a shared host hands the control-plane token — and with it every captured
+credential — to any local account.
 
 ### Security boundaries
 
