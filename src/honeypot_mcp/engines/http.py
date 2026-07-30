@@ -53,7 +53,7 @@ from honeypot_mcp.engines.http_personas import (
     pick_random_persona_id,
 )
 from honeypot_mcp.engines.http_templates import get_template
-from honeypot_mcp.http_identity import server_identity_middleware
+from honeypot_mcp.http_identity import identity_runner, server_identity_middleware
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -373,7 +373,9 @@ class HTTPEngine(HoneypotEngine):
         log.info("HTTP honeypot '%s' deploying as persona=%s tls=%s", name, persona.id, tls_enabled)
 
         app = self._build_app(name, hp_id, persona, config)
-        runner = web.AppRunner(app)
+        # The persona's own banner, so a malformed probe answers as the same
+        # server a well-formed one does.
+        runner = identity_runner(app, persona.server_header)
         await runner.setup()
 
         ssl_context = None

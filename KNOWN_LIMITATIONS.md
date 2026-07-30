@@ -5,10 +5,19 @@ in deception tech knows where the gaps are; pretending they aren't there is the
 fastest way to lose credibility. This document exists so you can decide whether
 HoneyPot MCP fits your use case before you spend time on it.
 
-The short version: **this is a homelab / SOC-training / automated-attack-
-collection project, not an APT-research or commercial-grade deception
-platform.** It will catch internet-scale automated traffic on a public IP. It
-will not fool a skilled human attacker probing manually.
+The short version: **this catches the automated population — which is the
+overwhelming majority of what reaches a public IP — and it is built to be
+indistinguishable to a scanner.** `nmap -sV` identifies most engines as the
+software they impersonate, by name and version. What it does not attempt is
+fooling a skilled human who probes by hand for an extended session; the
+in-process engines are protocol facades, not real servers, and a determined
+operator will eventually find the edge of one.
+
+Every entry below is one of three things, and they are kept separate on
+purpose: a boundary set by software outside this codebase, a deliberate design
+decision, or something explicitly out of scope. Anything that was simply
+unfinished has been fixed rather than documented — a limitations file is not a
+place to park work.
 
 For higher-fidelity needs, look at [T-Pot](https://github.com/telekom-security/tpotce)
 (full distribution with 30+ honeypots), [OpenCanary](https://github.com/thinkst/opencanary),
@@ -102,8 +111,10 @@ signal, but nothing is embedded in the document for it.
 **Credential token cross-reference (post-fix).** If you plant fake creds via
 `honeytoken_generate_credentials` and an attacker tries them on one of your
 own honeypots, the alert pipeline now auto-escalates severity to CRITICAL and
-links the alert back to the originating token. See "What is partially
-functional" below for the caveat.
+links the alert back to the originating token. Tokens also record where they
+were planted, so a trigger months later says which system the attacker
+reached rather than only which token fired. See "What is partially functional"
+below for the caveat on scope.
 
 ---
 
@@ -120,15 +131,14 @@ As of the last sweep, `nmap -sV` identifies SSH, FTP (ProFTPD 1.3.5), SMTP
 MongoDB (5.0.14), Redis (7.0.5), VNC (RFB 3.8), RDP, SMB (microsoft-ds) and
 HTTP (the deployed persona) as the software they impersonate.
 
-**Residual, honestly stated:** aiohttp answers protocol-level malformed
-requests — an unparseable method, non-HTTP bytes on an HTTP port — inside its
-own `handle_error` path, before any application middleware runs. Those replies
-carry a generic `Server: nginx` banner rather than the deployed persona, so an
-HTTP honeypot wearing an Apache or IIS persona answers a *malformed* request as
-nginx. No implementation detail leaks (the aiohttp/Python banner is gone), and
-scanner version detection keys off well-formed responses, so the persona still
-determines identification — but an expert who deliberately diffs malformed and
-well-formed responses can spot the mismatch.
+**Malformed requests wear the same identity as valid ones.** aiohttp rejects
+unparseable requests inside `RequestHandler.handle_error`, below any
+middleware, so those replies used to fall back to a process-wide banner — an
+Apache-persona honeypot answered a malformed probe as nginx, and every persona
+in the process leaked at the same seam. `http_identity.identity_runner`
+subclasses the runner, server and request handler so each listener stamps its
+own banner on protocol errors too. Verified: malformed and well-formed requests
+now return identical `Server` headers on all five aiohttp listeners.
 
 **Memcached and SNMP deliberately never amplify.** Both are reflection
 vectors, and both engines are built to watch the reconnaissance rather than
@@ -140,17 +150,22 @@ a real agent sends, for the same reason. Both still record the probe, and both
 report a measured amplification factor, so the intent is captured; what is
 withheld is the traffic. This is a design decision, not an omission.
 
-**The Docker API engine is identified as `nginx` by `nmap -sV`, not Docker.**
-Every real response carries `Server: Docker/24.0.7 (linux)` and the correct
-`Api-Version` headers, so the campaigns that actually hunt port 2375 — which
-open with `GET /version` or `GET /containers/json` — see a faithful daemon. But
-aiohttp answers *malformed* requests inside `RequestHandler.handle_error`,
-below any middleware, and that response falls back to the process-wide
-`SERVER_SOFTWARE` (see `http_identity.py`), which is `nginx`. aiohttp exposes
-no per-server override, so one process-global has to serve every aiohttp
-listener here. nmap's version probes include malformed requests, so it matches
-nginx first. A real daemon returns no `Server` header at all on a bad request.
-The same limitation applies to the HTTP persona engine's Apache/IIS personas.
+**The Docker API engine identifies as Docker, byte-for-byte.** `nmap -sV`
+returns `docker  Docker 24.0.7` — a hard match, not a softmatch. Getting there
+took matching nmap's published rule exactly, because it is an exact rule: a
+real daemon's 404 carries `Content-Type`, `Date`, `Content-Length: 29` and the
+body `{"message":"page not found"}`, with **no `Server` header and nothing
+else**. Three separate things were breaking it — an extra `Server` header from
+aiohttp's global fallback, `Content-Length` emitted before `Date`, and the
+request path interpolated into the message so the body was not 29 bytes — and
+the port read as `nginx`, which nobody runs on 2375.
+
+The general lesson, since it applies to any engine added later: header
+*order* is semantically irrelevant to HTTP and entirely relevant to
+fingerprinting, and scanner rules are anchored regexes over the whole
+response. `http_identity.ExactHeaderResponse` exists for this — it suppresses
+the `Server` header and pins header order. `test_protocol_fidelity.py` quotes
+the nmap rule it satisfies.
 
 ## What is partially functional
 
@@ -200,7 +215,12 @@ capture NTLM hashes but is a large implementation for marginal gain.
 
 ---
 
-## What does not work today
+## Boundaries imposed from outside this codebase
+
+Nothing in this section is a defect that could be fixed here — each is a
+constraint set by software we do not control. They are listed because knowing
+where the edges are is the point of this document, not because they are
+outstanding work.
 
 **PDF file tokens — fires on open but Acrobat prompts on first use.** The
 current implementation (`tokens/file_token.py:_create_pdf`) injects an
@@ -216,7 +236,10 @@ once the user clicks anywhere in the document. Treat PDF tokens as a
 high-confidence-but-not-guaranteed trigger — the canary URL token is still
 the most reliable wire for adversarial detection.
 
-**AWS / Azure / GCP key tokens — detection requires deploying a forwarder.**
+**AWS / Azure / GCP key tokens require a forwarder in your cloud account.**
+This is not a gap in the token — it is how cloud credential canaries work at
+all, including commercial ones. Nothing observes an API call made against
+AWS except AWS, so detection has to come from an audit-log feed you own.
 The generated keys look real (correct AKIA/ASIA prefix, correct character
 set, correct length) and will sit plausibly in a `.env` file or
 `~/.aws/credentials`. But the key alone has no callback path — detection
@@ -231,6 +254,13 @@ forwarder — without that step the generated key is a believable decoy and
 nothing more. [Thinkst's Canarytokens](https://canarytokens.org) (free)
 remains the zero-setup alternative with a hosted detection backend. The
 token's `plant_instructions` text says this explicitly.
+
+---
+
+## Deliberate design decisions
+
+These are choices, with the reasoning, not things left undone. Changing any of
+them is a product decision rather than a bug fix.
 
 **HTTP — no authenticated session flow.** Sessions are issued and tracked
 (cookie persistence + repeat-visit escalation), and `POST /login` now

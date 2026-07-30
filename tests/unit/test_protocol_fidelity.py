@@ -15,6 +15,7 @@ import re
 import struct
 
 import pytest
+from aiohttp import web
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 
@@ -337,3 +338,90 @@ async def test_elasticsearch_marks_itself_as_elastic():
     response = await _elastic_headers(None, handler)
     assert response.headers["X-elastic-product"] == "Elasticsearch"
     assert "aiohttp" not in response.headers.get("Server", "").lower()
+
+
+@pytest.mark.asyncio
+async def test_docker_404_matches_nmaps_docker_signature_byte_for_byte():
+    """nmap identifies a real daemon from its 404, and the rule is exact.
+
+        softmatch docker m|^HTTP/1\\.0 404 Not Found\\r\\nContent-Type:
+        application/json\\r\\nDate: .*\\r\\nContent-Length: 29\\r\\n\\r\\n
+        \\{"message":"page not found"\\}\\n|
+
+    Three things break it, and all three were true here: an extra `Server`
+    header from aiohttp's global fallback, `Content-Length` emitted before
+    `Date`, and the request path interpolated into the message so the body was
+    not 29 bytes. The port read as `nginx` — which nobody runs on 2375 — and
+    this was written off as an aiohttp limitation rather than fixed.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from honeypot_mcp.engines.docker_api import DockerAPIEngine
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
+
+    # This module has no DB fixture, but the handler records an alert.
+    event_buffer.reset_for_tests()
+    await init_db()
+    engine = DockerAPIEngine()
+    client = TestClient(TestServer(engine._build_app("fidelity", None)))
+    await client.start_server()
+    try:
+        response = await client.get("/nope")
+        assert response.status == 404
+        body = await response.read()
+        assert body == b'{"message":"page not found"}\n', "body must be byte-exact"
+        assert len(body) == 29
+        assert "Server" not in response.headers, (
+            "a real daemon sends no Server header here; one extra header misses the match"
+        )
+        names = [name for name, _ in response.raw_headers]
+        decoded = [n.decode() for n in names]
+        assert decoded.index(b"Date".decode()) < decoded.index(b"Content-Length".decode()), (
+            "nmap's rule expects Date before Content-Length"
+        )
+    finally:
+        await client.close()
+        await close_db()
+        event_buffer.reset_for_tests()
+
+    # And the assembled response really does satisfy the published rule.
+    rendered = (
+        b"HTTP/1.0 404 Not Found\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Date: Thu, 30 Jul 2026 00:00:00 GMT\r\n"
+        b"Content-Length: 29\r\n\r\n" + body
+    )
+    rule = re.compile(
+        rb"^HTTP/1\.0 404 Not Found\r\nContent-Type: application/json\r\n"
+        rb'Date: .*\r\nContent-Length: 29\r\n\r\n\{"message":"page not found"\}\n'
+    )
+    assert rule.match(rendered)
+
+
+@pytest.mark.asyncio
+async def test_malformed_requests_wear_the_same_banner_as_valid_ones():
+    """The persona must not change when the request is unparseable.
+
+    aiohttp rejects malformed requests inside `RequestHandler.handle_error`,
+    below any middleware, so those replies used the process-wide fallback. An
+    Apache-persona honeypot therefore answered a malformed probe as nginx, and
+    diffing the two responses exposed every persona in the system at once.
+    """
+    from honeypot_mcp.http_identity import identity_runner
+
+    runner = identity_runner(web.Application(), "Apache/2.4.41 (Ubuntu)")
+    handler_factory = await runner._make_server()
+    handler = handler_factory()
+
+    class _Request:
+        """The minimum `handle_error` touches."""
+
+        headers: dict[str, str] = {}
+        remote = "127.0.0.1"
+        path = "/"
+        method = "GET"
+        writer = type("W", (), {"output_size": 0})()
+
+    response = handler.handle_error(_Request(), status=400, message="Bad Request")
+    assert response.headers["Server"] == "Apache/2.4.41 (Ubuntu)"

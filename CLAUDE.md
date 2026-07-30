@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (623 unit tests covering security-critical paths)
+# Tests (625 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -613,7 +613,24 @@ because one is not enough:
    offers no supported hook, so rebinding the default is the available fix; it
    only changes the fallback, and explicit headers still win.
 
-Any new aiohttp server must import `http_identity` and set its own identity.
+3. `identity_runner(app, banner)` covers the case middleware cannot reach *and*
+   the global gets wrong: protocol-level errors. It subclasses `AppRunner`,
+   `Server` and `RequestHandler` so `handle_error` stamps that listener's own
+   banner. Before it, one process-global served every listener, so an
+   Apache-persona honeypot answered a malformed probe as nginx — and since
+   `nmap -sV` deliberately sends malformed probes, that is what it matched on.
+   Every persona leaked at the same seam.
+
+`ExactHeaderResponse` handles the last mile: it suppresses the `Server` header
+entirely (aiohttp's `setdefault` otherwise guarantees one) and pins header
+order. Both matter because scanner signatures are anchored regexes over the
+whole response — nmap's Docker rule wants `Content-Type`, `Date`,
+`Content-Length: 29` in that order with nothing else, and `Content-Length`
+before `Date` is enough to miss. Header order is semantically irrelevant to
+HTTP and entirely relevant to fingerprinting.
+
+Any new aiohttp server must use `identity_runner` and set its own identity;
+`web.AppRunner` alone leaves the protocol-error path wearing the wrong name.
 
 ### Intent-level tools (`deception/`)
 

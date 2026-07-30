@@ -17,9 +17,10 @@ So identity is set explicitly here rather than left to a library default.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from aiohttp import web, web_response
+from aiohttp import web, web_protocol, web_response, web_server
 
 # A bare, extremely common banner. Real nginx sends exactly this when
 # `server_tokens off` is set — the default in Debian/Ubuntu packages and most
@@ -75,3 +76,106 @@ def server_identity_middleware(
         return response
 
     return _middleware
+
+
+def identity_runner(app: web.Application, server: str) -> web.AppRunner:
+    """An `AppRunner` whose *protocol-level* errors also wear the right banner.
+
+    Middleware cannot reach every response. When aiohttp rejects a request
+    before routing — an unparseable method, non-HTTP bytes on an HTTP port, an
+    oversized header — `RequestHandler.handle_error` builds the reply itself,
+    and it falls back to the process-wide `SERVER_SOFTWARE`. One global cannot
+    be right for several listeners at once, so an Apache-persona honeypot and a
+    Docker API decoy both answered malformed probes as nginx.
+
+    That is not a cosmetic gap. `nmap -sV` sends malformed probes deliberately
+    and matches on whatever comes back, so it identified the Docker API engine
+    as nginx — a service nobody runs on 2375 — and an expert diffing a
+    malformed against a well-formed response saw two different servers on one
+    port. Every persona in the system leaked at the same seam.
+
+    aiohttp has no per-server setting for this, but the object graph is
+    reachable: `AppRunner._make_server()` builds the `Server`, `Server.__call__`
+    builds the `RequestHandler`, and `handle_error` returns an ordinary
+    `Response` before it is written. Subclassing the three and stamping the
+    header on the way out fixes it without touching the global, so listeners in
+    one process can wear different identities. An explicitly set header beats
+    the `setdefault` that would otherwise apply the global.
+    """
+
+    class _IdentityRequestHandler(web_protocol.RequestHandler):  # type: ignore[misc,type-arg]
+        def handle_error(
+            self,
+            request: Any,
+            status: int = 500,
+            exc: BaseException | None = None,
+            message: str | None = None,
+        ) -> Any:
+            response = super().handle_error(request, status, exc, message)
+            response.headers["Server"] = server
+            return response
+
+    class _IdentityServer(web_server.Server):  # type: ignore[misc]
+        def __call__(self) -> Any:
+            return _IdentityRequestHandler(self, loop=self._loop, **self._kwargs)
+
+    class _IdentityRunner(web.AppRunner):
+        async def _make_server(self) -> Any:
+            loop = asyncio.get_event_loop()
+            self._app._set_loop(loop)
+            self._app.on_startup.freeze()
+            await self._app.startup()
+            self._app.freeze()
+            return _IdentityServer(
+                self._app._handle,  # type: ignore[arg-type]
+                request_factory=self._app._make_request,
+                loop=loop,
+                **self._kwargs,
+            )
+
+    return _IdentityRunner(app)
+
+
+class ExactHeaderResponse(web.Response):
+    """A response with no `Server` header and a caller-chosen header order.
+
+    Some services genuinely send none, and "none" is not something aiohttp can
+    express: `_prepare_headers` unconditionally `setdefault`s the header, so
+    the best a caller can normally do is an empty `Server:` line — which is
+    still a line, and still wrong.
+
+    It matters because nmap's service signatures are exact. Its Docker match is
+    a real daemon's 404 — `Content-Type`, `Date`, `Content-Length: 29`, that
+    body, and nothing else — so a single extra header makes an otherwise
+    byte-faithful response fail to identify, and the port reads as `unknown` or,
+    worse, as whatever the fallback banner says.
+
+    Order matters for the same reason. nmap's Docker rule expects
+    `Content-Type`, then `Date`, then `Content-Length`; aiohttp emits
+    Content-Length before Date, and that alone is enough to miss. Header order
+    is semantically irrelevant to HTTP and entirely relevant to fingerprinting.
+
+    `_prepare_headers` runs before `_write_headers`, so this is the last point
+    at which either can be changed.
+    """
+
+    #: Header names in the order they should appear. Anything not listed keeps
+    #: its existing relative position, after the ordered ones.
+    header_order: tuple[str, ...] = ()
+
+    async def _prepare_headers(self) -> None:
+        await super()._prepare_headers()
+        self._headers.popall("Server", None)  # type: ignore[arg-type]
+        if not self.header_order:
+            return
+        remaining = [
+            (name, value)
+            for name, value in self._headers.items()
+            if name.lower() not in {h.lower() for h in self.header_order}
+        ]
+        ordered = [
+            (name, self._headers[name]) for name in self.header_order if name in self._headers
+        ]
+        self._headers.clear()
+        for name, value in ordered + remaining:
+            self._headers.add(name, value)

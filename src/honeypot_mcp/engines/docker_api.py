@@ -44,7 +44,7 @@ from typing import Any
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.http_identity import server_identity_middleware
+from honeypot_mcp.http_identity import ExactHeaderResponse, identity_runner
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -77,6 +77,12 @@ _MALICIOUS_COMMAND = re.compile(
 )
 
 _MAX_BODY_BYTES = 64 * 1024
+
+
+class _DaemonNotFound(ExactHeaderResponse):
+    """The 404 a real daemon returns, in the order nmap matches on."""
+
+    header_order = ("Content-Type", "Date", "Content-Length")
 
 
 def _now_iso() -> str:
@@ -197,6 +203,7 @@ class DockerAPIEngine(HoneypotEngine):
             return {
                 "Api-Version": _API_VERSION,
                 "Docker-Experimental": "false",
+                "Server": _SERVER_BANNER,
                 "Ostype": "linux",
                 "Cache-Control": "no-cache, no-store, must-revalidate",
             }
@@ -409,11 +416,23 @@ class DockerAPIEngine(HoneypotEngine):
 
         async def catch_all(request: web.Request) -> web.Response:
             await self._record(hp_id, request, "docker_api_probe", AlertSeverity.MEDIUM, {})
-            return web.json_response(
-                {"message": f"page not found: {request.path}"}, status=404, headers=headers()
+            # Byte-exact to a real daemon's 404, because that response *is*
+            # nmap's Docker signature: it matches on `Content-Type`, `Date` and
+            # `Content-Length: 29` followed by this precise body, with nothing
+            # else present. Adding our usual Api-Version/Server headers here —
+            # or interpolating the path into the message — breaks the match and
+            # the service reads as `unknown`, which no real daemon does.
+            return _DaemonNotFound(
+                body=b'{"message":"page not found"}\n',
+                status=404,
+                content_type="application/json",
             )
 
-        app = web.Application(middlewares=[server_identity_middleware(_SERVER_BANNER)])
+        # No identity middleware: it would stamp `Server` onto the 404 and
+        # break nmap's byte-exact Docker signature. Real API responses set
+        # their own headers below, and `identity_runner` still covers
+        # protocol-level errors that never reach the app.
+        app = web.Application()
         router = app.router
         # Docker clients prefix every call with /v1.43; both forms must work.
         for prefix in ("", "/v{api:[0-9.]+}"):
@@ -442,7 +461,7 @@ class DockerAPIEngine(HoneypotEngine):
             if hp:
                 hp_id = hp.id
 
-        runner = web.AppRunner(self._build_app(name, hp_id))
+        runner = identity_runner(self._build_app(name, hp_id), _SERVER_BANNER)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", port).start()
 

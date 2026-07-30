@@ -47,7 +47,7 @@ from typing import Any
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.http_identity import server_identity_middleware
+from honeypot_mcp.http_identity import identity_runner, server_identity_middleware
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -459,7 +459,7 @@ class KubernetesEngine(HoneypotEngine):
             if hp:
                 hp_id = hp.id
 
-        runner = web.AppRunner(self._build_app(name, hp_id))
+        runner = identity_runner(self._build_app(name, hp_id), _SERVER_BANNER)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", port).start()
         cid = f"k8s-{secrets.token_hex(8)}"

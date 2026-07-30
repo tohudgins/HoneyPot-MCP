@@ -23,7 +23,7 @@ from aiohttp import web
 from sqlalchemy import select
 
 from honeypot_mcp.config import get_settings
-from honeypot_mcp.http_identity import NGINX_BANNER, server_identity_middleware
+from honeypot_mcp.http_identity import NGINX_BANNER, identity_runner, server_identity_middleware
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
@@ -362,7 +362,7 @@ async def start_canary_server() -> web.AppRunner | None:
     host = settings.canary_callback_host
     port = settings.canary_callback_port
 
-    runner = web.AppRunner(build_app())
+    runner = identity_runner(build_app(), NGINX_BANNER)
     try:
         await runner.setup()
         site = web.TCPSite(runner, host, port)
