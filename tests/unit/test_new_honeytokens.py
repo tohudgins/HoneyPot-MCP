@@ -433,3 +433,53 @@ async def test_gcp_service_account_provider_contains_real_rsa_key():
     # uses cryptography so the structure is real).
     key = serialization.load_pem_private_key(parsed["private_key"].encode(), password=None)
     assert key.key_size == 2048
+
+
+# ── Every implemented token type is reachable from the MCP interface ────────
+
+
+def test_honeytoken_create_offers_every_registered_type():
+    """A token type that cannot be asked for barely exists.
+
+    `kubeconfig`, `slack_webhook`, `azure_credential` and `gcp_service_account`
+    shipped complete — provider module, registry entry, enum value, migration —
+    and the `Literal` on `honeytoken_create` listed seven types, so none of the
+    four could be created through the only interface this tool has. The tool
+    body is fully generic (`get_provider(HoneytokenType(type))`), so the
+    annotation was the entire blocker and nothing failed loudly.
+
+    Identical defect to Telnet before it became a first-class honeypot type, and
+    the same rule applies: for a natural-language-driven system, the tool
+    signature *is* the capability surface.
+    """
+    import typing
+
+    from honeypot_mcp.storage.models import HoneytokenType
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
+
+    hints = typing.get_type_hints(honeytoken_create)
+    offered = set(typing.get_args(hints["type"]))
+    registered = {t.value for t in HoneytokenType}
+
+    assert offered == registered, (
+        f"honeytoken_create cannot create: {sorted(registered - offered)}; "
+        f"offers non-existent: {sorted(offered - registered)}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token_type",
+    ["kubeconfig", "slack_webhook", "azure_credential", "gcp_service_account"],
+)
+async def test_every_registered_provider_produces_a_token(token_type: str):
+    """Reachability is necessary but not sufficient — each provider must also
+    return a usable artefact and plant instructions."""
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
+
+    created = await honeytoken_create(type=token_type, label=f"test-{token_type}")
+
+    assert created["id"]
+    assert created["status"] == "active"
+    assert created["token_value"], f"{token_type} produced an empty token value"
+    assert created["plant_instructions"].strip(), f"{token_type} has no plant instructions"

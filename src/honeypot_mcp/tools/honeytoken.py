@@ -29,7 +29,19 @@ def _invalidate_matcher_caches(token_type: HoneytokenType | None = None) -> None
 
 @mcp.tool
 async def honeytoken_create(
-    type: Literal["api_key", "canary_url", "credential", "file", "ssh_key", "jwt", "db_row"],
+    type: Literal[
+        "api_key",
+        "canary_url",
+        "credential",
+        "file",
+        "ssh_key",
+        "jwt",
+        "db_row",
+        "kubeconfig",
+        "slack_webhook",
+        "azure_credential",
+        "gcp_service_account",
+    ],
     label: str,
     metadata: dict[str, Any] | None = None,
     planted_at: str | None = None,
@@ -45,6 +57,10 @@ async def honeytoken_create(
               - ssh_key: planted SSH private key (fingerprint match on SSH auth)
               - jwt: signed JWT (jti match on HTTP Authorization header)
               - db_row: canary database row with unique email (match on SMTP RCPT TO)
+              - kubeconfig: cluster credentials for a decoy API server
+              - slack_webhook: incoming-webhook URL that fires when posted to
+              - azure_credential: service-principal client id/secret pair
+              - gcp_service_account: service-account JSON key
         label: Human-readable label to identify this token (e.g. 'prod-server .env backup').
         metadata: Optional type-specific settings (e.g. {'service': 'aws', 'region': 'us-east-1'}).
         planted_at: Where this token is being placed — "the finance file share",

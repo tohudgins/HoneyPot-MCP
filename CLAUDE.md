@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (719 unit tests covering security-critical paths)
+# Tests (724 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -90,6 +90,19 @@ await submit_event(PendingEvent(
 No direct DB sessions in engines — go through the buffer.
 
 **Honeytoken providers** — subclass `HoneytokenProvider` (in `tokens/base.py`) and implement `create` (returns `(token_value, metadata)`) and `plant_instructions`. Register in `tokens/__init__.py`.
+
+Registering a provider is **not** enough to ship it. `kubeconfig`,
+`slack_webhook`, `azure_credential` and `gcp_service_account` each had a
+provider module, a registry entry, a `HoneytokenType` value, a migration and an
+ATT&CK mapping in `deception/coverage.py` — and could not be created, because
+the `Literal` on `honeytoken_create` listed seven types. The tool body is fully
+generic (`get_provider(HoneytokenType(type))`), so the annotation was the whole
+blocker and nothing failed loudly; everything downstream was ready and the front
+door was locked. Same defect as Telnet before it became a first-class honeypot
+type: **for a natural-language-driven system, the tool signature is the
+capability surface.** `test_honeytoken_create_offers_every_registered_type`
+asserts the `Literal` equals `HoneytokenType` exactly — add new types to both,
+and to the planner in `deception/planner.py` when a sensor pairs with one.
 
 ### Database layer
 

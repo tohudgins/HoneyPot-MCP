@@ -321,6 +321,24 @@ def _plan_tokens(
             )
         )
 
+    if "kubernetes" in by_type:
+        tokens.append(
+            PlannedToken(
+                type="kubeconfig",
+                label=f"{prefix}-cluster-admin-kubeconfig",
+                metadata={},
+                plant_location="a developer workstation or CI runner's ~/.kube/config",
+                cross_references="canary callback server",
+                rationale=(
+                    "A stolen kubeconfig is used before it is understood — the first "
+                    "`kubectl get pods` reaches the cluster URL in the file, which is "
+                    "the canary. Pairs with the Kubernetes sensor: one catches an "
+                    "attacker who found the API server, the other catches one who "
+                    "found the credentials for it."
+                ),
+            )
+        )
+
     tokens.append(
         PlannedToken(
             type="canary_url",
