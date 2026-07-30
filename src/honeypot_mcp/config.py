@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     # How often the retention sweep runs, in hours. Independent of the
     # watchdog's health-check cadence — pruning daily is plenty.
     retention_sweep_interval_hours: float = 24.0
+    # Write matching alerts to a JSON Lines archive in `reports_dir` before the
+    # retention sweep deletes them. On by default: the sweep runs unattended,
+    # so it is the likeliest way to lose a months-old campaign nobody had
+    # finished investigating. Set false only if you genuinely want the data
+    # destroyed. A failed archive cancels that sweep rather than pruning
+    # without one.
+    retention_archive: bool = True
 
     # Per-source-IP concurrent-connection cap for the in-process TCP engines
     # (VNC/Redis/MySQL/PostgreSQL/MSSQL/MongoDB/SMTP/SMB). A single hostile or

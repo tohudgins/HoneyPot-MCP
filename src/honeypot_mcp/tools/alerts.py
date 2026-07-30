@@ -17,6 +17,7 @@ from honeypot_mcp.tools._format import (
     digest_payload,
     resolve_artifact_path,
     truncate_payload,
+    write_artifact,
 )
 
 
@@ -325,12 +326,27 @@ async def alerts_acknowledge(
 
 
 @mcp.tool
-async def alerts_prune(older_than_days: int = 90) -> dict[str, Any]:
-    """Delete alerts and attacker_events older than the cutoff. Useful for
-    keeping the DB bounded — by default retains the last 90 days.
+async def alerts_prune(
+    older_than_days: int = 90,
+    archive: bool = True,
+    archive_path: str | None = None,
+) -> dict[str, Any]:
+    """Delete alerts and attacker_events older than the cutoff, archiving first.
+
+    Deletion here is unrecoverable and it destroys evidence: a campaign that
+    began eleven months ago is gone, and so is anything a future investigation
+    or a compliance request would have needed. So `archive` defaults to True —
+    matching alerts are written to a JSON Lines file (full payloads, one object
+    per line) before anything is removed, and if that write fails nothing is
+    deleted.
+
+    Pass `archive=False` only when you genuinely want the data destroyed.
 
     Args:
         older_than_days: Cutoff age in days (default 90).
+        archive: Write the matching alerts to disk before deleting (default True).
+        archive_path: Filename for the archive, inside the reports directory.
+                      Auto-named if omitted.
     """
     from datetime import datetime, timedelta
 
@@ -338,19 +354,48 @@ async def alerts_prune(older_than_days: int = 90) -> dict[str, Any]:
         return {"error": "older_than_days must be at least 1 to avoid deleting current data."}
 
     cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+
+    archive_info: dict[str, Any] | None = None
+    if archive:
+        try:
+            async with get_session() as session:
+                content = await queries.serialise_alerts_before(session, cutoff)
+            if content:
+                archive_info = write_artifact(
+                    content,
+                    prefix=f"alerts-archive-before-{cutoff.date().isoformat()}",
+                    extension="jsonl",
+                    output_path=archive_path,
+                )
+        except Exception as e:
+            # Refusing to delete is the safe failure. Pruning anyway would
+            # destroy exactly the data the archive existed to keep.
+            return {
+                "error": f"Archive failed, so nothing was deleted: {e}",
+                "hint": "Fix the archive destination, or pass archive=False to delete regardless.",
+            }
+
     async with get_session() as session:
         result = await queries.prune_alerts_before(session, cutoff)
     await record_action(
         "alerts_prune",
         summary=(
             f"deleted {result.get('alerts_deleted', 0)} alert(s) and "
-            f"{result.get('events_deleted', 0)} event(s) older than {older_than_days}d"
+            f"{result.get('attacker_events_deleted', 0)} event(s) older than "
+            f"{older_than_days}d"
+            + (f", archived to {archive_info['path']}" if archive_info else ", NOT archived")
         ),
-        arguments={"older_than_days": older_than_days, "cutoff": cutoff.isoformat()},
+        arguments={
+            "older_than_days": older_than_days,
+            "cutoff": cutoff.isoformat(),
+            "archived": bool(archive_info),
+        },
     )
     return {
         "older_than_days": older_than_days,
         "cutoff": cutoff.isoformat(),
+        "archive": archive_info
+        or ("nothing matched the cutoff" if archive else "skipped (archive=False)"),
         **result,
     }
 

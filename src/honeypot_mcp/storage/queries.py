@@ -335,3 +335,44 @@ async def get_top_offenders(
         .order_by(desc("c"))
     )
     return [(row[0], row[1]) for row in result.all()]
+
+
+async def serialise_alerts_before(session: AsyncSession, cutoff) -> str:
+    """JSON Lines of every alert older than `cutoff`, for archival.
+
+    One JSON object per line rather than one big array: an archive of a busy
+    year is large, and JSONL streams into `jq`, Splunk, an S3 upload or a
+    `for line in open(...)` loop without loading the whole file. Full payloads
+    are kept — the point of an archive is that it is the record of last resort,
+    so digesting it the way the list tools do would defeat it.
+    """
+    import json
+
+    from honeypot_mcp.storage.models import Alert
+
+    rows = (
+        (await session.execute(select(Alert).where(Alert.timestamp < cutoff).order_by(Alert.id)))
+        .scalars()
+        .all()
+    )
+    return "\n".join(
+        json.dumps(
+            {
+                "id": a.id,
+                "honeypot_id": a.honeypot_id,
+                "source_ip": a.source_ip,
+                "source_port": a.source_port,
+                "event_type": a.event_type,
+                "severity": a.severity.value,
+                "payload": a.payload,
+                "acknowledged": a.acknowledged,
+                "disposition": a.disposition.value if a.disposition else None,
+                "triage_note": a.triage_note,
+                "triaged_by": a.triaged_by,
+                "triaged_at": a.triaged_at.isoformat() if a.triaged_at else None,
+                "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+            },
+            default=str,
+        )
+        for a in rows
+    )

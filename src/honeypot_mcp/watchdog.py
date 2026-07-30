@@ -30,6 +30,7 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity, Honeypot, HoneypotStatus
+from honeypot_mcp.tools._format import write_artifact
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +94,32 @@ class HoneypotWatchdog:
         self._last_prune_at = now
 
         cutoff = datetime.now(UTC) - timedelta(days=days)
+
+        # Archive before deleting, unless the operator opted out. This sweep
+        # runs unattended, so it is the path most likely to quietly destroy a
+        # months-old campaign nobody had finished investigating — and unlike
+        # the manual tool, nobody is watching when it does. A failed archive
+        # cancels the prune rather than proceeding without one.
+        if settings.retention_archive:
+            try:
+                async with get_session() as session:
+                    content = await queries.serialise_alerts_before(session, cutoff)
+                if content:
+                    artifact = write_artifact(
+                        content,
+                        prefix=f"retention-archive-before-{cutoff.date().isoformat()}",
+                        extension="jsonl",
+                    )
+                    log.info("Retention archive written to %s", artifact["path"])
+            except Exception as e:
+                log.error(
+                    "Retention archive failed (%s) — skipping this sweep rather than "
+                    "deleting unarchived alerts. Set RETENTION_ARCHIVE=false to prune "
+                    "without archiving.",
+                    e,
+                )
+                return
+
         async with get_session() as session:
             result = await queries.prune_alerts_before(session, cutoff)
         deleted = result.get("alerts_deleted", 0) + result.get("attacker_events_deleted", 0)

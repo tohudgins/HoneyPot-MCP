@@ -13,6 +13,20 @@ from honeypot_mcp.tokens import get_provider
 from honeypot_mcp.tools._audit import record_action
 
 
+def _invalidate_matcher_caches(token_type: HoneytokenType | None = None) -> None:
+    """Drop the in-memory cross-reference caches after a token changes.
+
+    Over-invalidating is deliberate: the caches rebuild lazily on the next
+    match attempt, so the cost is negligible, and missing one means a revoked
+    token keeps firing or a fresh one silently does not.
+    """
+    from honeypot_mcp.credential_match import invalidate_cache as invalidate_creds
+    from honeypot_mcp.token_matchers import invalidate_cache as invalidate_token_match
+
+    invalidate_creds()
+    invalidate_token_match()
+
+
 @mcp.tool
 async def honeytoken_create(
     type: Literal["api_key", "canary_url", "credential", "file", "ssh_key", "jwt", "db_row"],
@@ -59,19 +73,7 @@ async def honeytoken_create(
         await session.flush()
         token_id = token.id
 
-    # Invalidate cross-reference caches for any token type that has a matcher.
-    if HoneytokenType(type) == HoneytokenType.CREDENTIAL:
-        from honeypot_mcp.credential_match import invalidate_cache
-
-        invalidate_cache()
-    if HoneytokenType(type) in (
-        HoneytokenType.SSH_KEY,
-        HoneytokenType.JWT,
-        HoneytokenType.DB_ROW,
-    ):
-        from honeypot_mcp.token_matchers import invalidate_cache as invalidate_token_match
-
-        invalidate_token_match()
+    _invalidate_matcher_caches(HoneytokenType(type))
 
     return {
         "id": token_id,
@@ -79,7 +81,11 @@ async def honeytoken_create(
         "label": label,
         "token_value": token_value,
         "status": "active",
-        "metadata": {**(metadata or {}), **extra_meta},
+        "metadata": {
+            **(metadata or {}),
+            **extra_meta,
+            **({"planted_at": planted_at} if planted_at else {}),
+        },
         "plant_instructions": provider.plant_instructions(
             token_value, {**(metadata or {}), **extra_meta}
         ),
@@ -162,6 +168,110 @@ async def honeytoken_status(token_id: int) -> dict[str, Any]:
 
 
 @mcp.tool
+async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dict[str, Any]:
+    """Replace a honeytoken with a fresh one, keeping its identity and history.
+
+    Rotation is routine: a token fires and has to be replaced, or a planted
+    secret has simply been in place long enough. Doing it as revoke-then-create
+    loses the thread — the new token is unrelated to the old one, so "this
+    credential has now fired three times over eight months" becomes three
+    unconnected incidents, and the old value stops being attributable.
+
+    This keeps both. The old token is marked REVOKED and stays in the database,
+    so historical triggers still resolve to it; the new one carries the same
+    label, type and metadata and records `rotated_from`, with the old one
+    recording `rotated_to`. Where it is planted carries over unless you give a
+    new location.
+
+    The new secret is different, so the planted copy has to be replaced
+    wherever it lives — `plant_instructions` in the response says how.
+
+    Args:
+        token_id: The honeytoken to rotate.
+        planted_at: New location, if it is moving. Defaults to the old one.
+    """
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.models import Honeytoken
+
+    async with get_session() as session:
+        old = (
+            await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
+        ).scalar_one_or_none()
+        if old is None:
+            return {"error": f"No honeytoken with id={token_id}."}
+        if old.status is HoneytokenStatus.REVOKED:
+            return {
+                "error": f"Honeytoken {token_id} is already revoked — create a new one instead.",
+            }
+        old_type = old.type
+        old_label = old.label
+        old_meta = dict(old.token_meta or {})
+
+    # Anything the provider generated is regenerated; only the operator's
+    # own settings carry across, or the "new" token would be the old one.
+    _GENERATED = {
+        "token_id",
+        "token_uid",
+        "tracking_url",
+        "dns_canary",
+        "file_path",
+        "url",
+        "password",
+        "access_key_id",
+        "secret_access_key",
+        "private_key",
+        "public_key",
+        "fingerprint",
+        "jti",
+        "token",
+        "rotated_from",
+        "rotated_to",
+        "planted_at",
+    }
+    carried = {k: v for k, v in old_meta.items() if k not in _GENERATED}
+
+    created = await honeytoken_create(
+        type=old_type.value,  # type: ignore[arg-type]
+        label=old_label,
+        metadata=carried,
+        planted_at=planted_at or old_meta.get("planted_at"),
+    )
+    if "error" in created:
+        return created
+
+    async with get_session() as session:
+        new_token = (
+            await session.execute(select(Honeytoken).where(Honeytoken.id == created["id"]))
+        ).scalar_one()
+        new_token.token_meta = {**(new_token.token_meta or {}), "rotated_from": token_id}
+        old = (
+            await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
+        ).scalar_one()
+        old.status = HoneytokenStatus.REVOKED
+        old.token_meta = {**(old.token_meta or {}), "rotated_to": created["id"]}
+
+    _invalidate_matcher_caches(old_type)
+
+    await record_action(
+        "honeytoken_rotate",
+        summary=f"rotated honeytoken {token_id} ('{old_label}') into {created['id']}",
+        arguments={"token_id": token_id, "planted_at": planted_at},
+        target=old_label,
+    )
+    created["metadata"] = {**created.get("metadata", {}), "rotated_from": token_id}
+    return {
+        "rotated_from": token_id,
+        "new_token": created,
+        "note": (
+            "The old token is REVOKED but retained, so past triggers still resolve to "
+            "it. The secret has changed — replace the planted copy at "
+            f"'{planted_at or old_meta.get('planted_at') or 'its recorded location'}'."
+        ),
+    }
+
+
+@mcp.tool
 async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
     """Deactivate a honeytoken so it no longer triggers alerts.
 
@@ -181,14 +291,7 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
         if result.rowcount == 0:  # type: ignore[attr-defined]
             return {"error": f"No honeytoken with id={token_id}."}
 
-    # Cheap: invalidate all match caches regardless of token type — they only
-    # rebuild when something asks them to match, and we'd rather over-invalidate
-    # than miss a revoke.
-    from honeypot_mcp.credential_match import invalidate_cache as invalidate_creds
-    from honeypot_mcp.token_matchers import invalidate_cache as invalidate_token_match
-
-    invalidate_creds()
-    invalidate_token_match()
+    _invalidate_matcher_caches()
 
     await record_action(
         "honeytoken_revoke",

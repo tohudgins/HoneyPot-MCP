@@ -147,7 +147,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-599 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+623 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -304,6 +304,8 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 | `deception_coverage` | What the live deployment detects per ATT&CK tactic, and the ranked blind spots |
 | `soc_brief` | Shift handover — what needs a human, separated from the background radiation |
 | `honeypot_deploy` | Deploy any of the 25 engine types |
+| `honeypot_stop` | Stop one, several by name, or every honeypot matching a type/status filter |
+| `honeytoken_rotate` | Replace a token's secret while keeping its identity and history |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
 | `honeypot_stop` / `honeypot_pause` / `honeypot_resume` | Lifecycle control |
 | `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |
@@ -418,7 +420,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 599 unit tests
+uv run pytest tests/unit/ -v     # 623 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

@@ -250,38 +250,105 @@ async def honeypot_status(name: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def honeypot_stop(name: str, remove: bool = False) -> dict[str, Any]:
-    """Stop a running honeypot.
+async def honeypot_stop(
+    name: str | None = None,
+    names: list[str] | None = None,
+    type: str | None = None,
+    status: Literal["running", "paused", "error"] | None = None,
+    remove: bool = False,
+) -> dict[str, Any]:
+    """Stop one honeypot, several by name, or every honeypot matching a filter.
+
+    A deployment is 20+ sensors, so stopping them one call at a time is not a
+    workflow — "shut down the Windows decoys" or "stop everything" has to be a
+    single operation. Give exactly one of:
+
+    * `name` — a single honeypot.
+    * `names` — an explicit list.
+    * `type` and/or `status` — every honeypot matching. `type="all"` selects
+      every type, which is how you stop the whole estate.
+
+    A call with none of these is rejected rather than interpreted, because the
+    natural default would be "everything" and silently stopping an entire
+    deployment is not recoverable — collection simply ends.
 
     Args:
-        name: The honeypot name.
-        remove: If True, also remove the container and DB record entirely.
+        name: Single honeypot name.
+        names: Several honeypot names.
+        type: Filter by protocol type, or "all" for every type.
+        status: Filter by current status.
+        remove: Also delete the container and the DB record.
     """
+    if not name and not names and not type and not status:
+        return {
+            "error": (
+                "Refusing to guess. Pass `name`, `names`, or a `type`/`status` filter "
+                '— use type="all" to stop every honeypot.'
+            )
+        }
+
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}' found."}
-
-        if hp.status == HoneypotStatus.STOPPED:
-            return {"error": f"Honeypot '{name}' is already stopped."}
-
-        engine = get_engine(hp.type)
-        if hp.container_id:
-            await engine.stop(hp.container_id, remove=remove)
-
-        if remove:
-            await session.delete(hp)
+        targets: list[Honeypot] = []
+        if name or names:
+            wanted = list(names or [])
+            if name:
+                wanted.append(name)
+            for candidate in wanted:
+                hp = await queries.get_honeypot_by_name(session, candidate)
+                if hp is None:
+                    return {"error": f"No honeypot named '{candidate}' found."}
+                targets.append(hp)
         else:
-            hp.status = HoneypotStatus.STOPPED
-            hp.container_id = None
+            all_honeypots = await queries.list_honeypots(session)
+            for hp in all_honeypots:
+                if type and type != "all" and hp.type.value != type:
+                    continue
+                if status and hp.status.value != status:
+                    continue
+                if hp.status is HoneypotStatus.STOPPED:
+                    continue
+                targets.append(hp)
+
+        if not targets:
+            return {"stopped": [], "note": "Nothing matched — no honeypot was changed."}
+
+        stopped: list[str] = []
+        failed: list[dict[str, str]] = []
+        for hp in targets:
+            if hp.status == HoneypotStatus.STOPPED:
+                continue
+            try:
+                engine = get_engine(hp.type)
+                if hp.container_id:
+                    await engine.stop(hp.container_id, remove=remove)
+            except Exception as e:
+                failed.append({"name": hp.name, "error": str(e)})
+                continue
+            stopped.append(hp.name)
+            if remove:
+                await session.delete(hp)
+            else:
+                hp.status = HoneypotStatus.STOPPED
+                hp.container_id = None
 
     await record_action(
         "honeypot_stop",
-        summary=f"{'removed' if remove else 'stopped'} honeypot '{name}' — collection ended",
-        arguments={"name": name, "remove": remove},
-        target=name,
+        summary=(
+            f"{'removed' if remove else 'stopped'} {len(stopped)} honeypot(s) — "
+            f"collection ended for: {', '.join(stopped) or 'none'}"
+        ),
+        arguments={"name": name, "names": names, "type": type, "status": status, "remove": remove},
+        target=", ".join(stopped)[:128] or None,
+        outcome="error" if failed else "success",
+        error="; ".join(f["error"] for f in failed) if failed else None,
     )
-    return {"name": name, "action": "removed" if remove else "stopped", "status": "ok"}
+    return {
+        "action": "removed" if remove else "stopped",
+        "stopped": stopped,
+        "count": len(stopped),
+        "failed": failed,
+        "status": "ok" if not failed else "partial",
+    }
 
 
 @mcp.tool
