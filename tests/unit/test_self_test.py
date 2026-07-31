@@ -6,6 +6,15 @@ that have the most logic risk:
 - A non-existent honeypot returns a clean error
 - A stopped honeypot returns a clean error
 - The HTTP probe end-to-end against a real in-process HTTP engine
+- Every in-process engine has a working probe (parametrized end-to-end)
+- The probe dispatch table covers every `HoneypotType` — this is the same
+  "shipped but unreachable" defect class the project has hit repeatedly
+  elsewhere (a registered capability whose tool-facing surface doesn't cover
+  it): `_send_probe` used to dispatch for only 14 of 25 types, so
+  `honeypot_self_test` silently couldn't verify 44% of the protocol
+  catalogue. `telnet` is Cowrie-in-Docker and can't be driven end-to-end here
+  (see `tests/integration/test_ssh_capture.py`), so it's checked for dispatch
+  coverage only, not exercised.
 """
 
 import os
@@ -139,6 +148,16 @@ def _free_port() -> int:
         ("honeypot_mcp.engines.postgresql", "PostgreSQLEngine", "POSTGRESQL"),
         ("honeypot_mcp.engines.mongodb", "MongoDBEngine", "MONGODB"),
         ("honeypot_mcp.engines.mssql", "MSSQLEngine", "MSSQL"),
+        ("honeypot_mcp.engines.memcached", "MemcachedEngine", "MEMCACHED"),
+        ("honeypot_mcp.engines.snmp", "SNMPEngine", "SNMP"),
+        ("honeypot_mcp.engines.ldap", "LDAPEngine", "LDAP"),
+        ("honeypot_mcp.engines.docker_api", "DockerAPIEngine", "DOCKER_API"),
+        ("honeypot_mcp.engines.imap", "IMAPEngine", "IMAP"),
+        ("honeypot_mcp.engines.sip", "SIPEngine", "SIP"),
+        ("honeypot_mcp.engines.rsync", "RsyncEngine", "RSYNC"),
+        ("honeypot_mcp.engines.nfs", "NFSEngine", "NFS"),
+        ("honeypot_mcp.engines.pop3", "POP3Engine", "POP3"),
+        ("honeypot_mcp.engines.kubernetes", "KubernetesEngine", "KUBERNETES"),
     ],
 )
 @pytest.mark.asyncio
@@ -176,3 +195,18 @@ async def test_self_test_in_process_engines_end_to_end(engine_path, engine_cls, 
         assert result.get("alert_received") is True, result
     finally:
         await engine.stop(container_id)
+
+
+def test_probe_dispatch_covers_every_honeypot_type():
+    """`_send_probe` dispatches through `_PROBES`, a registry rather than an
+    if-chain specifically so this is assertable: a 26th protocol added to
+    `HoneypotType` without a matching entry here must fail loudly, not leave
+    `honeypot_self_test` silently unable to verify it."""
+    from honeypot_mcp.storage.models import HoneypotType
+    from honeypot_mcp.tools.honeypot import _PROBES
+
+    deployable = {t.value for t in HoneypotType}
+    assert set(_PROBES) == deployable, (
+        f"probe registry out of sync — missing {sorted(deployable - set(_PROBES))}, "
+        f"extra {sorted(set(_PROBES) - deployable)}"
+    )

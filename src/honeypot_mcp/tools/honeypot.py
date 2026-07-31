@@ -536,8 +536,9 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
     logs them.
 
     The probe is protocol-appropriate (SSH banner / HTTP request / SMTP AUTH /
-    FTP USER / DNS query) and embeds a random marker in a field that lands in
-    the alert payload. We then poll for an alert containing that marker.
+    FTP USER / DNS query / …) and embeds a random marker in a field that
+    lands in the alert payload. We then poll for an alert containing that
+    marker. All 25 deployable types have a matching probe.
 
     Args:
         name: The honeypot name to probe.
@@ -624,36 +625,11 @@ async def _send_probe(hp_type: str, port: int, marker: str) -> tuple[bool, str, 
     protocol that can only carry raw bytes (VNC) returns the hex form it
     actually put on the wire.
     """
-    try:
-        if hp_type == "ssh":
-            return await _ssh_probe(port, marker)
-        if hp_type == "http":
-            return await _http_probe(port, marker)
-        if hp_type == "smtp":
-            return await _smtp_probe(port, marker)
-        if hp_type == "ftp":
-            return await _ftp_probe(port, marker)
-        if hp_type == "dns":
-            return await _dns_probe(port, marker)
-        if hp_type == "rdp":
-            return await _rdp_probe(port, marker)
-        if hp_type == "vnc":
-            return await _vnc_probe(port, marker)
-        if hp_type == "redis":
-            return await _redis_probe(port, marker)
-        if hp_type == "mysql":
-            return await _mysql_probe(port, marker)
-        if hp_type == "elasticsearch":
-            return await _elasticsearch_probe(port, marker)
-        if hp_type == "smb":
-            return await _smb_probe(port, marker)
-        if hp_type == "postgresql":
-            return await _postgresql_probe(port, marker)
-        if hp_type == "mongodb":
-            return await _mongodb_probe(port, marker)
-        if hp_type == "mssql":
-            return await _mssql_probe(port, marker)
+    probe = _PROBES.get(hp_type)
+    if probe is None:
         return False, f"No self-test probe defined for honeypot type {hp_type}", marker
+    try:
+        return await probe(port, marker)
     except Exception as e:
         return False, f"Probe failed: {e}", marker
 
@@ -947,6 +923,255 @@ async def _mongodb_probe(port: int, marker: str) -> tuple[bool, str, str]:
         with contextlib.suppress(Exception):
             await writer.wait_closed()
     return True, "MongoDB isMaster sent", marker
+
+
+async def _telnet_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Send a login attempt with the marker as the username. Unlike SSH,
+    Telnet has no version-banner exchange, so the marker rides the login line
+    instead — Cowrie logs cowrie.login.failed (retagged to telnet_login_failed
+    by ssh.py:_retag_for_protocol) with the marker in payload['username'].
+
+    Deliberately tolerant of Telnet's IAC option negotiation: real scanners
+    (Mirai and descendants, the dominant traffic on this port) mostly skip a
+    compliant handshake and just send raw login lines, and Cowrie's telnet
+    listener is built to catch exactly that."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+            await asyncio.wait_for(reader.read(512), timeout=1.0)
+        writer.write(f"{marker}\r\n".encode())
+        await writer.drain()
+        with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+            await asyncio.wait_for(reader.read(512), timeout=1.0)
+        writer.write(b"x\r\n")
+        await writer.drain()
+        await asyncio.sleep(0.5)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "Telnet login sent", marker
+
+
+async def _memcached_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """`set <marker> 0 0 3` — the key lands in payload['key']."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(f"set {marker} 0 0 3\r\nabc\r\n".encode())
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(128), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "Memcached set sent", marker
+
+
+async def _snmp_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """UDP GetRequest with `marker` as the community string — lands in
+    payload['community'] (mirrored to username/password for cross-referencing
+    planted community-string honeytokens)."""
+    from honeypot_mcp.engines.snmp import build_get_request
+
+    loop = asyncio.get_event_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        asyncio.DatagramProtocol, remote_addr=("127.0.0.1", port)
+    )
+    try:
+        transport.sendto(build_get_request("1.3.6.1.2.1.1.1.0", community=marker))
+        await asyncio.sleep(0.3)
+    finally:
+        transport.close()
+    return True, "SNMP GetRequest sent", marker
+
+
+async def _ldap_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Simple bind with `marker` as the DN — lands in payload['bind_dn'] (and
+    payload['username'])."""
+    from honeypot_mcp.engines.ldap import _BIND_REQUEST, _OCTET_STRING, _SEQUENCE, _encode_int, _tlv
+
+    auth = _tlv(0x80, b"x")  # context tag 0: simple auth, password "x"
+    bind_body = _encode_int(3) + _tlv(_OCTET_STRING, marker.encode()) + auth
+    message = _tlv(_SEQUENCE, _encode_int(1) + _tlv(_BIND_REQUEST, bind_body))
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(message)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "LDAP bind request sent", marker
+
+
+async def _docker_api_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """HTTP GET /version with marker in the User-Agent — lands in
+    payload['user_agent']."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(
+            f"http://127.0.0.1:{port}/version",
+            headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
+        )
+    return True, f"HTTP {resp.status_code}", marker
+
+
+async def _imap_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """`a1 LOGIN <marker> x` — lands in payload['username']."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=3.0)  # greeting
+        writer.write(f"a1 LOGIN {marker} x\r\n".encode())
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=3.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "IMAP LOGIN sent", marker
+
+
+async def _sip_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """UDP OPTIONS with marker as the User-Agent — lands in
+    payload['user_agent']. Not a scanner UA, so it classifies as
+    sip_options_probe rather than sip_scan."""
+    message = (
+        f"OPTIONS sip:probe@127.0.0.1 SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-selftest\r\n"
+        f"From: <sip:selftest@127.0.0.1>;tag=1\r\n"
+        f"To: <sip:probe@127.0.0.1>\r\n"
+        f"Call-ID: selftest-{marker}\r\n"
+        f"CSeq: 1 OPTIONS\r\n"
+        f"User-Agent: {marker}\r\n"
+        f"Content-Length: 0\r\n\r\n"
+    ).encode()
+    loop = asyncio.get_event_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        asyncio.DatagramProtocol, remote_addr=("127.0.0.1", port)
+    )
+    try:
+        transport.sendto(message)
+        await asyncio.sleep(0.3)
+    finally:
+        transport.close()
+    return True, "SIP OPTIONS sent", marker
+
+
+async def _rsync_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """Handshake, then request a module named `marker` — no module matches,
+    so it lands in payload['module'] via rsync_unknown_module."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=3.0)  # @RSYNCD: greeting
+        writer.write(b"@RSYNCD: 31.0\n")
+        await writer.drain()
+        writer.write(f"{marker}\n".encode())
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.readline(), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "rsync module request sent", marker
+
+
+async def _nfs_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """ONC RPC MOUNT/MNT call requesting export path `/<marker>` — lands in
+    payload['path'] via nfs_mount_attempt."""
+    import struct
+
+    from honeypot_mcp.engines.nfs import MOUNT_MNT, PROG_MOUNT, xdr_string
+
+    path = f"/{marker}"
+    header = struct.pack(">IIIIII", 1, 0, 2, PROG_MOUNT, 3, MOUNT_MNT)
+    credential = struct.pack(">II", 0, 0)  # AUTH_NULL: flavour=0, length=0
+    verifier = struct.pack(">II", 0, 0)  # AUTH_NULL: flavour=0, length=0
+    body = header + credential + verifier + xdr_string(path)
+    frame = struct.pack(">I", 0x80000000 | len(body)) + body
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(frame)
+        await writer.drain()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(256), timeout=2.0)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "NFS MOUNT/MNT sent", path
+
+
+async def _pop3_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """USER + PASS — marker goes in the username, lands in
+    payload['username']."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=3.0)  # greeting
+        writer.write(f"USER {marker}\r\n".encode())
+        await writer.drain()
+        await asyncio.wait_for(reader.readline(), timeout=3.0)
+        writer.write(b"PASS x\r\n")
+        await writer.drain()
+        await asyncio.sleep(0.3)
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    return True, "POP3 USER+PASS sent", marker
+
+
+async def _kubernetes_probe(port: int, marker: str) -> tuple[bool, str, str]:
+    """HTTP GET /version with marker in the User-Agent — lands in
+    payload['user_agent']."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(
+            f"http://127.0.0.1:{port}/version",
+            headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
+        )
+    return True, f"HTTP {resp.status_code}", marker
+
+
+# Registry, not an if-chain, so completeness against `HoneypotType` is
+# directly assertable (see test_self_test.py) rather than parsed out of an
+# if-chain's source. Same idiom as `capabilities.BY_TYPE` / `get_provider()` /
+# `engines.get_engine()` elsewhere in this codebase.
+_PROBES: dict[str, Any] = {
+    "ssh": _ssh_probe,
+    "http": _http_probe,
+    "smtp": _smtp_probe,
+    "ftp": _ftp_probe,
+    "dns": _dns_probe,
+    "rdp": _rdp_probe,
+    "vnc": _vnc_probe,
+    "redis": _redis_probe,
+    "mysql": _mysql_probe,
+    "elasticsearch": _elasticsearch_probe,
+    "smb": _smb_probe,
+    "postgresql": _postgresql_probe,
+    "mongodb": _mongodb_probe,
+    "mssql": _mssql_probe,
+    "telnet": _telnet_probe,
+    "memcached": _memcached_probe,
+    "snmp": _snmp_probe,
+    "ldap": _ldap_probe,
+    "docker_api": _docker_api_probe,
+    "imap": _imap_probe,
+    "sip": _sip_probe,
+    "rsync": _rsync_probe,
+    "nfs": _nfs_probe,
+    "pop3": _pop3_probe,
+    "kubernetes": _kubernetes_probe,
+}
 
 
 @mcp.tool
