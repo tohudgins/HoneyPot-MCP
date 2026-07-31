@@ -80,9 +80,19 @@ def _make_campaign_id(event_type: str, start) -> str:
 
 
 def _deduplicate(campaigns: list[dict]) -> list[dict]:
-    """Remove campaigns that are strict subsets of larger campaigns."""
+    """Remove campaigns that are strict subsets of larger campaigns.
+
+    Processes largest-first. A campaign is only ever compared against ones
+    already accepted into `seen`, so if a smaller window were kept ahead of a
+    later, larger superset — the common case, since windows for one
+    event_type are produced in chronological (not size) order and an
+    attacker scanning over hours shows up in more than one of them — the
+    smaller one would never get retroactively dropped. Sorting first
+    guarantees every superset is in `seen` before any of its subsets are
+    considered, regardless of which window was detected earlier.
+    """
     seen: list[dict] = []
-    for c in campaigns:
+    for c in sorted(campaigns, key=lambda c: len(c["source_ips"]), reverse=True):
         ips = set(c["source_ips"])
         if not any(
             ips.issubset(set(s["source_ips"])) and c["event_type"] == s["event_type"] for s in seen

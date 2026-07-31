@@ -61,3 +61,33 @@ async def test_separate_event_types_are_separate_campaigns():
 async def test_empty_alerts_returns_empty():
     campaigns = await detect_campaigns([], window_minutes=60, min_sources=3)
     assert campaigns == []
+
+
+@pytest.mark.asyncio
+async def test_earlier_smaller_window_deduplicated_against_later_superset():
+    """Windows for one event_type are produced in chronological order, not
+    size order — an attacker who reappears later shows up in a second,
+    larger window whose IP set is a strict superset of the first. The
+    smaller, earlier window must not survive dedup just because it was
+    discovered first; only the largest (here, the later) window should be
+    reported, per the module's own "keep the largest" contract."""
+    alerts = [
+        # Window 1 (t=0..10): 1.1.1.1, 2.2.2.2, 3.3.3.3
+        _make_alert("1.1.1.1", "ssh_brute_force", 0),
+        _make_alert("2.2.2.2", "ssh_brute_force", 5),
+        _make_alert("3.3.3.3", "ssh_brute_force", 10),
+        # Window 2 (t=70..85): the same three IPs return, plus a new one —
+        # a strict superset of window 1's IP set.
+        _make_alert("1.1.1.1", "ssh_brute_force", 70),
+        _make_alert("2.2.2.2", "ssh_brute_force", 75),
+        _make_alert("3.3.3.3", "ssh_brute_force", 80),
+        _make_alert("4.4.4.4", "ssh_brute_force", 85),
+    ]
+    campaigns = await detect_campaigns(alerts, window_minutes=60, min_sources=3)
+
+    ssh_campaigns = [c for c in campaigns if c["event_type"] == "ssh_brute_force"]
+    assert len(ssh_campaigns) == 1, (
+        f"expected only the larger superset window to survive dedup, got {ssh_campaigns}"
+    )
+    assert ssh_campaigns[0]["unique_source_ips"] == 4
+    assert set(ssh_campaigns[0]["source_ips"]) == {"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"}
