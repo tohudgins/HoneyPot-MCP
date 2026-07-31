@@ -124,3 +124,39 @@ async def test_inactive_rule_does_not_match():
 
     suppress, _ = await suppression.should_suppress(_event(ip="1.1.1.1"))
     assert suppress is False
+
+
+@pytest.mark.asyncio
+async def test_rate_state_evicts_decayed_entries_once_table_is_large():
+    """_rate_state has no TTL of its own — one entry per (rule, ip, event_type)
+    ever seen, on a public honeypot that could be thousands of distinct
+    attacker IPs. Without eviction this grows without bound for the life of
+    the process, exactly the risk canary.py's own rate limiter already guards
+    against for the identical reason."""
+    from honeypot_mcp import suppression
+
+    rule_id = await _add_rule(
+        label="rate",
+        ip_pattern="",
+        action="rate_limit",
+        rate_limit_count=100,
+        rate_limit_window_seconds=60,
+    )
+    suppression.invalidate_rule_cache()
+
+    # Seed a decayed entry directly — as if this (rule, ip, event_type) passed
+    # once a long time ago and nothing from it since.
+    import time as _time
+
+    stale_key = (rule_id, "203.0.113.1", "ssh_login_failed")
+    suppression._rate_state[stale_key] = [_time.monotonic() - 3600]  # window is 60s
+
+    # Push the table over the eviction threshold with fresh, non-decayed keys.
+    for i in range(suppression._RATE_STATE_MAX_KEYS + 1):
+        suppression._rate_state[(rule_id, f"198.51.100.{i}", "http_probe")] = [_time.monotonic()]
+
+    await suppression.should_suppress(_event(ip="9.9.9.9", event_type="http_probe"))
+
+    assert stale_key not in suppression._rate_state, (
+        "a decayed rate-limit entry should be evicted once the table grows large"
+    )

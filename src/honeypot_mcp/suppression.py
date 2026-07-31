@@ -51,6 +51,11 @@ _rules: list[_Rule] = []
 _rules_loaded_at: float = 0.0
 # (rule_id, ip, event_type) → list of monotonic timestamps of events seen in window
 _rate_state: dict[tuple[int, str, str], list[float]] = {}
+# Above this many tracked keys we sweep out decayed entries on the next check.
+# Mirrors canary.py's _rate_state / _RATE_STATE_MAX_IPS — the identical
+# unbounded-growth risk (one entry per distinct key ever seen on a long-lived
+# public deployment), just keyed on rule+IP+event_type instead of IP alone.
+_RATE_STATE_MAX_KEYS = 10_000
 
 
 def invalidate_rule_cache() -> None:
@@ -113,10 +118,28 @@ def _rule_matches(rule: _Rule, event: PendingEvent) -> bool:
     )
 
 
+def _evict_stale_rate_state() -> None:
+    """Drop (rule_id, ip, event_type) entries whose window has fully decayed
+    for their own rule, or whose rule no longer exists. Called only when the
+    table grows large, mirroring canary.py's _evict_stale_rate_windows."""
+    now = time.monotonic()
+    windows = {r.id: r.rate_limit_window_seconds for r in _rules if r.rate_limit_window_seconds}
+    stale = [
+        key
+        for key, history in _rate_state.items()
+        if not history or key[0] not in windows or history[-1] < now - windows[key[0]]
+    ]
+    for key in stale:
+        del _rate_state[key]
+
+
 def _rate_limited(rule: _Rule, event: PendingEvent) -> bool:
     """Return True if this rate-limit rule says drop this event."""
     if rule.rate_limit_count is None or rule.rate_limit_window_seconds is None:
         return True  # malformed rule — treat as drop to be safe
+
+    if len(_rate_state) > _RATE_STATE_MAX_KEYS:
+        _evict_stale_rate_state()
 
     key = (rule.id, event.source_ip, event.event_type)
     now = time.monotonic()
