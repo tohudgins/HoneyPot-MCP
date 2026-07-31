@@ -48,6 +48,12 @@ log = logging.getLogger(__name__)
 # plenty to fingerprint a dropped webshell or malware stager.
 _MAX_UPLOAD_BYTES = 1_048_576
 
+# The control channel has no cap of its own: a client that never sends a bare
+# CRLF grows `self._buf` without bound — one connection, zero further
+# syscalls needed, a Slowloris-style memory-exhaustion DoS against the whole
+# process. Real FTP command lines are short; this is a generous ceiling.
+_MAX_LINE_BYTES = 8192
+
 
 def _classify_upload(filename: str, data: bytes) -> str | None:
     """Recognise the artefact an attacker STORs. Returns a short label or None.
@@ -139,6 +145,13 @@ class _FTPProtocol(asyncio.Protocol):
 
     def data_received(self, data: bytes) -> None:
         self._buf += data
+        if len(self._buf) > _MAX_LINE_BYTES and b"\r\n" not in self._buf:
+            # Real ProFTPD enforces a line-length limit too — refusing here
+            # is protocol-faithful, not just a safety measure.
+            if self._transport is not None:
+                self._transport.write(b"500 Command too long\r\n")
+                self._transport.close()
+            return
         while b"\r\n" in self._buf:
             line, self._buf = self._buf.split(b"\r\n", 1)
             cmd = line.decode("utf-8", errors="replace").strip()

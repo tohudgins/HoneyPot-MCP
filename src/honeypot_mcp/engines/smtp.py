@@ -51,6 +51,14 @@ from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
 
+# RFC 5321 §4.5.3.1.4 caps a command line at 1000 octets; this is a generous
+# multiple of that. Without a cap, a client that never sends a bare CRLF
+# — one connection, zero further syscalls needed — grows `self._buf` without
+# bound: a Slowloris-style memory-exhaustion DoS against the whole process,
+# not just this connection. The 200-line cap on the DATA body doesn't help
+# here, since it only applies after a line is actually split out of `_buf`.
+_MAX_LINE_BYTES = 8192
+
 
 def _b64_decode(s: str) -> str:
     try:
@@ -146,6 +154,13 @@ class _SMTPProtocol(asyncio.Protocol):
 
     def data_received(self, data: bytes) -> None:
         self._buf += data
+        if len(self._buf) > _MAX_LINE_BYTES and b"\r\n" not in self._buf:
+            # A real Postfix enforces a line-length limit too — refusing here
+            # is protocol-faithful, not just a safety measure.
+            if self._transport is not None:
+                self._transport.write(b"500 5.5.2 Line too long\r\n")
+                self._transport.close()
+            return
         while b"\r\n" in self._buf:
             line, self._buf = self._buf.split(b"\r\n", 1)
             decoded = line.decode("utf-8", errors="replace")

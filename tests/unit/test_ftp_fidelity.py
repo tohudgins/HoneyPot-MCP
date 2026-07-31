@@ -305,3 +305,29 @@ async def test_list_without_pasv_returns_425(ftp_server):
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_data_received_caps_unbounded_buffer_growth(ftp_server):
+    """A client that never sends a bare CRLF on the control channel must not
+    be able to grow `self._buf` without bound — one connection, zero further
+    syscalls, a memory-exhaustion DoS against the whole process. The control
+    channel has no cap of its own (unlike the upload path's
+    `_MAX_UPLOAD_BYTES`), so the engine should refuse and close once the
+    buffer passes a sane line-length ceiling."""
+    from honeypot_mcp.engines.ftp import _MAX_LINE_BYTES
+
+    port = ftp_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await _read_line(reader)  # banner
+        writer.write(b"A" * (_MAX_LINE_BYTES + 1))  # no CRLF, ever
+        await writer.drain()
+        reply = await _read_line(reader)
+        assert reply.startswith(b"500"), reply
+        eof = await asyncio.wait_for(reader.read(1), timeout=2.0)
+        assert eof == b""
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()

@@ -239,3 +239,28 @@ async def test_smtp_open_relay_detected(smtp_server):
     assert alerts[0].severity.value == "high"
     assert alerts[0].payload["mail_from"] == "spammer@gmail.com"
     assert alerts[0].payload["rcpt_to"] == "victim@yahoo.com"
+
+
+@pytest.mark.asyncio
+async def test_data_received_caps_unbounded_buffer_growth(smtp_server):
+    """A client that never sends a bare CRLF must not be able to grow
+    `self._buf` without bound — that's a one-connection, zero-further-syscall
+    memory-exhaustion DoS against the whole process. The engine should refuse
+    and close once the buffer passes a sane line-length ceiling."""
+    from honeypot_mcp.engines.smtp import _MAX_LINE_BYTES
+
+    port = smtp_server
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await asyncio.wait_for(reader.readline(), timeout=2.0)  # banner
+        writer.write(b"A" * (_MAX_LINE_BYTES + 1))  # no CRLF, ever
+        await writer.drain()
+        reply = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert reply.startswith(b"500"), reply
+        # The server must have closed its end.
+        eof = await asyncio.wait_for(reader.read(1), timeout=2.0)
+        assert eof == b""
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
