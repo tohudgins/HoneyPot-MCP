@@ -243,6 +243,31 @@ async def test_audit_never_records_secrets():
 
 
 @pytest.mark.asyncio
+async def test_audit_redacts_secrets_nested_inside_a_list():
+    """dict values were recursed into; a list of dicts was not — a secret
+    nested inside one (e.g. a planted credential pair) reached the audit log
+    unredacted. honeytoken_create's `metadata` can carry
+    `{"credentials": [{"username": ..., "password": ...}]}`."""
+    from honeypot_mcp.tools._audit import redact_arguments
+
+    redacted = redact_arguments(
+        {
+            "pairs": [
+                {"username": "admin", "password": "hunter2"},
+                {"username": "root", "password": "toor"},
+            ],
+            "label": "prod",
+        }
+    )
+    assert redacted["label"] == "prod"
+    for pair in redacted["pairs"]:
+        assert pair["username"] in ("admin", "root")
+        assert pair["password"] == "[redacted]"
+    assert "hunter2" not in str(redacted)
+    assert "toor" not in str(redacted)
+
+
+@pytest.mark.asyncio
 async def test_audit_failure_never_breaks_the_action(monkeypatch):
     """An unwritable audit table must not stop an operator from acting."""
     from honeypot_mcp.tools import _audit

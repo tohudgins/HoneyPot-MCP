@@ -49,13 +49,22 @@ def redact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         if any(hint in key.lower() for hint in _SECRET_HINTS):
             out[key] = _REDACTED
             continue
-        if isinstance(value, dict):
-            out[key] = redact_arguments(value)
-        elif isinstance(value, str) and len(value) > _MAX_VALUE_CHARS:
-            out[key] = value[:_MAX_VALUE_CHARS] + "…"
-        else:
-            out[key] = value
+        out[key] = _redact_value(value)
     return out
+
+
+def _redact_value(value: Any) -> Any:
+    """Recurse into dicts AND lists so a secret nested inside either is still
+    caught — e.g. a list of {"username": ..., "password": ...} pairs. A bare
+    dict value used to be the only recursed case; a list of dicts fell
+    through untouched to the caller's `else: out[key] = value`."""
+    if isinstance(value, dict):
+        return redact_arguments(value)
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    if isinstance(value, str) and len(value) > _MAX_VALUE_CHARS:
+        return value[:_MAX_VALUE_CHARS] + "…"
+    return value
 
 
 async def record_action(
