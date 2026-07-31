@@ -26,6 +26,7 @@ which is already a runtime dep.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal
 
 import httpx
@@ -138,6 +139,7 @@ async def blocklist_push_pfsense(
     hours: int = 24,
     min_hits: int = 5,
     dry_run: bool = False,
+    verify_tls: bool = True,
 ) -> dict[str, Any]:
     """Push offender IPs to a pfSense firewall alias via the Netgate v2 REST API.
 
@@ -153,6 +155,14 @@ async def blocklist_push_pfsense(
         hours: Time window for offenders.
         min_hits: Minimum alert count to include.
         dry_run: If True, compute the diff but don't apply.
+        verify_tls: Verify the appliance's TLS certificate (default True).
+              pfSense's REST API commonly runs on a self-signed cert out of
+              the box — set this to False ONLY for that case, and only once
+              you've confirmed you're actually talking to your own appliance
+              (e.g. over a trusted network segment or VPN). Disabling this
+              makes the API key and the blocklist push vulnerable to MITM by
+              anyone on the network path, not just to the appliance's own
+              self-signed cert.
 
     Returns:
         `{added, skipped, failed, dry_run}` uniform shape.
@@ -164,7 +174,7 @@ async def blocklist_push_pfsense(
     headers = {"Authorization": api_key, "Content-Type": "application/json"}
     base = base_url.rstrip("/")
 
-    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=verify_tls) as client:
         # 1. Read the current alias
         resp = await client.get(
             f"{base}/api/v2/firewall/alias", headers=headers, params={"name": alias_name}
@@ -271,9 +281,18 @@ async def blocklist_push_aws_waf(
 
     offender_cidrs = [ip if "/" in ip else f"{ip}/32" for ip in offenders]
 
-    client = boto3.client("wafv2", region_name=region)
+    # boto3 is synchronous — every in-process engine (HTTP, SMTP, FTP,
+    # Redis, MySQL, ...) shares this one event loop, so a bare boto3 call
+    # here would stall all of them for the duration of each AWS round trip
+    # (worse under throttling, where boto3's own retry/backoff can take
+    # seconds). engines/ssh.py wraps every docker-py call in
+    # run_in_executor for the identical reason; boto3 gets the same
+    # treatment via asyncio.to_thread.
     try:
-        current = client.get_ip_set(Name=ip_set_name, Id=ip_set_id, Scope=scope)
+        client = await asyncio.to_thread(boto3.client, "wafv2", region_name=region)
+        current = await asyncio.to_thread(
+            client.get_ip_set, Name=ip_set_name, Id=ip_set_id, Scope=scope
+        )
     except Exception as e:
         return {
             "added": [],
@@ -293,7 +312,8 @@ async def blocklist_push_aws_waf(
 
     merged = sorted(existing | set(to_add))
     try:
-        client.update_ip_set(
+        await asyncio.to_thread(
+            client.update_ip_set,
             Name=ip_set_name,
             Id=ip_set_id,
             Scope=scope,

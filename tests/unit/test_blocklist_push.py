@@ -259,6 +259,60 @@ async def test_pfsense_push_unions_with_existing_address_list():
 
 
 @pytest.mark.asyncio
+async def test_pfsense_push_verifies_tls_by_default():
+    """pfSense's REST API commonly runs on a self-signed cert, but the
+    default must still be secure — an operator has to explicitly opt out
+    (verify_tls=False) rather than the tool silently accepting any
+    certificate from any host, which would make the API key and the
+    blocklist push vulnerable to MITM by anyone on the network path."""
+    from honeypot_mcp.tools import blocklist_push
+
+    await _insert_offenders([("1.1.1.1", 10)])
+
+    fake = _FakePfClient(existing_addresses="")
+    seen_kwargs: dict = {}
+
+    def _capture(**kwargs):
+        seen_kwargs.update(kwargs)
+        return fake
+
+    with patch("honeypot_mcp.tools.blocklist_push.httpx.AsyncClient", _capture):
+        await blocklist_push.blocklist_push_pfsense(
+            base_url="https://pf.local",
+            api_key="key",
+            alias_name="honeypot_block",
+            min_hits=5,
+        )
+
+    assert seen_kwargs["verify"] is True
+
+
+@pytest.mark.asyncio
+async def test_pfsense_push_verify_tls_false_is_an_explicit_opt_in():
+    from honeypot_mcp.tools import blocklist_push
+
+    await _insert_offenders([("1.1.1.1", 10)])
+
+    fake = _FakePfClient(existing_addresses="")
+    seen_kwargs: dict = {}
+
+    def _capture(**kwargs):
+        seen_kwargs.update(kwargs)
+        return fake
+
+    with patch("honeypot_mcp.tools.blocklist_push.httpx.AsyncClient", _capture):
+        await blocklist_push.blocklist_push_pfsense(
+            base_url="https://pf.local",
+            api_key="key",
+            alias_name="honeypot_block",
+            min_hits=5,
+            verify_tls=False,
+        )
+
+    assert seen_kwargs["verify"] is False
+
+
+@pytest.mark.asyncio
 async def test_pfsense_push_dry_run_skips_put_and_apply():
     from honeypot_mcp.tools import blocklist_push
 
@@ -332,6 +386,55 @@ async def test_waf_push_converts_bare_ip_to_cidr_and_unions():
     assert call_kwargs["LockToken"] == "lock-abc"
     assert call_kwargs["Scope"] == "REGIONAL"
     assert set(call_kwargs["Addresses"]) == {"1.1.1.1/32", "2.2.2.2/32", "9.9.9.9/32"}
+
+
+@pytest.mark.asyncio
+async def test_waf_push_does_not_block_the_event_loop():
+    """boto3 is synchronous; every in-process engine (HTTP, SMTP, FTP, Redis,
+    MySQL, ...) shares this one event loop, so a bare boto3 call would stall
+    all of them for the duration of the AWS round trip — worse under
+    throttling, where boto3's own retry/backoff can take seconds. Proves the
+    blocking call is actually offloaded to a thread: a concurrent asyncio
+    task must keep making progress while a slow, synchronous get_ip_set is
+    "in flight"."""
+    import asyncio
+    import time
+
+    from honeypot_mcp.tools import blocklist_push
+
+    await _insert_offenders([("1.1.1.1", 10)])
+
+    def _slow_get_ip_set(**kwargs):
+        time.sleep(0.3)  # a slow/throttled synchronous AWS call
+        return {"IPSet": {"Addresses": []}, "LockToken": "lock-abc"}
+
+    boto_client = MagicMock()
+    boto_client.get_ip_set.side_effect = _slow_get_ip_set
+    boto_client.update_ip_set.return_value = {}
+
+    progress = 0
+
+    async def _ticker():
+        nonlocal progress
+        while True:
+            await asyncio.sleep(0.01)
+            progress += 1
+
+    with patch("boto3.client", return_value=boto_client):
+        ticker_task = asyncio.create_task(_ticker())
+        try:
+            await blocklist_push.blocklist_push_aws_waf(
+                ip_set_id="ips-id",
+                ip_set_name="honeypot-blocklist",
+                region="us-east-1",
+                min_hits=5,
+            )
+        finally:
+            ticker_task.cancel()
+
+    # If the boto3 call blocked the event loop, the ticker would have made
+    # essentially zero progress during the ~0.3s the call was "in flight".
+    assert progress >= 10, f"event loop was blocked during the AWS call (progress={progress})"
 
 
 @pytest.mark.asyncio
