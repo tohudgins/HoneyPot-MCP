@@ -64,6 +64,67 @@ async def test_asn_merged_into_result(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_corrupted_city_db_reports_unavailable_not_success(monkeypatch, tmp_path):
+    """A truncated/corrupted/wrong-format .mmdb file must NOT be reported as
+    available: True — the caller caches a 'successful' result for 24h, so a
+    bad database file would otherwise become a silent, self-reinforcing
+    outage: every enrichment for a full day quietly returns empty geo data
+    with no error surfaced anywhere. Only AddressNotFoundError (the DB opened
+    fine, the IP just isn't in it) should produce available: True."""
+    import geoip2.database
+    import geoip2.errors
+
+    from honeypot_mcp.intel import geoip
+
+    class _BrokenReader:
+        def __init__(self, path):
+            raise OSError("Error opening database file")
+
+    monkeypatch.setattr(geoip2.database, "Reader", _BrokenReader)
+
+    db_path = tmp_path / "GeoLite2-City.mmdb"
+    db_path.write_bytes(b"not a real mmdb file")
+
+    result = await geoip._lookup_city("203.0.113.9", str(db_path))
+
+    assert result["available"] is False
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_address_not_found_still_reports_available(monkeypatch, tmp_path):
+    """Contrast case: a working DB that simply has no data for this IP is a
+    normal outcome, not a failure — must stay available: True."""
+    import geoip2.database
+    import geoip2.errors
+
+    from honeypot_mcp.intel import geoip
+
+    class _EmptyHitReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def city(self, ip):
+            raise geoip2.errors.AddressNotFoundError("The address is not in the database.")
+
+    monkeypatch.setattr(geoip2.database, "Reader", _EmptyHitReader)
+
+    db_path = tmp_path / "GeoLite2-City.mmdb"
+    db_path.write_bytes(b"placeholder")
+
+    result = await geoip._lookup_city("203.0.113.9", str(db_path))
+
+    assert result["available"] is True
+    assert "geo_note" in result
+
+
+@pytest.mark.asyncio
 async def test_profile_passes_asn_through():
     """The profiler forwards the whole geoip block, so asn/reverse_dns reach
     the attacker profile without extra plumbing."""

@@ -77,6 +77,7 @@ async def lookup_geoip(ip: str) -> dict[str, Any]:
 async def _lookup_city(ip: str, db_path: str) -> dict[str, Any]:
     try:
         import geoip2.database
+        import geoip2.errors
     except ImportError:
         return {"available": False, "ip": ip, "error": "geoip2 library not installed"}
 
@@ -94,9 +95,16 @@ async def _lookup_city(ip: str, db_path: str) -> dict[str, Any]:
                 "longitude": response.location.longitude,
                 "timezone": response.location.time_zone,
             }
-        except Exception as e:
-            # AddressNotFoundError etc. — the DB works, the IP just isn't in it.
+        except geoip2.errors.AddressNotFoundError as e:
+            # The DB opened and works, the IP just isn't in it — a normal
+            # outcome, not a failure.
             return {"available": True, "ip": ip, "geo_note": str(e)}
+        # Anything else (corrupted/truncated file, wrong format, permission
+        # error) must NOT be reported as available: True — the caller caches
+        # a successful-looking result for 24h, which would turn one bad
+        # database file into a silent, self-reinforcing outage: every
+        # enrichment for a full day quietly returns empty geo data with no
+        # error surfaced anywhere. Let it propagate to the outer handler.
 
     loop = asyncio.get_event_loop()
     try:
