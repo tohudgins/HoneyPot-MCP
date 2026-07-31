@@ -656,16 +656,28 @@ class HTTPEngine(HoneypotEngine):
             # %-encoded payloads don't slip past. Any hit re-tags the event and
             # raises severity to at least the matched level — this is the intel
             # a SOC actually wants (which CVE/technique was thrown at you).
-            surface_parts = [request.path_qs, user_agent]
-            surface_parts.extend(str(v) for v in request.headers.values())
-            surface_parts.extend(f"{k}={v}" for k, v in post_data.items())
+            #
+            # Body and form data come FIRST, not last: they're the
+            # highest-payload-density fields, and the joined string is
+            # truncated to a total budget below. Putting them last meant an
+            # attacker could pad an earlier field (a handful of near-max-size
+            # headers is enough) to push a real exploit payload in the body
+            # out of the scanned window entirely — a real Log4Shell/webshell/
+            # SQLi payload would then classify as ordinary traffic instead of
+            # http_exploit_attempt. Path/UA/headers fill whatever budget the
+            # body doesn't use.
+            surface_parts = []
             if raw_body_scan:
                 surface_parts.append(raw_body_scan)
+            surface_parts.extend(f"{k}={v}" for k, v in post_data.items())
+            surface_parts.append(request.path_qs)
+            surface_parts.append(user_agent)
+            surface_parts.extend(str(v) for v in request.headers.values())
             # Bound the scanned surface: exploit strings (jndi, <?php, ../,
-            # UNION SELECT) are short and appear early, so scanning the first
-            # 32 KB catches them without letting a large POST turn each request
-            # into a big regex sweep. The full body is still captured verbatim
-            # in raw_body_b64 for forensics.
+            # UNION SELECT) are short, so scanning the first 32 KB catches
+            # them without letting a large POST turn each request into a big
+            # regex sweep. The full body is still captured verbatim in
+            # raw_body_b64 for forensics.
             surface = " ".join(surface_parts)[:_MAX_SCAN_SURFACE]
             exploit_categories, exploit_sev = _classify_http_attack(
                 surface + " " + unquote(surface)

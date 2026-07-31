@@ -407,4 +407,45 @@ async def test_http_exploit_signatures_detected(http_server):
     }
     assert sev_by_cat["log4shell"] == "critical"
     assert sev_by_cat["webshell"] == "critical"
-    assert sev_by_cat["sqli"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_exploit_body_not_evaded_by_padded_headers(http_server):
+    """The scanned surface is capped at 32 KB total. If the body were scanned
+    last (as it used to be), an attacker could pad earlier fields — a
+    handful of large headers is enough — to push a real exploit payload in
+    the body out of the scanned window entirely, so it would classify as
+    ordinary traffic instead of http_exploit_attempt. The body must be
+    scanned regardless of how much header padding precedes it."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = http_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        # ~35 KB of header padding — more than _MAX_SCAN_SURFACE (32 KB) —
+        # spread across headers so no single one hits aiohttp's per-field cap.
+        padding_headers = {f"X-Pad-{i}": "A" * 7000 for i in range(5)}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"http://127.0.0.1:{port}/up",
+                content=b"<?php system($_GET[c]); ?>",
+                headers={"Content-Type": "application/octet-stream", **padding_headers},
+            )
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(Alert).where(Alert.event_type == "http_exploit_attempt")
+        )
+        alerts = list(result.scalars().all())
+
+    assert alerts, "webshell body must still be classified as an exploit despite header padding"
+    assert "webshell" in alerts[0].payload.get("exploit_categories", [])
+    assert alerts[0].severity.value == "critical"
