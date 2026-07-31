@@ -278,6 +278,38 @@ def test_throttle_key_map_stays_bounded():
     assert len(throttle._last_sent) <= 64
 
 
+def test_eviction_does_not_silently_discard_a_pending_suppressed_count():
+    """Eviction used to pick victims purely by age, with no regard for
+    whether a key had events suppressed on it waiting to ride out on the
+    next send — discarding that count is exactly what this class's own
+    guarantee ("suppressed volume is never hidden, only delayed") forbids.
+    A key with pending suppressed events must survive eviction ahead of an
+    idle key, even if the pending key is older."""
+    from honeypot_mcp.webhooks import _NotifyThrottle
+
+    throttle = _NotifyThrottle(window_seconds=3600, max_keys=8)
+
+    # Fill to capacity — 8 distinct keys, oldest (index 0) first.
+    for i in range(8):
+        assert throttle.check(1, _event(event_type=f"t{i}"))[0] is True
+
+    # The oldest key gets hit again inside the window: throttled, and now
+    # carries a pending suppressed count of 1.
+    send, _ = throttle.check(1, _event(event_type="t0"))
+    assert send is False
+    oldest_key = (1, "t0", "203.0.113.44")
+    assert throttle._suppressed[oldest_key] == 1
+
+    # A 9th distinct key pushes the map over max_keys and triggers eviction.
+    throttle.check(1, _event(event_type="t8"))
+
+    assert oldest_key in throttle._suppressed, (
+        "a key with a pending suppressed count must not be evicted while "
+        "zero-suppressed keys are still available to evict instead"
+    )
+    assert throttle._suppressed[oldest_key] == 1
+
+
 # ── Subscription validation ─────────────────────────────────────────────────
 
 

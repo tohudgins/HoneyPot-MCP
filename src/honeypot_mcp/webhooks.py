@@ -758,10 +758,17 @@ class _NotifyThrottle:
             return False, 0
         # Unbounded growth would be a slow leak on a host seeing a wide IP
         # spread, so drop the oldest entries once the map gets large.
+        # Keys with a nonzero pending _suppressed count are evicted last —
+        # evicting one before its count ever rides out on a send silently
+        # discards it, which breaks this class's own guarantee that
+        # suppressed volume is never hidden, only delayed. Only spills into
+        # a nonzero-suppressed key if there aren't enough zero-suppressed
+        # ones to make room, so eviction still terminates either way.
         if len(self._last_sent) >= self._max_keys:
-            oldest = sorted(self._last_sent, key=lambda k: self._last_sent[k])[
-                : self._max_keys // 4
-            ]
+            oldest = sorted(
+                self._last_sent,
+                key=lambda k: (self._suppressed.get(k, 0) > 0, self._last_sent[k]),
+            )[: self._max_keys // 4]
             for stale in oldest:
                 self._last_sent.pop(stale, None)
                 self._suppressed.pop(stale, None)
