@@ -111,6 +111,52 @@ async def test_abandoned_events_are_reported_with_a_count(monkeypatch, caplog):
     assert "shutdown_drain_seconds" in combined, "say which knob fixes it"
 
 
+async def test_abandoned_count_includes_a_batch_mid_flush_at_shutdown(monkeypatch, caplog):
+    """The discard count used to come from queue.qsize() alone — but a batch
+    is pulled OFF the queue before _flush() runs, so a batch that is
+    genuinely mid-flush when the drain timeout fires (a slow/remote DB, the
+    exact case shutdown_drain_seconds exists for) vanished from the count
+    entirely: gone from the queue, never committed, never reported. The
+    previous test only exercises "flusher is hung, nothing pulled yet" —
+    this one drives the real _run() loop so a real batch gets pulled and is
+    then cancelled mid-flush.
+    """
+    from honeypot_mcp import config
+    from honeypot_mcp.storage import event_buffer
+
+    monkeypatch.setattr(
+        config, "get_settings", lambda: _settings_with(config, shutdown_drain_seconds=0.05)
+    )
+
+    buffer = event_buffer.get_buffer()
+
+    async def _stuck_flush(batch):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(buffer, "_flush", _stuck_flush)
+
+    await buffer.start()
+    # More than one batch's worth: the first `_batch_size` get pulled into
+    # the now-stuck flush, the rest stay genuinely queued behind it.
+    total = buffer._batch_size + 20
+    for i in range(total):
+        await buffer.submit(_event(i))
+
+    # Give the flusher time to actually pull its batch and enter the (now
+    # stuck) flush before triggering shutdown.
+    await asyncio.sleep(0.5)
+
+    with caplog.at_level(logging.ERROR, logger="honeypot_mcp.storage.event_buffer"):
+        await buffer.stop()
+
+    assert await _stored() == 0, "the stuck batch must not have committed"
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    combined = " ".join(messages)
+    assert str(total) in combined, (
+        f"expected all {total} events (queued + mid-flush) counted as discarded: {combined}"
+    )
+
+
 def _settings_with(config_module, **overrides):
     real = config_module.Settings()
     for key, value in overrides.items():

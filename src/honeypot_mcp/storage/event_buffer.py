@@ -52,6 +52,14 @@ class EventBuffer:
         self._flush_interval = flush_interval
         self._stop = asyncio.Event()
         self._on_flush: Callable[[list[PendingEvent]], Awaitable[None]] | None = None
+        # Size of the batch currently mid-flush, if any. A batch is pulled off
+        # `_queue` (via get()/get_nowait()) before `_flush()` runs, so
+        # `_queue.qsize()` no longer reflects it — if the flusher task is
+        # cancelled while `_flush()` is awaiting a slow/remote DB write (the
+        # exact case shutdown_drain_seconds exists for), those events would
+        # otherwise vanish from the shutdown discard count entirely, silently
+        # undercounting by up to `batch_size`.
+        self._in_flight = 0
 
     def set_on_flush(self, hook: Callable[[list[PendingEvent]], Awaitable[None]] | None) -> None:
         """Hook invoked AFTER a successful DB flush. Used by webhooks delivery
@@ -88,7 +96,7 @@ class EventBuffer:
             try:
                 await asyncio.wait_for(self._task, timeout=timeout)
             except TimeoutError:
-                abandoned = self._queue.qsize()
+                abandoned = self._queue.qsize() + self._in_flight
                 log.error(
                     "Event buffer did not finish draining within %.1fs — %d captured "
                     "event(s) were DISCARDED. Raise `shutdown_drain_seconds` if the "
@@ -118,11 +126,21 @@ class EventBuffer:
                 except asyncio.QueueEmpty:
                     break
 
+            self._in_flight = len(batch)
             try:
                 await self._flush(batch)
+            except asyncio.CancelledError:
+                # stop()'s wait_for timed out while this batch was mid-flush.
+                # Leave _in_flight set to len(batch) — that's what makes it
+                # visible to stop()'s shutdown-discard count instead of the
+                # batch silently vanishing (already off the queue, never
+                # committed).
+                raise
             except Exception as e:
                 log.warning("Event buffer flush failed (%d events lost): %s", len(batch), e)
+                self._in_flight = 0
                 continue
+            self._in_flight = 0
 
             if self._on_flush is not None:
                 try:
