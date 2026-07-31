@@ -283,7 +283,12 @@ class _RedisProtocol(asyncio.Protocol):
         # (they verify), then capture the whole payload at SAVE time.
         self._store: dict[str, str] = {}
         self._config: dict[str, str] = {}
-        self._save_reported = False
+        # Dedup key is (target_path, keyspace snapshot), not a bare bool —
+        # an attacker can CONFIG SET a new dir/dbfilename and SET new keys
+        # partway through the same connection (a second, materially distinct
+        # drop attempt), and a one-shot flag would silently swallow it after
+        # the first SAVE ever fired.
+        self._save_reported: set[tuple[str, frozenset[tuple[str, str]]]] = set()
         # RESP protocol version negotiated via HELLO (2 = legacy, 3 = Redis 6+).
         # Every reply we emit is wire-identical across both, so tracking it is
         # only needed to answer HELLO consistently if it's sent twice.
@@ -515,9 +520,10 @@ class _RedisProtocol(asyncio.Protocol):
         target_dir = self._config.get("dir")
         target_file = self._config.get("dbfilename")
         redirected = target_dir is not None or target_file is not None
-        if redirected and self._store and not self._save_reported:
-            self._save_reported = True
-            target_path = f"{target_dir or _CONFIG_DEFAULTS['dir']}/{target_file or 'dump.rdb'}"
+        target_path = f"{target_dir or _CONFIG_DEFAULTS['dir']}/{target_file or 'dump.rdb'}"
+        dedup_key = (target_path, frozenset(self._store.items()))
+        if redirected and self._store and dedup_key not in self._save_reported:
+            self._save_reported.add(dedup_key)
             payloads = [
                 {"key": k, "value": v[:2048], "payload_kind": _classify_payload(v)}
                 for k, v in self._store.items()

