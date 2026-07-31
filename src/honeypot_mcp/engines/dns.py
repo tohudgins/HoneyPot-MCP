@@ -127,33 +127,26 @@ class _DNSProtocol(asyncio.DatagramProtocol):
 
         # File honeytokens use a 32-char UUID hex as a subdomain label.
         # Match against `token_meta.token_uid` (what file_token.py actually stores)
-        # rather than the brittle `token_value in qname` heuristic.
+        # rather than the brittle `token_value in qname` heuristic. Matching
+        # goes through token_matchers' TTL-cached index rather than a fresh
+        # DB query + full table scan on every packet — this is the ingest
+        # hot path, and a DNS-tunneling burst is exactly the traffic that
+        # would turn an uncached per-query lookup into a DB bottleneck.
         labels = [p for p in qname.split(".") if len(p) == 32]
         if labels:
             severity = AlertSeverity.HIGH
             event_type = "dns_canary_callback"
-            async with get_session() as session:
-                from sqlalchemy import select
+            from honeypot_mcp.token_matchers import match_file_uid
 
-                from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
-
-                result = await session.execute(
-                    select(Honeytoken).where(
-                        Honeytoken.type == HoneytokenType.FILE,
-                        Honeytoken.status == HoneytokenStatus.ACTIVE,
+            token_id = await match_file_uid(labels)
+            if token_id is not None:
+                async with get_session() as session:
+                    await queries.mark_honeytoken_triggered(
+                        session, token_id, {"trigger_ip": src_ip, "dns_query": qname}
                     )
-                )
-                for token in result.scalars().all():
-                    meta = token.token_meta or {}
-                    uid = meta.get("token_uid", "")
-                    if uid and uid in labels:
-                        await queries.mark_honeytoken_triggered(
-                            session, token.id, {"trigger_ip": src_ip, "dns_query": qname}
-                        )
-                        severity = AlertSeverity.CRITICAL
-                        matched_token_id = token.id
-                        payload["matched_token_id"] = token.id
-                        break
+                severity = AlertSeverity.CRITICAL
+                matched_token_id = token_id
+                payload["matched_token_id"] = token_id
 
         await submit_event(
             PendingEvent(

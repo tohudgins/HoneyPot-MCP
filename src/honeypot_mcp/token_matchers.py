@@ -47,6 +47,7 @@ CACHE_REFRESH_SECONDS = 30
 _ssh_key_index: dict[str, int] = {}  # fingerprint → token_id
 _jwt_index: dict[str, int] = {}  # jti → token_id
 _dbrow_index: dict[str, int] = {}  # canary_email → token_id
+_file_uid_index: dict[str, int] = {}  # token_uid → token_id (FILE tokens)
 # Cloud-credential index — keyed on whatever identifying field a cloud
 # audit log emits for the credential. AWS uses `accessKeyId`, Azure uses
 # `appid` / `client_id`, GCP uses `principalEmail` (the service account
@@ -75,7 +76,7 @@ def invalidate_cache() -> None:
 
 
 async def _load_indices() -> None:
-    global _ssh_key_index, _jwt_index, _dbrow_index, _cloud_cred_index, _loaded_at
+    global _ssh_key_index, _jwt_index, _dbrow_index, _cloud_cred_index, _file_uid_index, _loaded_at
     now = time.monotonic()
     if now - _loaded_at < CACHE_REFRESH_SECONDS:
         return
@@ -92,6 +93,7 @@ async def _load_indices() -> None:
                         HoneytokenType.API_KEY,
                         HoneytokenType.AZURE_CREDENTIAL,
                         HoneytokenType.GCP_SERVICE_ACCOUNT,
+                        HoneytokenType.FILE,
                     ]
                 ),
             )
@@ -102,6 +104,7 @@ async def _load_indices() -> None:
     jwt: dict[str, int] = {}
     dbr: dict[str, int] = {}
     cloud: dict[str, int] = {}
+    file_uid: dict[str, int] = {}
     for t in tokens:
         meta = t.token_meta or {}
         if t.type == HoneytokenType.SSH_KEY:
@@ -135,12 +138,38 @@ async def _load_indices() -> None:
             pkid = meta.get("private_key_id")
             if isinstance(pkid, str) and pkid:
                 cloud[pkid] = t.id
+        elif t.type == HoneytokenType.FILE:
+            uid = meta.get("token_uid")
+            if isinstance(uid, str) and uid:
+                file_uid[uid] = t.id
 
     _ssh_key_index = ssh
     _jwt_index = jwt
     _dbrow_index = dbr
     _cloud_cred_index = cloud
+    _file_uid_index = file_uid
     _loaded_at = now
+
+
+async def match_file_uid(labels: list[str]) -> int | None:
+    """Return the token id of the first active FILE honeytoken whose
+    `token_uid` appears in `labels`, or None.
+
+    Pulled out for DNS's canary-subdomain matching (`<uid>.<zone>` queries),
+    which previously ran an uncached DB query plus a full Python-side scan of
+    every active FILE honeytoken on *every* matching DNS packet — no TTL
+    cache, unlike every other honeytoken cross-reference in this codebase.
+    Under a DNS-tunneling-shaped burst (the exact traffic this engine exists
+    to catch), that's a per-packet DB round trip on the ingest hot path.
+    """
+    await _load_indices()
+    if not _file_uid_index:
+        return None
+    for label in labels:
+        token_id = _file_uid_index.get(label)
+        if token_id is not None:
+            return token_id
+    return None
 
 
 async def match_cloud_event(event: dict) -> tuple[int | None, str | None]:
