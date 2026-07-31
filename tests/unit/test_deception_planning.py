@@ -171,6 +171,25 @@ async def test_a_credential_token_for_an_undeployed_service_is_an_error():
     assert "postgresql" in error["fix"]
 
 
+async def test_a_service_less_credential_token_with_no_credential_sensor_is_an_error():
+    """An unset `service` normally means "matches whichever credential-
+    capturing sensor is deployed" — but if none is deployed at all, there is
+    no login-attempt-shaped event for credential_match.py to ever
+    cross-reference this against. This previously slipped past
+    check_coherence entirely: the existing check only fires when `service`
+    is explicitly set to something undeployed, not when it's unset and
+    nothing credential-capturing exists to match it against anyway."""
+    from honeypot_mcp.deception.planner import PlannedSensor, PlannedToken, check_coherence
+
+    result = check_coherence(
+        [PlannedSensor(type="dns", name="x-dns", port=5353)],
+        [PlannedToken(type="credential", label="generic-creds", metadata={})],
+    )
+    assert result["consistent"] is False
+    error = next(i for i in result["issues"] if i["severity"] == "error")
+    assert "can never fire" in error["issue"]
+
+
 async def test_planned_tokens_always_target_a_deployed_service():
     """The planner must never generate the error above for its own output."""
     from honeypot_mcp.deception.capabilities import all_profiles

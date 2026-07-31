@@ -412,6 +412,26 @@ def check_coherence(sensors: list[PlannedSensor], tokens: list[PlannedToken]) ->
                     + ", ".join(sorted(deployed_credential_services)),
                 }
             )
+        elif not service and not deployed_credential_services:
+            # An unset (or "any") service normally means "matches whichever
+            # credential-capturing sensor is deployed" — but if none are
+            # deployed at all (e.g. a DNS + Elasticsearch plan), there is no
+            # login-attempt-shaped event for credential_match.py to ever
+            # cross-reference this against, silently the same way an
+            # explicit service mismatch is.
+            issues.append(
+                {
+                    "severity": "error",
+                    "issue": (
+                        f"Credential token '{token.label}' has no explicit service, but no "
+                        "sensor in this plan captures credentials at all — it can never fire."
+                    ),
+                    "fix": (
+                        "Deploy a credential-capturing sensor (e.g. ssh, http, ftp) for it to "
+                        "cross-reference."
+                    ),
+                }
+            )
 
     return {
         "consistent": not any(i["severity"] == "error" for i in issues),
