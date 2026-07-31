@@ -9,7 +9,15 @@ set -euo pipefail
 SRC="${1:?usage: restore.sh <backup-dir>}"
 [ -d "$SRC" ] || { echo "no such backup: $SRC" >&2; exit 1; }
 
-if pgrep -f "honeypot_mcp.server" >/dev/null 2>&1; then
+# Match both invocation forms: `python -m honeypot_mcp.server` (argv contains
+# the module path literally) and the `honeypot-mcp` console-script entry
+# point (pyproject.toml's [project.scripts], and what the Docker image's
+# ENTRYPOINT uses) — a console script's argv is just its own wrapper path
+# ("…/bin/honeypot-mcp"), which never contains the string "honeypot_mcp.server"
+# even though that's the module it imports internally. Checking only the
+# first form let a server started the documented/default-deployment way run
+# straight through this guard.
+if pgrep -f "honeypot_mcp\.server|honeypot-mcp" >/dev/null 2>&1; then
   echo "!! the server is still running — stop it first, or the restore is silently discarded" >&2
   exit 1
 fi
