@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 import secrets
 import string
 from typing import Any
@@ -30,20 +29,22 @@ _USERNAMES = [
     "docker",
 ]
 
+def _rand_str(pool: str, k: int) -> str:
+    return "".join(secrets.choice(pool) for _ in range(k))
+
+
 _PASSWORD_PATTERNS = [
-    lambda: f"{''.join(random.choices(string.ascii_letters + string.digits, k=12))}!",
-    lambda: (
-        f"{''.join(random.choices(string.ascii_lowercase, k=8))}{''.join(random.choices(string.digits, k=4))}"
-    ),
-    lambda: f"P@ssw0rd{random.randint(100, 999)}",
-    lambda: f"{''.join(random.choices(string.ascii_letters, k=6))}_{random.randint(10, 99)}!",
-    lambda: f"{''.join(random.choices(string.ascii_lowercase + string.digits + '!@#$', k=16))}",
+    lambda: f"{_rand_str(string.ascii_letters + string.digits, 12)}!",
+    lambda: f"{_rand_str(string.ascii_lowercase, 8)}{_rand_str(string.digits, 4)}",
+    lambda: f"P@ssw0rd{secrets.randbelow(900) + 100}",
+    lambda: f"{_rand_str(string.ascii_letters, 6)}_{secrets.randbelow(90) + 10}!",
+    lambda: f"{_rand_str(string.ascii_lowercase + string.digits + '!@#$', 16)}",
 ]
 
 
 def _generate_pair(service: str) -> dict[str, str]:
-    username = random.choice(_USERNAMES)
-    password = random.choice(_PASSWORD_PATTERNS)()
+    username = secrets.choice(_USERNAMES)
+    password = secrets.choice(_PASSWORD_PATTERNS)()
     return {"username": username, "password": password, "service": service}
 
 

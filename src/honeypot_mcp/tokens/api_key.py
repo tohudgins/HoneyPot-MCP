@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 import secrets
 import string
 from typing import Any
@@ -15,13 +14,13 @@ _SECRET_CHARS = string.ascii_letters + string.digits + "/+"
 
 def _generate_aws_key_id(prefix: str = "AKIA") -> str:
     """Generate an AWS-format access key ID (20 chars, starts with prefix)."""
-    body = "".join(random.choices(_AWS_CHARS, k=16))
+    body = "".join(secrets.choice(_AWS_CHARS) for _ in range(16))
     return f"{prefix}{body}"
 
 
 def _generate_aws_secret() -> str:
     """Generate a 40-char AWS secret key lookalike."""
-    return "".join(random.choices(_SECRET_CHARS, k=40))
+    return "".join(secrets.choice(_SECRET_CHARS) for _ in range(40))
 
 
 class APIKeyProvider(HoneytokenProvider):
