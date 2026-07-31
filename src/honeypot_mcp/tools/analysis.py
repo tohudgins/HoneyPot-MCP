@@ -694,13 +694,16 @@ async def threat_timeline(
     ip: str | None = None,
     hours: int = 24,
     limit: int = 200,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """Get a chronological event timeline for a time range or specific IP.
 
     Args:
         ip: Filter to a specific attacker IP (omit for all sources).
         hours: How many hours back to look (default 24).
-        limit: Maximum events to return.
+        limit: Maximum events to return (default 200). When a window has more
+              matching events than this, the most recent `limit` are kept —
+              not the oldest — since recency is what a caller filtering to
+              "the last N hours" almost always wants.
     """
     from datetime import datetime, timedelta
 
@@ -714,11 +717,13 @@ async def threat_timeline(
         q = select(Alert).where(Alert.timestamp >= since)
         if ip:
             q = q.where(Alert.source_ip == ip)
-        q = q.order_by(Alert.timestamp).limit(limit)
+        # Order DESC to select the most recent `limit` rows when the window
+        # holds more than that; re-sorted ASC below for chronological display.
+        q = q.order_by(Alert.timestamp.desc()).limit(limit)
         result = await session.execute(q)
-        alerts = list(result.scalars().all())
+        alerts = sorted(result.scalars().all(), key=lambda a: a.timestamp)
 
-    return [
+    events = [
         {
             "timestamp": a.timestamp.isoformat(),
             "source_ip": a.source_ip,
@@ -728,3 +733,10 @@ async def threat_timeline(
         }
         for a in alerts
     ]
+    out: dict[str, Any] = {"count": len(events), "events": events, "window": f"last {hours}h"}
+    if len(events) == limit:
+        out["note"] = (
+            f"Hit the limit of {limit} — there may be more (and older) events in "
+            f"this window. Narrow with `ip`, shrink `hours`, or raise `limit`."
+        )
+    return out

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from honeypot_mcp import pcap as pcap_module
 from honeypot_mcp.server import mcp
@@ -108,7 +108,7 @@ async def pcap_files() -> dict[str, Any]:
 
 
 @mcp.tool
-async def pcap_control(action: str) -> dict[str, Any]:
+async def pcap_control(action: Literal["start", "stop", "restart"]) -> dict[str, Any]:
     """Start, stop or restart packet capture.
 
     Restart is the one to reach for after deploying a honeypot on a new port —
@@ -119,12 +119,12 @@ async def pcap_control(action: str) -> dict[str, Any]:
     Args:
         action: "start", "stop", or "restart".
     """
-    action = (action or "").strip().lower()
-    if action not in ("start", "stop", "restart"):
+    normalized = (action or "").strip().lower()
+    if normalized not in ("start", "stop", "restart"):
         return {"error": f"action must be start, stop or restart (got {action!r})"}
 
     capture = pcap_module.get_capture()
-    if action == "stop":
+    if normalized == "stop":
         await capture.stop()
         await _audit.record_action("pcap_control", "packet capture stopped")
         return {"stopped": True, **capture.status()}
@@ -132,8 +132,8 @@ async def pcap_control(action: str) -> dict[str, Any]:
     result = await pcap_module.start_capture_for_running_honeypots()
     await _audit.record_action(
         "pcap_control",
-        f"packet capture {action}",
-        arguments={"action": action},
+        f"packet capture {normalized}",
+        arguments={"action": normalized},
         outcome="ok" if result.get("started") else "failed",
         error=None if result.get("started") else str(result.get("reason"))[:200],
     )

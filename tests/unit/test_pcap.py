@@ -285,3 +285,58 @@ async def test_refresh_is_silent_when_capture_is_disabled():
     from honeypot_mcp.pcap import refresh_capture
 
     await refresh_capture()  # must not raise
+
+
+# ── pcap_control (the MCP tool wrapper, not just the underlying module) ────
+
+
+@pytest.mark.asyncio
+async def test_pcap_control_rejects_an_unknown_action():
+    """`action` is now a `Literal`, so a compliant MCP client can't send this —
+    but the tool is directly callable as plain Python in tests (and by any
+    caller that bypasses schema validation), so the runtime guard still
+    matters."""
+    from honeypot_mcp.tools.pcap import pcap_control
+
+    result = await pcap_control("bogus")
+    assert result == {"error": "action must be start, stop or restart (got 'bogus')"}
+
+
+@pytest.mark.asyncio
+async def test_pcap_control_stop_is_a_no_op_when_not_running():
+    import honeypot_mcp.pcap as pcap_module
+    from honeypot_mcp.storage.database import close_db, init_db
+    from honeypot_mcp.tools.pcap import pcap_control
+
+    pcap_module._capture = None
+    await init_db()
+    try:
+        result = await pcap_control("stop")
+        assert result["stopped"] is True
+        assert result["running"] is False
+    finally:
+        await close_db()
+        pcap_module._capture = None
+
+
+@pytest.mark.asyncio
+async def test_pcap_control_start_reports_disabled_when_pcap_is_off():
+    """Default config has PCAP_ENABLED=false — starting must degrade
+    gracefully rather than trying to shell out to tcpdump."""
+    import honeypot_mcp.config as config_module
+    import honeypot_mcp.pcap as pcap_module
+    from honeypot_mcp.storage.database import close_db, init_db
+    from honeypot_mcp.tools.pcap import pcap_control
+
+    pcap_module._capture = None
+    config_module._settings = None
+    await init_db()
+    try:
+        assert config_module.get_settings().pcap_enabled is False
+        result = await pcap_control("start")
+        assert result["started"] is False
+        assert result["enabled"] is False
+    finally:
+        await close_db()
+        pcap_module._capture = None
+        config_module._settings = None
