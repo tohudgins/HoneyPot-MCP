@@ -167,36 +167,93 @@ def _recommendations(
     sev: dict[str, int],
     abuse: dict[str, Any],
 ) -> list[str]:
-    recs = []
+    """Prioritised, self-explanatory action list for a human analyst.
+
+    Each line carries its own `[Immediate]` / `[Short-term]` / `[Monitor]`
+    tag and, for the ones that can otherwise look alarming next to a low
+    aggregate score, says why it fired independently of that score.
+
+    This is deliberate: `risk_score` measures how *sustained and
+    multi-signal* this attacker's behaviour looks over the whole profile,
+    while a single high-severity finding — an exploit attempt, a triggered
+    honeytoken — is actionable the moment it happens and must not wait for
+    the aggregate to climb before recommending a block. The previous version
+    put strongly-worded, unqualified actions ("block immediately", "escalate")
+    next to a bare "LOW (19/100)" badge with nothing tying the two together —
+    both numbers were individually correct, but an analyst reading them side
+    by side reasonably read that as the tool contradicting itself. Priority
+    tags plus an inline reason make the two axes legible instead of adjacent
+    and unexplained.
+    """
+    immediate: list[str] = []
+    short_term: list[str] = []
+    monitor: list[str] = []
+
     tactics = {t["tactic"] for t in ttps}
+    hands_on = tactics & _HANDS_ON_TACTICS
 
-    if "Initial Access" in tactics:
-        recs.append("Block this IP at the perimeter firewall immediately.")
-    if "Credential Access" in tactics:
-        recs.append("Rotate any credentials that may have been exposed to this IP.")
-    if "Command and Control" in tactics:
-        recs.append("Check for outbound connections to this IP from internal hosts.")
-    if "Reconnaissance" in tactics:
-        recs.append("Review WAF logs for related scanning activity.")
+    # T1078 (Valid Accounts) fires on either a genuine honeytoken trigger or
+    # a plain "login success" event — same technique, very different
+    # confidence. Only the former can be stated as confirmed compromise;
+    # check what actually matched rather than assuming from the tactic alone.
+    t1078 = next((t for t in ttps if t.get("technique_id") == "T1078"), None)
+    honeytoken_confirmed = bool(
+        t1078 and any("honeytoken" in str(m).lower() for m in t1078.get("matched_by", []))
+    )
+
     if sev.get("critical", 0) > 0:
-        recs.append("Escalate to incident response — critical severity events detected.")
+        n = sev["critical"]
+        immediate.append(
+            f"Escalate to incident response — {n} critical-severity event{'s' if n != 1 else ''} "
+            "observed. This is independent of the aggregate risk score below, which reflects "
+            "sustained behaviour across the whole profile, not the severity of any single event."
+        )
 
-    # AbuseIPDB score
+    if honeytoken_confirmed:
+        immediate.append(
+            "A planted honeytoken credential was used — this cannot be a false positive. "
+            "Treat as confirmed compromise and block this IP now."
+        )
+    elif "Initial Access" in tactics:
+        immediate.append(
+            "An exploit or valid-account attempt against a decoy was observed (Initial Access). "
+            "Block this IP at the perimeter firewall."
+        )
+
+    if hands_on:
+        immediate.append(
+            "Hands-on activity observed, not just scanning — tactic(s): "
+            f"{', '.join(sorted(hands_on))}. Treat as an active intrusion."
+        )
+
     abuse_score = abuse.get("abuse_confidence_score", 0) or 0
     if abuse_score >= 80:
-        recs.append(
-            f"AbuseIPDB confidence score {abuse_score}% — strongly confirmed malicious. Report and block."
+        immediate.append(
+            f"AbuseIPDB confidence {abuse_score}% — strongly confirmed malicious. Report and block."
         )
-    elif abuse_score >= 50:
-        recs.append(
-            f"AbuseIPDB confidence score {abuse_score}% — likely malicious. Consider reporting via report_ip_abuse tool."
-        )
-    elif abuse_score == 0 and abuse.get("available"):
-        recs.append("No prior AbuseIPDB reports — this may be a new or VPN-masked attacker.")
 
+    if "Credential Access" in tactics:
+        short_term.append("Rotate any credentials that may have been exposed to this IP.")
+    if "Command and Control" in tactics:
+        short_term.append("Check for outbound connections to this IP from internal hosts.")
+    if 50 <= abuse_score < 80:
+        short_term.append(
+            f"AbuseIPDB confidence {abuse_score}% — likely malicious. Consider reporting via "
+            "the report_ip_abuse tool."
+        )
     if risk_score >= 75:
-        recs.append("Submit this IP to AbuseIPDB using the report_ip_abuse tool.")
-    if not recs:
-        recs.append("Monitor this IP for continued activity — low risk currently.")
+        short_term.append("Submit this IP to AbuseIPDB using the report_ip_abuse tool.")
 
-    return recs
+    if "Reconnaissance" in tactics:
+        monitor.append("Review WAF/firewall logs for related scanning activity from this IP.")
+    if abuse_score == 0 and abuse.get("available"):
+        monitor.append("No prior AbuseIPDB reports — this may be a new or VPN-masked attacker.")
+
+    if not (immediate or short_term or monitor):
+        monitor.append("No actionable findings yet — continue monitoring this IP.")
+
+    return (
+        [f"[Immediate] {r}" for r in immediate]
+        + [f"[Short-term] {r}" for r in short_term]
+        + [f"[Monitor] {r}" for r in monitor]
+    )

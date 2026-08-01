@@ -158,3 +158,77 @@ async def test_compromise_plus_token_is_critical():
     )
     _s, level = await _score(alerts)
     assert level == "CRITICAL"
+
+
+# ── Recommendations: priority-tagged and self-explanatory ───────────────────
+#
+# A single critical-severity finding (e.g. one Log4Shell exploit attempt) can
+# legitimately produce a LOW aggregate score — the score measures sustained,
+# multi-signal behaviour, not the severity of any one event — while still
+# warranting an "escalate now" recommendation. Previously that recommendation
+# had no explanation of why it applied despite the low score, which reads as
+# the tool contradicting itself. These pin the fix: every recommendation
+# carries a priority tag, and the ones that can look alarming next to a low
+# score say why they fired independently of it.
+
+
+async def _profile(alerts):
+    from honeypot_mcp.analysis.profiler import build_profile
+
+    return await build_profile(
+        ip="1.2.3.4", alerts=alerts, events=[], geoip={}, vt={}, abuse={}
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_critical_event_recommendation_explains_the_low_score():
+    """A lone Log4Shell attempt: LOW/MEDIUM aggregate score, but the
+    recommendation must still say to escalate immediately, and must say why
+    that doesn't require the score to be high."""
+    profile = await _profile(_alerts(1, "critical", "http_exploit_attempt_log4shell"))
+    recs = profile["recommendations"]
+    escalate = [r for r in recs if "Escalate to incident response" in r]
+    assert escalate, recs
+    assert escalate[0].startswith("[Immediate]")
+    assert "independent of the aggregate risk score" in escalate[0]
+
+
+@pytest.mark.asyncio
+async def test_honeytoken_trigger_is_stated_as_confirmed_not_suspected():
+    profile = await _profile(_alerts(1, "critical", "honeytoken_triggered_credential_via_ssh"))
+    recs = profile["recommendations"]
+    hits = [r for r in recs if "honeytoken credential was used" in r]
+    assert hits, recs
+    assert hits[0].startswith("[Immediate]")
+    assert "cannot be a false positive" in hits[0]
+
+
+@pytest.mark.asyncio
+async def test_plain_login_success_is_not_overclaimed_as_a_honeytoken_hit():
+    """login_success maps to the same MITRE technique (T1078, Valid Accounts)
+    as a honeytoken trigger, but without the word "honeytoken" in the matched
+    event it must not be asserted as confirmed honeytoken compromise."""
+    profile = await _profile(_alerts(1, "critical", "ssh_login_success"))
+    recs = profile["recommendations"]
+    assert not any("honeytoken credential was used" in r for r in recs), recs
+    assert any("valid-account attempt" in r and r.startswith("[Immediate]") for r in recs), recs
+
+
+@pytest.mark.asyncio
+async def test_recommendations_are_ordered_immediate_first():
+    alerts = _alerts(1, "critical", "http_exploit_attempt_log4shell") + _alerts(
+        1, "low", "http_probe"
+    )
+    profile = await _profile(alerts)
+    recs = profile["recommendations"]
+    tags = [r.split("]")[0] + "]" for r in recs]
+    priority = {"[Immediate]": 0, "[Short-term]": 1, "[Monitor]": 2}
+    ranks = [priority[t] for t in tags]
+    assert ranks == sorted(ranks), recs
+
+
+@pytest.mark.asyncio
+async def test_no_findings_gives_a_monitor_only_message():
+    profile = await _profile([])
+    recs = profile["recommendations"]
+    assert recs == ["[Monitor] No actionable findings yet — continue monitoring this IP."]
