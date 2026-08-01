@@ -36,9 +36,14 @@ def mysql_native_token(password: bytes, salt: bytes) -> bytes:
     `salt` is the full 20-byte scramble the server advertised in its Initial
     Handshake (auth-plugin-data parts 1 + 2). Returns the 20-byte token.
     """
-    h1 = hashlib.sha1(password).digest()
-    h2 = hashlib.sha1(h1).digest()
-    inner = hashlib.sha1(salt + h2).digest()
+    # usedforsecurity=False: SHA1 here isn't a security choice, it's the
+    # mysql_native_password wire protocol's specified algorithm. Without the
+    # flag, a FIPS-mode OpenSSL build (common on enterprise/govt Linux) can
+    # refuse to compute SHA1 at all, breaking MySQL honeytoken verification
+    # outright on those deployments rather than just being "less secure."
+    h1 = hashlib.sha1(password, usedforsecurity=False).digest()
+    h2 = hashlib.sha1(h1, usedforsecurity=False).digest()
+    inner = hashlib.sha1(salt + h2, usedforsecurity=False).digest()
     return bytes(a ^ b for a, b in zip(h1, inner, strict=True))
 
 
