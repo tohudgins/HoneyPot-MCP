@@ -90,6 +90,13 @@ dev = [
     "mypy>=1.10.0",
     # So `pytest` can exercise the Postgres path in CI.
     "asyncpg>=0.29.0",
+    # Property-based testing for the pure functions attacker-controlled data
+    # reaches directly: payload redaction/truncation, path/name validation,
+    # risk scoring, credential-digest math. Complements the example-based
+    # unit tests and the mutation fuzzing done against the live engines —
+    # this explores the input space of isolated functions systematically
+    # rather than mutating one seed.
+    "hypothesis>=6.100.0",
 ]
 
 [project.urls]

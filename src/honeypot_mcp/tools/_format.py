@@ -98,8 +98,15 @@ def digest_payload(payload: Any) -> dict[str, Any]:
 
     digest: dict[str, Any] = {}
     for key in _DIGEST_KEYS:
-        if key in payload and payload[key] not in (None, "", [], {}):
-            digest[key] = _clip(payload[key], _MAX_DIGEST_VALUE_CHARS)
+        value = payload.get(key)
+        if key in payload and value not in (None, "", [], {}) and not isinstance(value, dict):
+            # Nested structures belong in the full payload (alerts_get), same
+            # rule the catch-all loop below already applies to unrecognised
+            # keys — this loop had no such guard, so a _DIGEST_KEYS field
+            # (e.g. "command") holding a dict instead of the usual string
+            # would leak the raw structure into the digest untouched: _clip()
+            # only special-cases str/list, so a dict passes through as-is.
+            digest[key] = _clip(value, _MAX_DIGEST_VALUE_CHARS)
 
     # Enrichment is nested and verbose; lift just the verdict-bearing fields.
     enrichment = payload.get("enrichment")
@@ -161,9 +168,21 @@ def resolve_artifact_path(output_path: str | None, *, prefix: str, extension: st
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         return root / f"{prefix}-{stamp}.{extension}"
 
-    candidate = Path(output_path).expanduser()
-    # A bare filename is the common, intended case.
-    dest = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    try:
+        candidate = Path(output_path).expanduser()
+        # A bare filename is the common, intended case.
+        dest = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+    except Exception as e:
+        # output_path is attacker-adjacent (see the docstring), so a string
+        # that Path/.expanduser()/.resolve() itself rejects must not raise
+        # out of a tool call uncaught — same outcome as any other rejected
+        # path: a clean error, not a crash. Deliberately broad: property-
+        # based testing found two *different* exception types from this one
+        # call chain in a single run (ValueError on an embedded null byte,
+        # RuntimeError from expanduser() on "~0" — a `~user` form for a user
+        # that doesn't exist) — enumerating exception types here is a losing
+        # game against arbitrary attacker-chosen strings.
+        return f"{output_path!r} is not a usable path: {e}"
     if dest != root and root not in dest.parents:
         return (
             f"Refusing to write outside the reports directory ({root}). "
