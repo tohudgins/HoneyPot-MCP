@@ -182,6 +182,51 @@ async def test_memcached_small_set_is_not_an_amplification_alert():
     assert "memcached_amplification_attempt" not in types
 
 
+async def test_memcached_set_body_with_embedded_crlf_does_not_desync_the_parser():
+    """The data block of a `set` is exactly <bytes> bytes of arbitrary
+    content, which may legitimately contain embedded CRLFs — real memcached
+    values are not text lines. Splitting on the next b"\\r\\n" instead of
+    consuming exactly the declared byte count truncated the body early at
+    the embedded CRLF and fed the remainder back into the parser as a new
+    "command", corrupting both the stored size and every command after it
+    in the same connection."""
+    from honeypot_mcp.engines.memcached import MemcachedEngine
+    from honeypot_mcp.storage.models import HoneypotType
+
+    port = await _register("mc-embedded-crlf", HoneypotType.MEMCACHED)
+    engine = MemcachedEngine()
+    cid = await engine.start("mc-embedded-crlf", port, {})
+    try:
+        # Declares 10 bytes; the 10-byte body itself contains a CRLF at
+        # position 2. A desynced parser stops at that embedded CRLF (2-byte
+        # "body"), then misreads the remaining "cdefgh" + the real
+        # terminator as a bogus next command instead of the tail of the
+        # value — and STORED never arrives for the real set, nor does the
+        # subsequent `version` command get a clean reply.
+        body = b"ab\r\ncdefgh"
+        assert len(body) == 10
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"set k 0 0 10\r\n" + body + b"\r\n" + b"version\r\n")
+            await writer.drain()
+            await asyncio.sleep(0.4)
+            resp = await asyncio.wait_for(reader.read(65536), timeout=2.0)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+    finally:
+        await engine.stop(cid)
+
+    assert resp.count(b"STORED\r\n") == 1, resp
+    assert b"VERSION" in resp, resp
+
+    alerts = await _alerts()
+    set_events = [a for a in alerts if a.event_type in ("memcached_set", "memcached_large_set")]
+    assert len(set_events) == 1
+    assert set_events[0].payload.get("value_bytes") == 10
+
+
 async def test_memcached_flush_all_is_recorded_as_destructive():
     from honeypot_mcp.engines.memcached import MemcachedEngine
     from honeypot_mcp.storage.models import HoneypotType

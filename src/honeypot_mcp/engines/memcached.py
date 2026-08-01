@@ -137,17 +137,36 @@ class _MemcachedProtocol(asyncio.Protocol):
         self._buf += data
         if len(self._buf) > _MAX_LINE_BYTES + _MAX_TRACKED_VALUE_BYTES:
             # Oversized garbage — real memcached errors out rather than buffering.
+            # Must also drop a pending body: if we discard the buffer without
+            # doing this, the *next* data_received() treats whatever the peer
+            # sends next as the completion of a `set` body that was actually
+            # abandoned here, misparsing an unrelated command as opaque bytes.
             self._send(b"ERROR\r\n")
             self._buf = b""
+            self._pending_body = None
             return
-        while b"\r\n" in self._buf:
-            line, self._buf = self._buf.split(b"\r\n", 1)
+        while True:
             if self._pending_body is not None:
-                key, _declared = self._pending_body
+                # The data block is exactly `declared` bytes of arbitrary
+                # content — real memcached values can contain embedded CRLFs,
+                # so this must never be parsed as a CRLF-delimited line. That
+                # was the previous bug: splitting on the next b"\r\n" instead
+                # of consuming exactly `declared` bytes let an embedded CRLF
+                # truncate the body early and resync the parser mid-value,
+                # treating the remainder of an attacker's payload as a new
+                # command.
+                key, declared = self._pending_body
+                needed = declared + 2  # + trailing CRLF
+                if len(self._buf) < needed:
+                    return
+                self._buf = self._buf[needed:]
                 self._pending_body = None
                 self._send(b"STORED\r\n")
-                self._on_stored(key, len(line))
+                self._on_stored(key, declared)
                 continue
+            if b"\r\n" not in self._buf:
+                return
+            line, self._buf = self._buf.split(b"\r\n", 1)
             if not self._handle_line(line):
                 return
 
