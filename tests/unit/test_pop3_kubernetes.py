@@ -225,6 +225,55 @@ async def test_ordinary_pods_are_not_flagged_as_escapes(spec):
     assert analyse_pod_spec(spec) == []
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"spec": "pwned"},
+        {"spec": {"volumes": [{"hostPath": "not-a-dict"}]}},
+        {"spec": {"containers": [{"securityContext": "not-a-dict"}]}},
+        {"spec": {"containers": [{"securityContext": {"capabilities": "not-a-dict"}}]}},
+    ],
+)
+async def test_pod_spec_does_not_crash_on_type_confused_fields(spec):
+    """`body.get("spec") or {}` (and the same pattern nested at hostPath,
+    securityContext, and capabilities) only replaces falsy values — a
+    non-empty non-dict at any of those raised AttributeError on the next
+    .get(), uncaught, before the request ever reached _record(). A real
+    pod-escape attempt with one malformed field went completely uncaptured
+    instead of alerting."""
+    from honeypot_mcp.engines.kubernetes import analyse_pod_spec
+
+    assert analyse_pod_spec(spec) == []
+
+
+async def test_malformed_pod_create_is_still_captured_not_500d():
+    """The HTTP-level regression: a crash inside analyse_pod_spec happens
+    before self._record() runs, so the attempt silently vanishes — no
+    alert, and the attacker sees a raw 500 instead of the realistic
+    response, itself a honeypot-identifying tell."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from honeypot_mcp.engines.kubernetes import KubernetesEngine
+    from honeypot_mcp.storage.models import HoneypotType
+
+    await _register("k8s-malformed", HoneypotType.KUBERNETES)
+    engine = KubernetesEngine()
+    client = TestClient(TestServer(engine._build_app("k8s-malformed", None)))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/api/v1/namespaces/default/pods",
+            json={"metadata": {"name": "x"}, "spec": "not-a-dict"},
+        )
+        assert resp.status == 201, "must still respond realistically, not 500"
+        await asyncio.sleep(0.4)
+    finally:
+        await client.close()
+
+    captured = await _of_type("kubernetes_pod_create") or await _of_type("kubernetes_pod_escape")
+    assert captured, "the malformed pod-create attempt must still produce an alert"
+
+
 async def test_kubernetes_responses_carry_the_headers_a_real_apiserver_sends():
     """Their absence identifies a decoy in one request."""
     from aiohttp.test_utils import TestClient, TestServer

@@ -78,6 +78,17 @@ _PAYLOAD_COMMAND = re.compile(
 _SENSITIVE_HOST_PATHS = ("/", "/etc", "/root", "/var/run", "/var/lib/kubelet", "/proc", "/sys")
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """`value.get("X") or {}` still leaves `value` as whatever the attacker
+    sent if it was a non-empty non-dict (e.g. spec: "pwned") — `or {}` only
+    replaces falsy values (None, "", missing), not wrong types. The next
+    `.get()` on that then raises AttributeError, uncaught, before the request
+    ever reaches _record() — a real pod-escape attempt with one malformed
+    field goes completely uncaptured instead of alerting. Mirrors
+    docker_api.py's identical helper."""
+    return value if isinstance(value, dict) else {}
+
+
 def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     """Named reasons a pod definition is an escape, or an empty list.
 
@@ -85,12 +96,12 @@ def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     specific property, not in returning a boolean.
     """
     reasons: list[str] = []
-    spec = body.get("spec") or {}
+    spec = _as_dict(body.get("spec"))
 
     for volume in spec.get("volumes") or []:
         if not isinstance(volume, dict):
             continue
-        host_path = (volume.get("hostPath") or {}).get("path")
+        host_path = _as_dict(volume.get("hostPath")).get("path")
         if host_path == "/":
             reasons.append("mounts the node's root filesystem (hostPath: /)")
         elif host_path in _SENSITIVE_HOST_PATHS:
@@ -109,14 +120,14 @@ def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     for container in containers:
         if not isinstance(container, dict):
             continue
-        security = container.get("securityContext") or {}
+        security = _as_dict(container.get("securityContext"))
         if security.get("privileged"):
             reasons.append("privileged container — full node capability set")
         if security.get("allowPrivilegeEscalation"):
             reasons.append("allowPrivilegeEscalation enabled")
         if security.get("runAsUser") == 0:
             reasons.append("runs as root (runAsUser: 0)")
-        capabilities = (security.get("capabilities") or {}).get("add") or []
+        capabilities = _as_dict(security.get("capabilities")).get("add") or []
         dangerous = {"SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "NET_ADMIN", "ALL"}
         hit = sorted({c for c in capabilities if isinstance(c, str) and c.upper() in dangerous})
         if hit:

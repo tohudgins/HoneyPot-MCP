@@ -89,6 +89,16 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime())
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """`value.get("X") or {}` still leaves `value` as whatever the attacker
+    sent if it was a non-empty non-dict (e.g. HostConfig: "pwned") — `or {}`
+    only replaces falsy values (None, "", missing), not wrong types. The next
+    `.get()` on that then raises AttributeError, uncaught, before the request
+    ever reaches _record() — a real container-escape attempt with one
+    malformed field goes completely uncaptured instead of alerting."""
+    return value if isinstance(value, dict) else {}
+
+
 def analyse_container_create(spec: dict[str, Any]) -> list[str]:
     """Return the escape indicators present in a container-create body.
 
@@ -97,7 +107,7 @@ def analyse_container_create(spec: dict[str, Any]) -> list[str]:
     not actionable and "mounts host / at /mnt" is.
     """
     reasons: list[str] = []
-    host_config = spec.get("HostConfig") or {}
+    host_config = _as_dict(spec.get("HostConfig"))
 
     binds = host_config.get("Binds") or []
     if isinstance(binds, list):

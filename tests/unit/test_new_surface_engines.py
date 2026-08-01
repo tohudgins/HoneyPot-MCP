@@ -541,6 +541,54 @@ async def test_ordinary_container_create_is_not_flagged_as_escape(spec):
     assert analyse_container_create(spec) == []
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"HostConfig": "pwned"},
+        {"HostConfig": 12345},
+        {"HostConfig": ["a", "list"]},
+        {"HostConfig": None, "Mounts": "also not a list"},
+    ],
+)
+async def test_container_create_does_not_crash_on_type_confused_host_config(spec):
+    """`spec.get("HostConfig") or {}` only replaces falsy values — a non-empty
+    non-dict HostConfig (a string, a list, ...) passed straight through and
+    the next .get() on it raised AttributeError, uncaught, before the
+    request ever reached _record(). A real escape attempt with one
+    malformed field went completely uncaptured instead of alerting."""
+    from honeypot_mcp.engines.docker_api import analyse_container_create
+
+    assert analyse_container_create(spec) == []
+
+
+async def test_malformed_container_create_is_still_captured_not_500d():
+    """The HTTP-level regression: a crash inside analyse_container_create
+    happens before self._record() runs, so the attempt silently vanishes —
+    no alert, and the attacker sees a raw 500 instead of the realistic
+    201 response, itself a honeypot-identifying tell."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from honeypot_mcp.engines.docker_api import DockerAPIEngine
+    from honeypot_mcp.storage.models import HoneypotType
+
+    await _register("dockerapi-malformed", HoneypotType.DOCKER_API)
+    engine = DockerAPIEngine()
+    app = engine._build_app("dockerapi-malformed", None)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/containers/create", json={"Image": "alpine", "HostConfig": "not-a-dict"}
+        )
+        assert resp.status == 201, "must still respond realistically, not 500"
+        await asyncio.sleep(0.4)
+    finally:
+        await client.close()
+
+    types = [a.event_type for a in await _alerts()]
+    assert "docker_api_container_create" in types or "docker_api_container_escape" in types
+
+
 async def test_docker_api_full_attack_chain_is_captured():
     """Recon → pull → escape-create → start → exec, as the campaigns run it."""
     from aiohttp.test_utils import TestClient, TestServer
