@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from honeypot_mcp.engines import get_engine
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -17,7 +18,7 @@ from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_honeypot_name
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_deploy(
     type: Literal[
         "ssh",
@@ -255,7 +256,7 @@ async def honeypot_status(name: str) -> dict[str, Any]:
         }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_stop(
     name: str | None = None,
     names: list[str] | None = None,
@@ -362,7 +363,7 @@ async def honeypot_stop(
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_pause(name: str) -> dict[str, Any]:
     """Pause a running honeypot without removing it.
 
@@ -384,7 +385,7 @@ async def honeypot_pause(name: str) -> dict[str, Any]:
     return {"name": name, "status": "paused"}
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_resume(name: str) -> dict[str, Any]:
     """Resume a paused honeypot.
 
@@ -406,7 +407,7 @@ async def honeypot_resume(name: str) -> dict[str, Any]:
     return {"name": name, "status": "running"}
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any]:
     """Update the configuration for an existing honeypot.
     Changes take effect after the next stop/start cycle.
@@ -527,7 +528,7 @@ async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict
     return results
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, Any]:
     """End-to-end smoke test: send a synthetic probe to the honeypot's port and
     confirm an alert with our unique marker shows up in the DB. Catches subtle
@@ -1174,7 +1175,7 @@ _PROBES: dict[str, Any] = {
 }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeypot_clone(
     source_name: str, new_port: int, new_name: str | None = None
 ) -> dict[str, Any]:

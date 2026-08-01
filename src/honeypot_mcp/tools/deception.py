@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from honeypot_mcp.deception.capabilities import BY_TYPE, all_capabilities, all_profiles
 from honeypot_mcp.deception.coverage import build_coverage
 from honeypot_mcp.deception.planner import build_plan
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
@@ -162,7 +163,7 @@ async def deception_plan(
     return plan
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def deception_deploy_plan(
     sensors: list[dict[str, Any]],
     tokens: list[dict[str, Any]] | None = None,

@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (784 unit tests covering security-critical paths)
+# Tests (814 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -886,7 +886,42 @@ A `config/settings.yaml` overlay used to be loaded alongside it. Nothing ever re
 
 `none` is collector mode: `_run_collector()` enters the `lifespan` context and waits on an `asyncio.Event` armed by SIGTERM/SIGINT, so the whole capture plane (engines, canary server, watchdog, webhook delivery, `/metrics`) runs with no MCP transport at all. This is the only correct mode for a detached container — stdio there reads EOF from an unattached stdin and exits immediately, which restart-loops forever. `docker-compose.yml` sets `MCP_TRANSPORT=none` for exactly this reason. Since it exposes no control plane, `_networked_auth_error()` treats it like stdio and requires no token.
 
-The networked control plane can deploy honeypots and read all captured data, so it's **fail-closed**: `main()` calls `_networked_auth_error()` and refuses to start (`SystemExit`) if the transport isn't stdio and neither `mcp_auth_token` nor `mcp_allow_unauthenticated` is set. When `mcp_auth_token` is set, `_build_auth()` attaches FastMCP's `StaticTokenVerifier` (from `fastmcp.server.auth.providers.jwt`) at construction, so clients must send `Authorization: Bearer <token>` (401 otherwise). `_build_auth()` returns `None` for stdio, so the auth object never affects the local path or the test suite (which runs over in-memory stdio). `_networked_auth_error()` is a pure function for testability.
+The networked control plane can deploy honeypots and read all captured data, so it's **fail-closed**: `main()` calls `_networked_auth_error()` and refuses to start (`SystemExit`) if the transport isn't stdio and none of `mcp_auth_token` / `mcp_auth_tokens` / `mcp_allow_unauthenticated` is set. When a token setting is present, `_build_auth()` attaches FastMCP's `StaticTokenVerifier` (from `fastmcp.server.auth.providers.jwt`) at construction, so clients must send `Authorization: Bearer <token>` (401 otherwise). `_build_auth()` returns `None` for stdio, so the auth object never affects the local path or the test suite (which runs over in-memory stdio). `_networked_auth_error()` is a pure function for testability.
+
+### Role-based access control (`rbac.py`)
+
+Three roles, each a strict superset of the one before it — **viewer** (read-only:
+list/get/search/analyse/report), **operator** (viewer + manage this system's own
+resources: deploy/stop honeypots, create/rotate/revoke honeytokens, acknowledge
+alerts, suppression rules, webhooks, pcap, deception deploy — every effect reversible
+and contained to this system's own data), **admin** (operator + the tools whose blast
+radius reaches outside this system's own database: `alerts_prune`, the
+`blocklist_push_*` tools, `audit_log_search`).
+
+`MCP_AUTH_TOKENS` (`token:role,token:role,...`) replaces the single `MCP_AUTH_TOKEN`
+when set, so an operator can hand out tokens with less than full access instead of one
+shared admin token; `parse_auth_tokens()` falls back to treating a lone
+`MCP_AUTH_TOKEN` as one implicit admin token, so existing single-token deployments are
+unaffected. `_build_auth()` puts the resolved role in each token's `claims["role"]` on
+the `StaticTokenVerifier` entry.
+
+Enforcement is per-tool, not global middleware: gated tools carry
+`@mcp.tool(auth=require_role("operator"))` (or `"admin"`) directly on the decorator —
+FastMCP checks `tool.auth` itself before every call and already short-circuits it for
+stdio (`server.py:_get_auth_context`'s `skip_auth`), so `require_role`'s own
+`ctx.token is None → True` branch only ever fires for a networked transport running via
+`MCP_ALLOW_UNAUTHENTICATED` (no token configured at all — see the rbac.py module
+docstring for why that's safe: `_networked_auth_error` guarantees the server never
+reaches that state *with* a token required). Viewer-tier tools carry no `auth=` kwarg
+at all — any caller holding a valid token of any role can use them, matching the "no
+gate below the lowest tier" model.
+
+New tools **must** be added to exactly one of `VIEWER_TOOLS` / `OPERATOR_TOOLS` /
+`ADMIN_TOOLS` in `rbac.py`, and gated ones need the matching decorator —
+`test_rbac_covers_every_registered_tool` (fail-closed: unclassified fails the build,
+never defaults to viewer-open) and `test_operator_and_admin_tools_actually_carry_an_auth_check`
+(catches listing a tool without also decorating it) pin this the same way
+`test_honeytoken_create_offers_every_registered_type` pins `HoneytokenType`.
 
 ## Optional external dependencies
 

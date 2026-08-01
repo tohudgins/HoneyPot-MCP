@@ -296,12 +296,13 @@ async def test_metrics_endpoint_counts_alerts_by_severity():
 # ── MCP control-plane authentication ─────────────────────────────────────────
 
 
-def _settings_ns(transport, token="", allow=False):
+def _settings_ns(transport, token="", allow=False, tokens=""):
     from types import SimpleNamespace
 
     return SimpleNamespace(
         mcp_transport=transport,
         mcp_auth_token=token,
+        mcp_auth_tokens=tokens,
         mcp_allow_unauthenticated=allow,
     )
 

@@ -175,9 +175,7 @@ async def test_compromise_plus_token_is_critical():
 async def _profile(alerts):
     from honeypot_mcp.analysis.profiler import build_profile
 
-    return await build_profile(
-        ip="1.2.3.4", alerts=alerts, events=[], geoip={}, vt={}, abuse={}
-    )
+    return await build_profile(ip="1.2.3.4", alerts=alerts, events=[], geoip={}, vt={}, abuse={})
 
 
 @pytest.mark.asyncio

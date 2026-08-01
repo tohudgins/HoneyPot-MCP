@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from honeypot_mcp import pcap as pcap_module
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.tools import _audit
 from honeypot_mcp.tools._format import validate_ip
@@ -37,7 +38,7 @@ async def pcap_status() -> dict[str, Any]:
     return status
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def pcap_extract(
     source_ip: str,
     output_path: str | None = None,
@@ -107,7 +108,7 @@ async def pcap_files() -> dict[str, Any]:
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def pcap_control(action: Literal["start", "stop", "restart"]) -> dict[str, Any]:
     """Start, stop or restart packet capture.
 

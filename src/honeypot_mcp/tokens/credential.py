@@ -29,6 +29,7 @@ _USERNAMES = [
     "docker",
 ]
 
+
 def _rand_str(pool: str, k: int) -> str:
     return "".join(secrets.choice(pool) for _ in range(k))
 

@@ -31,6 +31,7 @@ from typing import Any, Literal
 
 import httpx
 
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -46,7 +47,7 @@ async def _offender_ips(hours: int, min_hits: int) -> list[str]:
 # ── Cloudflare ──────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("admin"))
 async def blocklist_push_cloudflare(
     account_id: str,
     list_id: str,
@@ -131,7 +132,7 @@ async def blocklist_push_cloudflare(
 # ── pfSense ─────────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("admin"))
 async def blocklist_push_pfsense(
     base_url: str,
     api_key: str,
@@ -237,7 +238,7 @@ async def blocklist_push_pfsense(
 # ── AWS WAFv2 ───────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("admin"))
 async def blocklist_push_aws_waf(
     ip_set_id: str,
     ip_set_name: str,

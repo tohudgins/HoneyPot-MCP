@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy import select, update
 
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertSeverity, Subscription, SuppressionRule
@@ -25,7 +26,7 @@ from honeypot_mcp.storage.models import AlertSeverity, Subscription, Suppression
 # ── Subscriptions ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def alert_subscribe(
     url: str,
     label: str,
@@ -161,7 +162,7 @@ async def alert_subscribe(
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
     """Deactivate a webhook subscription. Existing rows are kept for audit; only
     `active=False` is set so deliveries stop.
@@ -217,7 +218,7 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
 # ── Suppression rules ─────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def suppression_add(
     label: str,
     ip_pattern: str | None = None,
@@ -293,7 +294,7 @@ async def suppression_add(
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def suppression_remove(rule_id: int) -> dict[str, Any]:
     """Deactivate a suppression rule.
 
@@ -345,7 +346,7 @@ async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
     ]
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     """Apply a bundled suppression preset (e.g. 'shodan', 'censys',
     'internal-rfc1918').

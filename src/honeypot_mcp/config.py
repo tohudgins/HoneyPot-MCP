@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     # Generate one with `openssl rand -hex 32`. Clients send it as
     # `Authorization: Bearer <token>`.
     mcp_auth_token: str = ""
+    # Multiple role-scoped tokens: "token:role,token:role,..." where role is
+    # one of viewer/operator/admin (see rbac.py for what each can do). Takes
+    # priority over mcp_auth_token when set, so an operator can hand out
+    # tokens with less than full access instead of one shared admin token.
+    # When this is empty, mcp_auth_token (if set) becomes a single implicit
+    # admin token — existing single-token deployments are unaffected.
+    mcp_auth_tokens: str = ""
     # Escape hatch: run a networked control plane without a token because you
     # front it with your own auth (e.g. an authenticating reverse proxy or an
     # SSH tunnel you fully trust). Off by default so an open control plane is

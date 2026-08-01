@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -229,7 +230,7 @@ async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
     return stats
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def alerts_acknowledge(
     alert_ids: list[int] | None = None,
     disposition: Literal["true_positive", "false_positive", "benign", "duplicate"] | None = None,
@@ -325,7 +326,7 @@ async def alerts_acknowledge(
     return result
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("admin"))
 async def alerts_prune(
     older_than_days: int = 90,
     archive: bool = True,
@@ -400,7 +401,7 @@ async def alerts_prune(
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def alerts_export(
     format: Literal["json", "csv"] = "json",
     limit: int = 1000,
@@ -480,7 +481,7 @@ async def alerts_export(
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("admin"))
 async def audit_log_search(
     tool: str | None = None,
     target: str | None = None,

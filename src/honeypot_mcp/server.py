@@ -98,18 +98,29 @@ def _build_auth() -> Any:
     """Build the auth provider for the control plane, or None.
 
     stdio needs no auth (it's a local per-chat subprocess). A networked
-    transport authenticates clients with a static bearer token when
-    `mcp_auth_token` is set. The fail-closed check (refuse to run a networked
-    transport with no token) lives in `main()`, so importing this module — and
-    the test suite, which runs over in-memory stdio — never trips it.
+    transport authenticates clients with one or more static bearer tokens
+    when `mcp_auth_token` / `mcp_auth_tokens` is set — each token carries a
+    role (viewer/operator/admin, see rbac.py) as a claim, which the
+    `auth=require_role(...)` on individual `@mcp.tool` decorators enforces
+    per call. The fail-closed check (refuse to run a networked transport with
+    no token) lives in `main()`, so importing this module — and the test
+    suite, which runs over in-memory stdio — never trips it.
     """
     settings = get_settings()
-    if settings.mcp_transport == "stdio" or not settings.mcp_auth_token:
+    if settings.mcp_transport == "stdio":
+        return None
+    from honeypot_mcp.rbac import parse_auth_tokens
+
+    tokens = parse_auth_tokens(settings.mcp_auth_token, settings.mcp_auth_tokens)
+    if not tokens:
         return None
     from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
     return StaticTokenVerifier(
-        tokens={settings.mcp_auth_token: {"client_id": "honeypot-operator", "scopes": []}}
+        tokens={
+            token: {"client_id": f"honeypot-{role}", "scopes": [role], "role": role}
+            for token, role in tokens.items()
+        }
     )
 
 
@@ -226,14 +237,16 @@ def _networked_auth_error(settings: Any) -> str | None:
     exposes no control plane to authenticate."""
     if settings.mcp_transport in ("stdio", "none"):
         return None
-    if settings.mcp_auth_token or settings.mcp_allow_unauthenticated:
+    if settings.mcp_auth_token or settings.mcp_auth_tokens or settings.mcp_allow_unauthenticated:
         return None
     return (
         f"Refusing to start the '{settings.mcp_transport}' control plane without "
         "authentication.\n"
-        "Set MCP_AUTH_TOKEN (generate one with `openssl rand -hex 32`) so clients must\n"
-        "present it as `Authorization: Bearer <token>`. If you intentionally front the\n"
-        "server with your own auth (reverse proxy / trusted SSH tunnel), set\n"
+        "Set MCP_AUTH_TOKEN (generate one with `openssl rand -hex 32`) for a single\n"
+        "full-access token, or MCP_AUTH_TOKENS ('token:role,token:role', role one of\n"
+        "viewer/operator/admin) for multiple role-scoped tokens — see rbac.py. Clients\n"
+        "present a token as `Authorization: Bearer <token>`. If you intentionally front\n"
+        "the server with your own auth (reverse proxy / trusted SSH tunnel), set\n"
         "MCP_ALLOW_UNAUTHENTICATED=true to override."
     )
 
@@ -280,7 +293,7 @@ def main() -> None:
     gate_error = _networked_auth_error(settings)
     if gate_error is not None:
         raise SystemExit(gate_error)
-    if not settings.mcp_auth_token:
+    if not settings.mcp_auth_token and not settings.mcp_auth_tokens:
         log.warning(
             "MCP control plane running WITHOUT authentication (MCP_ALLOW_UNAUTHENTICATED=true). "
             "Ensure an external auth layer protects %s:%d.",
@@ -288,7 +301,15 @@ def main() -> None:
             settings.mcp_port,
         )
     else:
-        log.info("MCP control plane authentication enabled (bearer token).")
+        from honeypot_mcp.rbac import parse_auth_tokens
+
+        roles = sorted(
+            set(parse_auth_tokens(settings.mcp_auth_token, settings.mcp_auth_tokens).values())
+        )
+        log.info(
+            "MCP control plane authentication enabled (bearer token, roles: %s).",
+            ", ".join(roles),
+        )
 
     # Persistent networked server — clients connect to
     # http://<mcp_host>:<mcp_port>/mcp with the bearer token.

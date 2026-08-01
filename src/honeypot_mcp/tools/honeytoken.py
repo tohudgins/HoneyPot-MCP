@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -27,7 +28,7 @@ def _invalidate_matcher_caches(token_type: HoneytokenType | None = None) -> None
     invalidate_token_match()
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_create(
     type: Literal[
         "api_key",
@@ -183,7 +184,7 @@ async def honeytoken_status(token_id: int) -> dict[str, Any]:
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dict[str, Any]:
     """Replace a honeytoken with a fresh one, keeping its identity and history.
 
@@ -287,7 +288,7 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
     """Deactivate a honeytoken so it no longer triggers alerts.
 
@@ -318,7 +319,7 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
     return {"token_id": token_id, "status": "revoked"}
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_generate_aws(
     label: str,
     region: str = "us-east-1",
@@ -338,7 +339,7 @@ async def honeytoken_generate_aws(
     )
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_generate_credentials(
     label: str,
     count: int = 5,
@@ -358,7 +359,7 @@ async def honeytoken_generate_credentials(
     )
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_embed_file(
     label: str,
     file_type: Literal["pdf", "docx"] = "pdf",
@@ -379,7 +380,7 @@ async def honeytoken_embed_file(
     )
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def honeytoken_export(
     token_id: int, context: Literal["env_file", "aws_credentials", "bash", "json"] = "json"
 ) -> str:

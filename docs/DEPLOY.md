@@ -136,6 +136,17 @@ MCP_PORT=8000
 #   openssl rand -hex 32
 MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>
 
+# ALTERNATIVE to the single token above: hand out multiple tokens with
+# different access levels instead of one shared full-access token. Takes
+# priority over MCP_AUTH_TOKEN when set. Format: "token:role,token:role",
+# role is one of viewer (read-only triage/analysis), operator (also
+# deploy/stop honeypots, manage honeytokens, acknowledge alerts — everything
+# reversible and contained to this system's own data), or admin (also prune
+# alerts, push to a real external firewall/WAF, read the audit log). See
+# src/honeypot_mcp/rbac.py for exactly which tool needs which role.
+#   openssl rand -hex 32   # once per token you hand out
+# MCP_AUTH_TOKENS=<viewer-token>:viewer,<operator-token>:operator,<admin-token>:admin
+
 # REQUIRED for canary tokens to fire from the internet
 CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
 

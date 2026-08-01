@@ -236,7 +236,13 @@ def validate_honeypot_name(name: str) -> str | None:
     also matches Docker's own container-name rules, so a name that passes here
     cannot fail later at `docker run`.
     """
-    if not name or not _NAME_RE.match(name):
+    # ".." embedded in an otherwise-legal name (e.g. "0..", "a..b") isn't a
+    # real traversal — ".." is only special as a whole path *component*, and
+    # the character class already forbids "/" so this can never become one —
+    # but the docstring above promises "'..' are not allowed" outright, and a
+    # property-based test holds the code to that literal claim. Reject the
+    # substring explicitly rather than loosen the documented contract.
+    if not name or not _NAME_RE.match(name) or ".." in name:
         return (
             f"Invalid honeypot name {name!r}. Use 1-64 characters: letters, digits, "
             f"dot, dash or underscore, starting with a letter or digit. Names become "

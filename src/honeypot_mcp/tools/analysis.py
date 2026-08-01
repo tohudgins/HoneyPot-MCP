@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -46,7 +47,7 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def report_ip_abuse(
     ip: str,
     categories: list[int] | None = None,
@@ -569,7 +570,7 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def export_blocklist(
     format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
     hours: int = 24,
@@ -626,7 +627,7 @@ async def export_blocklist(
     }
 
 
-@mcp.tool
+@mcp.tool(auth=require_role("operator"))
 async def export_stix(
     hours: int = 24,
     min_hits: int = 1,
