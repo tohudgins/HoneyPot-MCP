@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (814 unit tests covering security-critical paths)
+# Tests (818 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -1049,6 +1049,32 @@ Re-run the generator after touching mappings or adding an engine. Tactic IDs
 Multi-tactic events count under *every* tactic they map to — hence UNION ALL
 rather than CASE, which can only bucket a row once and would under-report the
 later tactic.
+
+**The "Tactic timeline" panel's styling is hand-maintained, not generated** —
+`generate_mitre_dashboard.py` only rewrites the two panels' SQL (`_set_panel_sql`
+patches `queryText`/`rawQueryText` in place), so `fieldConfig`/`options` survive
+regeneration untouched and can be edited directly without fighting
+`test_dashboard_matches_the_generator`. That panel now carries fixed, per-tactic
+`fieldConfig.overrides` colors (up to 14 series — Grafana's auto-palette repeats
+hues past ~8, which is exactly the range this panel needs) and
+`scaleDistribution: {type: "log"}`, not just distinct colors: un-stacking the
+chart to fix color legibility (a filled, stacked area blends overlapping bands
+into a muddy blob) revealed a second, different problem — Credential Access
+outweighs the other tactics by 10-100x in raw count, so on a linear axis every
+smaller series still flattens to invisible near zero even with correct colors.
+Log scale is what actually makes a Persistence spike of 3 events visible next to
+a Credential Access band in the thousands. `test_every_tactic_has_a_fixed_color_override` /
+`test_tactic_colors_are_unique` / `test_tactic_timeline_is_not_stacked` pin this.
+
+**The threat map's basemap must not render place labels.** Its `"type": "default"`
+basemap resolves to CARTO's free `basemaps.cartocdn.com` raster XYZ tiles, which
+render OSM's local-language place names with no English-only variant available at
+that endpoint — country/city labels showed up in a mix of Portuguese, Arabic and
+Chinese script. `showLabels: false` in the basemap config removes labels entirely
+rather than chasing a tile provider that promises consistent English (which would
+also add an API-key dependency this docker-compose demo doesn't otherwise need);
+the adjacent "Top countries" table already carries that detail in the viewer's own
+language. `test_threat_map_basemap_has_no_labels` pins it.
 
 **Timeseries panels derive their bucket width from the window, never hardcode
 it.** Every Grafana timeseries query buckets on

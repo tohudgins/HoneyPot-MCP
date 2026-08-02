@@ -50,7 +50,9 @@
         "basemap": {
           "type": "default",
           "name": "Layer 0",
-          "config": {}
+          "config": {
+            "showLabels": false
+          }
         },
         "controls": {
           "showZoom": true,

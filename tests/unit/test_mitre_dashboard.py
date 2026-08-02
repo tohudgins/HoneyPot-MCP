@@ -222,3 +222,66 @@ def test_table_panels_format_timestamps_rather_than_returning_raw_columns():
             assert not re.search(
                 r"(?<!strftime\(')(?:MAX|MIN)\(\s*timestamp\s*\)\s+AS", sql, re.I
             ), f"{panel.get('title')}: selects a raw timestamp column"
+
+
+# ── Tactic timeline: every tactic gets its own distinguishable color ────────
+#
+# Grafana's auto-palette repeats/shades hues past ~8 series, which is exactly
+# the range this panel needs (up to 14 tactics) — the original symptom was a
+# handful of kill-chain-adjacent tactics rendering as indistinguishable
+# shades of blue/purple in a filled, stacked chart. Fixed per-tactic colors
+# replace the auto-palette; these tests hold that fix in place rather than
+# letting a future edit quietly drop back to Grafana's default assignment.
+
+
+def test_every_tactic_has_a_fixed_color_override():
+    from honeypot_mcp.intel.mitre import TACTIC_ORDER
+
+    dashboard = json.loads(DASHBOARD.read_text())
+    panel = next(p for p in dashboard["panels"] if p["title"] == "Tactic timeline")
+    overridden = {
+        o["matcher"]["options"]
+        for o in panel["fieldConfig"]["overrides"]
+        if o["matcher"]["id"] == "byName"
+    }
+    missing = set(TACTIC_ORDER) - overridden
+    assert not missing, f"tactic(s) with no fixed color override: {missing}"
+
+
+def test_tactic_colors_are_unique():
+    dashboard = json.loads(DASHBOARD.read_text())
+    panel = next(p for p in dashboard["panels"] if p["title"] == "Tactic timeline")
+    colors = [
+        prop["value"]["fixedColor"]
+        for o in panel["fieldConfig"]["overrides"]
+        for prop in o["properties"]
+        if prop["id"] == "color"
+    ]
+    assert len(colors) == len(set(colors)), f"two tactics share a color: {colors}"
+
+
+def test_tactic_timeline_is_not_stacked():
+    """A filled, stacked area chart blends overlapping bands into a muddy
+    blob — the panel's actual question ('when did which tactic spike') is
+    better served by overlaid lines than a cumulative stacked view, and it
+    also happens to be far easier to color-distinguish."""
+    dashboard = json.loads(DASHBOARD.read_text())
+    panel = next(p for p in dashboard["panels"] if p["title"] == "Tactic timeline")
+    assert panel["fieldConfig"]["defaults"]["custom"]["stacking"]["mode"] == "none"
+
+
+# ── Threat map: basemap must not render place labels ────────────────────────
+
+
+def test_threat_map_basemap_has_no_labels():
+    """CARTO's default XYZ raster basemap renders place names in each
+    region's local language with no English-only variant available on the
+    free basemaps.cartocdn.com endpoint — the fix is not showing labels at
+    all (the adjacent 'Top countries' table already carries that detail),
+    not chasing a tile provider that promises consistent English."""
+    path = ROOT / "docker" / "grafana" / "dashboards" / "02-threat-map.json"
+    dashboard = json.loads(path.read_text())
+    geomap_panels = [p for p in dashboard["panels"] if p.get("type") == "geomap"]
+    assert geomap_panels, "no geomap panel found in the threat map dashboard"
+    for panel in geomap_panels:
+        assert panel["options"]["basemap"]["config"].get("showLabels") is False
