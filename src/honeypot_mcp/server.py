@@ -105,19 +105,26 @@ def _build_auth() -> Any:
     per call. The fail-closed check (refuse to run a networked transport with
     no token) lives in `main()`, so importing this module — and the test
     suite, which runs over in-memory stdio — never trips it.
+
+    The returned verifier also checks live-provisioned `ApiKey` rows
+    (`tools/api_keys.py`) after the static tokens, so static tokens remain a
+    restart-only break-glass credential while day-to-day access can be
+    granted/revoked without restarting the server. DB-backed keys are only
+    ever a fallback here — with zero static tokens configured this still
+    returns None, same as before, because api_key_create is itself
+    admin-gated and needs at least one credential to exist first.
     """
     settings = get_settings()
     if settings.mcp_transport == "stdio":
         return None
-    from honeypot_mcp.rbac import parse_auth_tokens
+    from honeypot_mcp.rbac import build_combined_verifier, parse_auth_tokens
 
     tokens = parse_auth_tokens(settings.mcp_auth_token, settings.mcp_auth_tokens)
     if not tokens:
         return None
-    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
-    return StaticTokenVerifier(
-        tokens={
+    return build_combined_verifier(
+        {
             token: {"client_id": f"honeypot-{role}", "scopes": [role], "role": role}
             for token, role in tokens.items()
         }
@@ -140,6 +147,7 @@ mcp = FastMCP(
 # Import here so the @mcp.tool decorators execute at module load time.
 import honeypot_mcp.tools.alerts  # noqa: E402, F401
 import honeypot_mcp.tools.analysis  # noqa: E402, F401
+import honeypot_mcp.tools.api_keys  # noqa: E402, F401
 import honeypot_mcp.tools.blocklist_push  # noqa: E402, F401
 import honeypot_mcp.tools.deception  # noqa: E402, F401
 import honeypot_mcp.tools.honeypot  # noqa: E402, F401

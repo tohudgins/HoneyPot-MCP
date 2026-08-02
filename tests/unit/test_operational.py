@@ -347,7 +347,12 @@ def test_build_auth_none_for_stdio():
     assert _build_auth() is None
 
 
-def test_build_auth_verifier_for_networked_token(monkeypatch):
+@pytest.mark.asyncio
+async def test_build_auth_verifier_for_networked_token(monkeypatch):
+    """`_build_auth` must return a working verifier for the configured static
+    token — the concrete class is an internal implementation detail
+    (`rbac.build_combined_verifier` also checks live-provisioned ApiKey rows,
+    see test_api_keys.py), so this checks behaviour, not a class name."""
     from honeypot_mcp import config
     from honeypot_mcp.server import _build_auth
 
@@ -357,7 +362,10 @@ def test_build_auth_verifier_for_networked_token(monkeypatch):
     try:
         auth = _build_auth()
         assert auth is not None
-        assert type(auth).__name__ == "StaticTokenVerifier"
+        access = await auth.verify_token("abc123")
+        assert access is not None
+        assert access.claims["role"] == "admin"
+        assert await auth.verify_token("wrong-token") is None
     finally:
         monkeypatch.setattr(config, "_settings", None)  # don't leak to other tests
 

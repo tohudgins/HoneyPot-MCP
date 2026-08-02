@@ -147,6 +147,19 @@ MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>
 #   openssl rand -hex 32   # once per token you hand out
 # MCP_AUTH_TOKENS=<viewer-token>:viewer,<operator-token>:operator,<admin-token>:admin
 
+# For a TEAM: treat MCP_AUTH_TOKEN/MCP_AUTH_TOKENS above as a break-glass
+# bootstrap credential, not something you hand to every team member. Once
+# the server is up, use that admin token to mint real per-person keys —
+# these can be issued and revoked live, no restart, and each carries a real
+# name so audit_log_search can say who did what, not just what happened:
+#
+#   > create an operator API key for alice
+#   (admin-only tool api_key_create returns the plaintext token ONCE — copy
+#   it immediately, there is no way to retrieve it again)
+#
+#   > revoke alice's API key          (api_key_revoke, takes effect in ~30s)
+#   > list active API keys            (api_key_list)
+
 # REQUIRED for canary tokens to fire from the internet
 CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
 

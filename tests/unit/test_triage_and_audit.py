@@ -281,6 +281,44 @@ async def test_audit_failure_never_breaks_the_action(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_audit_log_records_the_actor():
+    """A plain test call has no FastMCP request context — same as stdio in
+    production — so the actor must be the fixed "stdio" label, not blank."""
+    from honeypot_mcp.tools.alerts import alerts_prune, audit_log_search
+
+    await _seed(count=2, hours_ago=24 * 200)
+    await alerts_prune(older_than_days=30)
+
+    entry = (await audit_log_search(tool="alerts_prune"))["actions"][0]
+    assert entry["actor"] == "stdio"
+
+
+@pytest.mark.asyncio
+async def test_audit_log_filters_by_actor(monkeypatch):
+    """A networked caller's actor is its ApiKey label + role, and
+    audit_log_search can filter down to one person's actions."""
+    from dataclasses import dataclass
+
+    import fastmcp.server.dependencies as deps
+
+    @dataclass
+    class _Token:
+        claims: dict
+
+    monkeypatch.setattr(
+        deps, "get_access_token", lambda: _Token(claims={"role": "operator", "label": "alice"})
+    )
+
+    from honeypot_mcp.tools._audit import record_action
+    from honeypot_mcp.tools.alerts import audit_log_search
+
+    await record_action("honeypot_stop", "stopped web-01", target="web-01")
+    entry = (await audit_log_search(actor="alice"))["actions"][0]
+    assert entry["actor"] == "alice (operator)"
+    assert (await audit_log_search(actor="bob"))["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_audit_records_failed_actions_too():
     from honeypot_mcp.tools._audit import record_action
     from honeypot_mcp.tools.alerts import audit_log_search

@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-818%20unit%20%2B%206%20e2e-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-842%20unit%20%2B%206%20e2e-brightgreen)](tests/)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 25
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -149,7 +149,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-818 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+842 unit tests plus 6 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -255,14 +255,21 @@ The networked control plane can deploy honeypots and read everything they captur
 it is **fail-closed**: the server refuses to start on a networked transport unless
 `MCP_AUTH_TOKEN` is set (or you explicitly opt out with `MCP_ALLOW_UNAUTHENTICATED`).
 
-**Role-based access.** One token is one role for the whole control plane — fine for a
-single operator, not for a team. Set `MCP_AUTH_TOKENS` instead of `MCP_AUTH_TOKEN` to
-hand out separately-scoped tokens: `viewer` (read-only triage/analysis/reports),
-`operator` (also deploy/stop honeypots, manage honeytokens, acknowledge alerts —
-everything reversible and contained to this system's own data), or `admin` (also prune
-alerts, push to a real external firewall/WAF, read the audit log). See
-[`src/honeypot_mcp/rbac.py`](src/honeypot_mcp/rbac.py) for exactly which tool needs
-which role, and [`docs/DEPLOY.md`](docs/DEPLOY.md) for the format.
+**Role-based access.** `MCP_AUTH_TOKENS` hands out separately-scoped tokens instead of
+one shared full-access one: `viewer` (read-only triage/analysis/reports), `operator`
+(also deploy/stop honeypots, manage honeytokens, acknowledge alerts — everything
+reversible and contained to this system's own data), or `admin` (also prune alerts,
+push to a real external firewall/WAF, read the audit log, manage other people's
+access). See [`src/honeypot_mcp/rbac.py`](src/honeypot_mcp/rbac.py) for exactly which
+tool needs which role, and [`docs/DEPLOY.md`](docs/DEPLOY.md) for the format.
+
+**Per-person access for a team.** Env-var tokens need a restart to add or revoke and
+carry no identity beyond a role — fine to bootstrap with, not what you hand to five
+teammates. Once the server is up, an admin token can mint real per-person API keys
+live (`api_key_create`/`api_key_revoke`/`api_key_list`) — each with its own name, so
+`audit_log_search` can say *who* deployed a honeypot or pruned alerts, not just that
+someone did. Keys take effect within 30 seconds, no restart; the plaintext is shown
+exactly once, at creation.
 
 ### Collector (none)
 
@@ -487,7 +494,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 818 unit tests
+uv run pytest tests/unit/ -v     # 842 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

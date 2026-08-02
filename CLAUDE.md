@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (818 unit tests covering security-critical paths)
+# Tests (842 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -74,6 +74,7 @@ Current tool modules:
 - `tools/deception.py` — the intent-level tools: `deception_plan`,
   `deception_deploy_plan`, `deception_coverage`, `soc_brief`, `deception_profiles`
 - `tools/pcap.py` — `pcap_status`, `pcap_extract`, `pcap_files`, `pcap_control`
+- `tools/api_keys.py` — `api_key_create`, `api_key_revoke`, `api_key_list` (live-provisioned, per-person credentials — see "Role-based access control" below)
 
 The `@mcp.tool` decorator returns the original function unchanged, so tools are directly callable in tests (no `.fn` accessor needed).
 
@@ -903,7 +904,30 @@ when set, so an operator can hand out tokens with less than full access instead 
 shared admin token; `parse_auth_tokens()` falls back to treating a lone
 `MCP_AUTH_TOKEN` as one implicit admin token, so existing single-token deployments are
 unaffected. `_build_auth()` puts the resolved role in each token's `claims["role"]` on
-the `StaticTokenVerifier` entry.
+the verifier's static-token entries.
+
+**Static tokens are restart-only** — `MCP_AUTH_TOKENS` is read once at process start,
+so revoking one team member's access without restarting the whole shared server, or
+adding someone mid-operation, isn't possible through env vars alone. `tools/api_keys.py`
+(`api_key_create`/`api_key_revoke`/`api_key_list`, all admin-only) is the live
+counterpart: `ApiKey` rows in the DB, only a SHA-256 digest stored (never the
+plaintext — returned exactly once, at creation), checked by
+`rbac.build_combined_verifier()`'s `_CombinedTokenVerifier` after the static tokens
+fail to match. A 30s in-memory cache (`rbac.API_KEY_REFRESH_SECONDS`, mirrors
+`suppression.py`'s rule cache exactly) avoids a DB round-trip per request, invalidated
+immediately on create/revoke (`invalidate_api_key_cache()`) so a change is live on the
+process that made it well before the TTL would otherwise expire it. Static tokens
+remain supported specifically as the break-glass bootstrap credential — `api_key_create`
+is itself admin-gated, so at least one credential has to exist before any `ApiKey` row
+can be minted; with zero static tokens configured, `_build_auth()` still returns `None`
+exactly as before; DB-backed keys are purely additive; never a way around the
+`_networked_auth_error` fail-closed gate.
+
+Every `ApiKey` carries a `label` — a real per-person or per-automation identity, not
+just a role — which `rbac.current_actor()` reads into `AuditLog.actor` (see
+"Control-plane audit log" below) as `"alice (operator)"`. This is what makes the audit
+log answer "who," not just "what": under the static-token-only model every operator
+sharing one token was indistinguishable.
 
 Enforcement is per-tool, not global middleware: gated tools carry
 `@mcp.tool(auth=require_role("operator"))` (or `"admin"`) directly on the decorator —
@@ -1001,19 +1025,31 @@ plane is driven by a language model, so "what did the agent do?" is a question
 an operator will need answered — `alerts_prune` can delete months of evidence
 and `honeypot_stop` can silently end collection.
 
-Two invariants:
+Three invariants:
 - **Auditing never breaks the action.** `record_action` swallows and logs its
   own failures; refusing to stop a honeypot because the audit table is
   unavailable would be the worse outcome.
 - **Secrets never land in the log.** Arguments are recorded, so
   `redact_arguments()` masks anything whose key contains secret/token/password/
   api_key/credential/auth before persisting.
+- **Every row says who, not just what.** `record_action` resolves
+  `rbac.current_actor()` itself rather than taking an `actor=` parameter, so
+  every one of its ~11 call sites gets correct attribution without having to
+  thread identity through each one individually, and any future call site
+  gets it for free. The actor is an `ApiKey`'s `label (role)` when the caller
+  used one, a bare role for an unlabelled legacy `MCP_AUTH_TOKEN`, or `stdio`
+  for a local chat session — never blank. `audit_log_search(actor=...)`
+  substring-matches it. Rows written before this column existed have `actor
+  IS NULL`, which means "recorded before actor tracking existed", not
+  "caller unknown" — the two are deliberately kept distinguishable.
 
 Currently audited: `honeypot_deploy` (success and failure), `honeypot_stop`,
-`honeytoken_revoke`, `alerts_prune`, `alerts_acknowledge`. Add a
-`record_action` call to any new tool that changes state. Reads are not audited —
-they are high-volume and low-consequence. The table is append-only and the
-retention sweep does not touch it.
+`honeytoken_revoke`, `honeytoken_rotate`, `deception_deploy_plan`,
+`pcap_control`, `pcap_extract`, `alerts_prune`, `alerts_acknowledge`,
+`api_key_create`, `api_key_revoke`. Add a `record_action` call to any new tool
+that changes state. Reads are not audited — they are high-volume and
+low-consequence. The table is append-only and the retention sweep does not
+touch it.
 
 ### ATT&CK mapping and risk scoring
 

@@ -25,8 +25,10 @@ Three roles, each a strict superset of the one before it:
               outside this system's own database: `alerts_prune` (permanent
               evidence deletion), the `blocklist_push_*` tools (write to a
               real external firewall/WAF — production infrastructure this
-              codebase doesn't own), and `audit_log_search` (oversight of
-              what every other role did).
+              codebase doesn't own), `audit_log_search` (oversight of what
+              every other role did), and `api_key_create`/`api_key_revoke`/
+              `api_key_list` (granting or revoking someone else's access is
+              itself an admin-tier action).
 
 New tools MUST be added to exactly one of the three sets below AND decorated
 with the matching `@mcp.tool(auth=require_role(...))` — viewer tools need no
@@ -40,14 +42,44 @@ decided was safe to leave open — treat that as a bug, not a default.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+import hashlib
+import logging
+import time
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from fastmcp.server.auth import AccessToken
     from fastmcp.utilities.authorization import AuthCheck, AuthContext
+
+log = logging.getLogger(__name__)
 
 Role = Literal["viewer", "operator", "admin"]
 
 _ROLE_RANK: dict[Role, int] = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+def current_actor() -> str:
+    """Best-effort identity string for the audit log's `actor` column.
+
+    stdio has no token at all — a per-chat local subprocess, trusted by
+    design (see `server.py:_build_auth`) — and gets a fixed label rather
+    than empty/None, so a reader never has to wonder whether the caller was
+    missed vs. genuinely local. A networked caller is labelled by its
+    token's `label` claim (an `ApiKey`'s name) when it has one, falling back
+    to its bare role — an unlabelled legacy `MCP_AUTH_TOKEN`/`MCP_AUTH_TOKENS`
+    entry still gets a recognisable actor string ("admin") instead of
+    nothing.
+    """
+    from fastmcp.server.dependencies import get_access_token
+
+    token = get_access_token()
+    if token is None:
+        return "stdio"
+    claims = token.claims or {}
+    role = claims.get("role", "unknown")
+    label = claims.get("label")
+    return f"{label} ({role})" if label else role
 
 
 def require_role(role: Role) -> AuthCheck:
@@ -107,6 +139,126 @@ def parse_auth_tokens(single_token: str, multi_tokens: str) -> dict[str, Role]:
     if single_token:
         return {single_token: "admin"}
     return {}
+
+
+def hash_token(token: str) -> str:
+    """SHA-256 hex digest — what `ApiKey.token_hash` stores and looks up by.
+
+    Tokens are high-entropy random strings (`api_key_create` mints them with
+    `secrets.token_hex`), not low-entropy secrets like passwords, so a fast
+    hash is the right tool here: there's nothing to dictionary-attack, and a
+    slow password hash (bcrypt/argon2) would just tax every single tool call
+    for no security benefit. Same reasoning GitHub/AWS use for API-key-shaped
+    credentials.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# ── Live-provisioned API keys ─────────────────────────────────────────────────
+#
+# Mirrors suppression.py's rule cache exactly: an in-memory dict refreshed at
+# most every API_KEY_REFRESH_SECONDS, invalidated immediately on
+# create/revoke so a change is never stale for longer than one refresh
+# window on THIS process (multi-process deployments still wait out the TTL
+# on the others — acceptable for a credential change, unlike a suppression
+# rule, since accidentally-still-valid access for at most 30s is not a hole
+# an attacker can reliably time against).
+
+API_KEY_REFRESH_SECONDS = 30
+
+_api_keys: dict[str, dict[str, Any]] = {}  # token_hash -> {id, role, label, expires_at}
+_api_keys_loaded_at: float = 0.0
+
+
+def invalidate_api_key_cache() -> None:
+    """Force the next verification to reload keys from the DB."""
+    global _api_keys_loaded_at
+    _api_keys_loaded_at = 0.0
+
+
+async def _load_api_keys() -> None:
+    global _api_keys, _api_keys_loaded_at
+    now = time.monotonic()
+    if now - _api_keys_loaded_at < API_KEY_REFRESH_SECONDS:
+        return
+
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import ApiKey
+
+    async with get_session() as session:
+        result = await session.execute(select(ApiKey).where(ApiKey.revoked_at.is_(None)))
+        rows = result.scalars().all()
+
+    _api_keys = {
+        row.token_hash: {
+            "id": row.id,
+            "role": row.role,
+            "label": row.label,
+            "expires_at": row.expires_at,
+        }
+        for row in rows
+    }
+    _api_keys_loaded_at = now
+
+
+async def verify_db_token(token: str) -> AccessToken | None:
+    """Look up `token` against live-provisioned `ApiKey` rows.
+
+    Returns None for anything not found, revoked (excluded by the query
+    itself), or past its `expires_at` — indistinguishable from an unknown
+    token to the caller, same as `StaticTokenVerifier`'s own behaviour.
+    """
+    await _load_api_keys()
+    data = _api_keys.get(hash_token(token))
+    if data is None:
+        return None
+    expires_at = data["expires_at"]
+    if expires_at is not None and expires_at < datetime.now(UTC):
+        return None
+
+    from fastmcp.server.auth import AccessToken
+
+    return AccessToken(
+        token=token,
+        client_id=data["label"],
+        scopes=[data["role"]],
+        claims={"role": data["role"], "label": data["label"], "api_key_id": data["id"]},
+    )
+
+
+def build_combined_verifier(static_tokens: dict[str, dict[str, Any]]) -> Any:
+    """A `TokenVerifier` checking static env-configured tokens first, then
+    live `ApiKey` rows.
+
+    Static tokens (`MCP_AUTH_TOKEN`/`MCP_AUTH_TOKENS`) stay in-memory and
+    restart-only — a deliberate break-glass credential, and the only way to
+    bootstrap the very first `ApiKey` row (`api_key_create` is itself
+    admin-gated). Everything provisioned afterwards can go through
+    `api_key_create`/`api_key_revoke` instead, which take effect live.
+
+    A factory function rather than a module-level class so the `fastmcp`
+    import (needed to subclass `TokenVerifier`, not just duck-type it — it
+    carries OAuth-metadata/route scaffolding from `AuthProvider` that a bare
+    class wouldn't have) stays deferred to call time, same as every other
+    `fastmcp`-touching function in this module.
+    """
+    from fastmcp.server.auth import AccessToken, TokenVerifier
+
+    class _CombinedTokenVerifier(TokenVerifier):
+        async def verify_token(self, token: str) -> AccessToken | None:
+            if token in static_tokens:
+                data = static_tokens[token]
+                return AccessToken(
+                    token=token,
+                    client_id=data["client_id"],
+                    scopes=data["scopes"],
+                    claims=data,
+                )
+            return await verify_db_token(token)
+
+    return _CombinedTokenVerifier()
 
 
 # ── Tool → role map ──────────────────────────────────────────────────────────
@@ -189,5 +341,8 @@ ADMIN_TOOLS: frozenset[str] = frozenset(
         "blocklist_push_pfsense",
         "blocklist_push_aws_waf",
         "audit_log_search",
+        "api_key_create",
+        "api_key_revoke",
+        "api_key_list",
     }
 )

@@ -342,3 +342,45 @@ class AuditLog(Base):
     target: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now(), index=True)
+    # Who did this — an ApiKey's label+role ("alice (operator)"), a bare role
+    # for a legacy MCP_AUTH_TOKEN with no per-user identity, or "stdio" for a
+    # local chat session (which has no token at all, and is trusted by
+    # design). Nullable because rows written before this column existed have
+    # no honest answer — NULL means "recorded before actor tracking existed",
+    # not "unknown caller who should have been recorded".
+    actor: Mapped[str | None] = mapped_column(String(160), nullable=True)
+
+
+class ApiKey(Base):
+    """A team member's or automation's credential for the networked control
+    plane — the live-provisioned counterpart to the static MCP_AUTH_TOKEN(S)
+    settings.
+
+    Static env-configured tokens require a process restart to add, change or
+    revoke, and carry no identity beyond a role — every operator sharing one
+    looks identical in the audit log. ApiKey rows fix both: `api_key_create`/
+    `api_key_revoke` (tools/api_keys.py) take effect within one cache refresh
+    (`rbac.API_KEY_REFRESH_SECONDS`) with no restart, and `label` gives each
+    key a real identity that `record_action` can attribute actions to.
+
+    Only the token's SHA-256 digest is stored, never the plaintext — the
+    plaintext is returned exactly once, at creation, the same UX as GitHub
+    PATs or AWS access keys. A stolen `token_hash` is useless without the
+    original high-entropy token; there is nothing to crack.
+
+    Static tokens remain supported alongside this table (not replaced by it)
+    specifically as a break-glass bootstrap: `api_key_create` is itself
+    admin-gated, so at least one credential has to exist before any ApiKey
+    row can be minted.
+    """
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    created_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True, index=True)

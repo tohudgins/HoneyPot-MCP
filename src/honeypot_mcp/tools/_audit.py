@@ -5,7 +5,7 @@ question isn't only "what did the attacker do" but "what did the agent do".
 `alerts_prune` can delete months of evidence; `honeypot_stop` can silently end
 collection. Neither previously left any trace.
 
-Two rules shape this module:
+Three rules shape this module:
 
 * **Auditing must never break the action.** A failure to write the audit row is
   logged and swallowed — refusing to stop a honeypot because the audit table is
@@ -13,6 +13,13 @@ Two rules shape this module:
 * **Secrets never land in the log.** Tool arguments are recorded so an operator
   can see what was requested, which means anything credential-shaped has to be
   redacted on the way in.
+* **The actor is resolved here, not by the caller.** Every `record_action`
+  call site used to record *what* happened with no way to say *who* did it —
+  fine for a solo operator, useless for a team sharing role-scoped tokens.
+  Resolving `rbac.current_actor()` inside this function instead of threading
+  an `actor=` parameter through every one of the ~10 call sites means new
+  call sites get correct attribution for free and none of the existing ones
+  needed to change.
 """
 
 from __future__ import annotations
@@ -78,6 +85,7 @@ async def record_action(
 ) -> None:
     """Append one audit row. Never raises."""
     try:
+        from honeypot_mcp.rbac import current_actor
         from honeypot_mcp.storage.database import get_session
         from honeypot_mcp.storage.models import AuditLog
 
@@ -90,6 +98,7 @@ async def record_action(
                     target=target,
                     outcome=outcome,
                     error=error[:2000] if error else None,
+                    actor=current_actor(),
                 )
             )
     except Exception:

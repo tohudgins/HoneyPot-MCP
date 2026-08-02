@@ -485,12 +485,13 @@ async def alerts_export(
 async def audit_log_search(
     tool: str | None = None,
     target: str | None = None,
+    actor: str | None = None,
     since_hours: float | None = None,
     outcome: Literal["ok", "error"] | None = None,
     limit: int = 50,
 ) -> dict[str, Any]:
     """Review what the control plane did — every honeypot deployed or stopped,
-    every prune, every token revoked.
+    every prune, every token revoked, and who did it.
 
     This server's control plane is driven by a language model, so "what did the
     agent actually do, and when?" is a question you will eventually need
@@ -501,6 +502,11 @@ async def audit_log_search(
     Args:
         tool: Filter to one tool name (e.g. alerts_prune, honeypot_stop).
         target: Filter to what was acted on — a honeypot name, IP, or token id.
+        actor: Filter to who did it — an ApiKey label, a bare role
+              (e.g. "admin") for a legacy MCP_AUTH_TOKEN, or "stdio" for a
+              local chat session. Substring match, so "alice" matches
+              "alice (operator)". Rows written before actor tracking existed
+              have no actor recorded and are excluded by this filter.
         since_hours: Only actions from the last N hours.
         outcome: Filter to successful (`ok`) or failed (`error`) actions.
         limit: Maximum entries to return (default 50, max 500).
@@ -521,6 +527,8 @@ async def audit_log_search(
         q = q.where(AuditLog.tool == tool)
     if target:
         q = q.where(AuditLog.target == target)
+    if actor:
+        q = q.where(AuditLog.actor.contains(actor))
     if outcome:
         q = q.where(AuditLog.outcome == outcome)
     if since is not None:
@@ -538,6 +546,7 @@ async def audit_log_search(
             "id": r.id,
             "timestamp": r.timestamp.isoformat(),
             "tool": r.tool,
+            "actor": r.actor,
             "summary": r.summary,
             "target": r.target,
             "outcome": r.outcome,
