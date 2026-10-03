@@ -239,6 +239,13 @@ _SCAN_BODY_TAIL_CHARS = 16_384
 # Event-payload bounds for attacker-controlled form data.
 _MAX_POST_FIELDS = 64
 _MAX_POST_VALUE_CHARS = 4_096
+# Total characters of non-credential form data kept per event. Without it 64
+# fields of 4,096 chars (~260 KB) exceeds the per-event payload budget and the
+# clamp drops the whole `post_data` key — credentials included.
+_MAX_POST_TOTAL_CHARS = 24_576
+_CREDENTIAL_FIELDS = frozenset(
+    {"username", "user", "email", "login", "password", "pass", "passwd", "pwd"}
+)
 _MAX_USER_AGENT_CHARS = 2_048
 _MAX_PATH_CHARS = 2_048
 
@@ -311,6 +318,7 @@ def _summarise_form(form: Any, scan: _Scan) -> tuple[dict[str, Any], bool]:
     """
     out: dict[str, Any] = {}
     overflow = False
+    total_chars = 0
     for key, value in form.items():
         name = clip(key, 256)
         if isinstance(value, FileField):
@@ -344,10 +352,20 @@ def _summarise_form(form: Any, scan: _Scan) -> tuple[dict[str, Any], bool]:
         scan.feed(text_for_scan)
         if name in out:
             continue
-        if len(out) >= _MAX_POST_FIELDS:
+        # Credential-shaped fields are the evidence (and what honeytoken
+        # matching reads), so they are kept however much junk precedes them;
+        # only the filler is dropped when the form is large.
+        is_credential = name.lower() in _CREDENTIAL_FIELDS
+        size = len(entry) if isinstance(entry, str) else 256
+        if not is_credential and (
+            len(out) >= _MAX_POST_FIELDS or total_chars + size > _MAX_POST_TOTAL_CHARS
+        ):
             overflow = True
             continue
+        if is_credential and isinstance(entry, str):
+            entry = entry[:_MAX_POST_VALUE_CHARS]
         out[name] = entry
+        total_chars += size
     return out, overflow
 
 

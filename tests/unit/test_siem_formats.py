@@ -28,6 +28,15 @@ from aiohttp import web
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
+@pytest.fixture(autouse=True)
+def _allow_loopback_destinations(monkeypatch):
+    """These tests deliver to receivers on 127.0.0.1; the destination policy
+    (covered in test_audit_c1_hooks.py) refuses that unless opted in."""
+    from honeypot_mcp.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", True)
+
+
 def _free_port(kind: int = socket.SOCK_STREAM) -> int:
     s = socket.socket(socket.AF_INET, kind)
     s.bind(("0.0.0.0", 0))

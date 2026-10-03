@@ -288,6 +288,8 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
         "rotated_from",
         "rotated_to",
         "planted_at",
+        # Trigger history belongs to the old secret; the new token starts clean.
+        "triggers",
     }
     carried = {k: v for k, v in old_meta.items() if k not in _GENERATED}
 

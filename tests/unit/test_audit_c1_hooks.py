@@ -90,12 +90,79 @@ async def test_subscription_list_redacts_destination_credentials(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_delivery_time_check_refuses_a_destination_that_became_internal(monkeypatch):
-    from honeypot_mcp.webhooks import check_destination
+async def test_delivery_refuses_a_stored_subscription_whose_destination_is_internal(monkeypatch):
+    """The gate must sit on the delivery path, not only in alert_subscribe: a row
+    created before the policy existed (or under a looser setting, or whose name
+    later re-resolves to an internal address) must not be posted to."""
+    from aiohttp import web
 
-    refusal, addresses = await check_destination("http://169.254.169.254/x", "json")
-    assert refusal and "refused" in refusal
-    assert addresses == []
+    from honeypot_mcp import webhooks
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.storage.models import AlertSeverity, Subscription
+
+    received: list[bytes] = []
+
+    async def hook(request: web.Request) -> web.Response:
+        received.append(await request.read())
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_post("/hook", hook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+    sub = Subscription(
+        label="stored",
+        url=f"http://127.0.0.1:{port}/hook",
+        format="json",
+        severity_threshold=AlertSeverity.LOW,
+        hmac_secret="s" * 20,
+        active=True,
+    )
+    sub.id = 1
+    delivery = webhooks.WebhookDelivery()
+    await delivery.start()
+    try:
+        monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", False)
+        ok, err = await delivery._dispatch(_event("high"), sub)
+        assert ok is False and err and "refused" in err
+        assert received == [], "an event was POSTed to a refused destination"
+
+        # The same subscription is delivered once the operator opts in.
+        monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", True)
+        ok, err = await delivery._dispatch(_event("high"), sub)
+        assert ok is True, err
+        assert len(received) == 1
+    finally:
+        await delivery.stop()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_delivery_refuses_link_local_even_when_private_is_allowed(monkeypatch):
+    from honeypot_mcp import webhooks
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.storage.models import AlertSeverity, Subscription
+
+    monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", True)
+    sub = Subscription(
+        label="meta",
+        url="http://169.254.169.254/latest/meta-data/",
+        format="json",
+        severity_threshold=AlertSeverity.LOW,
+        hmac_secret="s" * 20,
+        active=True,
+    )
+    sub.id = 2
+    delivery = webhooks.WebhookDelivery()
+    await delivery.start()
+    try:
+        ok, err = await delivery._dispatch(_event("high"), sub)
+    finally:
+        await delivery.stop()
+    assert ok is False and err and "refused" in err
 
 
 def test_smtp_url_rejects_typoed_tls_and_cleartext_auth_to_remote_hosts():

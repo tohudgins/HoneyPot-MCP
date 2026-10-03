@@ -27,6 +27,7 @@ Wire format: RFC 1939 (POP3), RFC 2449 (CAPA).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import time
@@ -93,7 +94,9 @@ class _POP3Protocol(asyncio.Protocol):
 
     def _send(self, text: str) -> None:
         if self._transport is not None and not self._transport.is_closing():
-            self._transport.write((text + "\r\n").encode("utf-8", errors="replace"))
+            # Half-closed by `close_after_error`; see the IMAP engine.
+            with contextlib.suppress(RuntimeError):
+                self._transport.write((text + "\r\n").encode("utf-8", errors="replace"))
 
     def _close(self) -> None:
         # Session ending on our side: drop lines queued behind this one.

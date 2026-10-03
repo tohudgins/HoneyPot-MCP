@@ -37,6 +37,7 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import (
@@ -71,6 +72,8 @@ _MAX_PASV_PER_SESSION = 64
 # Attacker-chosen strings (command lines, credentials, filenames) placed in
 # events are clipped to this many characters.
 _MAX_EVENT_STRING = 256
+# Unread reply bytes tolerated before the connection is dropped.
+_MAX_WRITE_BACKLOG = 512 * 1024
 
 
 def _clip(value: str) -> str:
@@ -193,6 +196,9 @@ class _FTPProtocol(asyncio.Protocol):
         )
         for line in lines:
             if self._transport is None or self._transport.is_closing():
+                return
+            if write_backlogged(self._transport, _MAX_WRITE_BACKLOG):
+                self._transport.abort()
                 return
             cmd = line.decode("utf-8", errors="replace").strip()
             if cmd:

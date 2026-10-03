@@ -21,6 +21,15 @@ import pytest
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
+@pytest.fixture(autouse=True)
+def _allow_loopback_destinations(monkeypatch):
+    """Delivery tests post to a receiver on 127.0.0.1; see test_audit_c1_hooks.py
+    for the destination policy itself."""
+    from honeypot_mcp.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", True)
+
+
 def _event(severity: str = "high", event_type: str = "ssh_login_failed", **overrides):
     from honeypot_mcp.storage.event_buffer import PendingEvent
     from honeypot_mcp.storage.models import AlertSeverity

@@ -70,6 +70,13 @@ _ERR_TOO_BIG = 1
 # Attacker-chosen strings placed in events are clipped to this many chars.
 _MAX_EVENT_STRING = 256
 
+# UDP sources are spoofable, so a reply is never allowed to dwarf the request:
+# at most this many times its size, and replies per source are rate limited. A
+# factor of exactly 1 made every ordinary snmpget (a 40-byte request whose real
+# answer is ~140 bytes) come back `tooBig`, which no real agent does. At 4x and
+# ~10 replies/s per victim the platform adds a few KB/s to a reflection — noise.
+_UDP_REPLY_FACTOR = 4
+
 _PDU_NAMES = {
     _GET_REQUEST: "GetRequest",
     _GET_NEXT_REQUEST: "GetNextRequest",
@@ -391,7 +398,7 @@ class _SNMPProtocol(asyncio.DatagramProtocol):
             return
         if not self._reply_limiter.allow(addr[0]):
             return
-        reply = build_bounded_response(request, len(data))
+        reply = build_bounded_response(request, len(data) * _UDP_REPLY_FACTOR)
         if reply is None:
             return
         try:

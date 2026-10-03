@@ -65,6 +65,10 @@ _PBX_NAME = "Asterisk PBX 18.10.0"
 # A SIP request over UDP fits in one MTU in practice (RFC 3261 §18.1.1 moves
 # anything near 1300 bytes to TCP). Larger datagrams are dropped unparsed.
 _MAX_UDP_DATAGRAM = 4096
+# UDP sources are spoofable: a reply is at most this many times the request
+# (and replies per source are rate limited). Exactly 1x left a short REGISTER
+# unable to receive its digest challenge, so no tool could ever answer it.
+_UDP_REPLY_FACTOR = 3
 # TCP framing buffer. A message that has not completed within this many bytes
 # is not SIP; the connection is closed.
 _MAX_TCP_MESSAGE = 65_535
@@ -356,6 +360,10 @@ class _SIPHandler:
             reply = build_response(request, status, reason).encode()
 
         if max_reply is not None and len(reply) > max_reply:
+            if method in ("REGISTER", "INVITE"):
+                # A 401/407 without its digest challenge is unanswerable (there is
+                # no nonce to hash against) and a tell on its own; stay silent.
+                return None
             reply = build_response(request, status, reason, minimal=True).encode()
             if len(reply) > max_reply:
                 return None
@@ -399,7 +407,7 @@ class _SIPDatagramProtocol(asyncio.DatagramProtocol):
         spawn(self._respond(data, addr, may_reply), name="sip-udp")
 
     async def _respond(self, data: bytes, addr: tuple[str, int], may_reply: bool) -> None:
-        reply = await self._handler.handle(data, addr, max_reply=len(data))
+        reply = await self._handler.handle(data, addr, max_reply=len(data) * _UDP_REPLY_FACTOR)
         if reply and may_reply and self._transport is not None:
             try:
                 self._transport.sendto(reply, addr)

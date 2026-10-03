@@ -42,6 +42,7 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import (
@@ -75,6 +76,8 @@ _MAX_MESSAGE_BYTES = 10_240_000
 _MAX_BODY_PREVIEW = 4096
 # Attacker-chosen strings (commands, addresses, credentials) placed in events.
 _MAX_EVENT_STRING = 256
+# Unread reply bytes tolerated before the connection is dropped.
+_MAX_WRITE_BACKLOG = 512 * 1024
 
 
 def _clip(value: str) -> str:
@@ -188,6 +191,11 @@ class _SMTPProtocol(asyncio.Protocol):
         )
         for line in lines:
             if self._transport is None or self._transport.is_closing():
+                return
+            if write_backlogged(self._transport, _MAX_WRITE_BACKLOG):
+                # The peer is pipelining commands and not reading the replies
+                # (each EHLO answers ~55x its size); stop queueing them.
+                self._transport.abort()
                 return
             if self._starttls_pending:
                 # RFC 3207: anything pipelined behind STARTTLS is discarded.

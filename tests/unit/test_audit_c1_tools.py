@@ -204,25 +204,28 @@ async def test_pfsense_refuses_cleartext_or_relative_urls(base_url):
     client_factory.assert_not_called()
 
 
+class _PfClient:
+    """Stands in for httpx.AsyncClient against a pfSense API."""
+
+    async def __aenter__(self) -> _PfClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def get(self, _url: str, headers: Any = None, params: Any = None) -> MagicMock:  # noqa: ARG002
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json = MagicMock(return_value={"data": {"address": ""}})
+        return resp
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base_url", ["http://127.0.0.1:8443", "http://localhost", "http://[::1]"])
 async def test_pfsense_allows_http_to_loopback(base_url):
     from honeypot_mcp.tools import blocklist_push
 
     await _insert_offenders(["1.1.1.1"])
-
-    class _PfClient:
-        async def __aenter__(self) -> _PfClient:
-            return self
-
-        async def __aexit__(self, *_: object) -> None:
-            return None
-
-        async def get(self, _url: str, headers: Any = None, params: Any = None) -> MagicMock:  # noqa: ARG002
-            resp = MagicMock()
-            resp.status_code = 200
-            resp.json = MagicMock(return_value={"data": {"address": ""}})
-            return resp
 
     with patch("httpx.AsyncClient", return_value=_PfClient()):
         result = await blocklist_push.blocklist_push_pfsense(
@@ -269,11 +272,19 @@ async def test_blocklist_push_is_audited_without_the_credential():
 async def test_pfsense_audit_records_host_not_url_credentials():
     from honeypot_mcp.tools import blocklist_push
 
-    await blocklist_push.blocklist_push_pfsense(
-        base_url="https://admin:hunter2@pf.example:8443/", api_key="KEY-XYZ", alias_name="b"
-    )
+    # An offender must exist, or the tool returns early on "nothing to push" and
+    # never builds the URL-bearing summary/error this test is about.
+    await _insert_offenders(["1.1.1.1"])
+    with patch("httpx.AsyncClient", return_value=_PfClient()):
+        await blocklist_push.blocklist_push_pfsense(
+            base_url="https://admin:hunter2@pf.example:8443/",
+            api_key="KEY-XYZ",
+            alias_name="b",
+            dry_run=True,
+        )
     rows = await _audit_rows("blocklist_push_pfsense")
     assert len(rows) == 1
+    assert "1 IP" in rows[0].summary  # the push path ran, not the empty-offenders branch
     assert rows[0].target == "pf.example"
     flat = f"{rows[0].summary} {rows[0].arguments} {rows[0].target}"
     assert "hunter2" not in flat

@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1037 unit tests covering security-critical paths)
+# Tests (1061 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -1330,8 +1330,12 @@ to reduce alert latency.
   lifetime timeouts, `extract_lines`, `LineWorker`, `UdpReplyLimiter`,
   `close_after_error`, `shutdown_server`), `secure_io` (private files are created
   0600, never chmod'd afterwards) and `_loop_bound.LoopBound` (loop-safe locks).
-- **UDP replies are never larger than the request** and are rate limited per
-  source; the event is recorded either way.
+- **UDP replies are bounded to a small multiple of the request** (SNMP 4x, SIP
+  3x, DNS 2x) and rate limited per source; the event is recorded either way. The
+  multiple is not 1x on purpose: at 1x an ordinary `snmpget` (40 B in, ~140 B out)
+  comes back `tooBig` and a short REGISTER gets a 401 with no digest challenge —
+  both identify the decoy and capture nothing. With the per-source limiter the
+  platform adds a few KB/s to a reflection, which is noise.
 - **Write helpers that return `{"error": ...}` do not raise.** Callers must
   check the result (`alerts_prune` deletes nothing unless the archive succeeded);
   caller-named artifact paths refuse to overwrite.
@@ -1348,4 +1352,13 @@ to reduce alert latency.
   `honeypot_mcp.server.mcp`, not on `__main__.mcp`.
 - Cowrie's root filesystem is read-only; its wget/curl emulation makes real
   outbound requests, so egress control is a host-firewall concern.
+- **Honeytoken matching runs on the payload before it is clamped** (the clamp
+  drops whole keys over budget, and a planted credential inside a dropped
+  `post_data` must still escalate). The HTTP engine keeps credential-aliased form
+  fields however much junk precedes them.
+- **The webhook destination policy is enforced on every delivery**
+  (`WebhookDelivery._dispatch` → `check_destination`, 10 s cache), not only in
+  `alert_subscribe`; syslog connects to the validated address.
+- **The canary's global rate ceiling applies only to requests that matched a
+  token**, so a flood of random ids cannot starve a real trigger.
 

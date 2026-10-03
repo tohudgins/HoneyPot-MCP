@@ -58,10 +58,12 @@ _PIXEL = base64.b64decode(
 # flusher and potentially DOSing real alert delivery.
 _RATE_WINDOW_SECONDS = 60.0
 _RATE_MAX_PER_WINDOW = 30  # 30 hits/source/min is generous for legitimate canary use
-# Global ceiling across every source. The per-source limit alone does nothing
-# against a botnet: ten thousand addresses at 30 hits each is still 300k hits a
-# minute, each of which costs a lookup and possibly an alert.
-_GLOBAL_RATE_MAX_PER_WINDOW = 300
+# Global ceiling on hits that matched a real token and so cost an alert and a
+# database write. The per-source limit alone does nothing against a botnet: ten
+# thousand addresses at 30 hits each is still 300k a minute. It is applied only
+# after the token lookup: counted on every request, a flood of random ids would
+# exhaust it and the canary would silently ignore the one hit that matters.
+_GLOBAL_RATE_MAX_PER_WINDOW = 600
 # Above this many tracked sources we sweep out decayed windows.
 _RATE_STATE_MAX_IPS = 10_000
 _rate_state: dict[str, deque[float]] = defaultdict(deque)
@@ -142,7 +144,10 @@ def _global_rate_limit_check() -> bool:
 
 
 def _over_limit(src_ip: str) -> bool:
-    return _rate_limit_check(src_ip) or _global_rate_limit_check()
+    """Per-source limit only. The global ceiling is applied after the token
+    lookup (see `_global_rate_limit_check`), so requests for ids that match
+    nothing can never consume the budget real triggers need."""
+    return _rate_limit_check(src_ip)
 
 
 # ── Token lookup index ─────────────────────────────────────────────────────
@@ -375,7 +380,7 @@ async def _handle_token(request: web.Request) -> web.Response:
     # PDF tracker uses /t/<uid>.png — strip extension for matching.
     token_id = raw.split(".", 1)[0]
     token_pk = await _find_token_by_id(token_id)
-    if token_pk is not None:
+    if token_pk is not None and not _global_rate_limit_check():
         await _trigger(token_pk, request)
 
     if raw.endswith(".png"):
@@ -484,7 +489,7 @@ async def _handle_token_tail(request: web.Request) -> web.Response:
 
     token_id = request.match_info.get("token_id", "").split(".", 1)[0]
     token_pk = await _find_token_by_id(token_id)
-    if token_pk is not None:
+    if token_pk is not None and not _global_rate_limit_check():
         await _trigger(token_pk, request)
     return response
 
@@ -507,7 +512,7 @@ async def _handle_slack_webhook(request: web.Request) -> web.Response:
         return web.Response(text="ok", content_type="text/plain")
 
     token_pk = await _find_token_by_id(token_id, types=(HoneytokenType.SLACK_WEBHOOK,))
-    if token_pk is not None:
+    if token_pk is not None and not _global_rate_limit_check():
         await _trigger(token_pk, request)
     # Real Slack webhooks reply `200 OK` with body `ok` on accepted posts.
     return web.Response(text="ok", content_type="text/plain")

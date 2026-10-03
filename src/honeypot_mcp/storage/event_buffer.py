@@ -506,8 +506,11 @@ def reset_for_tests() -> None:
 async def submit_event(event: PendingEvent) -> None:
     """Module-level convenience for engines.
 
-    The payload is clamped first (see `clamp_payload`) so everything after —
-    matchers, queue, database — sees bounded, storable data.
+    Honeytoken matching reads the payload *before* it is clamped: the clamp
+    drops whole top-level keys once an event is over budget, and a planted
+    credential inside a dropped `post_data` must still escalate the event. The
+    engines already bound what they capture, so the matchers see bounded data;
+    everything stored afterwards is clamped.
 
     Suppression rules are evaluated here — events that match an active drop or
     rate-limit rule are dropped before they enter the buffer. Credential
@@ -521,7 +524,6 @@ async def submit_event(event: PendingEvent) -> None:
     credential_match)."""
     from honeypot_mcp import self_probe, suppression
 
-    event.payload, event.size_hint = clamp_payload(event.payload)
     _sanitise_identity(event)
 
     # Ahead of suppression: the watchdog's own health probes reach the engines
@@ -542,6 +544,8 @@ async def submit_event(event: PendingEvent) -> None:
         if rule_id is not None:
             suppression.record_suppressed(rule_id)
         return
+
+    event.payload, event.size_hint = clamp_payload(event.payload)
 
     await get_buffer().submit(event)
 

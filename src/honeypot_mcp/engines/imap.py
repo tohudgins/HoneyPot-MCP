@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import secrets
 from typing import Any
@@ -95,7 +96,11 @@ class _IMAPProtocol(asyncio.Protocol):
 
     def _send(self, text: str) -> None:
         if self._transport is not None and not self._transport.is_closing():
-            self._transport.write(text.encode("utf-8", errors="replace"))
+            # Half-closed by `close_after_error` (write_eof already sent): lines
+            # still queued behind a flood are processed for the evidence they
+            # carry, but their replies have nowhere to go.
+            with contextlib.suppress(RuntimeError):
+                self._transport.write(text.encode("utf-8", errors="replace"))
 
     def data_received(self, data: bytes) -> None:
         lines, self._buf, problem = extract_lines(

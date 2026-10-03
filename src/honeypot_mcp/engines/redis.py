@@ -53,7 +53,7 @@ from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
+from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory, shutdown_server
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -224,6 +224,8 @@ _MAX_BULK_BYTES = 512 * 1024
 _FAIL_GRACE_SECONDS = 2.0
 _MAX_INLINE_BYTES = 64 * 1024
 _MAX_BUFFER_BYTES = 1024 * 1024
+_MAX_COMMANDS_PER_READ = 512
+_MAX_COMMANDS_PER_CONNECTION = 5000
 _MAX_WRITE_BUFFER = 1024 * 1024
 _MAX_STR = 2048
 _MAX_KEY = 2048
@@ -353,6 +355,7 @@ class _RedisProtocol(asyncio.Protocol):
         # reports it in HELLO and CLIENT INFO. A server that always says id:1
         # is trivially distinguishable from a real one.
         self._client_id = _next_client_id()
+        self._commands = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -388,6 +391,7 @@ class _RedisProtocol(asyncio.Protocol):
         if len(self._buf) < self._need:
             return
         pos = 0
+        commands_this_read = 0
         try:
             while not t.is_closing():
                 if write_backlogged(t, _MAX_WRITE_BUFFER):
@@ -398,6 +402,18 @@ class _RedisProtocol(asyncio.Protocol):
                     break
                 pos += consumed
                 if args:
+                    # Every command costs a dispatch and usually an event; a
+                    # 1 MiB buffer of `A\r\n` is ~340k of them, which used to
+                    # hold the shared loop for ~20 s. Real clients pipeline
+                    # tens of commands, not hundreds.
+                    commands_this_read += 1
+                    self._commands += 1
+                    if (
+                        commands_this_read > _MAX_COMMANDS_PER_READ
+                        or self._commands > _MAX_COMMANDS_PER_CONNECTION
+                    ):
+                        self._fail("too many commands")
+                        return
                     self._dispatch(args)
         except _ProtocolError as exc:
             self._fail(str(exc))
@@ -798,8 +814,7 @@ class RedisEngine(HoneypotEngine):
     async def stop(self, container_id: str, remove: bool = False) -> None:
         server = self._servers.pop(container_id, None)
         if server:
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_redis"}

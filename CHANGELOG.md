@@ -4,6 +4,40 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Independent review of the remediation
+
+A reviewer agent with no stake in the code attacked the two commits and
+reproduced defects the 1037-test suite did not catch. All are fixed, and
+each has a test that fails when its fix is reverted (`test_audit_review.py`).
+
+- **The webhook destination policy was only enforced at subscribe time**, despite
+  the changelog, a code comment and the module docstring all saying "re-checked
+  at delivery". A stored subscription, a name that later re-resolved to cloud
+  metadata, or a tightened setting were all still posted to. It is now enforced
+  in `WebhookDelivery._dispatch` (short cache bounds the rebinding window) and
+  syslog connects to the validated address.
+- **One Redis connection could hold the event loop ~20 s** with 1 MiB of
+  one-token commands; commands are now capped per read and per connection.
+- **The payload clamp ran before honeytoken matching** and could discard the
+  whole `post_data` holding a planted credential. Matching now runs first, and
+  the HTTP engine always keeps credential-aliased form fields.
+- **Ten engines still hung `stop()` on a connected idle client** (redis, mongodb,
+  postgresql, nfs, mssql, mysql, ldap, memcached, vnc, smb); they use
+  `shutdown_server` now.
+- SMTP and FTP now drop a peer that pipelines commands but never reads (an `EHLO`
+  answers ~55x its size); the canary's global ceiling no longer counts requests
+  for unknown ids; `honeytoken_rotate` no longer copies the old trigger history;
+  IMAP/POP3 no longer raise when a queued line replies after the flood half-close.
+- **The strict "UDP reply never larger than the request" rule was too strict:** a
+  normal `snmpget` came back `tooBig` and a short SIP REGISTER got a 401 with no
+  challenge. Replies are now bounded to 4x (SNMP) / 3x (SIP), still per-source
+  rate limited.
+- Four audit tests passed with their fix removed (delivery-time check, pfSense
+  audit, SIP TCP flood, per-IP cap); they were rewritten to fail on revert.
+- Not reproduced and therefore not changed: a claim that `limited_handler` leaks
+  sockets when a handler swallows its own exception (asyncio closes the transport
+  when the handler task finishes).
+
 ## Closing the verification gaps
 
 Follow-up to the audit remediation: the things that were only unit-tested were
@@ -51,8 +85,8 @@ bounded regression test per finding (`tests/unit/test_audit_*.py`).
 - **Bounded engines.** Per-connection buffers, message counts and write
   backlogs are capped; `conn_limit` adds a central idle timeout, session
   lifetime and process-wide connection ceiling, and `stop()` no longer hangs on a
-  live client. UDP replies (SNMP, SIP, DNS) never exceed the request and are
-  rate limited per source, matching the "never amplifies" rule.
+  live client. UDP replies (SNMP, SIP, DNS) are bounded to a small multiple of the
+  request (see the review entry below) and rate limited per source.
 - **Ingest pipeline.** Payloads are clamped and the queue is bounded
   (`event_queue_max`, LOW shed first, drops counted); one poison event drops only
   itself; matcher caches refresh under a lock and keep serving stale data on a DB

@@ -328,7 +328,7 @@ async def test_bait_aws_key_is_random_per_render():
 # ── 5. identity_runner hygiene ──────────────────────────────────────────────
 
 
-async def test_identity_runner_closes_silent_connection_and_caps_per_ip():
+async def _identity_runner_on_free_port(**kwargs):
     from aiohttp import web
 
     from honeypot_mcp.http_identity import identity_runner
@@ -338,20 +338,39 @@ async def test_identity_runner_closes_silent_connection_and_caps_per_ip():
 
     app = web.Application()
     app.router.add_get("/", ok)
-    runner = identity_runner(app, "nginx", max_connections_per_ip=2, first_request_timeout=0.3)
+    runner = identity_runner(app, "nginx", **kwargs)
     await runner.setup()
     port = _free_port()
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    await site.start()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    return runner, port
+
+
+async def test_identity_runner_caps_connections_per_ip():
+    # A long first-request timer, so only the per-IP cap can close the third socket.
+    runner, port = await _identity_runner_on_free_port(
+        max_connections_per_ip=2, first_request_timeout=30
+    )
     try:
         r1, w1 = await asyncio.open_connection("127.0.0.1", port)
         r2, w2 = await asyncio.open_connection("127.0.0.1", port)
         r3, w3 = await asyncio.open_connection("127.0.0.1", port)
-        # Over the cap: closed straight away.
-        assert await asyncio.wait_for(r3.read(), 2) == b""
-        # Silent: closed by the first-request timer.
-        assert await asyncio.wait_for(r1.read(), 2) == b""
+        assert await asyncio.wait_for(r3.read(), 2) == b"", "the third connection was admitted"
+        # The two admitted connections are still open (their read times out).
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(r1.read(), 0.5)
         for w in (w1, w2, w3):
             w.close()
+    finally:
+        await runner.cleanup()
+
+
+async def test_identity_runner_closes_a_connection_that_never_sends_a_request():
+    runner, port = await _identity_runner_on_free_port(
+        max_connections_per_ip=100, first_request_timeout=0.3
+    )
+    try:
+        r1, w1 = await asyncio.open_connection("127.0.0.1", port)
+        assert await asyncio.wait_for(r1.read(), 2) == b""
+        w1.close()
     finally:
         await runner.cleanup()

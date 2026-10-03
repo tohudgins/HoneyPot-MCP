@@ -87,19 +87,16 @@ def test_sip_parse_digest_still_reads_a_real_header():
 
 
 @pytest.mark.asyncio
-async def test_sip_udp_reply_never_exceeds_request_and_event_is_recorded():
-    from honeypot_mcp.engines.sip import SIPEngine
+async def test_sip_udp_reply_is_bounded_by_the_reply_factor():
+    from honeypot_mcp.engines.sip import _UDP_REPLY_FACTOR, SIPEngine
 
     port = _free_port()
     await _make_honeypot("sip-a2", "sip", port)
     engine = SIPEngine()
     cid = await engine.start("sip-a2", port, {})
     try:
-        # A minimal REGISTER whose faithful 401 challenge is far larger.
-        request = (
-            b"REGISTER sip:x SIP/2.0\r\nVia: SIP/2.0/UDP a\r\nFrom: <sip:1@x>\r\n"
-            b"To: <sip:1@x>\r\nCall-ID: 1\r\nCSeq: 1 REGISTER\r\n\r\n"
-        )
+        # A tiny datagram whose faithful reply is many times larger.
+        request = b"OPTIONS sip:x SIP/2.0\r\nCSeq: 1 OPTIONS\r\n\r\n"
         loop = asyncio.get_running_loop()
         got: asyncio.Future[bytes] = loop.create_future()
 
@@ -111,9 +108,10 @@ async def test_sip_udp_reply_never_exceeds_request_and_event_is_recorded():
         transport, _ = await loop.create_datagram_endpoint(_Client, remote_addr=("127.0.0.1", port))
         try:
             transport.sendto(request)
+            # Silence is an acceptable answer; a reply larger than the bound is not.
             with contextlib.suppress(TimeoutError):
                 reply = await asyncio.wait_for(got, timeout=1.0)
-                assert len(reply) <= len(request)
+                assert len(reply) <= len(request) * _UDP_REPLY_FACTOR
         finally:
             transport.close()
     finally:
@@ -134,9 +132,13 @@ async def test_sip_tcp_blank_frame_flood_closes_connection_quickly():
         writer.write(b"\r\n\r\n" * 15_000)
         with contextlib.suppress(ConnectionError):
             await writer.drain()
-        # The server closes the connection instead of creating 15k tasks.
-        with contextlib.suppress(ConnectionError, TimeoutError):
-            await asyncio.wait_for(reader.read(65536), timeout=2.0)
+        # The server closes the connection instead of creating 15k tasks. A read
+        # timeout means it did NOT close, which must fail the test.
+        try:
+            closed = await asyncio.wait_for(reader.read(65536), timeout=2.0) == b""
+        except ConnectionError:
+            closed = True  # an RST is a close too
+        assert closed, "the server kept the flooding connection open"
         assert time.monotonic() - start < 2.5
         writer.close()
     finally:
@@ -296,9 +298,59 @@ async def test_ftp_pipelined_pasv_leaves_exactly_one_listener():
 
 
 @pytest.mark.asyncio
-async def test_ftp_rejects_data_connection_from_a_different_peer():
-    # The check compares the data peer to the control peer; exercise it by
-    # asking for a listing over a connection that does come from the same host.
+async def test_ftp_data_connection_from_a_different_host_is_refused(monkeypatch):
+    from honeypot_mcp.engines import ftp
+    from honeypot_mcp.engines.ftp import FTPEngine
+
+    async def pasv_port(pretend_control_peer: str | None) -> tuple[int, asyncio.StreamWriter]:
+        if pretend_control_peer is not None:
+            original = ftp._FTPProtocol.connection_made
+
+            def made(self, transport):  # type: ignore[no-untyped-def]
+                original(self, transport)
+                self._peer = (pretend_control_peer, 1)
+
+            monkeypatch.setattr(ftp._FTPProtocol, "connection_made", made)
+        port = _free_port()
+        await _make_honeypot(f"ftp-peer-{pretend_control_peer}", "ftp", port)
+        engine = FTPEngine()
+        cid = await engine.start(f"ftp-peer-{pretend_control_peer}", port, {})
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await reader.readline()
+        writer.write(b"USER anonymous\r\nPASS a@b.c\r\n")
+        await reader.readline()
+        await reader.readline()
+        writer.write(b"PASV\r\n")
+        line = (await asyncio.wait_for(reader.readline(), 3)).decode()
+        nums = line[line.index("(") + 1 : line.index(")")].split(",")
+        pasv = int(nums[4]) * 256 + int(nums[5])
+        # Keep the engine alive for the caller via the writer; stop on cleanup.
+        pasv_port.cleanups.append((engine, cid))  # type: ignore[attr-defined]
+        return pasv, writer
+
+    pasv_port.cleanups = []  # type: ignore[attr-defined]
+    try:
+        # Control peer is who it says it is: a data connection from it is kept.
+        pasv, ctl = await pasv_port(None)
+        _r, data_w = await asyncio.open_connection("127.0.0.1", pasv)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(_r.read(), 0.5)  # still open, waiting for LIST
+        data_w.close()
+        ctl.close()
+
+        # The control connection "came from" another host: the same data
+        # connection is now a stranger probing the port and is closed at once.
+        pasv, ctl = await pasv_port("203.0.113.5")
+        r2, w2 = await asyncio.open_connection("127.0.0.1", pasv)
+        assert await asyncio.wait_for(r2.read(), 2) == b""
+        w2.close()
+        ctl.close()
+    finally:
+        for engine, cid in pasv_port.cleanups:  # type: ignore[attr-defined]
+            await engine.stop(cid)
+
+
+async def test_pasv_address_advertises_the_control_sockets_own_address():
     from honeypot_mcp.engines.ftp import _pasv_address
 
     class _T:

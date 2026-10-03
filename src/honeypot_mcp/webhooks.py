@@ -1454,6 +1454,8 @@ class _Job:
 # it, and anything beyond the backlog is counted and skipped rather than piling
 # up in memory.
 _SUB_CONCURRENCY = 4
+# How long a validated destination is trusted before it is re-resolved.
+_DEST_CACHE_SECONDS = 10.0
 _MAX_SUB_BACKLOG = 64
 
 
@@ -1473,6 +1475,7 @@ class WebhookDelivery:
         )
         self._sub_sems: dict[int, asyncio.Semaphore] = {}
         self._sub_backlog: dict[int, int] = {}
+        self._dest_cache: dict[tuple[str, str, bool], tuple[float, str | None, list[str]]] = {}
         self._inflight: set[asyncio.Task[None]] = set()
         self.dropped = 0
         self._dropped_since_log = 0
@@ -1604,12 +1607,38 @@ class WebhookDelivery:
             else:
                 self._sub_backlog.pop(sub.id, None)
 
+    async def _checked_destination(
+        self, sub: Subscription, fmt: str
+    ) -> tuple[str | None, list[str]]:
+        """`check_destination` with a short per-URL cache, so a burst of events
+        to one subscription costs one DNS resolution, not one each. The TTL is
+        deliberately brief: it bounds the DNS-rebinding window."""
+        now = time.monotonic()
+        key = (sub.url, fmt, get_settings().webhook_allow_private_destinations)
+        hit = self._dest_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1], hit[2]
+        refusal, addresses = await check_destination(sub.url, fmt)
+        if len(self._dest_cache) >= 256:
+            self._dest_cache.clear()
+        self._dest_cache[key] = (now + _DEST_CACHE_SECONDS, refusal, addresses)
+        return refusal, addresses
+
     async def _dispatch(self, event: PendingEvent, sub: Subscription) -> tuple[bool, str | None]:
         """Pick the renderer + transport for this subscription's format."""
         fmt = (sub.format or "json").lower()
 
+        # The destination policy is enforced here, on every delivery, not only
+        # when the subscription was created: a hostname can be re-pointed at
+        # cloud metadata or an internal service after it was accepted, a name
+        # that did not resolve at subscribe time can resolve later, and the
+        # `webhook_allow_private_destinations` setting can be tightened.
+        refusal, addresses = await self._checked_destination(sub, fmt)
+        if refusal:
+            return False, refusal
+
         if fmt == "syslog":
-            return await self._dispatch_syslog(event, sub)
+            return await self._dispatch_syslog(event, sub, addresses[0] if addresses else None)
 
         if fmt in _HUMAN_CHANNELS:
             send, suppressed = self._throttle.check(sub.id, event)
@@ -1679,12 +1708,14 @@ class WebhookDelivery:
         return await _post_with_retry(self._client, sub.url, payload_bytes, headers)
 
     async def _dispatch_syslog(
-        self, event: PendingEvent, sub: Subscription
+        self, event: PendingEvent, sub: Subscription, connect_host: str | None = None
     ) -> tuple[bool, str | None]:
-        """Send via UDP or TCP depending on the URL scheme."""
+        """Send via UDP or TCP depending on the URL scheme. `connect_host` is
+        the address `check_destination` validated; connecting to it rather
+        than re-resolving the hostname closes the rebinding window."""
         parsed = urlparse(sub.url)
         scheme = parsed.scheme.lower()
-        host = parsed.hostname
+        host = connect_host or parsed.hostname
         port = parsed.port or 514
         if not host:
             return False, "syslog URL missing host"
