@@ -57,7 +57,11 @@ async def setup_db(tmp_path, monkeypatch):
     token_matchers.invalidate_cache()
     event_buffer.reset_for_tests()
     await init_db()
+    # Triggers reach the DB through the event buffer's flusher (audit C2-1).
+    buffer = event_buffer.get_buffer()
+    await buffer.start()
     yield
+    await buffer.stop()
     token_matchers.invalidate_cache()
     event_buffer.reset_for_tests()
     await close_db()

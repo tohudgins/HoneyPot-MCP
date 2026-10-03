@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from honeypot_mcp.intel import _cache
@@ -13,6 +14,16 @@ log = logging.getLogger(__name__)
 
 _CACHE_TTL = 86400  # 24h — geolocation barely changes
 _PTR_TIMEOUT = 3.0  # seconds — reverse DNS can hang on missing/slow PTR zones
+# PTR lookups block a thread for as long as the resolver takes (often far past
+# `_PTR_TIMEOUT`: the wait is abandoned, the thread is not). They run in their
+# own small pool so a flood of unresolvable IPs cannot starve the default
+# executor that the database and everything else share; once that many are in
+# flight, further PTRs are skipped rather than queued.
+_PTR_WORKERS = 4
+_PTR_MAX_IN_FLIGHT = 2 * _PTR_WORKERS
+_PTR_MISS_TTL = 300
+_ptr_executor = ThreadPoolExecutor(max_workers=_PTR_WORKERS, thread_name_prefix="ptr-lookup")
+_ptr_in_flight = 0
 
 
 async def lookup_geoip(ip: str) -> dict[str, Any]:
@@ -142,7 +153,15 @@ async def _lookup_asn(ip: str, db_path: str) -> dict[str, Any]:
 
 async def _reverse_dns(ip: str) -> str | None:
     """Best-effort PTR lookup with a hard timeout. Returns the hostname, or
-    None if there's no PTR record or the resolver is slow/unreachable."""
+    None if there's no PTR record or the resolver is slow/unreachable. Misses
+    are remembered for `_PTR_MISS_TTL` so an IP without a PTR record is not
+    re-resolved on every alert."""
+    global _ptr_in_flight
+    miss_key = f"ptr:{ip}"
+    if _cache.get_negative(miss_key) is not None:
+        return None
+    if _ptr_in_flight >= _PTR_MAX_IN_FLIGHT:
+        return None
 
     def _ptr() -> str | None:
         try:
@@ -151,9 +170,19 @@ async def _reverse_dns(ip: str) -> str | None:
         except (OSError, socket.herror, socket.gaierror):
             return None
 
-    loop = asyncio.get_event_loop()
+    def _release(_fut: object) -> None:
+        global _ptr_in_flight
+        _ptr_in_flight -= 1
+
+    loop = asyncio.get_running_loop()
+    _ptr_in_flight += 1
+    future = loop.run_in_executor(_ptr_executor, _ptr)
+    future.add_done_callback(_release)
     try:
-        return await asyncio.wait_for(loop.run_in_executor(None, _ptr), timeout=_PTR_TIMEOUT)
+        host = await asyncio.wait_for(asyncio.shield(future), timeout=_PTR_TIMEOUT)
     except Exception:
         # Timeout or any resolver error — PTR is best-effort, never fatal.
-        return None
+        host = None
+    if host is None:
+        _cache.set_negative(miss_key, {"available": False}, ttl=_PTR_MISS_TTL)
+    return host

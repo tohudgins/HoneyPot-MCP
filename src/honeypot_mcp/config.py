@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     # Prometheus /metrics endpoint — separate port from honeypot listeners
     # so scrapers can be locked down independently. Set port to 0 to disable.
-    metrics_host: str = "0.0.0.0"
+    metrics_host: str = "127.0.0.1"
     metrics_port: int = 9090
 
     # MCP transport. `stdio` (default) is what Claude Desktop / Claude Code
@@ -118,6 +118,32 @@ class Settings(BaseSettings):
     # Elasticsearch), which rely on aiohttp's own limits.
     max_connections_per_ip: int = 32
 
+    # ── connection infrastructure (slice A2, engines/conn_limit.py) ─────────
+    # Central slowloris protection for every TCP engine wrapped by
+    # `limited_factory` / `limited_handler`: a connection that sends nothing
+    # for `engine_idle_timeout_seconds` is closed, and no connection outlives
+    # `engine_max_session_seconds`. 0 disables either.
+    engine_idle_timeout_seconds: float = 120.0
+    engine_max_session_seconds: float = 900.0
+    # Process-wide ceiling on concurrent connections across ALL wrapped TCP
+    # engines (the per-IP cap alone is defeated by many source addresses).
+    # 0 = unlimited.
+    max_total_connections: int = 2000
+    # Per-source-IP token bucket for UDP replies (SNMP/SIP/DNS): sustained
+    # replies per second and burst size. Events are still recorded for
+    # rate-limited datagrams; only the reply is withheld. rate 0 disables.
+    udp_reply_rate_per_second: float = 10.0
+    udp_reply_burst: int = 20
+
+    # ── aiohttp engine timeouts (slice A3) ──────────────────────────────────
+    # Every aiohttp listener (HTTP/Elasticsearch/Docker API/Kubernetes/canary/
+    # metrics) also honours `max_connections_per_ip`. A connection that has not
+    # delivered a complete request head within this many seconds is closed
+    # (slowloris), and a request body that takes longer than the body timeout
+    # to arrive is abandoned with whatever was received. 0 disables either.
+    http_first_request_timeout_seconds: float = 15.0
+    http_body_timeout_seconds: float = 10.0
+
     # Docker
     docker_socket: str = Field(default="", description="Docker socket URI")
 
@@ -170,6 +196,27 @@ class Settings(BaseSettings):
     # remote database, where the same backlog takes proportionally longer.
     shutdown_drain_seconds: float = 5.0
 
+    # ── Ingest pipeline bounds (slice B1) ───────────────────────────────────
+    # High-water mark for events waiting to be written. Normal load never gets
+    # near it (measured commit rate ~1,550 events/sec), so nothing is dropped
+    # on the way in. Past it the buffer sheds by severity so an attacker-rate
+    # flood cannot exhaust memory: LOW is dropped from `event_queue_max`,
+    # MEDIUM from 1.5x, HIGH/CRITICAL only from 2x. Drops are counted and
+    # logged (at most once per 10s). 0 disables the bound.
+    event_queue_max: int = 100_000
+    # Same idea in bytes (estimated), because a queue of 100k events carrying
+    # 64 KB bodies is not the same memory as 100k small ones.
+    event_queue_max_bytes: int = 256 * 1024 * 1024
+    # Payloads are attacker-authored, so they are clamped before they are
+    # queued: each string to `event_payload_max_string_chars`, the whole
+    # payload to `event_payload_max_bytes` (serialized). A clamped payload
+    # carries `payload_truncated: true`. `raw_body_b64` — the HTTP engine's
+    # verbatim, already-capped (64 KB) forensic copy of a request body — keeps
+    # its own, larger per-string allowance and sits outside the total.
+    event_payload_max_string_chars: int = 4096
+    event_payload_max_bytes: int = 65_536
+    event_raw_body_max_chars: int = 98_304
+
     # Coalescing window for human-facing notification channels (Slack, Teams,
     # email). The same (event_type, source_ip) notifies at most once per
     # window; the suppressed count rides on the next message that goes out, so
@@ -212,6 +259,33 @@ class Settings(BaseSettings):
     # is far too large to put in an MCP response. The Docker image pre-creates
     # /app/reports and mounts a volume over it.
     reports_dir: Path = _PROJECT_ROOT / "reports"
+
+    # ── Control plane / delivery hardening (slice C1) ───────────────────────
+    # Webhook/syslog/SMTP destinations are validated at subscribe AND delivery
+    # time. Link-local (cloud metadata), unspecified, multicast and reserved
+    # addresses are ALWAYS refused. Loopback and private (RFC1918 / ULA)
+    # addresses are refused too unless this is true — a SOC subscribing an
+    # on-prem Splunk/Elastic on 10.x must opt in explicitly, because a
+    # subscription pointed at an internal service is an SSRF/exfil primitive.
+    webhook_allow_private_destinations: bool = False
+    # Upper bound on events waiting for webhook delivery (global queue AND each
+    # subscription's own queue). When full, the oldest lowest-severity event is
+    # dropped first and the drop is counted — an unbounded queue behind a dead
+    # endpoint is a slow memory leak.
+    webhook_queue_max: int = 10000
+    # Per-(subscription, event_type) cap on CRITICAL notifications per minute
+    # for the human channels. CRITICAL is exempt from the per-source-IP
+    # coalescing, but spoofed-source UDP floods rotate source_ip, so without a
+    # cap one flood turns the exemption into an unbounded stream.
+    notify_critical_per_minute: int = 30
+    # Comma-separated IPs/CIDRs that `blocklist_push_*` must never push (your
+    # own gateway, monitoring, office egress). Link-local/private/loopback and
+    # non-global addresses are never pushed regardless.
+    blocklist_allowlist: str = ""
+    # Extra Host header names the operations console answers to, comma-
+    # separated, in addition to loopback and `console_host`. Anything else gets
+    # 421, which stops a DNS-rebinding page reading the console from a browser.
+    console_allowed_hosts: str = ""
 
     # Logging
     log_level: str = "INFO"

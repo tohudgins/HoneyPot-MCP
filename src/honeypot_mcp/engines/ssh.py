@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import json
 import logging
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
 import docker.errors
+import docker.types
 
 import docker
 from honeypot_mcp import self_probe
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -19,7 +24,22 @@ from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
 
-COWRIE_IMAGE = "cowrie/cowrie:latest"
+# Pinned to an explicit release (3.0.15 is what `latest` and `3.0` resolved to
+# when this was pinned). `:latest` meant every fresh host — and every
+# `images.pull` after an upstream push — silently ran whatever was newest.
+# Bump deliberately, together with a run of the Docker-gated capture test.
+COWRIE_IMAGE = "cowrie/cowrie:3.0.15"
+
+# Resource ceiling for the attacker-facing container. Cowrie is a Python
+# emulator that an attacker drives interactively, so it must not be able to
+# starve the host. Mirrors docker/docker-compose.yml's cowrie-ssh service.
+COWRIE_MEM_LIMIT = "256m"
+COWRIE_PIDS_LIMIT = 128
+COWRIE_NANO_CPUS = 500_000_000  # 0.5 CPU
+# Cowrie's JSON event stream goes to stdout, so the docker json-file log *is*
+# the evidence channel; cap it or a long brute-force run fills the disk.
+COWRIE_LOG_MAX_SIZE = "10m"
+COWRIE_LOG_MAX_FILES = "3"
 # Ports Cowrie listens on inside the container, before any host publishing.
 COWRIE_INTERNAL_PORT = 2222
 COWRIE_TELNET_PORT = 2223
@@ -81,18 +101,50 @@ class SSHEngine(HoneypotEngine):
         # here, a running ingestion task is eligible for GC and event capture
         # stops silently. Keyed by container_id so reattach can dedup.
         self._ingest_tasks: dict[str, asyncio.Task] = {}
+        # container_id -> honeypot name, for every container we have started
+        # ingestion for. Lets health_check tell "no ingestion expected" from
+        # "ingestion died" and respawn it.
+        self._ingest_names: dict[str, str] = {}
 
     def _spawn_ingest_task(self, name: str, container_id: str) -> None:
+        self._ingest_names[container_id] = name
         existing = self._ingest_tasks.get(container_id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(self._ingest_logs(name, container_id), name=f"ssh-ingest-{name}")
+        task = spawn(self._supervise_ingest(name, container_id), name=f"ssh-ingest-{name}")
         self._ingest_tasks[container_id] = task
 
-        def _cleanup(_task: asyncio.Task, cid: str = container_id) -> None:
-            self._ingest_tasks.pop(cid, None)
+        def _cleanup(done: asyncio.Task, cid: str = container_id) -> None:
+            # Only drop our own entry: a respawn may already have replaced it.
+            if self._ingest_tasks.get(cid) is done:
+                self._ingest_tasks.pop(cid, None)
 
         task.add_done_callback(_cleanup)
+
+    def _ingest_alive(self, container_id: str) -> bool:
+        task = self._ingest_tasks.get(container_id)
+        return task is not None and not task.done()
+
+    async def _supervise_ingest(self, name: str, container_id: str) -> None:
+        """Run `_ingest_logs`, restarting it with backoff if it raises.
+
+        A clean return means the container is gone or stopped — nothing left to
+        tail. An exception used to end ingestion permanently while health
+        checks stayed green, so every later attack went unrecorded.
+        """
+        delay = 1.0
+        while True:
+            try:
+                await self._ingest_logs(name, container_id)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "Log ingestion for SSH honeypot '%s' crashed; restarting in %.0fs", name, delay
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         if not self._client:
@@ -178,6 +230,18 @@ class SSHEngine(HoneypotEngine):
                     "honeypot-telnet": "yes" if telnet_enabled else "no",
                 },
                 restart_policy={"Name": "unless-stopped"},
+                # Attacker-facing: bound what a compromised/abused Cowrie can
+                # consume or do. Cowrie listens on unprivileged ports, so it
+                # needs no capabilities at all.
+                mem_limit=COWRIE_MEM_LIMIT,
+                pids_limit=COWRIE_PIDS_LIMIT,
+                nano_cpus=COWRIE_NANO_CPUS,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                log_config=docker.types.LogConfig(
+                    type=docker.types.LogConfig.types.JSON,
+                    config={"max-size": COWRIE_LOG_MAX_SIZE, "max-file": COWRIE_LOG_MAX_FILES},
+                ),
             )
             return container.id
 
@@ -239,6 +303,10 @@ class SSHEngine(HoneypotEngine):
                 pass
 
         await loop.run_in_executor(None, _stop)
+        self._ingest_names.pop(container_id, None)
+        task = self._ingest_tasks.pop(container_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def health_check(self, container_id: str, port: int) -> dict[str, Any]:
         """SSH health: container is running AND the port is responsive.
@@ -289,6 +357,19 @@ class SSHEngine(HoneypotEngine):
                 tcp = await tcp_probe(self._PRIMARY_CONTAINER_PORT, host=ip)
                 if tcp["alive"]:
                     break
+
+        # A running, answering container whose log tailer has died is capturing
+        # attacks into logs nobody reads. That is a failed honeypot, not a
+        # healthy one. Restart the tailer so it heals, but still report the gap.
+        ingest_name = self._ingest_names.get(container_id)
+        if tcp["alive"] and ingest_name is not None and not self._ingest_alive(container_id):
+            self._spawn_ingest_task(ingest_name, container_id)
+            return {
+                "alive": False,
+                "detail": "container running but log ingestion was not running (restarted)",
+                "method": "docker+tcp+ingest",
+                "docker_status": state["docker_status"],
+            }
 
         return {
             "alive": tcp["alive"],
@@ -354,8 +435,6 @@ class SSHEngine(HoneypotEngine):
         bounded deque dedups boundary cases (when `since` returns a line we just
         saw on the previous poll due to docker's per-second timestamp granularity).
         """
-        import json as _json
-        from collections import deque
         from datetime import timedelta
 
         if not self._client:
@@ -407,7 +486,10 @@ class SSHEngine(HoneypotEngine):
                 continue
             last_check = now
 
-            for line in raw_logs.splitlines():
+            # Split on "\n" only: str.splitlines() also breaks on \x85, \u2028
+            # and friends, which can legitimately sit inside a JSON string
+            # value an attacker controls — that would shear one event in two.
+            for line in raw_logs.split("\n"):
                 if not line:
                     continue
                 h = hash(line)
@@ -418,48 +500,87 @@ class SSHEngine(HoneypotEngine):
                 recent_hashes.append(h)
                 seen.add(h)
 
+                # One odd line must never end ingestion: every later attack
+                # would go unrecorded while health checks stayed green.
                 try:
-                    entry = _json.loads(line)
-                except ValueError:
-                    continue
+                    await self._handle_line(line, hp_db_id, probe_sessions, probe_session_order)
+                except Exception as e:
+                    log.debug("Skipping unprocessable Cowrie line for %s: %s", honeypot_name, e)
 
-                event_id = entry.get("eventid", "")
-                if event_id not in _EVENT_MAP:
-                    continue
+    async def _handle_line(
+        self,
+        line: str,
+        hp_db_id: int | None,
+        probe_sessions: set[str],
+        probe_session_order: deque[str],
+    ) -> None:
+        """Turn one Cowrie JSON log line into an event (or drop it)."""
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(entry, dict):
+            return
 
-                event_type, severity = _EVENT_MAP[event_id]
-                event_type = _retag_for_protocol(event_type, entry.get("protocol"))
-                src_ip = entry.get("src_ip", "0.0.0.0")
-                src_port = entry.get("src_port")
-                session_id = entry.get("session")
+        event_id = entry.get("eventid")
+        if not isinstance(event_id, str) or event_id not in _EVENT_MAP:
+            return
 
-                # Self-probe filtering has to be session-scoped here, not just
-                # socket-scoped. Only `cowrie.session.connect` carries
-                # `src_port`; `session.closed` and `client.version` identify
-                # the connection by `session` alone, so matching on the socket
-                # dropped the watchdog's connect event and let its
-                # `ssh_session_closed` through every 30 seconds.
-                if session_id is not None and session_id in probe_sessions:
-                    continue
-                if src_port is not None and self_probe.claim(src_ip, src_port):
-                    if session_id is not None:
-                        if len(probe_session_order) == probe_session_order.maxlen:
-                            probe_sessions.discard(probe_session_order[0])
-                        probe_session_order.append(session_id)
-                        probe_sessions.add(session_id)
-                    continue
+        event_type, severity = _EVENT_MAP[event_id]
+        protocol = entry.get("protocol")
+        proto = protocol if isinstance(protocol, str) else None
+        event_type = _retag_for_protocol(event_type, proto)
 
-                payload = {
-                    k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")
-                }
+        # The source address becomes the attacker identity everything downstream
+        # keys on (blocklists, profiles, enrichment). Cowrie emits a real peer
+        # address, so anything else is a malformed or forged line — drop it
+        # rather than record an event attributed to an arbitrary string.
+        raw_ip = entry.get("src_ip", "0.0.0.0")
+        try:
+            addr = ipaddress.ip_address(raw_ip) if isinstance(raw_ip, str) else None
+        except ValueError:
+            addr = None
+        if addr is None or getattr(addr, "scope_id", None):
+            log.debug("Dropping Cowrie event with invalid src_ip %r", raw_ip)
+            return
+        src_ip = str(addr)
 
-                await submit_event(
-                    PendingEvent(
-                        honeypot_id=hp_db_id,
-                        source_ip=src_ip,
-                        source_port=src_port,
-                        event_type=event_type,
-                        payload=payload,
-                        severity=severity,
-                    )
-                )
+        raw_port = entry.get("src_port")
+        src_port = (
+            raw_port
+            if isinstance(raw_port, int)
+            and not isinstance(raw_port, bool)
+            and 0 <= raw_port <= 65535
+            else None
+        )
+        raw_session = entry.get("session")
+        session_id = raw_session if isinstance(raw_session, str) else None
+
+        # Self-probe filtering has to be session-scoped here, not just
+        # socket-scoped. Only `cowrie.session.connect` carries
+        # `src_port`; `session.closed` and `client.version` identify
+        # the connection by `session` alone, so matching on the socket
+        # dropped the watchdog's connect event and let its
+        # `ssh_session_closed` through every 30 seconds.
+        if session_id is not None and session_id in probe_sessions:
+            return
+        if src_port is not None and self_probe.claim(src_ip, src_port):
+            if session_id is not None:
+                if len(probe_session_order) == probe_session_order.maxlen:
+                    probe_sessions.discard(probe_session_order[0])
+                probe_session_order.append(session_id)
+                probe_sessions.add(session_id)
+            return
+
+        payload = {k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")}
+
+        await submit_event(
+            PendingEvent(
+                honeypot_id=hp_db_id,
+                source_ip=src_ip,
+                source_port=src_port,
+                event_type=event_type,
+                payload=payload,
+                severity=severity,
+            )
+        )

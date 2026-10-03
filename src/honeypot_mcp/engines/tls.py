@@ -13,12 +13,21 @@ generic placeholder.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import ssl
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from honeypot_mcp.secure_io import ensure_private_dir, write_private_file
+
 log = logging.getLogger(__name__)
+
+# Serialises first-time generation. Two concurrent first starts for the same
+# honeypot (HTTPS deploy racing a STARTTLS upgrade) would otherwise each write a
+# cert and a key and could leave a cert from one run beside a key from the other.
+_generate_lock = threading.Lock()
 
 
 def _cert_dir(honeypot_name: str) -> Path:
@@ -33,7 +42,9 @@ def _cert_dir(honeypot_name: str) -> Path:
     p = (root / honeypot_name).resolve()
     if p != root and root not in p.parents:
         raise ValueError(f"Unsafe honeypot name for a certificate directory: {honeypot_name!r}")
-    p.mkdir(parents=True, exist_ok=True)
+    # Private-key material lives under here: owner-only from the first instant.
+    ensure_private_dir(root)
+    ensure_private_dir(p)
     return p
 
 
@@ -70,14 +81,15 @@ def _generate_cert(common_name: str, cert_path: Path, key_path: Path) -> None:
         .sign(key, hashes.SHA256())
     )
 
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
+    # Key first: a cert on disk then always has its key beside it, so the
+    # "both exist" check in ensure_cert never sees a cert without a key.
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
     )
+    write_private_file(key_path, key_pem)
+    write_private_file(cert_path, cert.public_bytes(serialization.Encoding.PEM))
 
 
 def ensure_cert(honeypot_name: str, common_name: str | None = None) -> tuple[Path, Path]:
@@ -86,9 +98,13 @@ def ensure_cert(honeypot_name: str, common_name: str | None = None) -> tuple[Pat
     cert_path = d / "server.crt"
     key_path = d / "server.key"
     if not cert_path.exists() or not key_path.exists():
-        cn = common_name or honeypot_name
-        log.info("Generating self-signed TLS cert for honeypot '%s' (CN=%s)", honeypot_name, cn)
-        _generate_cert(cn, cert_path, key_path)
+        with _generate_lock:
+            if not cert_path.exists() or not key_path.exists():
+                cn = common_name or honeypot_name
+                log.info(
+                    "Generating self-signed TLS cert for honeypot '%s' (CN=%s)", honeypot_name, cn
+                )
+                _generate_cert(cn, cert_path, key_path)
     return cert_path, key_path
 
 
@@ -100,3 +116,15 @@ def build_server_ssl_context(honeypot_name: str, common_name: str | None = None)
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
     return ctx
+
+
+async def build_server_ssl_context_async(
+    honeypot_name: str, common_name: str | None = None
+) -> ssl.SSLContext:
+    """`build_server_ssl_context` off the event loop.
+
+    First-time generation is RSA-2048 key generation (tens to hundreds of ms of
+    CPU), which freezes every honeypot sharing the loop if run inline. Callers in
+    async code should prefer this variant.
+    """
+    return await asyncio.to_thread(build_server_ssl_context, honeypot_name, common_name)

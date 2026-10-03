@@ -41,6 +41,8 @@ import struct
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -70,6 +72,12 @@ _STATUS_FLAGS = 0x0002
 
 # Character set: utf8mb4_general_ci (0xff is wrong; 0x2D is utf8mb4_general_ci).
 _CHARSET = 0x2D
+
+# Per-connection bounds. The wire format allows 16 MiB packets; nothing a
+# honeypot needs to capture is that large, and buffering them is the exposure.
+_MAX_PACKET_BYTES = 1024 * 1024
+_MAX_PACKETS_PER_CONN = 1024
+_MAX_WRITE_BUFFER = 256 * 1024
 
 
 def _build_handshake_packet(salt_1: bytes, salt_2: bytes) -> bytes:
@@ -172,7 +180,7 @@ def _parse_handshake_response(payload: bytes) -> dict[str, Any]:
     null_idx = payload.find(b"\x00", pos)
     if null_idx == -1:
         return out
-    out["username"] = payload[pos:null_idx].decode("utf-8", errors="replace")
+    out["username"] = payload[pos : min(null_idx, pos + 2048)].decode("utf-8", errors="replace")
     pos = null_idx + 1
 
     # auth_response_length — length-encoded int. For our simple case the
@@ -192,7 +200,9 @@ def _parse_handshake_response(payload: bytes) -> dict[str, Any]:
     if pos < len(payload):
         next_null = payload.find(b"\x00", pos)
         if next_null != -1:
-            out["database"] = payload[pos:next_null].decode("utf-8", errors="replace")
+            out["database"] = payload[pos : min(next_null, pos + 2048)].decode(
+                "utf-8", errors="replace"
+            )
 
     return out
 
@@ -290,7 +300,8 @@ class _MySQLProtocol(asyncio.Protocol):
         self._hp_id = honeypot_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
+        self._packets = 0
         self._sent_handshake = False
         self._authed = False
         # Full 20-byte scramble we advertised — needed to verify the client's
@@ -310,31 +321,58 @@ class _MySQLProtocol(asyncio.Protocol):
         transport.write(_build_handshake_packet(salt_1, salt_2))
         self._sent_handshake = True
 
-        asyncio.create_task(self._record("mysql_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("mysql_connection", AlertSeverity.LOW, {}), name="mysql-event")
+
+    def _close(self) -> None:
+        self._buf.clear()
+        if self._transport is not None and not self._transport.is_closing():
+            self._transport.close()
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
         self._buf += data
-        # Drain all complete packets: 3-byte LE length + 1-byte seq + payload.
-        while len(self._buf) >= 4:
-            payload_len = int.from_bytes(self._buf[0:3], "little")
-            seq = self._buf[3]
-            if len(self._buf) < 4 + payload_len:
-                return
-            payload = self._buf[4 : 4 + payload_len]
-            self._buf = self._buf[4 + payload_len :]
-            if not self._authed:
-                self._handle_login(seq, payload)
-            else:
-                self._handle_command(seq, payload)
+        buf = self._buf
+        pos = 0
+        try:
+            # Drain all complete packets: 3-byte LE length + 1-byte seq + payload.
+            while len(buf) - pos >= 4 and not t.is_closing():
+                if write_backlogged(t, _MAX_WRITE_BUFFER):
+                    self._close()  # peer is not reading its replies
+                    return
+                payload_len = int.from_bytes(buf[pos : pos + 3], "little")
+                if payload_len > _MAX_PACKET_BYTES:
+                    self._close()
+                    return
+                seq = buf[pos + 3]
+                if len(buf) - pos < 4 + payload_len:
+                    break
+                self._packets += 1
+                if self._packets > _MAX_PACKETS_PER_CONN:
+                    self._close()
+                    return
+                payload = bytes(buf[pos + 4 : pos + 4 + payload_len])
+                pos += 4 + payload_len
+                if not self._authed:
+                    self._handle_login(seq, payload)
+                else:
+                    self._handle_command(seq, payload)
+        except Exception:
+            log.exception("mysql protocol error")
+            self._close()
+            return
+        del buf[:pos]
 
     def _handle_login(self, seq: int, payload: bytes) -> None:
         parsed = _parse_handshake_response(payload)
-        asyncio.create_task(
+        spawn(
             self._record(
                 "mysql_login_attempt",
                 AlertSeverity.HIGH,
                 {**parsed, "service": "mysql", "salt_hex": self._salt.hex()},
-            )
+            ),
+            name="mysql-event",
         )
         # Accept the login and enter the command phase. This is a fake datastore
         # with no real data, so granting "access" is safe — and it's what lets
@@ -357,8 +395,9 @@ class _MySQLProtocol(asyncio.Protocol):
         if command == 0x03:  # COM_QUERY
             sql = payload[1:].decode("utf-8", errors="replace")
             event_type, severity = _classify_query(sql)
-            asyncio.create_task(
-                self._record(event_type, severity, {"query": sql[:4096], "service": "mysql"})
+            spawn(
+                self._record(event_type, severity, {"query": sql[:4096], "service": "mysql"}),
+                name="mysql-event",
             )
             self._respond_to_query(sql)
             return
@@ -400,7 +439,7 @@ class _MySQLProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        self._buf.clear()
 
 
 class MySQLEngine(HoneypotEngine):

@@ -12,6 +12,11 @@
 # reason this script exists instead of a one-line cp in the docs.
 set -euo pipefail
 
+# The backup holds the database, honeytoken values, TLS keys and .env. Set the
+# umask before the first file or directory is created so nothing is ever, even
+# briefly, readable by other local users (a later chmod leaves that window open).
+umask 077
+
 DEST="${1:-./backups}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$DEST/honeypot-$STAMP"
@@ -22,8 +27,14 @@ if [ -f "$DB_PATH" ]; then
   sqlite3 "$DB_PATH" ".backup '$OUT/honeypot_mcp.db'"
   echo "  database  -> $OUT/honeypot_mcp.db ($(du -h "$OUT/honeypot_mcp.db" | cut -f1))"
 elif [ -n "${DATABASE_URL:-}" ] && [[ "$DATABASE_URL" == postgresql* ]]; then
-  # Strip the async driver suffix; pg_dump speaks libpq URLs.
-  pg_dump "$(echo "$DATABASE_URL" | sed 's|+asyncpg||')" > "$OUT/honeypot_mcp.sql"
+  # Strip the async driver suffix; pg_dump speaks libpq URLs. The password is
+  # moved out of the URL (and so out of argv, where `ps` shows it to every local
+  # user) into a mode-0600 PGPASSFILE that is removed on exit.
+  PGPASSFILE="$(mktemp)"
+  export PGPASSFILE
+  trap 'rm -f "$PGPASSFILE"' EXIT
+  PG_CLEAN_URL="$(python3 "$(dirname "${BASH_SOURCE[0]}")/_pgurl.py" "$DATABASE_URL" "$PGPASSFILE")"
+  pg_dump "$PG_CLEAN_URL" > "$OUT/honeypot_mcp.sql"
   echo "  database  -> $OUT/honeypot_mcp.sql ($(du -h "$OUT/honeypot_mcp.sql" | cut -f1))"
 else
   echo "  !! no database found at $DB_PATH and DATABASE_URL is not PostgreSQL" >&2

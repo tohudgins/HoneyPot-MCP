@@ -13,6 +13,9 @@ The persona module owns headers and 404s; this module owns body content.
 
 from __future__ import annotations
 
+import secrets
+import string
+
 _TEMPLATES: dict[str, str] = {
     # ── Admin panel variants ──────────────────────────────────────────────────
     "admin_panel": """<!DOCTYPE html><html><head><title>Admin Login</title>
@@ -116,8 +119,8 @@ DATABASE_URL=postgres://railsapp:HunteRailsPwd_99@db.internal:5432/rails_prod
 REDIS_URL=redis://:redispass2024@redis.internal:6379/0
 SIDEKIQ_REDIS_URL=redis://:redispass2024@redis.internal:6379/1
 
-AWS_ACCESS_KEY_ID=AKIA4NJ7IM3CYRX3XGZP
-AWS_SECRET_ACCESS_KEY=fakeSecretKeyHere1234567890qwertyuiopasdf
+AWS_ACCESS_KEY_ID=@@AWS_KEY_ID@@
+AWS_SECRET_ACCESS_KEY=@@AWS_SECRET@@
 AWS_REGION=us-west-2
 AWS_S3_BUCKET=rails-prod-assets
 
@@ -152,10 +155,25 @@ Password: <input type="password" name="password"><br>
 }
 
 
+_AWS_KEY_ALPHABET = string.ascii_uppercase + string.digits
+_AWS_SECRET_ALPHABET = string.ascii_letters + string.digits + "+/"
+
+
+def _render(body: str) -> str:
+    """Fill per-response placeholders. A bait credential that is byte-identical
+    on every deployment is a fingerprint — and, once leaked, an indicator that
+    cannot be attributed to the sensor it came from."""
+    if "@@" not in body:
+        return body
+    key_id = "AKIA" + "".join(secrets.choice(_AWS_KEY_ALPHABET) for _ in range(16))
+    secret = "".join(secrets.choice(_AWS_SECRET_ALPHABET) for _ in range(40))
+    return body.replace("@@AWS_KEY_ID@@", key_id).replace("@@AWS_SECRET@@", secret)
+
+
 def get_template(name: str) -> str:
     """Look up a template by name. Falls back to generic_login if missing —
     a misconfigured endpoint shouldn't 500 the honeypot."""
-    return _TEMPLATES.get(name, _TEMPLATES["generic_login"])
+    return _render(_TEMPLATES.get(name, _TEMPLATES["generic_login"]))
 
 
 def all_template_names() -> list[str]:

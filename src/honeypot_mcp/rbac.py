@@ -18,17 +18,21 @@ Three roles, each a strict superset of the one before it:
   - viewer:   read-only — list/get/search/analyse/report. No state changes.
   - operator: viewer + manage this system's own resources: deploy/stop
               honeypots, create/rotate/revoke honeytokens, acknowledge
-              alerts, suppression rules, webhook subscriptions, pcap,
-              deception plan deployment. Every effect is contained to, and
-              reversible within, this system's own data.
+              alerts, suppression rules, pcap, deception plan deployment.
+              Every effect is contained to, and reversible within, this
+              system's own data.
   - admin:    operator + the handful of tools whose blast radius reaches
               outside this system's own database: `alerts_prune` (permanent
               evidence deletion), the `blocklist_push_*` tools (write to a
               real external firewall/WAF — production infrastructure this
-              codebase doesn't own), `audit_log_search` (oversight of what
-              every other role did), and `api_key_create`/`api_key_revoke`/
-              `api_key_list` (granting or revoking someone else's access is
-              itself an admin-tier action).
+              codebase doesn't own), `alert_subscribe`/`alert_unsubscribe`
+              (point a stream of captured attack data — and, via SMTP/HTTP
+              destinations, outbound requests from this host — at an
+              address of the caller's choosing), `audit_log_search`
+              (oversight of what every other role did), and
+              `api_key_create`/`api_key_revoke`/`api_key_list` (granting or
+              revoking someone else's access is itself an admin-tier
+              action).
 
 New tools MUST be added to exactly one of the three sets below AND decorated
 with the matching `@mcp.tool(auth=require_role(...))` — viewer tools need no
@@ -42,6 +46,7 @@ decided was safe to leave open — treat that as a bug, not a default.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -82,6 +87,29 @@ def current_actor() -> str:
     return f"{label} ({role})" if label else role
 
 
+def current_role() -> Role:
+    """The calling role, for tools whose *output* (not access) depends on it.
+
+    stdio has no token and is trusted by design, so it counts as `admin` —
+    the same reading `require_role` gives a token-less call. A networked
+    caller gets the `role` claim of its token; a missing/unrecognised claim
+    is `viewer`, the least-privileged reading, so an odd token can only ever
+    see less.
+    """
+    from fastmcp.server.dependencies import get_access_token
+
+    token = get_access_token()
+    if token is None:
+        return "admin"
+    role = (token.claims or {}).get("role")
+    return role if role in _ROLE_RANK else "viewer"  # type: ignore[return-value]
+
+
+def role_at_least(role: Role) -> bool:
+    """True when the calling role is `role` or higher (see `current_role`)."""
+    return _ROLE_RANK[current_role()] >= _ROLE_RANK[role]
+
+
 def require_role(role: Role) -> AuthCheck:
     """Build an `auth=` check for `@mcp.tool` requiring `role` or higher.
 
@@ -116,28 +144,42 @@ def parse_auth_tokens(single_token: str, multi_tokens: str) -> dict[str, Role]:
     keep exactly the full access they already have; this is additive, not a
     breaking change.
 
-    Raises `ValueError` on a malformed `MCP_AUTH_TOKENS` entry — deliberately
-    fails startup loudly (this runs at `server.py` import time, building the
-    auth provider) rather than silently dropping a misconfigured token, which
-    would otherwise look like a working deployment with one fewer operator
-    able to log in.
+    Raises `ValueError` on a malformed `MCP_AUTH_TOKENS` entry or on the same
+    token listed with two different roles — deliberately fails startup loudly
+    (this runs at `server.py` import time, building the auth provider) rather
+    than silently dropping a misconfigured token, which would otherwise look
+    like a working deployment with one fewer operator able to log in, or let
+    a later entry quietly demote/promote an earlier one.
+
+    A value that parses to *no* tokens (`","`, whitespace) returns `{}`; the
+    startup gate (`server._networked_auth_error`) treats that as "no
+    authentication configured" rather than as authentication.
     """
-    if multi_tokens:
+    if multi_tokens.strip():
         tokens: dict[str, Role] = {}
         for entry in multi_tokens.split(","):
             entry = entry.strip()
             if not entry:
                 continue
             token, sep, role = entry.rpartition(":")
+            token = token.strip()
+            role = role.strip()
             if not sep or not token or role not in _ROLE_RANK:
+                detail = (
+                    f"; role {role!r} is not one of viewer/operator/admin" if sep and token else ""
+                )
                 raise ValueError(
-                    f"Invalid MCP_AUTH_TOKENS entry {entry!r}; expected "
-                    f"'<token>:<viewer|operator|admin>'"
+                    "Invalid MCP_AUTH_TOKENS entry (token redacted); expected "
+                    f"'<token>:<viewer|operator|admin>'{detail}"
+                )
+            if token in tokens and tokens[token] != role:
+                raise ValueError(
+                    "Invalid MCP_AUTH_TOKENS: the same token is listed with two different roles"
                 )
             tokens[token] = role  # type: ignore[assignment]
         return tokens
-    if single_token:
-        return {single_token: "admin"}
+    if single_token.strip():
+        return {single_token.strip(): "admin"}
     return {}
 
 
@@ -168,18 +210,41 @@ API_KEY_REFRESH_SECONDS = 30
 
 _api_keys: dict[str, dict[str, Any]] = {}  # token_hash -> {id, role, label, expires_at}
 _api_keys_loaded_at: float = 0.0
+# Bumped by `invalidate_api_key_cache()`. A load snapshots it before it queries
+# and refuses to publish if it moved: without that, a load that began before a
+# revoke could finish after it and re-publish the pre-revoke key set, leaving a
+# revoked key valid for another full refresh window.
+_api_keys_generation: int = 0
+_api_keys_lock: asyncio.Lock | None = None
+_api_keys_lock_loop: asyncio.AbstractEventLoop | None = None
 
 
 def invalidate_api_key_cache() -> None:
     """Force the next verification to reload keys from the DB."""
-    global _api_keys_loaded_at
+    global _api_keys, _api_keys_loaded_at, _api_keys_generation
+    _api_keys_generation += 1
     _api_keys_loaded_at = 0.0
+    # Fail closed: until the reload publishes, no cached key is honoured, so a
+    # revoked key cannot be answered from the pre-revoke snapshot by a request
+    # that raced the invalidation.
+    _api_keys = {}
+
+
+def _get_api_keys_lock() -> asyncio.Lock:
+    """One lock per running loop. pytest-asyncio gives every test its own
+    loop and an `asyncio.Lock` created in an earlier one misbehaves in the
+    next, so the lock is rebuilt when the loop changes."""
+    global _api_keys_lock, _api_keys_lock_loop
+    loop = asyncio.get_running_loop()
+    if _api_keys_lock is None or _api_keys_lock_loop is not loop:
+        _api_keys_lock = asyncio.Lock()
+        _api_keys_lock_loop = loop
+    return _api_keys_lock
 
 
 async def _load_api_keys() -> None:
     global _api_keys, _api_keys_loaded_at
-    now = time.monotonic()
-    if now - _api_keys_loaded_at < API_KEY_REFRESH_SECONDS:
+    if time.monotonic() - _api_keys_loaded_at < API_KEY_REFRESH_SECONDS:
         return
 
     from sqlalchemy import select
@@ -187,20 +252,31 @@ async def _load_api_keys() -> None:
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import ApiKey
 
-    async with get_session() as session:
-        result = await session.execute(select(ApiKey).where(ApiKey.revoked_at.is_(None)))
-        rows = result.scalars().all()
-
-    _api_keys = {
-        row.token_hash: {
-            "id": row.id,
-            "role": row.role,
-            "label": row.label,
-            "expires_at": row.expires_at,
-        }
-        for row in rows
-    }
-    _api_keys_loaded_at = now
+    async with _get_api_keys_lock():
+        # Re-check under the lock: a concurrent caller may have just loaded.
+        if time.monotonic() - _api_keys_loaded_at < API_KEY_REFRESH_SECONDS:
+            return
+        generation = _api_keys_generation
+        started = time.monotonic()
+        async with get_session() as session:
+            result = await session.execute(select(ApiKey).where(ApiKey.revoked_at.is_(None)))
+            rows = result.scalars().all()
+            snapshot = {
+                row.token_hash: {
+                    "id": row.id,
+                    "role": row.role,
+                    "label": row.label,
+                    "expires_at": row.expires_at,
+                }
+                for row in rows
+            }
+        if generation != _api_keys_generation:
+            # A revoke/create landed while we were reading. The snapshot may
+            # predate it, so it must not be published (and must not count as
+            # fresh — the next verification reloads).
+            return
+        _api_keys = snapshot
+        _api_keys_loaded_at = started
 
 
 async def verify_db_token(token: str) -> AccessToken | None:
@@ -210,7 +286,12 @@ async def verify_db_token(token: str) -> AccessToken | None:
     itself), or past its `expires_at` — indistinguishable from an unknown
     token to the caller, same as `StaticTokenVerifier`'s own behaviour.
     """
-    await _load_api_keys()
+    for _ in range(3):
+        await _load_api_keys()
+        if _api_keys_loaded_at != 0.0:
+            break
+        # The load was superseded by an invalidation mid-flight; read again so
+        # this verification never answers from a pre-invalidation snapshot.
     data = _api_keys.get(hash_token(token))
     if data is None:
         return None
@@ -320,8 +401,6 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
         "honeytoken_export",
         "alerts_acknowledge",
         "alerts_export",
-        "alert_subscribe",
-        "alert_unsubscribe",
         "suppression_add",
         "suppression_remove",
         "suppression_load_preset",
@@ -337,6 +416,8 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
 ADMIN_TOOLS: frozenset[str] = frozenset(
     {
         "alerts_prune",
+        "alert_subscribe",
+        "alert_unsubscribe",
         "blocklist_push_cloudflare",
         "blocklist_push_pfsense",
         "blocklist_push_aws_waf",

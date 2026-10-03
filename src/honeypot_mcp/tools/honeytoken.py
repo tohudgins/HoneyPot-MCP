@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from honeypot_mcp.rbac import require_role
+from honeypot_mcp.rbac import require_role, role_at_least
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -71,6 +71,40 @@ async def honeytoken_create(
                     the attacker actually reached; without it a CRITICAL arrives
                     with no location and triage starts from nothing.
     """
+    created = await _create_token(type, label, metadata, planted_at)
+    await _audit_creation("honeytoken_create", created, metadata, planted_at)
+    return created
+
+
+async def _audit_creation(
+    tool: str,
+    created: dict[str, Any],
+    metadata: dict[str, Any] | None,
+    planted_at: str | None,
+) -> None:
+    """Record a token creation. The secret itself never reaches the log; the
+    metadata is recorded by key only, since provider settings can carry
+    planted passwords under names the redactor would not recognise."""
+    await record_action(
+        tool,
+        summary=f"created {created['type']} honeytoken {created['id']} ('{created['label']}')",
+        arguments={
+            "type": created["type"],
+            "label": created["label"],
+            "planted_at": planted_at,
+            "metadata_keys": sorted((metadata or {}).keys()),
+        },
+        target=str(created["id"]),
+    )
+
+
+async def _create_token(
+    type: str,
+    label: str,
+    metadata: dict[str, Any] | None,
+    planted_at: str | None,
+) -> dict[str, Any]:
+    """Create and persist a token. Unaudited — every caller records its own action."""
     provider = get_provider(HoneytokenType(type))
     token_value, extra_meta = await provider.create(metadata or {})
 
@@ -162,13 +196,22 @@ async def honeytoken_status(token_id: int) -> dict[str, Any]:
         )
         token_events = list(ev_result.scalars().all())
 
+    token_value = token.token_value
+    metadata: dict[str, Any] | None = token.token_meta
+    if not role_at_least("operator"):
+        # A viewer can see that a token exists and whether it fired, but not
+        # the planted secret: the viewer tier is read-only and a full value
+        # here would let it plant (or burn) the credential itself.
+        token_value = f"{token_value[:4]}…" if token_value else token_value
+        metadata = {"redacted": True}
+
     return {
         "id": token.id,
         "type": token.type.value,
         "label": token.label,
-        "token_value": token.token_value,
+        "token_value": token_value,
         "status": token.status.value,
-        "metadata": token.token_meta,
+        "metadata": metadata,
         "created_at": token.created_at.isoformat() if token.created_at else None,
         "triggered_at": token.triggered_at.isoformat() if token.triggered_at else None,
         "trigger_metadata": token.trigger_metadata,
@@ -248,8 +291,8 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
     }
     carried = {k: v for k, v in old_meta.items() if k not in _GENERATED}
 
-    created = await honeytoken_create(
-        type=old_type.value,  # type: ignore[arg-type]
+    created = await _create_token(
+        type=old_type.value,
         label=old_label,
         metadata=carried,
         planted_at=planted_at or old_meta.get("planted_at"),
@@ -332,11 +375,10 @@ async def honeytoken_generate_aws(
         region: Fake AWS region to embed in the credentials file.
         service_prefix: AWS key prefix — AKIA (long-term) or ASIA (temporary).
     """
-    return await honeytoken_create(
-        type="api_key",
-        label=label,
-        metadata={"service": "aws", "region": region, "prefix": service_prefix},
-    )
+    metadata: dict[str, Any] = {"service": "aws", "region": region, "prefix": service_prefix}
+    created = await _create_token("api_key", label, metadata, None)
+    await _audit_creation("honeytoken_generate_aws", created, metadata, None)
+    return created
 
 
 @mcp.tool(auth=require_role("operator"))
@@ -352,11 +394,10 @@ async def honeytoken_generate_credentials(
         count: Number of credential pairs to generate (default 5).
         service: Target service context (ssh, mysql, ftp, admin).
     """
-    return await honeytoken_create(
-        type="credential",
-        label=label,
-        metadata={"service": service, "count": count},
-    )
+    metadata: dict[str, Any] = {"service": service, "count": count}
+    created = await _create_token("credential", label, metadata, None)
+    await _audit_creation("honeytoken_generate_credentials", created, metadata, None)
+    return created
 
 
 @mcp.tool(auth=require_role("operator"))
@@ -373,11 +414,10 @@ async def honeytoken_embed_file(
         file_type: Document format — pdf or docx.
         document_title: Title shown in the document.
     """
-    return await honeytoken_create(
-        type="file",
-        label=label,
-        metadata={"file_type": file_type, "document_title": document_title},
-    )
+    metadata: dict[str, Any] = {"file_type": file_type, "document_title": document_title}
+    created = await _create_token("file", label, metadata, None)
+    await _audit_creation("honeytoken_embed_file", created, metadata, None)
+    return created
 
 
 @mcp.tool(auth=require_role("operator"))

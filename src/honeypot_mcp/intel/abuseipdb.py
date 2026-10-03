@@ -7,12 +7,16 @@ from typing import Any
 
 import httpx
 
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.intel import _cache
 
 log = logging.getLogger(__name__)
 
 _BASE = "https://api.abuseipdb.com/api/v2"
 _CACHE_TTL = 900  # 15 min — abuse data updates faster than VT
+
+# One connection pool per event loop rather than a fresh client per lookup.
+_client: LoopBound[httpx.AsyncClient] = LoopBound(lambda: httpx.AsyncClient(timeout=15.0))
 
 
 async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
@@ -38,6 +42,10 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
             "note": "ABUSEIPDB_API_KEY not set. Add it to .env — free at abuseipdb.com.",
         }
 
+    failed = _cache.get_negative(cache_key)
+    if failed is not None:
+        return failed
+
     headers = {"Key": api_key, "Accept": "application/json"}
     params: dict[str, str | int] = {
         "ipAddress": ip,
@@ -45,11 +53,11 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
         "verbose": "true",
     }
 
+    failure: dict[str, Any]
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(f"{_BASE}/check", headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
+        resp = await _client.get().get(f"{_BASE}/check", headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
 
         # Summarise the category codes from recent reports
         report_categories: dict[str, int] = {}
@@ -81,17 +89,20 @@ async def lookup_abuseipdb(ip: str, max_age_days: int = 90) -> dict[str, Any]:
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
-            return {
+            failure = {
                 "available": False,
                 "error": "AbuseIPDB rate limit hit — 1,000/day on free tier.",
             }
-        if e.response.status_code == 422:
-            return {"available": False, "error": f"Invalid IP address: {ip}"}
-        log.warning("AbuseIPDB error for %s: %s", ip, e)
-        return {"available": False, "error": str(e)}
+        elif e.response.status_code == 422:
+            failure = {"available": False, "error": f"Invalid IP address: {ip}"}
+        else:
+            log.warning("AbuseIPDB error for %s: %s", ip, e)
+            failure = {"available": False, "error": str(e)}
     except Exception as e:
         log.warning("AbuseIPDB lookup failed for %s: %s", ip, e)
-        return {"available": False, "error": str(e)}
+        failure = {"available": False, "error": str(e)}
+    _cache.set_negative(cache_key, failure)
+    return failure
 
 
 async def report_ip(ip: str, categories: list[int], comment: str = "") -> dict[str, Any]:
@@ -120,10 +131,9 @@ async def report_ip(ip: str, categories: list[int], comment: str = "") -> dict[s
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{_BASE}/report", headers=headers, data=payload)
-            resp.raise_for_status()
-            return {"reported": True, "data": resp.json().get("data", {})}
+        resp = await _client.get().post(f"{_BASE}/report", headers=headers, data=payload)
+        resp.raise_for_status()
+        return {"reported": True, "data": resp.json().get("data", {})}
     except Exception as e:
         log.warning("AbuseIPDB report failed for %s: %s", ip, e)
         return {"reported": False, "error": str(e)}

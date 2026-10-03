@@ -7,6 +7,7 @@ Markdown rendering escapes pipe and backslash characters in cell values.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
@@ -204,11 +205,33 @@ def _render_html(ctx: dict) -> str:
     return _html_template.render(**ctx)
 
 
+# Markdown metacharacters that can start a link, image, emphasis, code span or
+# table cell. `_` is handled separately: CommonMark never treats an intraword
+# underscore as emphasis, so `ssh_login_failed` stays readable.
+_MD_ESCAPE = re.compile(r"([`\[\]!*|])")
+_MD_EDGE_UNDERSCORE = re.compile(r"(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])")
+
+
 def _md_cell(value: Any) -> str:
-    """Escape pipe / backslash / newline so attacker-controlled values can't
-    break the surrounding Markdown table."""
-    s = str(value)
-    return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+    """Neutralise attacker-controlled values for a Markdown table cell.
+
+    Backslash, pipe and newline would break the table; `<`/`>`/`&` would pass
+    raw HTML through to any renderer that allows it; links, images, emphasis
+    and code spans would let a captured string restyle or relink the report.
+    """
+    s = str(value).replace("\\", "\\\\")
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = _MD_ESCAPE.sub(r"\\\1", s)
+    s = _MD_EDGE_UNDERSCORE.sub(r"\\_", s)
+    return s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _md_code(value: Any) -> str:
+    """A value for inside a `code span`, where backslash escapes and entities
+    render literally: the only ways out are a backtick (closes the span), a
+    pipe (ends the table cell) and a newline."""
+    s = str(value).replace("`", "'").replace("|", "\\|")
+    return s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
 
 
 def _render_intel_md(intel: dict[str, Any] | None) -> str:
@@ -224,7 +247,7 @@ def _render_intel_md(intel: dict[str, Any] | None) -> str:
     if intel.get("asn"):
         rows.append(f"| Network (ASN) | {_md_cell(intel['asn'])} |")
     if intel.get("reverse_dns"):
-        rows.append(f"| Reverse DNS | `{_md_cell(intel['reverse_dns'])}` |")
+        rows.append(f"| Reverse DNS | `{_md_code(intel['reverse_dns'])}` |")
     if intel.get("isp"):
         usage = f" ({_md_cell(intel['usage_type'])})" if intel.get("usage_type") else ""
         rows.append(f"| ISP / Org | {_md_cell(intel['isp'])}{usage} |")
@@ -259,7 +282,7 @@ def _render_markdown(ctx: dict) -> str:
         for e in reversed(ctx["timeline"])
     )
 
-    target_line = f"**Target IP:** `{_md_cell(ctx['target_ip'])}`" if ctx["target_ip"] else ""
+    target_line = f"**Target IP:** `{_md_code(ctx['target_ip'])}`" if ctx["target_ip"] else ""
 
     return f"""# {_md_cell(ctx["title"])}
 

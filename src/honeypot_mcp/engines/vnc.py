@@ -33,6 +33,7 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -53,6 +54,7 @@ _SECURITY_TYPE_VNC_AUTH = 2
 _STATE_AWAIT_VERSION = 0
 _STATE_AWAIT_SECURITY_SELECTION = 1
 _STATE_AWAIT_AUTH_RESPONSE = 2
+_STATE_DONE = 3
 
 
 class _VNCProtocol(asyncio.Protocol):
@@ -75,15 +77,23 @@ class _VNCProtocol(asyncio.Protocol):
         # Send the server's protocol-version greeting immediately. Most
         # clients respond within one RTT.
         transport.write(_RFB_VERSION)
-        asyncio.create_task(self._record("vnc_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("vnc_connection", AlertSeverity.LOW, {}), name="vnc-event")
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing() or self._state == _STATE_DONE:
+            return
         self._buf += data
         # Each state consumes a fixed number of bytes — drain greedily so
         # we don't deadlock on a client that pipelines its writes.
-        progressed = True
-        while progressed:
-            progressed = self._advance()
+        try:
+            progressed = True
+            while progressed and not t.is_closing():
+                progressed = self._advance()
+        except Exception:
+            log.exception("vnc protocol error")
+            self._buf = b""
+            t.close()
 
     def _advance(self) -> bool:
         """Try to consume one state's worth of bytes. Return True if we
@@ -102,12 +112,13 @@ class _VNCProtocol(asyncio.Protocol):
             # Send security types list: 1 byte (count) + 1 byte per type.
             t.write(bytes([1, _SECURITY_TYPE_VNC_AUTH]))
             self._state = _STATE_AWAIT_SECURITY_SELECTION
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "vnc_handshake",
                     AlertSeverity.LOW,
                     {"client_version": self._client_version},
-                )
+                ),
+                name="vnc-event",
             )
             return True
 
@@ -122,12 +133,13 @@ class _VNCProtocol(asyncio.Protocol):
             # data without changing the failure outcome.
             t.write(self._challenge)
             self._state = _STATE_AWAIT_AUTH_RESPONSE
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "vnc_security_selected",
                     AlertSeverity.LOW,
                     {"selected_type": selected},
-                )
+                ),
+                name="vnc-event",
             )
             return True
 
@@ -142,7 +154,11 @@ class _VNCProtocol(asyncio.Protocol):
             reason = b"Authentication failure"
             packet = (1).to_bytes(4, "big") + len(reason).to_bytes(4, "big") + reason
             t.write(packet)
-            asyncio.create_task(
+            # The handshake is over: stop parsing so pipelined bytes behind the
+            # response cannot produce further auth events or grow the buffer.
+            self._state = _STATE_DONE
+            self._buf = b""
+            spawn(
                 self._record(
                     "vnc_auth_attempt",
                     AlertSeverity.MEDIUM,
@@ -151,7 +167,8 @@ class _VNCProtocol(asyncio.Protocol):
                         "challenge_hex": self._challenge.hex(),
                         "response_hex": response.hex(),
                     },
-                )
+                ),
+                name="vnc-event",
             )
             t.close()
             return False

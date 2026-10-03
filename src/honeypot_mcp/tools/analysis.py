@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -9,7 +10,11 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
+from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_ip, write_artifact
+
+_MAX_ABUSE_COMMENT_CHARS = 500
+_MAX_REPORT_ALERTS = 1000
 
 
 @mcp.tool
@@ -64,8 +69,41 @@ async def report_ip_abuse(
     """
     from honeypot_mcp.intel.abuseipdb import report_ip
 
+    if err := validate_ip(ip):
+        return {"error": err}
+    ip = ip.strip()
+    addr = ipaddress.ip_address(ip)
+    if not addr.is_global:
+        # Reporting a private/loopback/link-local address publishes nothing
+        # useful and, worse, lets an injected instruction use this tool to
+        # fingerprint the operator's own network in a public database.
+        return {"error": f"{ip} is not a globally routable address; refusing to report it."}
+    if len(comment) > _MAX_ABUSE_COMMENT_CHARS:
+        return {"error": f"comment is too long (max {_MAX_ABUSE_COMMENT_CHARS} characters)."}
     resolved_cats = categories or [14, 18]
-    return await report_ip(ip, resolved_cats, comment)
+    if not all(
+        isinstance(c, int) and not isinstance(c, bool) and 1 <= c <= 23 for c in resolved_cats
+    ):
+        return {"error": "categories must be AbuseIPDB category codes (integers 1-23)."}
+
+    # Only addresses this system has actually observed attacking it: the tool
+    # files a report under the operator's API key, and an IP that was merely
+    # typed (or injected via captured data) is not ours to accuse.
+    async with get_session() as session:
+        seen = await queries.get_recent_alerts(session, limit=1, source_ip=ip)
+    if not seen:
+        return {"error": f"No captured alerts from {ip}; refusing to report an unobserved IP."}
+
+    result = await report_ip(ip, resolved_cats, comment)
+    await record_action(
+        "report_ip_abuse",
+        summary=f"submitted AbuseIPDB report for {addr}",
+        arguments={"ip": str(addr), "categories": resolved_cats, "comment_chars": len(comment)},
+        target=str(addr),
+        outcome="ok" if result.get("reported") else "error",
+        error=None if result.get("reported") else str(result.get("note") or result.get("error")),
+    )
+    return result
 
 
 @mcp.tool
@@ -190,13 +228,25 @@ async def generate_report(
         format: Output format — html or markdown.
         since_hours: Only include activity from the last N hours (e.g. 168 for a
               weekly write-up). Omit for all available history.
-        limit: Maximum alerts to analyse (default 500).
-        output_path: Where to write. Defaults to `reports/report-<timestamp>.<ext>`.
+        limit: Maximum alerts to analyse (default 500, max 1000).
+        output_path: Where to write — a name inside the reports directory ending in
+              `.html` / `.md` to match the format. An existing file is never overwritten.
+              Defaults to `reports/report-<timestamp>.<ext>`.
     """
     from datetime import timedelta
 
     from honeypot_mcp.analysis.reporter import generate
 
+    limit = max(1, min(limit, _MAX_REPORT_ALERTS))
+    extension = "html" if format == "html" else "md"
+    if output_path and not output_path.lower().endswith(f".{extension}"):
+        return {
+            "error": (
+                f"output_path must end in .{extension} for format={format!r} "
+                f"(got {output_path!r}) — reports are written exactly as named, "
+                "so the extension has to match the content."
+            )
+        }
     if ip and (err := validate_ip(ip)):
         return {"error": err}
     since = None
@@ -244,11 +294,24 @@ async def generate_report(
     written = write_artifact(
         content,
         prefix="report",
-        extension="html" if format == "html" else "md",
+        extension=extension,
         output_path=output_path,
     )
     if "error" in written:
         return written
+    await record_action(
+        "generate_report",
+        summary=f"wrote {format} report ({len(alerts)} alert(s))"
+        + (f" scoped to {ip}" if ip else ""),
+        arguments={
+            "format": format,
+            "ip": ip,
+            "since_hours": since_hours,
+            "limit": limit,
+            "output_path": output_path,
+        },
+        target=ip or written["path"],
+    )
     return {
         **written,
         "title": title,
@@ -570,6 +633,37 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
     }
 
 
+def _usable_offenders(
+    offenders: list[tuple[str, int]],
+) -> list[tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
+    """Parse offender strings with `ipaddress`; drop anything that is not an IP.
+
+    The source is a captured string column, so a malformed value must not reach
+    a firewall rule or a STIX pattern. Global-only filtering is done by the
+    query (and re-asserted here, so the artifact stays safe even if a caller
+    hands in an unfiltered list).
+    """
+    usable: list[tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]] = []
+    for raw, count in offenders:
+        try:
+            addr = ipaddress.ip_address(str(raw).strip())
+        except ValueError:
+            continue
+        if not addr.is_global:
+            continue
+        usable.append((addr, count))
+    return usable
+
+
+def _stix_object_type(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    return "ipv6-addr" if addr.version == 6 else "ipv4-addr"
+
+
+def _stix_escape(value: str) -> str:
+    """Escape a string for a STIX pattern literal (backslash and single quote)."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 @mcp.tool(auth=require_role("operator"))
 async def export_blocklist(
     format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
@@ -592,7 +686,10 @@ async def export_blocklist(
         output_path: Where to write. Defaults to `reports/blocklist-<timestamp>.txt`.
     """
     async with get_session() as session:
-        offenders = await queries.get_top_offenders(session, hours, min_hits)
+        raw_offenders = await queries.get_top_offenders(
+            session, hours, min_hits, global_only=True, exclude_udp_only=True
+        )
+    offenders = _usable_offenders(raw_offenders)
 
     if not offenders:
         return {
@@ -605,13 +702,17 @@ async def export_blocklist(
         f"# {len(offenders)} IPs with >= {min_hits} alerts in the last {hours}h.\n"
     )
     if format == "iptables":
-        lines = [f"iptables -A INPUT -s {ip} -j DROP  # {cnt} hits" for ip, cnt in offenders]
+        lines = [
+            f"{'ip6tables' if addr.version == 6 else 'iptables'} -A INPUT -s {addr} -j DROP"
+            f"  # {cnt} hits"
+            for addr, cnt in offenders
+        ]
     elif format == "fail2ban":
-        lines = [f"{ip}  # {cnt} hits" for ip, cnt in offenders]
+        lines = [f"{addr}  # {cnt} hits" for addr, cnt in offenders]
     elif format == "cidr":
-        lines = [f"{ip}/32" for ip, _ in offenders]
+        lines = [f"{addr}/{addr.max_prefixlen}" for addr, _ in offenders]
     else:
-        lines = [ip for ip, _ in offenders]
+        lines = [str(addr) for addr, _ in offenders]
     content = header + "\n".join(lines) + "\n"
 
     written = write_artifact(content, prefix="blocklist", extension="txt", output_path=output_path)
@@ -623,7 +724,7 @@ async def export_blocklist(
         "ip_count": len(offenders),
         "window_hours": hours,
         "min_hits": min_hits,
-        "top_offenders": [{"ip": ip, "hits": cnt} for ip, cnt in offenders[:10]],
+        "top_offenders": [{"ip": str(addr), "hits": cnt} for addr, cnt in offenders[:10]],
     }
 
 
@@ -652,7 +753,10 @@ async def export_stix(
     from datetime import datetime
 
     async with get_session() as session:
-        offenders = await queries.get_top_offenders(session, hours, min_hits)
+        raw_offenders = await queries.get_top_offenders(
+            session, hours, min_hits, global_only=True, exclude_udp_only=True
+        )
+    offenders = _usable_offenders(raw_offenders)
 
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     objects = [
@@ -662,14 +766,14 @@ async def export_stix(
             "id": f"indicator--{uuid.uuid4()}",
             "created": now,
             "modified": now,
-            "name": f"Honeypot-detected attacker {ip}",
+            "name": f"Honeypot-detected attacker {addr}",
             "description": f"Source IP observed in {cnt} honeypot alerts within the last {hours}h.",
-            "pattern": f"[ipv4-addr:value = '{ip}']",
+            "pattern": f"[{_stix_object_type(addr)}:value = '{_stix_escape(str(addr))}']",
             "pattern_type": "stix",
             "valid_from": now,
             "labels": ["malicious-activity"],
         }
-        for ip, cnt in offenders
+        for addr, cnt in offenders
     ]
     bundle = {
         "type": "bundle",

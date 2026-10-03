@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.intel import _cache
 
 log = logging.getLogger(__name__)
@@ -14,13 +15,18 @@ log = logging.getLogger(__name__)
 _VT_BASE = "https://www.virustotal.com/api/v3"
 _CACHE_TTL = 1800  # 30 min — VT data drifts slowly
 
+# One connection pool for every lookup (per event loop), instead of a new
+# client — and a new TLS handshake — per CRITICAL alert.
+_client: LoopBound[httpx.AsyncClient] = LoopBound(lambda: httpx.AsyncClient(timeout=15.0))
+
 
 async def lookup_virustotal(ip: str) -> dict[str, Any]:
     """Query VirusTotal v3 for IP reputation data.
 
     Returns detection counts, reputation score, country, AS owner, and tags.
     Respects the free-tier 4 req/min rate limit via caller-side throttling.
-    Successful responses are cached for 30 minutes per IP.
+    Successful responses are cached for 30 minutes per IP; errors and rate
+    limits are remembered for a minute so a burst does not retry each time.
     """
     from honeypot_mcp.config import get_settings
 
@@ -38,13 +44,17 @@ async def lookup_virustotal(ip: str) -> dict[str, Any]:
             "note": "VIRUSTOTAL_API_KEY not set. Add it to .env to enable VT lookups.",
         }
 
+    failed = _cache.get_negative(cache_key)
+    if failed is not None:
+        return failed
+
     headers = {"x-apikey": api_key, "Accept": "application/json"}
 
+    failure: dict[str, Any]
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(f"{_VT_BASE}/ip_addresses/{ip}", headers=headers)
-            resp.raise_for_status()
-            data = resp.json().get("data", {}).get("attributes", {})
+        resp = await _client.get().get(f"{_VT_BASE}/ip_addresses/{ip}", headers=headers)
+        resp.raise_for_status()
+        data = resp.json().get("data", {}).get("attributes", {})
 
         last_analysis = data.get("last_analysis_stats", {})
         malicious = last_analysis.get("malicious", 0)
@@ -74,9 +84,12 @@ async def lookup_virustotal(ip: str) -> dict[str, Any]:
             _cache.set(cache_key, result, ttl=_CACHE_TTL)
             return result
         if e.response.status_code == 429:
-            return {"available": False, "error": "VT rate limit exceeded — wait 60 seconds."}
-        log.warning("VT API error for %s: %s", ip, e)
-        return {"available": False, "error": str(e)}
+            failure = {"available": False, "error": "VT rate limit exceeded — wait 60 seconds."}
+        else:
+            log.warning("VT API error for %s: %s", ip, e)
+            failure = {"available": False, "error": str(e)}
     except Exception as e:
         log.warning("VT lookup failed for %s: %s", ip, e)
-        return {"available": False, "error": str(e)}
+        failure = {"available": False, "error": str(e)}
+    _cache.set_negative(cache_key, failure)
+    return failure

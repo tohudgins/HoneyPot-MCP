@@ -96,7 +96,9 @@ async def test_a_windows_plan_is_internally_consistent():
 
     assert plan["identity"]["domain"] == "corp.local"
     by_type = {s["type"]: s for s in plan["sensors"]}
-    assert by_type["ldap"]["config"]["base_dn"] == "dc=corp,dc=local"
+    # The LDAP engine does not read a configured base DN, so the plan must not
+    # claim one (audit C2-8); the domain is carried in the identity block.
+    assert "base_dn" not in by_type["ldap"]["config"]
     for sensor in plan["sensors"]:
         assert sensor["hostname"].startswith("corp-"), sensor
     assert plan["coherence"]["consistent"]

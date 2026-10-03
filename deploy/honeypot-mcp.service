@@ -3,7 +3,7 @@
 # This runs the server as a PERSISTENT daemon over HTTP transport, so the
 # honeypots you deploy through natural language keep running 24/7 — independent
 # of any chat session. Your MCP client (Claude Code / Claude Desktop) connects
-# to it over the network at http://<vps-ip>:8000/mcp.
+# to it over an SSH tunnel at http://127.0.0.1:8000/mcp (see docs/DEPLOY.md).
 #
 # Install:
 #   sudo cp deploy/honeypot-mcp.service /etc/systemd/system/
@@ -14,7 +14,16 @@
 #   journalctl -u honeypot-mcp -f      # live logs
 #
 # The service reads configuration from the repo's .env file (EnvironmentFile).
-# Set MCP_TRANSPORT=http there (see .env.example).
+# Set MCP_TRANSPORT=http there (see .env.example), and point DATABASE_URL at the
+# writable data directory:
+#   DATABASE_URL=sqlite+aiosqlite:///./data/honeypot_mcp.db
+#
+# Layout assumed by the sandbox below (create once, see docs/DEPLOY.md):
+#   /opt/honeypot-mcp            owned by root, read-only to the service
+#   /opt/honeypot-mcp/.venv      built with `uv sync --frozen --no-dev`
+#   /opt/honeypot-mcp/.env       root:honeypot, mode 0640
+#   /opt/honeypot-mcp/{data,reports,tls,pcap}   owned by honeypot — the ONLY
+#                                writable paths (DB, exports, TLS keys, captures)
 
 [Unit]
 Description=HoneyPot MCP control plane (persistent daemon)
@@ -24,32 +33,87 @@ Requires=docker.service
 
 [Service]
 Type=simple
-# A dedicated non-login user that is a member of the `docker` group (needed
-# for the SSH/Cowrie engine to manage containers). Create with:
+# A dedicated non-login user. It needs Docker access for the SSH/Cowrie engine:
 #   sudo useradd --system --home /opt/honeypot-mcp --shell /usr/sbin/nologin honeypot
 #   sudo usermod -aG docker honeypot
+#
+# TRADEOFF — read this: membership in the `docker` group is root-equivalent on
+# the host. Anyone who can run Docker commands can start a privileged container
+# that bind-mounts `/`. This daemon parses untrusted attacker payloads all day,
+# so a bug in it that reaches arbitrary Docker calls is root on the box. The
+# sandbox below does not remove that, because the Docker socket is how the
+# daemon controls Docker. If you do not need dynamically-launched Cowrie
+# containers, do NOT add the user to the docker group: drop
+# `docker.service` from Requires=, skip the usermod, and use only the
+# in-process engines (HTTP/SMTP/FTP/DNS/RDP/...). A socket proxy
+# (tecnativa/docker-socket-proxy, as in docker/docker-compose.yml) narrows
+# the API to container+image endpoints but does not filter request bodies, so
+# it limits blast radius rather than eliminating it. Run this on a dedicated
+# host either way.
 User=honeypot
 Group=honeypot
 WorkingDirectory=/opt/honeypot-mcp
 EnvironmentFile=/opt/honeypot-mcp/.env
-# `uv run` resolves the project venv. Use an absolute path — systemd has a
-# minimal PATH. Find yours with `which uv` (often /usr/local/bin/uv or
-# /home/<user>/.local/bin/uv). Or point ExecStart at the installed script:
-#   ExecStart=/opt/honeypot-mcp/.venv/bin/honeypot-mcp
-ExecStart=/usr/local/bin/uv run --project /opt/honeypot-mcp honeypot-mcp
+Environment=PYTHONDONTWRITEBYTECODE=1
+# The venv's own entry point — no `uv` on the runtime path, no resolution or
+# network access at start. Build it with: uv sync --frozen --no-dev
+ExecStart=/opt/honeypot-mcp/.venv/bin/honeypot-mcp
 Restart=on-failure
 RestartSec=5
 # The reconcile step re-establishes RUNNING honeypots on every restart, so a
 # crash-restart transparently brings the fleet back.
 
+# ── Resource limits ──────────────────────────────────────────────────────────
+# One socket per attacker connection plus per-engine listeners: the default
+# 1024 file descriptors is exhausted by a modest scan.
+LimitNOFILE=65536
+# Thread/process ceiling (executor threads, docker-py, tcpdump child).
+TasksMax=512
+# Hard memory ceiling so a flood cannot take the host down with it. Tune to
+# the machine: on a 1 GB VPS set 768M so the OOM killer picks this unit, not sshd.
+MemoryMax=1G
+
 # ── Hardening ────────────────────────────────────────────────────────────────
 # The daemon processes untrusted attacker payloads all day. Constrain it.
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# Writable paths the server needs: DB, TLS certs, generated reports.
-ReadWritePaths=/opt/honeypot-mcp
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+# Everything else is read-only (ProtectSystem=strict). Only the data the server
+# genuinely writes is writable: DB, generated reports/archives, TLS keys, pcap.
+# Code, .venv and .env are NOT writable, so a compromised process cannot
+# persist by rewriting itself or its configuration.
+ReadWritePaths=/opt/honeypot-mcp/data /opt/honeypot-mcp/reports /opt/honeypot-mcp/tls /opt/honeypot-mcp/pcap
+# No Linux capabilities: every default honeypot port is unprivileged (>1024).
+# Listening on <1024 directly needs CAP_NET_BIND_SERVICE; prefer a firewall
+# redirect (see docs/DEPLOY.md) over granting it.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Sockets the server uses: IP, the Docker unix socket, netlink for interface
+# lookups. (Packet capture also needs AF_PACKET — see the drop-in below.)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# ── Optional: packet capture (PCAP_ENABLED=true) ─────────────────────────────
+# tcpdump needs CAP_NET_RAW + CAP_NET_ADMIN and raw packet sockets. With
+# NoNewPrivileges a `setcap` on the tcpdump binary is ignored, so grant them
+# to the unit instead, in a drop-in (`sudo systemctl edit honeypot-mcp`):
+#   [Service]
+#   CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+#   AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
+# Leave it out entirely if you do not use packet capture.
 
 [Install]
 WantedBy=multi-user.target

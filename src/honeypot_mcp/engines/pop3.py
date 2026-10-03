@@ -33,8 +33,16 @@ import time
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    LineWorker,
+    close_after_error,
+    extract_lines,
+    limited_factory,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -44,6 +52,8 @@ log = logging.getLogger(__name__)
 
 _DOVECOT_VERSION = "2.3.19.1"
 _MAX_LINE = 4096
+# Lines processed per network read; more is a flood and the connection is closed.
+_MAX_LINES_PER_READ = 16
 # Real servers pause before rejecting. Instant refusal makes guessing free and
 # is itself a tell.
 _AUTH_FAIL_DELAY = 1.2
@@ -67,6 +77,7 @@ class _POP3Protocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
+        self._worker = LineWorker(self._handle_raw, name="pop3-lines")
         self._username = ""
         # The APOP challenge from our greeting. Recorded with any digest so the
         # captured hash can be attacked offline.
@@ -78,26 +89,36 @@ class _POP3Protocol(asyncio.Protocol):
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         self._apop_challenge = f"<{secrets.token_hex(8)}.{int(time.time())}@mail>"
         self._send(f"+OK Dovecot ready. {self._apop_challenge}")
-        asyncio.create_task(self._record("pop3_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("pop3_connection", AlertSeverity.LOW, {}), name="pop3-connect")
 
     def _send(self, text: str) -> None:
         if self._transport is not None and not self._transport.is_closing():
             self._transport.write((text + "\r\n").encode("utf-8", errors="replace"))
 
     def _close(self) -> None:
+        # Session ending on our side: drop lines queued behind this one.
+        self._worker.stop()
         if self._transport is not None:
             self._transport.close()
 
+    async def _auth_delay(self) -> None:
+        if self._transport is not None and not self._transport.is_closing():
+            await asyncio.sleep(_AUTH_FAIL_DELAY)
+
     def data_received(self, data: bytes) -> None:
-        self._buf += data
-        if len(self._buf) > _MAX_LINE * 4:
-            self._buf = b""
-            self._send("-ERR Line too long")
-            self._close()
-            return
-        while b"\n" in self._buf:
-            raw, self._buf = self._buf.split(b"\n", 1)
-            asyncio.create_task(self._handle(raw.decode("utf-8", errors="replace").strip()))
+        lines, self._buf, problem = extract_lines(
+            self._buf + data, max_lines=_MAX_LINES_PER_READ, max_line=_MAX_LINE * 4
+        )
+        accepted = self._worker.submit(lines)
+        if problem or not accepted:
+            # Flood or oversized line: keep what was already queued (it is
+            # evidence), refuse the rest and hang up.
+            self._send("-ERR Line too long" if problem == "too_long" else "-ERR Too fast")
+            if self._transport is not None:
+                close_after_error(self._transport)
+
+    async def _handle_raw(self, raw: bytes) -> None:
+        await self._handle(raw.decode("utf-8", errors="replace").strip())
 
     async def _handle(self, line: str) -> None:
         if not line:
@@ -129,7 +150,7 @@ class _POP3Protocol(asyncio.Protocol):
                     "method": "USER/PASS",
                 },
             )
-            await asyncio.sleep(_AUTH_FAIL_DELAY)
+            await self._auth_delay()
             self._send("-ERR [AUTH] Authentication failed.")
             return
 
@@ -149,7 +170,7 @@ class _POP3Protocol(asyncio.Protocol):
                     "method": "APOP",
                 },
             )
-            await asyncio.sleep(_AUTH_FAIL_DELAY)
+            await self._auth_delay()
             self._send("-ERR [AUTH] Authentication failed.")
             return
 
@@ -230,8 +251,7 @@ class POP3Engine(HoneypotEngine):
     async def stop(self, container_id: str, remove: bool = False) -> None:
         server = self._servers.pop(container_id, None)
         if server:
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_pop3"}

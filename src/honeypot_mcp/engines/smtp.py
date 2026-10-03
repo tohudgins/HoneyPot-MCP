@@ -42,8 +42,15 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    close_after_error,
+    extract_lines,
+    limited_factory,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -58,6 +65,20 @@ log = logging.getLogger(__name__)
 # not just this connection. The 200-line cap on the DATA body doesn't help
 # here, since it only applies after a line is actually split out of `_buf`.
 _MAX_LINE_BYTES = 8192
+# Lines handled per network read. DATA bodies legitimately arrive many lines to
+# a segment, so this is generous; it only stops a single read from being an
+# unbounded amount of per-line work.
+_MAX_LINES_PER_READ = 1024
+# The SIZE advertised in EHLO; a longer message is refused with 552 like Postfix.
+_MAX_MESSAGE_BYTES = 10_240_000
+# Bytes of DATA body kept for the event.
+_MAX_BODY_PREVIEW = 4096
+# Attacker-chosen strings (commands, addresses, credentials) placed in events.
+_MAX_EVENT_STRING = 256
+
+
+def _clip(value: str) -> str:
+    return value[:_MAX_EVENT_STRING]
 
 
 def _b64_decode(s: str) -> str:
@@ -142,6 +163,9 @@ class _SMTPProtocol(asyncio.Protocol):
         self._auth_username = ""
         # Envelope tracking for open-relay detection.
         self._mail_from = ""
+        self._data_preview_len = 0
+        self._starttls_pending = False
+        self._wrapper: Any = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         # asyncio.Protocol's contract narrows this — it's always a stream
@@ -150,24 +174,37 @@ class _SMTPProtocol(asyncio.Protocol):
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         transport.write(f"220 {self._hostname} ESMTP Postfix\r\n".encode())
-        asyncio.create_task(self._record_event("smtp_connection", AlertSeverity.LOW, {}))
+        spawn(self._record_event("smtp_connection", AlertSeverity.LOW, {}), name="smtp-record")
 
     def data_received(self, data: bytes) -> None:
-        self._buf += data
-        if len(self._buf) > _MAX_LINE_BYTES and b"\r\n" not in self._buf:
-            # A real Postfix enforces a line-length limit too — refusing here
-            # is protocol-faithful, not just a safety measure.
-            if self._transport is not None:
-                self._transport.write(b"500 5.5.2 Line too long\r\n")
-                self._transport.close()
-            return
-        while b"\r\n" in self._buf:
-            line, self._buf = self._buf.split(b"\r\n", 1)
+        if self._tls_active and self._wrapper is not None:
+            # Post-STARTTLS bytes bypass the wrapper, so keep its idle timer fed.
+            self._wrapper.touch()
+        # The line cap applies to every extracted line, not only to a buffer
+        # holding no CRLF: previously ~256 KB of mixed lines passed and the
+        # split loop re-copied the buffer once per line.
+        lines, self._buf, problem = extract_lines(
+            self._buf + data, max_lines=_MAX_LINES_PER_READ, max_line=_MAX_LINE_BYTES
+        )
+        for line in lines:
+            if self._transport is None or self._transport.is_closing():
+                return
+            if self._starttls_pending:
+                # RFC 3207: anything pipelined behind STARTTLS is discarded.
+                break
             decoded = line.decode("utf-8", errors="replace")
             if self._in_data:
                 self._handle_data_line(decoded)
             else:
                 self._dispatch(decoded.strip())
+        if problem and self._transport is not None and not self._transport.is_closing():
+            # A real Postfix enforces a line-length limit too — refusing here
+            # is protocol-faithful, not just a safety measure.
+            if problem == "too_long":
+                self._transport.write(b"500 5.5.2 Line too long\r\n")
+            else:
+                self._transport.write(b"421 4.7.0 Too many commands, closing connection\r\n")
+            close_after_error(self._transport)
 
     def _dispatch(self, line: str) -> None:
         if not line:
@@ -203,18 +240,20 @@ class _SMTPProtocol(asyncio.Protocol):
                 # poisons the wire — post-TLS EHLO then fails with
                 # WRONG_VERSION_NUMBER on the client side.
                 t.pause_reading()
-                asyncio.create_task(self._upgrade_to_tls())
+                self._starttls_pending = True
+                spawn(self._upgrade_to_tls(), name="smtp-starttls")
         elif upper.startswith("AUTH"):
             self._handle_auth(line, upper)
         elif upper.startswith("MAIL FROM"):
             self._mail_from = _extract_addr(line)
             t.write(b"250 2.1.0 Ok\r\n")
-            asyncio.create_task(
+            spawn(
                 self._record_event(
                     "smtp_mail_from",
                     AlertSeverity.MEDIUM,
-                    {"command": line, "address": self._mail_from},
-                )
+                    {"command": _clip(line), "address": _clip(self._mail_from)},
+                ),
+                name="smtp-record",
             )
         elif upper.startswith("RCPT TO"):
             rcpt = _extract_addr(line)
@@ -229,12 +268,17 @@ class _SMTPProtocol(asyncio.Protocol):
                 and not self._is_local_domain(to_dom)
                 and not self._is_local_domain(from_dom)
             )
-            asyncio.create_task(
+            spawn(
                 self._record_event(
                     "smtp_open_relay" if is_relay else "smtp_rcpt_to",
                     AlertSeverity.HIGH if is_relay else AlertSeverity.MEDIUM,
-                    {"command": line, "mail_from": self._mail_from, "rcpt_to": rcpt},
-                )
+                    {
+                        "command": _clip(line),
+                        "mail_from": _clip(self._mail_from),
+                        "rcpt_to": _clip(rcpt),
+                    },
+                ),
+                name="smtp-record",
             )
         elif upper == "DATA":
             t.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
@@ -243,8 +287,9 @@ class _SMTPProtocol(asyncio.Protocol):
             self._data_size = 0
         elif upper.startswith("VRFY"):
             t.write(b"252 2.5.2 Send some mail, I'll try my best\r\n")
-            asyncio.create_task(
-                self._record_event("smtp_vrfy", AlertSeverity.LOW, {"command": line})
+            spawn(
+                self._record_event("smtp_vrfy", AlertSeverity.LOW, {"command": _clip(line)}),
+                name="smtp-record",
             )
         elif upper.startswith("ETRN"):
             t.write(b"500 5.5.2 Need account name\r\n")
@@ -285,8 +330,9 @@ class _SMTPProtocol(asyncio.Protocol):
             return
         # Unknown/unsupported mechanism — still record the attempt.
         t.write(b"504 5.7.4 Unrecognized authentication type\r\n")
-        asyncio.create_task(
-            self._record_event("smtp_auth_attempt", AlertSeverity.HIGH, {"command": line})
+        spawn(
+            self._record_event("smtp_auth_attempt", AlertSeverity.HIGH, {"command": _clip(line)}),
+            name="smtp-record",
         )
 
     def _handle_auth_continuation(self, line: str) -> None:
@@ -323,12 +369,13 @@ class _SMTPProtocol(asyncio.Protocol):
 
     def _record_auth(self, username: str, password: str) -> None:
         # service="smtp" so credential_match cross-references planted tokens.
-        asyncio.create_task(
+        spawn(
             self._record_event(
                 "smtp_auth_attempt",
                 AlertSeverity.HIGH,
-                {"username": username, "password": password, "service": "smtp"},
-            )
+                {"username": _clip(username), "password": _clip(password), "service": "smtp"},
+            ),
+            name="smtp-record",
         )
 
     def _handle_data_line(self, line: str) -> None:
@@ -337,11 +384,16 @@ class _SMTPProtocol(asyncio.Protocol):
             self._in_data = False
             queue_id = secrets.token_hex(5).upper()
             t = self._transport
+            too_big = self._data_size > _MAX_MESSAGE_BYTES
             if t is not None:
-                t.write(f"250 2.0.0 Ok: queued as {queue_id}\r\n".encode())
+                if too_big:
+                    # Honour the SIZE we advertised in EHLO.
+                    t.write(b"552 5.3.4 Error: message file too big\r\n")
+                else:
+                    t.write(f"250 2.0.0 Ok: queued as {queue_id}\r\n".encode())
             # First 4 KB only — keeps payload size bounded even on spam blast.
-            body_preview = "\n".join(self._data_lines)[:4096]
-            asyncio.create_task(
+            body_preview = "\n".join(self._data_lines)[:_MAX_BODY_PREVIEW]
+            spawn(
                 self._record_event(
                     "smtp_message_received",
                     AlertSeverity.HIGH,
@@ -349,18 +401,24 @@ class _SMTPProtocol(asyncio.Protocol):
                         "queue_id": queue_id,
                         "size_bytes": self._data_size,
                         "body_preview": body_preview,
+                        "rejected_too_big": too_big,
                     },
-                )
+                ),
+                name="smtp-record",
             )
             self._data_lines = []
             self._data_size = 0
+            self._data_preview_len = 0
             return
         # SMTP dot-stuffing: a line starting with `..` represents a literal `.`
         if line.startswith(".."):
             line = line[1:]
         self._data_size += len(line) + 2  # +CRLF
-        if len(self._data_lines) < 200:
-            self._data_lines.append(line)
+        # Only the preview is ever reported, so stop holding lines once it is
+        # full: the size counter above is all a 50 MB body needs.
+        if self._data_preview_len < _MAX_BODY_PREVIEW:
+            self._data_lines.append(line[:_MAX_BODY_PREVIEW])
+            self._data_preview_len += len(line) + 1
 
     async def _upgrade_to_tls(self) -> None:
         """Replace the plaintext transport with a TLS-wrapped one.
@@ -370,12 +428,12 @@ class _SMTPProtocol(asyncio.Protocol):
         the TLS boundary. Failure closes the connection; that looks like a
         broken cert config to the attacker, which is a plausible real-server
         failure mode."""
-        from honeypot_mcp.engines.tls import build_server_ssl_context
+        from honeypot_mcp.engines.tls import build_server_ssl_context_async
 
         if self._transport is None:
             return
         try:
-            ssl_ctx = build_server_ssl_context(self._name, common_name=self._hostname)
+            ssl_ctx = await build_server_ssl_context_async(self._name, common_name=self._hostname)
             loop = asyncio.get_event_loop()
             new_transport = await loop.start_tls(
                 self._transport,
@@ -389,6 +447,7 @@ class _SMTPProtocol(asyncio.Protocol):
             assert new_transport is not None
             self._transport = new_transport  # type: ignore[assignment]
             self._tls_active = True
+            self._starttls_pending = False
             # Per RFC 3207: discard everything before TLS and require fresh EHLO.
             self._buf = b""
             self._in_data = False
@@ -421,8 +480,16 @@ class _SMTPProtocol(asyncio.Protocol):
             )
         )
 
+    def adopt_wrapper(self, wrapper: Any) -> None:
+        """Called by `_LimitedProtocol` on admission. After STARTTLS the SSL
+        transport reports `connection_lost` to *this* protocol, not to the
+        wrapper, so without a handle on it the per-IP slot is never released."""
+        self._wrapper = wrapper
+
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        wrapper, self._wrapper = self._wrapper, None
+        if wrapper is not None:
+            wrapper.connection_lost(exc)
 
 
 class SMTPEngine(HoneypotEngine):
@@ -470,8 +537,7 @@ class SMTPEngine(HoneypotEngine):
         entry = self._servers.pop(container_id, None)
         if entry:
             server, _ = entry
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_smtp"}

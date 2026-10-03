@@ -26,6 +26,7 @@ seam a real attacker would notice.
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +37,30 @@ from honeypot_mcp.deception.capabilities import (
     EnvironmentProfile,
     all_profiles,
 )
+
+_MAX_PORT = 65535
+# The prefix becomes part of honeypot names and hostnames; the domain lands in
+# hostnames and is shown to the operator as the identity. Both must be inert
+# DNS-style identifiers.
+_PREFIX_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?$")
+_DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_DOMAIN_RE = re.compile(rf"^{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})*$")
+
+
+def _reserved_ports() -> dict[int, str]:
+    """Ports this process itself listens on, which no sensor may be planned onto."""
+    from honeypot_mcp.config import get_settings
+
+    s = get_settings()
+    reserved = {
+        s.canary_callback_port: "canary callback server",
+        s.metrics_port: "metrics endpoint",
+        s.console_port: "operations console",
+    }
+    if s.mcp_transport not in ("stdio", "none"):
+        reserved[s.mcp_port] = "MCP control plane"
+    return {port: owner for port, owner in reserved.items() if port > 0}
+
 
 # Hostname pools per identity family. Names have to look assigned by an
 # infrastructure team, not generated: `corp-dc1` reads as real, `honeypot-3`
@@ -149,12 +174,19 @@ def build_plan(
         }
 
     prefix = identity_prefix or (profile.hostname_prefix if profile else "srv")
+    if not _PREFIX_RE.match(prefix):
+        return {
+            "error": "identity_prefix must be 1-32 letters, digits or '-' "
+            "(no leading/trailing '-'), e.g. 'corp'."
+        }
+    if domain is not None and (len(domain) > 253 or not _DOMAIN_RE.match(domain)):
+        return {"error": "domain must be a DNS name such as 'corp.local'."}
     resolved_domain = domain or (profile.domain if profile else None)
     if resolved_domain is None and any(BY_TYPE[t].os_family == "windows" for t in types):
         resolved_domain = f"{prefix}.local"
 
     taken_hostnames: set[str] = set()
-    used_ports = dict(existing_ports)
+    used_ports = {**_reserved_ports(), **existing_ports}
     sensors: list[PlannedSensor] = []
     conflicts: list[str] = []
 
@@ -164,6 +196,11 @@ def build_plan(
         original_port = port
         while port in used_ports:
             port += 1
+            if port > _MAX_PORT:
+                return {
+                    "error": f"No free port at or above {original_port} for "
+                    f"{cap.display_name} — every port up to {_MAX_PORT} is taken."
+                }
         if port != original_port:
             conflicts.append(
                 f"{cap.display_name}: port {original_port} already used by "
@@ -179,14 +216,12 @@ def build_plan(
             suffix += 1
         existing_names.add(name)
 
+        # Only the Cowrie-backed engines (ssh, and telnet which subclasses it)
+        # read a configured hostname. Emitting `fake_hostname`/`fake_domain`/
+        # `base_dn` for engines that ignore them would promise an identity the
+        # sensors never present. `hostname` below stays as the planned name.
         config: dict[str, Any] = {}
         if engine_type in ("ssh", "telnet"):
-            config["fake_hostname"] = hostname
-        elif engine_type in ("smtp",):
-            config["fake_domain"] = resolved_domain or f"{prefix}.com"
-        elif engine_type == "ldap" and resolved_domain:
-            config["base_dn"] = "dc=" + ",dc=".join(resolved_domain.split("."))
-        elif engine_type in ("rdp", "smb", "mssql", "vnc", "ftp"):
             config["fake_hostname"] = hostname
 
         sensors.append(

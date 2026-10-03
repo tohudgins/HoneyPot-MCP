@@ -10,6 +10,8 @@ Subscriptions and rules are stored in the DB and survive restarts.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,11 +24,70 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertSeverity, Subscription, SuppressionRule
+from honeypot_mcp.tools._audit import record_action
+
+_ACTIONS = ("drop", "rate_limit")
+_MAX_RATE_COUNT = 1_000_000
+_MAX_RATE_WINDOW = 7 * 24 * 3600
+_MAX_PATTERN_LEN = 256
+
+
+def _wildcard_only(pattern: str) -> bool:
+    """True for patterns like `*`, `**`, `?*` that match everything."""
+    return bool(pattern) and set(pattern) <= {"*", "?"} and "*" in pattern
+
+
+def _validate_rule(
+    ip_pattern: object,
+    event_type_pattern: object,
+    action: object,
+    rate_limit_count: object,
+    rate_limit_window_seconds: object,
+    *,
+    confirm_match_all: bool,
+) -> str | None:
+    """Why a suppression rule is unacceptable, or None. Shared by
+    `suppression_add` and `suppression_load_preset` so a preset cannot do what
+    the tool refuses."""
+    if action not in _ACTIONS:
+        return f"action must be one of {list(_ACTIONS)}, got {action!r}."
+    if action == "rate_limit":
+        count, window = rate_limit_count, rate_limit_window_seconds
+        if count is None or window is None:
+            return "rate_limit action requires rate_limit_count and rate_limit_window_seconds."
+        if not (isinstance(count, int) and isinstance(window, int)) or isinstance(count, bool):
+            return "rate_limit_count and rate_limit_window_seconds must be integers."
+        if not (1 <= count <= _MAX_RATE_COUNT and 1 <= window <= _MAX_RATE_WINDOW):
+            return (
+                f"rate_limit_count must be 1-{_MAX_RATE_COUNT} and "
+                f"rate_limit_window_seconds 1-{_MAX_RATE_WINDOW}."
+            )
+
+    ip_matches_all = event_matches_all = True
+    if ip_pattern:
+        if not isinstance(ip_pattern, str) or len(ip_pattern) > _MAX_PATTERN_LEN:
+            return "ip_pattern must be an IP address or CIDR string."
+        try:
+            network = ipaddress.ip_network(ip_pattern.strip(), strict=False)
+        except ValueError:
+            return f"ip_pattern {ip_pattern!r} is not a valid IP address or CIDR."
+        ip_matches_all = network.prefixlen == 0
+    if event_type_pattern:
+        if not isinstance(event_type_pattern, str) or len(event_type_pattern) > _MAX_PATTERN_LEN:
+            return "event_type_pattern must be a string."
+        event_matches_all = _wildcard_only(event_type_pattern)
+    if ip_matches_all and event_matches_all and not confirm_match_all:
+        return (
+            "This rule would match every event and silently end all collection. "
+            "Narrow it, or pass confirm_match_all=True if that is really the intent."
+        )
+    return None
+
 
 # ── Subscriptions ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("admin"))
 async def alert_subscribe(
     url: str,
     label: str,
@@ -86,7 +147,8 @@ async def alert_subscribe(
 
     These three are **coalesced**: the same (event_type, source_ip) notifies at
     most once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed
-    count carried on the next message. CRITICAL always goes through. One
+    count carried on the next message. CRITICAL bypasses that window (capped
+    per event type per minute). One
     scanner produces thousands of events an hour, and a channel that relays
     them one-to-one gets muted — which is worse than no integration, because
     everyone then believes they are covered. Set `severity_threshold="high"`
@@ -131,6 +193,27 @@ async def alert_subscribe(
         except ValueError as e:
             return {"error": str(e)}
 
+    # Destination policy: this tool sends captured attack data to an address
+    # of the caller's choosing, so it must not reach cloud metadata, loopback
+    # or internal ranges (unless the operator opted in). Checked again before
+    # every delivery; this is the fail-fast copy.
+    from honeypot_mcp.webhooks import check_destination, redact_url
+
+    refusal, _addresses = await check_destination(url, format)
+    # A name that does not resolve *right now* is not a policy violation (DNS
+    # can be briefly down, and the delivery-time check records it in
+    # `last_error`); only an address captured data must not go to is refused.
+    if refusal and refusal.startswith("destination refused"):
+        await record_action(
+            "alert_subscribe",
+            f"Refused subscription {label!r} to {redact_url(url)}: {refusal}",
+            arguments={"label": label, "format": format, "destination": redact_url(url)},
+            target=redact_url(url),
+            outcome="refused",
+            error=refusal,
+        )
+        return {"error": refusal}
+
     if hmac_secret == "":
         hmac_secret = secrets.token_urlsafe(32)
 
@@ -151,6 +234,17 @@ async def alert_subscribe(
 
     invalidate_subscription_cache()
 
+    await record_action(
+        "alert_subscribe",
+        f"Subscribed #{sub_id} ({label}) to {redact_url(url)} as {format}",
+        arguments={
+            "label": label,
+            "format": format,
+            "severity_threshold": severity_threshold,
+            "destination": redact_url(url),
+        },
+        target=redact_url(url),
+    )
     return {
         "id": sub_id,
         "label": label,
@@ -162,10 +256,12 @@ async def alert_subscribe(
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("admin"))
 async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
     """Deactivate a webhook subscription. Existing rows are kept for audit; only
     `active=False` is set so deliveries stop.
+
+    Admin-only, like `alert_subscribe`: it changes where captured data flows.
 
     Args:
         subscription_id: The subscription ID returned by alert_subscribe.
@@ -180,6 +276,12 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
     from honeypot_mcp.webhooks import invalidate_subscription_cache
 
     invalidate_subscription_cache()
+    await record_action(
+        "alert_unsubscribe",
+        f"Deactivated subscription #{subscription_id}",
+        arguments={"subscription_id": subscription_id},
+        target=str(subscription_id),
+    )
     return {"id": subscription_id, "active": False}
 
 
@@ -187,9 +289,15 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
 async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, Any]]:
     """List webhook subscriptions with their delivery health stats.
 
+    This is viewer-tier, so destinations are redacted to `scheme://host[:port]`:
+    webhook URLs carry their credential in the path or userinfo, and SMTP URLs
+    carry recipient addresses. Secrets are never returned.
+
     Args:
         active_only: If True (default), only return active subscriptions.
     """
+    from honeypot_mcp.webhooks import redact_url
+
     async with get_session() as session:
         q = select(Subscription)
         if active_only:
@@ -201,14 +309,14 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
         {
             "id": s.id,
             "label": s.label,
-            "url": s.url,
+            "url": redact_url(s.url),
             "severity_threshold": s.severity_threshold.value,
             "format": s.format,
             "active": s.active,
             "delivery_count": s.delivery_count,
             "failure_count": s.failure_count,
             "last_delivery_at": s.last_delivery_at.isoformat() if s.last_delivery_at else None,
-            "last_error": s.last_error,
+            "last_error": (s.last_error or "")[:160] or None,
             "created_at": s.created_at.isoformat() if s.created_at else None,
         }
         for s in subs
@@ -227,6 +335,7 @@ async def suppression_add(
     rate_limit_count: int | None = None,
     rate_limit_window_seconds: int | None = None,
     expires_in_hours: int | None = None,
+    confirm_match_all: bool = False,
 ) -> dict[str, Any]:
     """Add a suppression rule. Matched events are dropped or rate-limited
     BEFORE they enter the alert pipeline (no DB write, no webhook delivery).
@@ -246,16 +355,25 @@ async def suppression_add(
         rate_limit_count: Max events allowed per window (rate_limit only).
         rate_limit_window_seconds: Window length in seconds (rate_limit only).
         expires_in_hours: Auto-deactivate the rule after this many hours.
+        confirm_match_all: A rule that would match EVERY event (a wildcard-only
+            event pattern, a /0 CIDR) silently ends all collection; it is refused
+            unless this is explicitly True.
     """
-    if action == "rate_limit" and (rate_limit_count is None or rate_limit_window_seconds is None):
-        return {
-            "error": "rate_limit action requires rate_limit_count and rate_limit_window_seconds."
-        }
-
     if not ip_pattern and not event_type_pattern:
         return {
             "error": "Specify ip_pattern, event_type_pattern, or both — empty rules would match every event."
         }
+
+    problem = _validate_rule(
+        ip_pattern,
+        event_type_pattern,
+        action,
+        rate_limit_count,
+        rate_limit_window_seconds,
+        confirm_match_all=confirm_match_all,
+    )
+    if problem:
+        return {"error": problem}
 
     expires_at = None
     if expires_in_hours is not None:
@@ -281,6 +399,18 @@ async def suppression_add(
 
     invalidate_rule_cache()
 
+    await record_action(
+        "suppression_add",
+        f"Added {action} suppression rule #{rule_id} ({label})",
+        arguments={
+            "label": label,
+            "ip_pattern": ip_pattern,
+            "event_type_pattern": event_type_pattern,
+            "action": action,
+            "confirm_match_all": confirm_match_all,
+        },
+        target=str(rule_id),
+    )
     return {
         "id": rule_id,
         "label": label,
@@ -311,6 +441,12 @@ async def suppression_remove(rule_id: int) -> dict[str, Any]:
     from honeypot_mcp.suppression import invalidate_rule_cache
 
     invalidate_rule_cache()
+    await record_action(
+        "suppression_remove",
+        f"Deactivated suppression rule #{rule_id}",
+        arguments={"rule_id": rule_id},
+        target=str(rule_id),
+    )
     return {"id": rule_id, "active": False}
 
 
@@ -361,14 +497,21 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     """
     import yaml
 
+    if not _PRESET_NAME_RE.fullmatch(preset_name):
+        return {"error": "Preset names are letters, digits, '_' and '-' only (max 64)."}
     preset_text = _read_preset(preset_name)
     if preset_text is None:
         return {
             "error": (f"Preset '{preset_name}' not found. Available: {_list_available_presets()}")
         }
 
-    raw = yaml.safe_load(preset_text)
-    preset_rules = raw.get("rules") or []
+    try:
+        raw = yaml.safe_load(preset_text)
+    except yaml.YAMLError as e:
+        return {"error": f"Preset '{preset_name}' is not valid YAML: {e}"[:300]}
+    if not isinstance(raw, dict) or not isinstance(raw.get("rules"), list):
+        return {"error": f"Preset '{preset_name}' must be a mapping with a list of `rules`."}
+    preset_rules = raw["rules"]
     if not preset_rules:
         return {"error": f"Preset '{preset_name}' contains no rules."}
 
@@ -377,9 +520,25 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
 
     async with get_session() as session:
         for entry in preset_rules:
+            if not isinstance(entry, dict):
+                skipped.append({"entry": str(entry)[:80], "reason": "not a mapping"})
+                continue
             label = entry.get("label")
-            if not label:
-                skipped.append({"entry": entry, "reason": "missing label"})
+            if not label or not isinstance(label, str):
+                skipped.append({"entry": str(entry)[:80], "reason": "missing label"})
+                continue
+            # A preset gets exactly the validation suppression_add applies, and
+            # no way to confirm a match-all: that must be an explicit human call.
+            problem = _validate_rule(
+                entry.get("ip_pattern"),
+                entry.get("event_type_pattern"),
+                entry.get("action", "drop"),
+                entry.get("rate_limit_count"),
+                entry.get("rate_limit_window_seconds"),
+                confirm_match_all=False,
+            )
+            if problem:
+                skipped.append({"label": label, "reason": problem})
                 continue
             # Avoid duplicate: if a rule with this label already exists and is
             # active, skip rather than re-creating.
@@ -408,6 +567,12 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
 
         invalidate_rule_cache()
 
+    await record_action(
+        "suppression_load_preset",
+        f"Loaded suppression preset {preset_name!r}: {len(applied)} applied, {len(skipped)} skipped",
+        arguments={"preset_name": preset_name},
+        target=preset_name,
+    )
     return {
         "preset": preset_name,
         "description": raw.get("description", ""),
@@ -431,11 +596,22 @@ def _bundled_presets():  # type: ignore[no-untyped-def]
     return files("honeypot_mcp") / "presets"
 
 
+_PRESET_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 def _read_preset(name: str) -> str | None:
-    """Return a preset's YAML, preferring an operator override on disk."""
-    local = _LOCAL_PRESET_DIR / f"{name}.yaml"
-    if local.is_file():
-        return local.read_text()
+    """Return a preset's YAML, preferring an operator override on disk.
+
+    `name` is a bare stem: anything else (path separators, dots, NUL) is
+    refused before it can reach the filesystem, and the resolved operator path
+    must still sit inside the preset directory.
+    """
+    if not _PRESET_NAME_RE.fullmatch(name):
+        return None
+    local_dir = _LOCAL_PRESET_DIR.resolve()
+    local = (_LOCAL_PRESET_DIR / f"{name}.yaml").resolve()
+    if local.parent == local_dir and local.is_file():
+        return local.read_text(encoding="utf-8")
     with contextlib.suppress(FileNotFoundError, ModuleNotFoundError):
         resource = _bundled_presets() / f"{name}.yaml"
         if resource.is_file():

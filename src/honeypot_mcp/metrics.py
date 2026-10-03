@@ -22,12 +22,14 @@ independently of the honeypot ports.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from typing import Any
 
 from aiohttp import web
 from sqlalchemy import func, select
 
+from honeypot_mcp.http_identity import identity_runner
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
     Alert,
@@ -40,6 +42,16 @@ from honeypot_mcp.storage.models import (
 )
 
 log = logging.getLogger(__name__)
+
+# Server banner for protocol-level errors on this listener.
+_METRICS_BANNER = "HoneyPot MCP Metrics"
+
+
+def _pending_suppression_counts() -> dict[int, int]:
+    from honeypot_mcp import suppression
+
+    fn = getattr(suppression, "pending_suppression_counts", None)
+    return fn() if callable(fn) else {}
 
 
 def _line(name: str, labels: dict[str, str] | None, value: float | int) -> str:
@@ -123,14 +135,18 @@ async def _gather_metrics() -> str:
             type_value = ttype.value if hasattr(ttype, "value") else str(ttype)
             out.append(_line("honeypot_active_tokens", {"type": type_value}, count))
 
-        # Suppression drops by rule label (counter)
+        # Suppression drops by rule id (counter). Ids, not the operator-written
+        # labels: a label routinely names the scanner ranges or partner hosts
+        # being silenced, which an unauthenticated scrape must not disclose.
         supp_rows = (
-            await session.execute(select(SuppressionRule.label, SuppressionRule.suppressed_count))
+            await session.execute(select(SuppressionRule.id, SuppressionRule.suppressed_count))
         ).all()
+        pending = _pending_suppression_counts()
         out.append("# HELP honeypot_suppression_drops_total Events dropped per suppression rule.\n")
         out.append("# TYPE honeypot_suppression_drops_total counter\n")
-        for label, count in supp_rows:
-            out.append(_line("honeypot_suppression_drops_total", {"label": label}, count or 0))
+        for rule_id, count in supp_rows:
+            total = (count or 0) + pending.get(rule_id, 0)
+            out.append(_line("honeypot_suppression_drops_total", {"rule_id": str(rule_id)}, total))
 
         # Webhook delivery counters (counter)
         wh_rows = (
@@ -159,11 +175,36 @@ async def _gather_metrics() -> str:
     # events/sec); a number that climbs instead of oscillating means ingest is
     # outrunning the database, and it is visible here long before a restart
     # turns it into loss.
-    from honeypot_mcp.storage.event_buffer import get_buffer
+    from honeypot_mcp.storage import event_buffer
 
     out.append("# HELP honeypot_event_queue_depth Events awaiting commit in the ingest buffer.\n")
     out.append("# TYPE honeypot_event_queue_depth gauge\n")
-    out.append(_line("honeypot_event_queue_depth", None, get_buffer().qsize()))
+    out.append(_line("honeypot_event_queue_depth", None, event_buffer.get_buffer().qsize()))
+
+    # Events shed by the ingest queue's high-water policy, by severity.
+    by_sev = getattr(event_buffer, "dropped_event_counts_by_severity", None)
+    if callable(by_sev):
+        out.append(
+            "# HELP honeypot_event_queue_dropped_total Events shed by the ingest queue "
+            "high-water policy.\n"
+        )
+        out.append("# TYPE honeypot_event_queue_dropped_total counter\n")
+        for sev, n in sorted(by_sev().items()):
+            out.append(_line("honeypot_event_queue_dropped_total", {"severity": sev}, n))
+
+    # Webhook events dropped by the bounded delivery queues. Read the existing
+    # singleton only — a scrape must not be what instantiates the worker.
+    from honeypot_mcp import webhooks
+
+    delivery = getattr(webhooks, "_delivery", None)
+    wh_dropped = getattr(delivery, "dropped_count", None) if delivery is not None else 0
+    if isinstance(wh_dropped, int):
+        out.append(
+            "# HELP honeypot_webhook_dropped_total Webhook events dropped by a full "
+            "delivery queue.\n"
+        )
+        out.append("# TYPE honeypot_webhook_dropped_total counter\n")
+        out.append(_line("honeypot_webhook_dropped_total", None, wh_dropped))
 
     return "".join(out)
 
@@ -171,9 +212,11 @@ async def _gather_metrics() -> str:
 async def _handle_metrics(_request: web.Request) -> web.Response:
     try:
         body = await _gather_metrics()
-    except Exception as e:
-        log.warning("Metrics collection failed: %s", e)
-        body = f"# metrics_error: {e!r}\n"
+    except Exception:
+        # Detail stays in the server log: the scrape endpoint is reachable by
+        # whatever can reach the port, and exception text carries DB URLs/paths.
+        log.exception("Metrics collection failed")
+        body = "# metrics_error: collection failed\n"
     # aiohttp wants content_type and charset as separate kwargs; the version
     # parameter is Prometheus convention surfaced via the response body
     # itself (Prometheus scrapers don't require it in the Content-Type).
@@ -211,8 +254,9 @@ async def _handle_readyz(_request: web.Request) -> web.Response:
             # against an empty database file that lost its schema.
             await session.execute(select(func.count(Honeypot.id)))
         checks["database"] = "ok"
-    except Exception as e:
-        checks["database"] = f"unavailable: {type(e).__name__}: {e}"
+    except Exception:
+        log.exception("Readiness database check failed")
+        checks["database"] = "unavailable"
         ready = False
 
     depth = get_buffer().qsize()
@@ -238,11 +282,27 @@ def build_app() -> web.Application:
     return app
 
 
+def _is_loopback_host(host: str) -> bool:
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip().strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 async def start_metrics_server(host: str, port: int) -> web.AppRunner | None:
     """Start the /metrics server on (host, port). Returns the runner so
     caller can shut it down. Bind failures are logged but non-fatal — a
     busy port shouldn't take down honeypot ingest."""
-    runner = web.AppRunner(build_app())
+    if not _is_loopback_host(host):
+        log.warning(
+            "Metrics server bound to non-loopback %s: /metrics, /healthz and /readyz are "
+            "unauthenticated. Set METRICS_HOST=127.0.0.1 unless a firewall restricts %d.",
+            host,
+            port,
+        )
+    runner = identity_runner(build_app(), _METRICS_BANNER)
     try:
         await runner.setup()
         site = web.TCPSite(runner, host, port)

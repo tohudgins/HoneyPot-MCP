@@ -139,7 +139,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Persistence",
     ),
     (
-        re.compile(r"(outfile.write|into.outfile|webshell|web.shell|\.php.*upload)", re.I),
+        re.compile(r"(outfile.write|into.outfile|webshell|web.shell|\.php.{0,40}upload)", re.I),
         "T1505.003",
         "Server Software Component: Web Shell",
         "Persistence",
@@ -152,7 +152,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Lateral Movement",
     ),
     (
-        re.compile(r"rdp.*(handshake|mcs|connection)", re.I),
+        re.compile(r"rdp.{0,40}(handshake|mcs|connection)", re.I),
         "T1021.001",
         "Remote Services: Remote Desktop Protocol",
         "Lateral Movement",
@@ -166,7 +166,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         re.compile(
             r"^(?!.*exploit)"
             r"(ssh|ftp|rdp|smtp|vnc|redis|mysql|mssql|postgresql|smb|telnet)"
-            r".*(brute|login|auth|fail|session.setup)",
+            r".{0,64}(brute|login|auth|fail|session.setup)",
             re.I,
         ),
         "T1110.001",
@@ -329,7 +329,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     ),
     # ── Command and Control ──────────────────────────────────────────────────
     (
-        re.compile(r"(dns.tunnel|dns.exfil|dns.canary|dns.*callback|beacon)", re.I),
+        re.compile(r"(dns.tunnel|dns.exfil|dns.canary|dns.{0,40}callback|beacon)", re.I),
         "T1071.004",
         "Application Layer Protocol: DNS",
         "Command and Control",
@@ -353,7 +353,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Command and Control",
     ),
     (
-        re.compile(r"(file.upload|wget|curl|tftp|(download).*(payload|script|sh|exe))", re.I),
+        re.compile(r"(file.upload|wget|curl|tftp|download.{0,40}(payload|script|sh|exe))", re.I),
         "T1105",
         "Ingress Tool Transfer",
         "Command and Control",
@@ -378,7 +378,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     ),
     # ── Exfiltration ─────────────────────────────────────────────────────────
     (
-        re.compile(r"(sftp|scp|lo_export|outfile.*/tmp)", re.I),
+        re.compile(r"(sftp|scp|lo_export|outfile.{0,40}/tmp)", re.I),
         "T1041",
         "Exfiltration Over C2 Channel",
         "Exfiltration",
@@ -443,9 +443,9 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Discovery",
     ),
     (
-        re.compile(
-            r"(iam|s3|ec2|lambda|metadata\.google|169\.254\.169\.254).*(access|enumerat|)", re.I
-        ),
+        # `.*(access|enumerat|)` after the service keyword always succeeded (the
+        # empty alternative), so the keyword alone is the whole condition.
+        re.compile(r"(iam|s3|ec2|lambda|metadata\.google|169\.254\.169\.254)", re.I),
         "T1526",
         "Cloud Service Discovery",
         "Discovery",
@@ -536,17 +536,43 @@ def tactic_label(tactic: str) -> str:
     return f"{tactic} ({tid})" if tid else tactic
 
 
+# Hard bounds on what one `map_to_attack` call will scan. The terms are
+# event types *and* attacker-authored payload strings (paths, user agents,
+# base64 bodies) joined by callers, so both the per-term length and the number
+# of distinct terms are capped; an unbounded regex over attacker text is a CPU
+# denial of service on the analysis tools.
+_MAX_TERM_CHARS = 512
+_MAX_DISTINCT_TERMS = 2000
+_MAX_MATCHED_BY_CHARS = 200
+
+
 async def map_to_attack(terms: list[str]) -> list[dict[str, Any]]:
     """Map a list of observed event strings to MITRE ATT&CK techniques.
 
     Uses built-in regex mappings first, then enriches from the STIX bundle if available.
     Returns a deduplicated list of matched techniques sorted by tactic.
+
+    Each term is matched on its own (clipped to `_MAX_TERM_CHARS`) rather than
+    against one big joined string: a pattern can therefore never be satisfied by
+    fragments of two unrelated terms, and its cost is bounded per term.
     """
-    combined_text = " ".join(terms)
+    distinct: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        if term in seen:
+            continue
+        seen.add(term)
+        distinct.append(term)
+        if len(distinct) >= _MAX_DISTINCT_TERMS:
+            break
+    clipped = [t[:_MAX_TERM_CHARS] for t in distinct]
+
     found: dict[str, dict[str, Any]] = {}
 
     for pattern, tid, name, tactic in _BUILTIN_MAPPINGS:
-        if pattern.search(combined_text):
+        for term, text in zip(distinct, clipped, strict=True):
+            if not pattern.search(text):
+                continue
             if tid not in found:
                 found[tid] = {
                     "technique_id": tid,
@@ -555,9 +581,9 @@ async def map_to_attack(terms: list[str]) -> list[dict[str, Any]]:
                     "url": f"https://attack.mitre.org/techniques/{tid.replace('.', '/')}",
                     "matched_by": [],
                 }
-            for term in terms:
-                if pattern.search(term) and term not in found[tid]["matched_by"]:
-                    found[tid]["matched_by"].append(term)
+            shown = term[:_MAX_MATCHED_BY_CHARS]
+            if shown not in found[tid]["matched_by"]:
+                found[tid]["matched_by"].append(shown)
 
     stix_by_id = _load_stix_index()
     if stix_by_id:

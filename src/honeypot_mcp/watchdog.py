@@ -18,6 +18,7 @@ liveness housekeeping.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -30,7 +31,7 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity, Honeypot, HoneypotStatus
-from honeypot_mcp.tools._format import write_artifact
+from honeypot_mcp.tools._format import resolve_artifact_path
 
 log = logging.getLogger(__name__)
 
@@ -99,18 +100,12 @@ class HoneypotWatchdog:
         # runs unattended, so it is the path most likely to quietly destroy a
         # months-old campaign nobody had finished investigating — and unlike
         # the manual tool, nobody is watching when it does. A failed archive
-        # cancels the prune rather than proceeding without one.
+        # cancels the prune rather than proceeding without one: no row is
+        # deleted unless every row it covers is on disk first.
+        max_id: int | None = None
         if settings.retention_archive:
             try:
-                async with get_session() as session:
-                    content = await queries.serialise_alerts_before(session, cutoff)
-                if content:
-                    artifact = write_artifact(
-                        content,
-                        prefix=f"retention-archive-before-{cutoff.date().isoformat()}",
-                        extension="jsonl",
-                    )
-                    log.info("Retention archive written to %s", artifact["path"])
+                max_id = await self._archive_alerts(cutoff)
             except Exception as e:
                 log.error(
                     "Retention archive failed (%s) — skipping this sweep rather than "
@@ -119,17 +114,82 @@ class HoneypotWatchdog:
                     e,
                 )
                 return
+            if max_id is None:
+                max_id = 0  # nothing old enough to archive → no alert is deletable
 
-        async with get_session() as session:
-            result = await queries.prune_alerts_before(session, cutoff)
-        deleted = result.get("alerts_deleted", 0) + result.get("attacker_events_deleted", 0)
-        if deleted:
+        # Delete in bounded chunks, one transaction each, so the SQLite writer
+        # lock is never held for the whole sweep (a single unbatched DELETE of
+        # a year of rows outlasts busy_timeout and stalls ingest).
+        alerts_deleted = 0
+        if max_id != 0:
+            while True:
+                async with get_session() as session:
+                    n = await queries.delete_alerts_chunk(session, cutoff, max_id=max_id)
+                alerts_deleted += n
+                if n == 0:
+                    break
+                await asyncio.sleep(0)
+        events_deleted = 0
+        while True:
+            async with get_session() as session:
+                n = await queries.delete_attacker_events_chunk(session, cutoff)
+            events_deleted += n
+            if n == 0:
+                break
+            await asyncio.sleep(0)
+
+        if alerts_deleted or events_deleted:
             log.info(
                 "Retention sweep removed %d alerts + %d attacker_events older than %d days.",
-                result.get("alerts_deleted", 0),
-                result.get("attacker_events_deleted", 0),
+                alerts_deleted,
+                events_deleted,
                 days,
             )
+
+    async def _archive_alerts(self, cutoff: datetime) -> int | None:
+        """Stream alerts older than `cutoff` to a JSONL archive in `reports_dir`.
+
+        Reads in keyset-paginated chunks and writes each off the event loop, so
+        neither memory nor loop latency scales with the archive. Writes go to a
+        `.partial` file renamed into place only once complete; any failure
+        removes it and raises. Returns the highest alert id archived (the
+        delete is confined to it), or None when there was nothing to archive.
+        """
+        dest = resolve_artifact_path(
+            None,
+            prefix=f"retention-archive-before-{cutoff.date().isoformat()}",
+            extension="jsonl",
+        )
+        if isinstance(dest, str):
+            raise OSError(dest)
+        partial = dest.with_name(dest.name + ".partial")
+        await asyncio.to_thread(dest.parent.mkdir, parents=True, exist_ok=True)
+        fh = await asyncio.to_thread(partial.open, "w", encoding="utf-8")
+        last_id: int | None = None
+        try:
+            try:
+                first = True
+                async with get_session() as session:
+                    async for lines, chunk_last in queries.iter_alert_archive_chunks(
+                        session, cutoff
+                    ):
+                        text = ("" if first else "\n") + "\n".join(lines)
+                        await asyncio.to_thread(fh.write, text)
+                        first = False
+                        last_id = chunk_last
+                await asyncio.to_thread(fh.flush)
+            finally:
+                await asyncio.to_thread(fh.close)
+            if last_id is None:
+                await asyncio.to_thread(partial.unlink, True)
+                return None
+            await asyncio.to_thread(partial.replace, dest)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                partial.unlink(missing_ok=True)
+            raise
+        log.info("Retention archive written to %s", dest)
+        return last_id
 
     async def _check_all(self) -> None:
         # ERROR honeypots are swept too, not just RUNNING ones. Watching only

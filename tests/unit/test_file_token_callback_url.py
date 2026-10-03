@@ -20,6 +20,7 @@ still covers the PDF trigger constructs themselves.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import zipfile
 from pathlib import Path
@@ -47,7 +48,11 @@ async def setup_db():
 
     event_buffer.reset_for_tests()
     await init_db()
+    # Canary triggers are written by the event buffer's flusher (audit C2-1).
+    buffer = event_buffer.get_buffer()
+    await buffer.start()
     yield
+    await buffer.stop()
     await close_db()
     event_buffer.reset_for_tests()
 
@@ -154,12 +159,17 @@ async def test_fetching_the_embedded_url_triggers_the_token(file_type, tmp_path,
         assert resp.status == 200
         assert resp.content_type == "image/png"
 
-        async with get_session() as session:
-            token = (
-                await session.execute(select(Honeytoken).where(Honeytoken.id == created["id"]))
-            ).scalar_one()
-            assert token.status is HoneytokenStatus.TRIGGERED
+        # The trigger is written by the buffer's flusher; poll, bounded.
+        for _ in range(100):
+            async with get_session() as session:
+                token = await session.get(Honeytoken, created["id"])
+            assert token is not None
+            if token.status is HoneytokenStatus.TRIGGERED:
+                break
+            await asyncio.sleep(0.05)
+        assert token.status is HoneytokenStatus.TRIGGERED
 
+        async with get_session() as session:
             alerts = (await session.execute(select(Alert))).scalars().all()
             assert any(a.event_type == "honeytoken_triggered_file" for a in alerts)
     finally:

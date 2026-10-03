@@ -70,6 +70,17 @@ async def pcap_extract(
             arguments={"source_ip": source_ip, "output_path": output_path},
             target=source_ip,
         )
+    else:
+        # A failed extract still touched the filesystem (or tried to); the
+        # operator needs to see it was attempted and why it produced nothing.
+        await _audit.record_action(
+            "pcap_extract",
+            f"extract for {source_ip} failed",
+            arguments={"source_ip": source_ip, "output_path": output_path},
+            target=source_ip,
+            outcome="error",
+            error=str(result["error"])[:200],
+        )
     return result
 
 

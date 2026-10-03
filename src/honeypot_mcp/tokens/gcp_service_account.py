@@ -13,6 +13,7 @@ real detection, wire your GCP Audit Log sink to POST events into the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from typing import Any
@@ -46,7 +47,8 @@ class GCPServiceAccountProvider(HoneytokenProvider):
         private_key_id = secrets.token_hex(20)  # 40-hex GCP convention
         client_id = "".join(secrets.choice("0123456789") for _ in range(21))
         client_email = f"hp-canary-{secrets.token_hex(4)}@{project_id}.iam.gserviceaccount.com"
-        private_key_pem = _generate_throwaway_rsa_pem()
+        # RSA keygen is CPU-bound; keep it off the event loop.
+        private_key_pem = await asyncio.to_thread(_generate_throwaway_rsa_pem)
 
         sa_json = {
             "type": "service_account",

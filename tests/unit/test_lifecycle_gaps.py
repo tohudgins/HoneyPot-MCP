@@ -259,13 +259,15 @@ async def test_retention_sweep_skips_the_prune_when_archiving_fails():
 
     async def _boom(*_args, **_kwargs):
         raise OSError("read-only filesystem")
+        yield  # pragma: no cover — makes this an async generator
 
-    original = queries.serialise_alerts_before
-    queries.serialise_alerts_before = _boom  # type: ignore[assignment]
+    # The sweep streams the archive through `iter_alert_archive_chunks`.
+    original = queries.iter_alert_archive_chunks
+    queries.iter_alert_archive_chunks = _boom  # type: ignore[assignment]
     try:
         await HoneypotWatchdog()._maybe_prune()
     finally:
-        queries.serialise_alerts_before = original  # type: ignore[assignment]
+        queries.iter_alert_archive_chunks = original  # type: ignore[assignment]
 
     assert await _alert_count() == 7
 

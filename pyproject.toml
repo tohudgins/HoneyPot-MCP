@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "honeypot-mcp"
 version = "0.2.0"
-description = "Deception infrastructure you drive by talking to it — 14-protocol honeypots, honeytokens and attacker analysis over MCP"
+description = "Deception infrastructure you drive by talking to it — 25-protocol honeypots, honeytokens and attacker analysis over MCP"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = { file = "LICENSE" }
@@ -63,7 +63,9 @@ dependencies = [
     # hand-written asyncio protocol implementation.
     "dnslib>=0.9.24",
     # TLS (self-signed cert generation for HTTPS + SMTP STARTTLS)
-    "cryptography>=42.0.0",
+    # >=43: credential_verify imports TripleDES from cryptography.hazmat.decrepit,
+    # which only exists from 43.
+    "cryptography>=43.0.0",
     # Honeytoken file embedding
     "reportlab>=4.2.0",
     "python-docx>=1.1.0",
@@ -72,6 +74,11 @@ dependencies = [
     # Config
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.1",
+    # Security floors for transitive dependencies (pulled in via fastmcp/mcp and
+    # boto3/httpx/docker). Not imported directly: they exist so resolvers —
+    # including plain `pip install` — cannot pick a release with known CVEs.
+    "pyjwt>=2.15.0",
+    "urllib3>=2.8.0",
 ]
 
 [project.optional-dependencies]

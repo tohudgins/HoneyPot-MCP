@@ -10,14 +10,18 @@ pushing directly to:
 
 All three follow the same pattern:
 1. Pull the current set of offender IPs from the DB (via the same
-   `queries.get_top_offenders` that `export_blocklist` uses).
+   `queries.get_top_offenders` that `export_blocklist` uses), keeping only
+   globally routable sources not seen solely on spoofable UDP sensors, and
+   never anything in `BLOCKLIST_ALLOWLIST` or this server's own canary IP.
 2. Read the destination's current state (existing list / alias / IPSet).
 3. Compute the diff — only push IPs that aren't already blocked.
 4. Apply the change (or report what would happen if `dry_run=True`).
 5. Return a uniform `{added, skipped, failed, dry_run}` shape so a
    downstream automation can reason about each result identically.
 
-All three are idempotent — re-running is a no-op when nothing changed.
+All three are idempotent — re-running is a no-op when nothing changed. Every
+call is written to the audit log (destination host, counts, dry_run — never
+the credential).
 
 Note: `boto3` is gated behind a runtime import so the WAF tool can fail
 gracefully on installations without it. The other two tools use `httpx`
@@ -27,7 +31,10 @@ which is already a runtime dep.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import re
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 
@@ -35,13 +42,103 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
+from honeypot_mcp.tools._audit import record_action
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+# Cloudflare account and list ids are interpolated into the API URL path, so
+# anything beyond this alphabet could redirect the authenticated request.
+_CF_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
-async def _offender_ips(hours: int, min_hits: int) -> list[str]:
-    """Pull offender IPs via the same path as `export_blocklist`."""
+def _never_push() -> list[IPNetwork]:
+    """Networks that must never reach a blocklist: the operator's allowlist plus
+    this server's own canary address. The latter matters because a spoofed or
+    reflected hit "from" our own public IP would otherwise get the sensor's
+    callback endpoint blocked by the operator's own firewall.
+
+    Raises ValueError on a malformed allowlist entry: an entry the operator
+    wrote to protect something must not silently become a no-op.
+    """
+    from honeypot_mcp.config import get_settings
+
+    settings = get_settings()
+    nets: list[IPNetwork] = []
+    for raw in settings.blocklist_allowlist.split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            raise ValueError(
+                f"BLOCKLIST_ALLOWLIST entry {entry!r} is not an IP address or CIDR; "
+                "refusing to push until it is fixed."
+            ) from None
+    own_hosts = [settings.canary_callback_host, urlparse(settings.canary_public_url).hostname]
+    for host in own_hosts:
+        if not host:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(ipaddress.ip_address(host)))
+        except ValueError:
+            continue  # a hostname, not an IP literal
+    return nets
+
+
+def _pushable(ip: str, never: list[IPNetwork]) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_global and not any(addr in net for net in never)
+
+
+async def _offender_ips(hours: int, min_hits: int) -> tuple[list[str], int]:
+    """Pull offender IPs via the same path as `export_blocklist`.
+
+    Returns `(pushable, excluded_count)`. Non-global addresses, sources seen
+    only on spoofable UDP sensors, allowlisted networks and our own address
+    are dropped — a blocklist entry for any of them lets an attacker (or a
+    typo) cut off the operator's own infrastructure.
+    """
+    never = _never_push()
     async with get_session() as session:
-        rows = await queries.get_top_offenders(session, hours, min_hits)
-    return [ip for ip, _cnt in rows]
+        rows = await queries.get_top_offenders(
+            session, hours, min_hits, global_only=True, exclude_udp_only=True
+        )
+    ips = [ip for ip, _cnt in rows]
+    pushable = [ip for ip in ips if _pushable(ip, never)]
+    return pushable, len(ips) - len(pushable)
+
+
+def _rejected(error: str, dry_run: bool) -> dict[str, Any]:
+    return {"added": [], "skipped": [], "failed": [{"ip": "*", "error": error}], "dry_run": dry_run}
+
+
+async def _finish(
+    tool: str,
+    target: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+    excluded: int = 0,
+) -> dict[str, Any]:
+    """Audit the push and hand the result back. Callers never pass credentials
+    in `arguments` — redaction is a backstop, not the plan."""
+    failed = result.get("failed") or []
+    verb = "dry run: would push" if result.get("dry_run") else "pushed"
+    await record_action(
+        tool,
+        summary=(
+            f"{verb} {len(result.get('added') or [])} IP(s) to {target} "
+            f"({len(result.get('skipped') or [])} already present, {excluded} excluded)"
+        ),
+        arguments={**arguments, "excluded": excluded},
+        target=target,
+        outcome="error" if failed else "ok",
+        error="; ".join(f"{f.get('ip')}: {f.get('error')}" for f in failed[:20]) or None,
+    )
+    return result
 
 
 # ── Cloudflare ──────────────────────────────────────────────────────────────
@@ -74,10 +171,37 @@ async def blocklist_push_cloudflare(
         `{added: [...], skipped: [...], failed: [...], dry_run: bool}`.
         `skipped` IPs were already on the list.
     """
-    offenders = await _offender_ips(hours, min_hits)
+    tool = "blocklist_push_cloudflare"
+    target = "api.cloudflare.com"
+    args: dict[str, Any] = {
+        "account_id": account_id,
+        "list_id": list_id,
+        "hours": hours,
+        "min_hits": min_hits,
+        "dry_run": dry_run,
+    }
+    if not (_CF_ID_RE.fullmatch(account_id) and _CF_ID_RE.fullmatch(list_id)):
+        msg = "account_id and list_id must each match [A-Za-z0-9_-]{1,64}."
+        return await _finish(tool, target, args, _rejected(msg, dry_run))
+    try:
+        offenders, excluded = await _offender_ips(hours, min_hits)
+    except ValueError as e:
+        return await _finish(tool, target, args, _rejected(str(e), dry_run))
     if not offenders:
-        return {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
+        result: dict[str, Any] = {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
+    else:
+        result = await _cloudflare_push(account_id, list_id, api_token, offenders, hours, dry_run)
+    return await _finish(tool, target, args, result, excluded)
 
+
+async def _cloudflare_push(
+    account_id: str,
+    list_id: str,
+    api_token: str,
+    offenders: list[str],
+    hours: int,
+    dry_run: bool,
+) -> dict[str, Any]:
     base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/rules/lists/{list_id}/items"
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
 
@@ -168,10 +292,56 @@ async def blocklist_push_pfsense(
     Returns:
         `{added, skipped, failed, dry_run}` uniform shape.
     """
-    offenders = await _offender_ips(hours, min_hits)
+    tool = "blocklist_push_pfsense"
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    args: dict[str, Any] = {
+        "host": host,
+        "alias_name": alias_name,
+        "hours": hours,
+        "min_hits": min_hits,
+        "dry_run": dry_run,
+        "verify_tls": verify_tls,
+    }
+    if err := _pfsense_url_error(parsed.scheme, host):
+        return await _finish(tool, host or "pfsense", args, _rejected(err, dry_run))
+    try:
+        offenders, excluded = await _offender_ips(hours, min_hits)
+    except ValueError as e:
+        return await _finish(tool, host, args, _rejected(str(e), dry_run))
     if not offenders:
-        return {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
+        result: dict[str, Any] = {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
+    else:
+        result = await _pfsense_push(base_url, api_key, alias_name, offenders, dry_run, verify_tls)
+    return await _finish(tool, host, args, result, excluded)
 
+
+def _pfsense_url_error(scheme: str, host: str) -> str | None:
+    """The API key rides in every request header, so it must not cross the
+    network in the clear. Plain http is tolerated only to a loopback host
+    (an SSH tunnel or local proxy), where there is no network to cross."""
+    if not host:
+        return "base_url must be an absolute URL, e.g. https://pfsense.local."
+    if scheme == "https":
+        return None
+    if scheme == "http":
+        try:
+            loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if loopback:
+            return None
+    return "base_url must use https:// (http is only accepted for a loopback host)."
+
+
+async def _pfsense_push(
+    base_url: str,
+    api_key: str,
+    alias_name: str,
+    offenders: list[str],
+    dry_run: bool,
+    verify_tls: bool,
+) -> dict[str, Any]:
     headers = {"Authorization": api_key, "Content-Type": "application/json"}
     base = base_url.rstrip("/")
 
@@ -250,9 +420,9 @@ async def blocklist_push_aws_waf(
 ) -> dict[str, Any]:
     """Push offender IPs to an AWS WAFv2 IPSet.
 
-    The IPSet must already exist. Bare IPs are converted to `/32` since
-    WAFv2 requires CIDR. Credentials are picked up from the standard
-    boto3 chain (env vars, IAM role, profile).
+    The IPSet must already exist. Bare IPs are converted to `/32` (IPv4) or
+    `/128` (IPv6) since WAFv2 requires CIDR. Credentials are picked up from
+    the standard boto3 chain (env vars, IAM role, profile).
 
     Args:
         ip_set_id: WAFv2 IPSet ID (the `Id` field of the IPSet resource).
@@ -266,10 +436,36 @@ async def blocklist_push_aws_waf(
     Returns:
         `{added, skipped, failed, dry_run}` uniform shape.
     """
-    offenders = await _offender_ips(hours, min_hits)
+    tool = "blocklist_push_aws_waf"
+    target = f"wafv2:{region}/{ip_set_name}"
+    args: dict[str, Any] = {
+        "ip_set_id": ip_set_id,
+        "ip_set_name": ip_set_name,
+        "region": region,
+        "scope": scope,
+        "hours": hours,
+        "min_hits": min_hits,
+        "dry_run": dry_run,
+    }
+    try:
+        offenders, excluded = await _offender_ips(hours, min_hits)
+    except ValueError as e:
+        return await _finish(tool, target, args, _rejected(str(e), dry_run))
     if not offenders:
-        return {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
+        result: dict[str, Any] = {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
+    else:
+        result = await _waf_push(ip_set_id, ip_set_name, region, scope, offenders, dry_run)
+    return await _finish(tool, target, args, result, excluded)
 
+
+async def _waf_push(
+    ip_set_id: str,
+    ip_set_name: str,
+    region: str,
+    scope: str,
+    offenders: list[str],
+    dry_run: bool,
+) -> dict[str, Any]:
     try:
         import boto3
     except ImportError:
@@ -280,7 +476,12 @@ async def blocklist_push_aws_waf(
             "dry_run": dry_run,
         }
 
-    offender_cidrs = [ip if "/" in ip else f"{ip}/32" for ip in offenders]
+    # WAFv2 wants CIDRs: a host route is /32 for IPv4 and /128 for IPv6
+    # (`2001:db8::1/32` would block a whole /32 of someone else's space).
+    offender_cidrs: list[str] = []
+    for ip in offenders:
+        addr = ipaddress.ip_address(ip)
+        offender_cidrs.append(f"{addr}/{addr.max_prefixlen}")
 
     # boto3 is synchronous — every in-process engine (HTTP, SMTP, FTP,
     # Redis, MySQL, ...) shares this one event loop, so a bare boto3 call

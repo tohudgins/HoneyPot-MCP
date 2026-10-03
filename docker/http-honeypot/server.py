@@ -5,6 +5,27 @@ from aiohttp import web
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
+
+def _safe(value: str, limit: int = 200) -> str:
+    """Make attacker-controlled text safe to put on one log line.
+
+    aiohttp hands us the *decoded* path, so `%0a` arrives as a real newline and
+    would let a request forge a second, fake log line. Escape every
+    non-printable character (CR, LF, ESC, NUL, ...) instead of emitting it.
+    """
+    out = []
+    for ch in value[:limit]:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch.isprintable():
+            out.append(ch)
+        elif ord(ch) < 0x100:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(f"\\u{ord(ch):04x}")
+    return "".join(out)
+
+
 _FAKE_ENV = """APP_KEY=base64:xWnYiXxhsUFvBmm7pOVWXWoG0000000000==
 DB_HOST=127.0.0.1
 DB_DATABASE=production
@@ -27,7 +48,7 @@ async def handle(request: web.Request) -> web.Response:
     method = request.method
     ip = request.remote
     ua = request.headers.get("User-Agent", "")
-    log.info("%s %s %s | UA=%s", method, path, ip, ua[:60])
+    log.info("%s %s %s | UA=%s", _safe(method, 16), _safe(path), _safe(str(ip), 64), _safe(ua, 60))
 
     if path == "/.env":
         return web.Response(text=_FAKE_ENV, content_type="text/plain",

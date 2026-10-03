@@ -36,8 +36,15 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    LineWorker,
+    extract_lines,
+    limited_factory,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -64,6 +71,15 @@ _AUTH_MODULES = {name for name, _c, needs_auth in _MODULES if needs_auth}
 _OPEN_MODULES = {name for name, _c, needs_auth in _MODULES if not needs_auth}
 
 _MAX_LINE = 4096
+# Lines handled per network read, and in total per connection. A real client
+# sends its option list (one line per argument) and a file request; every
+# open-module line past this is a CRITICAL event, so an unbounded count would
+# let one connection mint unbounded alerts.
+_MAX_LINES_PER_READ = 32
+_MAX_LINES_PER_CONNECTION = 128
+# Events recorded per connection once a module is open. Generous enough for a
+# real client's full option list plus its file requests.
+_MAX_TRANSFER_EVENTS = 64
 
 _STATE_HANDSHAKE = 0
 _STATE_MODULE = 1
@@ -78,35 +94,48 @@ class _RsyncProtocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
+        self._worker = LineWorker(
+            self._handle_raw,
+            name="rsync-lines",
+            max_pending=_MAX_LINES_PER_READ * 2,
+            max_total=_MAX_LINES_PER_CONNECTION,
+        )
         self._state = _STATE_HANDSHAKE
         self._module = ""
         self._challenge = ""
+        self._transfer_events = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         self._send(f"@RSYNCD: {_RSYNC_VERSION}\n")
-        asyncio.create_task(self._record("rsync_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("rsync_connection", AlertSeverity.LOW, {}), name="rsync-connect")
 
     def _send(self, text: str) -> None:
         if self._transport is not None and not self._transport.is_closing():
             self._transport.write(text.encode("utf-8", errors="replace"))
 
     def _close(self) -> None:
+        # Session ending on our side: drop lines queued behind this one.
+        self._worker.stop()
         if self._transport is not None:
             self._transport.close()
 
     def data_received(self, data: bytes) -> None:
-        self._buf += data
-        if len(self._buf) > _MAX_LINE * 8:
-            self._buf = b""
+        lines, self._buf, problem = extract_lines(
+            self._buf + data, max_lines=_MAX_LINES_PER_READ, max_line=_MAX_LINE
+        )
+        accepted = self._worker.submit(lines)
+        if problem or not accepted:
+            # Flood or oversized line: keep what was already queued (it is
+            # evidence), refuse the rest and hang up.
             self._send("@ERROR: protocol error\n")
-            self._close()
-            return
-        while b"\n" in self._buf:
-            raw, self._buf = self._buf.split(b"\n", 1)
-            asyncio.create_task(self._handle(raw.decode("utf-8", errors="replace").strip()))
+            if self._transport is not None:
+                self._transport.close()
+
+    async def _handle_raw(self, raw: bytes) -> None:
+        await self._handle(raw.decode("utf-8", errors="replace").strip())
 
     async def _handle(self, line: str) -> None:
         if self._state == _STATE_HANDSHAKE:
@@ -169,7 +198,7 @@ class _RsyncProtocol(asyncio.Protocol):
                 )
                 return
 
-            self._send(f"@ERROR: Unknown module '{self._module}'\n")
+            self._send(f"@ERROR: Unknown module '{self._module[:64]}'\n")
             await self._record(
                 "rsync_unknown_module", AlertSeverity.MEDIUM, {"module": self._module[:64]}
             )
@@ -193,12 +222,20 @@ class _RsyncProtocol(asyncio.Protocol):
                     "service": "rsync",
                 },
             )
-            await asyncio.sleep(0.8)
+            if self._transport is not None and not self._transport.is_closing():
+                await asyncio.sleep(0.8)
             self._send("@ERROR: auth failed on module " + self._module + "\n")
             self._close()
             return
 
         # Post-OK: the client sends its option list, then the file request.
+        # Every line here is an event (file requests are CRITICAL), so the
+        # count per connection is bounded: past it the session is evidence
+        # enough and further lines are dropped rather than minting alerts.
+        self._transfer_events += 1
+        if self._transfer_events > _MAX_TRANSFER_EVENTS:
+            self._close()
+            return
         if line.startswith("-") or line == ".":
             await self._record(
                 "rsync_transfer_options", AlertSeverity.MEDIUM, {"options": line[:200]}
@@ -253,8 +290,7 @@ class RsyncEngine(HoneypotEngine):
     async def stop(self, container_id: str, remove: bool = False) -> None:
         server = self._servers.pop(container_id, None)
         if server:
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_rsync"}

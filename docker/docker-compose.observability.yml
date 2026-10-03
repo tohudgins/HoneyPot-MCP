@@ -6,11 +6,15 @@
 # host ports directly). This stack just visualises the data that daemon writes.
 #
 #   # 1. MCP daemon already running on the host (see deploy/honeypot-mcp.service),
-#   #    writing its SQLite DB to the repo root and exposing /metrics on :9090.
-#   # 2. Bring up the dashboards:
-#   HONEYPOT_DB_DIR=/opt/honeypot-mcp \
+#   #    writing its SQLite DB to /opt/honeypot-mcp/data/honeypot_mcp.db
+#   #    (DATABASE_URL in .env) and exposing /metrics on :9090 — bound to an
+#   #    address the Prometheus container can reach (see docs/DEPLOY.md).
+#   # 2. Bring up the dashboards (the password has no default):
+#   export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+#   HONEYPOT_DB_DIR=/opt/honeypot-mcp/data \
 #     docker compose -f docker-compose.observability.yml up -d
-#   # 3. Grafana on http://localhost:3000 (admin / ${GRAFANA_ADMIN_PASSWORD:-honeypot})
+#   # 3. Grafana on http://127.0.0.1:3000 (admin / $GRAFANA_ADMIN_PASSWORD) —
+#   #    loopback only; tunnel with `ssh -L 3000:127.0.0.1:3000`.
 #
 # For an all-in-one DEMO on a laptop (no host daemon, no real traffic) use the
 # full docker-compose.yml instead — it bundles the server + static honeypots.
@@ -42,9 +46,13 @@ services:
     depends_on:
       - prometheus
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      # Anonymous access OFF by default — this Grafana can query the whole DB
+      # (captured credentials, honeytoken values, API-key hashes, webhook
+      # secrets). Opt in only for a throwaway demo.
+      GF_AUTH_ANONYMOUS_ENABLED: "${GRAFANA_ANONYMOUS_ENABLED:-false}"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-honeypot}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      # The dashboards' SQLite panels need this community plugin.
       GF_INSTALL_PLUGINS: frser-sqlite-datasource
       GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: frser-sqlite-datasource
       GF_USERS_DEFAULT_THEME: dark
@@ -53,11 +61,13 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/etc/grafana/dashboards:ro
       # Read the host daemon's SQLite DB read-only. WAL mode (database.py) makes
-      # concurrent reads safe while the daemon writes. HONEYPOT_DB_DIR is the
-      # directory holding honeypot_mcp.db (the repo root by default).
-      - ${HONEYPOT_DB_DIR:-..}:/mcp-data:ro
+      # concurrent reads safe while the daemon writes.
+      # Directory holding ONLY honeypot_mcp.db (+ its -wal/-shm). Required, with
+      # no default: the old default of `..` mounted the whole repo — .env (auth
+      # tokens, API keys), tls/ private keys and reports/ — into Grafana.
+      - ${HONEYPOT_DB_DIR:?set HONEYPOT_DB_DIR to a directory containing only honeypot_mcp.db}:/mcp-data:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     security_opt:
       - no-new-privileges:true
 

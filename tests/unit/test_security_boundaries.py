@@ -100,10 +100,14 @@ async def test_every_export_tool_refuses_to_write_outside_reports_dir(bad_path):
 
 
 @pytest.mark.asyncio
-async def test_export_still_works_for_legitimate_filenames():
+async def test_export_still_works_for_legitimate_filenames(tmp_path, monkeypatch):
     """The boundary must not break the normal case."""
+    from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools.alerts import alerts_export
 
+    # A caller-named export refuses to overwrite, so it must not target the
+    # shared ./reports directory (a rerun would collide with its own output).
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
     await _seed()
     result = await alerts_export(format="csv", output_path="legit-export.csv")
     assert "error" not in result

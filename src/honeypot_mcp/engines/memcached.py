@@ -32,9 +32,12 @@ import asyncio
 import logging
 import secrets
 import time
+from collections import Counter
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -58,6 +61,13 @@ _AMPLIFICATION_PAYLOAD_BYTES = 4096
 _MAX_TRACKED_VALUE_BYTES = 64 * 1024
 
 _MAX_LINE_BYTES = 8192
+
+# Reply and bookkeeping bounds. A single reflected value is already capped at
+# _MAX_TRACKED_VALUE_BYTES; this caps the whole reply to one command, so no
+# request shape can make the honeypot emit (or build) a large response.
+_MAX_REPLY_BYTES = 128 * 1024
+_MAX_STAGED_KEYS = 64
+_MAX_WRITE_BUFFER = 512 * 1024
 
 
 def _stats_lines(uptime: int, conn_id: int) -> list[str]:
@@ -116,7 +126,7 @@ class _MemcachedProtocol(asyncio.Protocol):
         self._hp_id = hp_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
         self._started = time.time()
         # Keys this peer has staged with a large value — the second half of the
         # amplification pattern only matters for keys it actually set.
@@ -131,9 +141,18 @@ class _MemcachedProtocol(asyncio.Protocol):
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         # Real memcached sends no greeting; it waits for a command.
-        asyncio.create_task(self._record("memcached_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("memcached_connection", AlertSeverity.LOW, {}), name="memcached-event")
+
+    def _close(self) -> None:
+        self._buf.clear()
+        self._pending_body = None
+        if self._transport is not None and not self._transport.is_closing():
+            self._transport.close()
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
         self._buf += data
         if len(self._buf) > _MAX_LINE_BYTES + _MAX_TRACKED_VALUE_BYTES:
             # Oversized garbage — real memcached errors out rather than buffering.
@@ -142,33 +161,46 @@ class _MemcachedProtocol(asyncio.Protocol):
             # sends next as the completion of a `set` body that was actually
             # abandoned here, misparsing an unrelated command as opaque bytes.
             self._send(b"ERROR\r\n")
-            self._buf = b""
+            self._buf.clear()
             self._pending_body = None
             return
-        while True:
-            if self._pending_body is not None:
-                # The data block is exactly `declared` bytes of arbitrary
-                # content — real memcached values can contain embedded CRLFs,
-                # so this must never be parsed as a CRLF-delimited line. That
-                # was the previous bug: splitting on the next b"\r\n" instead
-                # of consuming exactly `declared` bytes let an embedded CRLF
-                # truncate the body early and resync the parser mid-value,
-                # treating the remainder of an attacker's payload as a new
-                # command.
-                key, declared = self._pending_body
-                needed = declared + 2  # + trailing CRLF
-                if len(self._buf) < needed:
+        buf = self._buf
+        pos = 0
+        try:
+            while not t.is_closing():
+                if write_backlogged(t, _MAX_WRITE_BUFFER):
+                    self._close()  # peer is not reading its replies
                     return
-                self._buf = self._buf[needed:]
-                self._pending_body = None
-                self._send(b"STORED\r\n")
-                self._on_stored(key, declared)
-                continue
-            if b"\r\n" not in self._buf:
-                return
-            line, self._buf = self._buf.split(b"\r\n", 1)
-            if not self._handle_line(line):
-                return
+                if self._pending_body is not None:
+                    # The data block is exactly `declared` bytes of arbitrary
+                    # content — real memcached values can contain embedded CRLFs,
+                    # so this must never be parsed as a CRLF-delimited line. That
+                    # was the previous bug: splitting on the next b"\r\n" instead
+                    # of consuming exactly `declared` bytes let an embedded CRLF
+                    # truncate the body early and resync the parser mid-value,
+                    # treating the remainder of an attacker's payload as a new
+                    # command.
+                    key, declared = self._pending_body
+                    needed = declared + 2  # + trailing CRLF
+                    if len(buf) - pos < needed:
+                        break
+                    pos += needed
+                    self._pending_body = None
+                    self._send(b"STORED\r\n")
+                    self._on_stored(key, declared)
+                    continue
+                end = buf.find(b"\r\n", pos)
+                if end == -1:
+                    break
+                line = bytes(buf[pos:end])
+                pos = end + 2
+                if not self._handle_line(line):
+                    break
+        except Exception:
+            log.exception("memcached protocol error")
+            self._close()
+            return
+        del buf[:pos]
 
     def _send(self, payload: bytes) -> None:
         if self._transport is not None and not self._transport.is_closing():
@@ -177,7 +209,7 @@ class _MemcachedProtocol(asyncio.Protocol):
     def _handle_line(self, raw: bytes) -> bool:
         """Return False to stop processing (connection closing)."""
         try:
-            text = raw.decode("utf-8", errors="replace").strip()
+            text = raw[:_MAX_LINE_BYTES].decode("utf-8", errors="replace").strip()
         except Exception:
             self._send(b"ERROR\r\n")
             return True
@@ -188,8 +220,9 @@ class _MemcachedProtocol(asyncio.Protocol):
 
         if command == "version":
             self._send(f"VERSION {_MEMCACHED_VERSION}\r\n".encode())
-            asyncio.create_task(
-                self._record("memcached_version_probe", AlertSeverity.LOW, {"command": text[:200]})
+            spawn(
+                self._record("memcached_version_probe", AlertSeverity.LOW, {"command": text[:200]}),
+                name="memcached-event",
             )
             return True
 
@@ -199,7 +232,7 @@ class _MemcachedProtocol(asyncio.Protocol):
             self._send(body.encode())
             # `stats` is how a reflector is measured: the response is ~1.5 KB
             # for a ~7-byte request, and it confirms the server answers at all.
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "memcached_stats_probe",
                     AlertSeverity.MEDIUM,
@@ -208,16 +241,20 @@ class _MemcachedProtocol(asyncio.Protocol):
                         "response_bytes": len(body),
                         "amplification_factor": round(len(body) / max(len(raw) + 2, 1), 1),
                     },
-                )
+                ),
+                name="memcached-event",
             )
             return True
 
         if command == "set" and len(parts) >= 5:
-            key = parts[1]
+            key = parts[1][:250]
             try:
                 declared = int(parts[4])
             except ValueError:
                 self._send(b"CLIENT_ERROR bad command line format\r\n")
+                return True
+            if declared < 0:
+                self._send(b"CLIENT_ERROR bad data chunk\r\n")
                 return True
             if declared > _MAX_TRACKED_VALUE_BYTES:
                 # Consume without storing; still record the intent.
@@ -229,42 +266,57 @@ class _MemcachedProtocol(asyncio.Protocol):
 
         if command in ("get", "gets") and len(parts) >= 2:
             keys = parts[1:]
-            staged = [k for k in keys if k in self._staged]
+            # Duplicated keys in one `get` are how a tiny request is turned into
+            # a huge reply (`get a a a …`). The *detection* still counts every
+            # occurrence arithmetically — that is the factor a real reflector
+            # would have produced — but the reply carries each key once and is
+            # capped, so this honeypot never amplifies.
+            counts = Counter(keys)
+            staged = [k for k in counts if k in self._staged]
             if staged:
                 # Stage-then-reflect: the payload this peer just stored is now
                 # being pulled back. Against a spoofed source that response goes
                 # to the victim.
-                total = sum(self._staged[k] for k in staged)
-                asyncio.create_task(
+                total = sum(self._staged[k] * counts[k] for k in staged)
+                spawn(
                     self._record(
                         "memcached_amplification_attempt",
                         AlertSeverity.CRITICAL,
                         {
                             "command": text[:200],
-                            "keys": staged[:10],
+                            "keys": [k[:120] for k in staged[:10]],
                             "staged_bytes": total,
                             "amplification_factor": round(total / max(len(raw) + 2, 1), 1),
                             "note": "large value stored then retrieved — reflector staging",
                         },
-                    )
+                    ),
+                    name="memcached-event",
                 )
-                payload = b""
+                chunks: list[bytes] = []
+                used = 0
                 for k in staged:
                     size = self._staged[k]
-                    payload += f"VALUE {k} 0 {size}\r\n".encode() + b"A" * size + b"\r\n"
-                self._send(payload + b"END\r\n")
+                    chunk = f"VALUE {k} 0 {size}\r\n".encode() + b"A" * size + b"\r\n"
+                    if chunks and used + len(chunk) > _MAX_REPLY_BYTES:
+                        break
+                    chunks.append(chunk)
+                    used += len(chunk)
+                self._send(b"".join(chunks) + b"END\r\n")
                 return True
             self._send(b"END\r\n")
-            asyncio.create_task(
+            spawn(
                 self._record(
-                    "memcached_get", AlertSeverity.LOW, {"command": text[:200], "keys": keys[:10]}
-                )
+                    "memcached_get",
+                    AlertSeverity.LOW,
+                    {"command": text[:200], "keys": [k[:120] for k in keys[:10]]},
+                ),
+                name="memcached-event",
             )
             return True
 
         if command == "flush_all":
             self._send(b"OK\r\n")
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "memcached_flush_all",
                     AlertSeverity.HIGH,
@@ -272,7 +324,8 @@ class _MemcachedProtocol(asyncio.Protocol):
                         "command": text[:200],
                         "note": "destroys every cached entry — unauthenticated availability attack",
                     },
-                )
+                ),
+                name="memcached-event",
             )
             return True
 
@@ -283,21 +336,24 @@ class _MemcachedProtocol(asyncio.Protocol):
 
         if command in ("delete", "add", "replace", "append", "prepend", "incr", "decr", "touch"):
             self._send(b"NOT_FOUND\r\n")
-            asyncio.create_task(
-                self._record("memcached_command", AlertSeverity.LOW, {"command": text[:200]})
+            spawn(
+                self._record("memcached_command", AlertSeverity.LOW, {"command": text[:200]}),
+                name="memcached-event",
             )
             return True
 
         self._send(b"ERROR\r\n")
-        asyncio.create_task(
-            self._record("memcached_command", AlertSeverity.LOW, {"command": text[:200]})
+        spawn(
+            self._record("memcached_command", AlertSeverity.LOW, {"command": text[:200]}),
+            name="memcached-event",
         )
         return True
 
     def _on_stored(self, key: str, size: int) -> None:
         if size >= _AMPLIFICATION_PAYLOAD_BYTES:
-            self._staged[key] = min(size, _MAX_TRACKED_VALUE_BYTES)
-            asyncio.create_task(
+            if key in self._staged or len(self._staged) < _MAX_STAGED_KEYS:
+                self._staged[key] = min(size, _MAX_TRACKED_VALUE_BYTES)
+            spawn(
                 self._record(
                     "memcached_large_set",
                     AlertSeverity.HIGH,
@@ -306,13 +362,15 @@ class _MemcachedProtocol(asyncio.Protocol):
                         "value_bytes": size,
                         "note": "oversized value — amplification payload staging",
                     },
-                )
+                ),
+                name="memcached-event",
             )
         else:
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "memcached_set", AlertSeverity.LOW, {"key": key[:120], "value_bytes": size}
-                )
+                ),
+                name="memcached-event",
             )
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:

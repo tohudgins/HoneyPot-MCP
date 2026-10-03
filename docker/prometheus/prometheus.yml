@@ -1,7 +1,7 @@
 # Prometheus config for HoneyPot MCP.
 #
 # Single scrape target: the MCP /metrics endpoint on the internal
-# honeypot-net. 15s interval is plenty — the metrics are aggregates over the
+# monitor-net. 15s interval is plenty — the metrics are aggregates over the
 # whole alerts table, not high-frequency counters.
 
 global:

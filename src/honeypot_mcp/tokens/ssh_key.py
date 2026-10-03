@@ -21,14 +21,33 @@ appearing in any auth attempt is high-fidelity evidence of compromise.
 
 from __future__ import annotations
 
+import asyncio
 import base64
-import contextlib
 import hashlib
+import re
 import uuid
 from pathlib import Path
 from typing import Any
 
+from honeypot_mcp.secure_io import ensure_private_dir, write_private_file
 from honeypot_mcp.tokens.base import HoneytokenProvider
+
+# A comment is appended to the public key as `<type> <blob> <comment>` and the
+# result goes into authorized_keys-style files, where one key is one line. Any
+# control character (newline above all) would let a caller append a second,
+# attacker-chosen key line.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_MAX_COMMENT_LEN = 256
+
+
+def _validate_comment(comment: Any) -> str:
+    if not isinstance(comment, str):
+        raise ValueError("ssh_key comment must be a string")
+    if len(comment) > _MAX_COMMENT_LEN:
+        raise ValueError(f"ssh_key comment must be at most {_MAX_COMMENT_LEN} characters")
+    if _CONTROL_CHARS.search(comment):
+        raise ValueError("ssh_key comment must not contain control characters or newlines")
+    return comment
 
 
 def _generate_keypair() -> tuple[str, str, str]:
@@ -75,9 +94,11 @@ def _generate_keypair() -> tuple[str, str, str]:
 class SSHKeyProvider(HoneytokenProvider):
     async def create(self, options: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         token_uid = uuid.uuid4().hex
-        comment = options.get("comment", f"deploy-{token_uid[:8]}@server")
+        comment = _validate_comment(options.get("comment", f"deploy-{token_uid[:8]}@server"))
 
-        private_pem, public_openssh, fingerprint = _generate_keypair()
+        # RSA key generation is CPU-bound and would stall the event loop (and
+        # every honeypot sharing it) for the duration.
+        private_pem, public_openssh, fingerprint = await asyncio.to_thread(_generate_keypair)
         # Append the comment to the public key like real ssh-keygen output.
         public_openssh = f"{public_openssh.strip()} {comment}\n"
 
@@ -85,12 +106,11 @@ class SSHKeyProvider(HoneytokenProvider):
         # actually plant it. The path is the token_value so the operator can
         # find it again via honeytoken_export.
         out_dir = Path("reports/generated")
-        out_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(out_dir)
         key_path = out_dir / f"id_rsa_{token_uid}"
-        key_path.write_text(private_pem)
-        # Match real ssh-keygen permissions on POSIX. Best-effort on Windows.
-        with contextlib.suppress(OSError):
-            key_path.chmod(0o600)
+        # Created 0600 from the first instant — chmod-after-write leaves a
+        # window where the private key is world-readable under a 022 umask.
+        write_private_file(key_path, private_pem)
 
         meta = {
             "token_uid": token_uid,

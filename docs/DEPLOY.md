@@ -129,12 +129,16 @@ Open `.env` and set:
 ```bash
 # Run as a persistent HTTP daemon so honeypots survive across chats.
 MCP_TRANSPORT=http
-MCP_HOST=0.0.0.0          # so your MCP client can reach it over the network
+MCP_HOST=127.0.0.1        # loopback only — reach it over the SSH tunnel (step 7)
 MCP_PORT=8000
 # REQUIRED for http/sse — the daemon refuses to start without it. Clients must
 # present it as `Authorization: Bearer <token>`. Generate a fresh one:
 #   openssl rand -hex 32
-MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>
+MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>   # min 16 chars; 64-hex recommended
+
+# The systemd unit (step 5) can write ONLY data/, reports/, tls/ and pcap/, so
+# the SQLite database must live under data/:
+DATABASE_URL=sqlite+aiosqlite:///./data/honeypot_mcp.db
 
 # ALTERNATIVE to the single token above: hand out multiple tokens with
 # different access levels instead of one shared full-access token. Takes
@@ -163,9 +167,10 @@ MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>
 # REQUIRED for canary tokens to fire from the internet
 CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
 
-# RECOMMENDED — sign up for the free tiers, paste keys here
-VIRUSTOTAL_API_KEY=...
-ABUSEIPDB_API_KEY=...
+# RECOMMENDED — sign up for the free tiers, paste real keys here. Leave them
+# EMPTY otherwise: any non-empty placeholder is treated as a key.
+VIRUSTOTAL_API_KEY=
+ABUSEIPDB_API_KEY=
 
 # OPTIONAL — drop GeoLite2 databases in config/ for geo + network enrichment
 GEOIP_DB_PATH=config/GeoLite2-City.mmdb
@@ -181,10 +186,12 @@ under `config/`. Each is independently optional; a missing one just leaves its
 fields out. MaxMind's license forbids redistribution, so neither is in the repo.
 
 > **Secure the control-plane port.** `MCP_PORT` (8000) can deploy honeypots and
-> read all captured data. It's now bearer-token authenticated (`MCP_AUTH_TOKEN`,
+> read all captured data. It's bearer-token authenticated (`MCP_AUTH_TOKEN`,
 > required — the daemon refuses to start without it), but treat the token as
-> defence-in-depth, not the only layer: still do **not** open 8000 in the
-> firewall. Reach it over an SSH tunnel (step 7) or bind it to `127.0.0.1`.
+> defence-in-depth, not the only layer: keep `MCP_HOST=127.0.0.1` and reach it
+> over an SSH tunnel (step 7). If several people need it, put a TLS reverse
+> proxy (Caddy/nginx) in front on 443 rather than binding 8000 to `0.0.0.0` —
+> the token travels in clear text over plain HTTP.
 
 ### 5. Run the server as a persistent daemon (2 min)
 
@@ -193,21 +200,49 @@ reboots and crashes (the startup `reconcile` step re-establishes running
 honeypots automatically):
 
 ```bash
-# Dedicated non-login user with Docker access (for the SSH engine)
+# Dedicated non-login user
 sudo useradd --system --home /opt/honeypot-mcp --shell /usr/sbin/nologin honeypot
+# Docker access for the SSH/Cowrie engine — see the tradeoff below before running
 sudo usermod -aG docker honeypot
-sudo chown -R honeypot:honeypot /opt/honeypot-mcp
+
+# Build the venv from the lock (the unit runs .venv/bin/honeypot-mcp directly)
+cd /opt/honeypot-mcp && sudo uv sync --frozen --no-dev
+
+# Code, .venv and .env stay root-owned and read-only to the service; only the
+# data directories are writable (the unit's ReadWritePaths= lists exactly these).
+sudo chown -R root:root /opt/honeypot-mcp
+sudo mkdir -p /opt/honeypot-mcp/{data,reports,tls,pcap}
+sudo chown honeypot:honeypot /opt/honeypot-mcp/{data,reports,tls,pcap}
+sudo chmod 0700 /opt/honeypot-mcp/{data,reports,tls,pcap}
+sudo chown root:honeypot /opt/honeypot-mcp/.env && sudo chmod 0640 /opt/honeypot-mcp/.env
 
 sudo cp deploy/honeypot-mcp.service /etc/systemd/system/
-# Edit ExecStart's uv path if `which uv` differs from /usr/local/bin/uv
 sudo systemctl daemon-reload
 sudo systemctl enable --now honeypot-mcp
 sudo systemctl status honeypot-mcp        # should be active (running)
 journalctl -u honeypot-mcp -f             # live logs
 ```
 
-The daemon now serves the MCP endpoint at `http://<vps-ip>:8000/mcp`, plus the
-canary callback (`:8888`) and Prometheus `/metrics` (`:9090`).
+The unit is sandboxed (`ProtectSystem=strict`, no capabilities, `MemoryMax=1G`,
+`TasksMax=512`, `LimitNOFILE=65536`, IP/Unix/netlink sockets only). Tune
+`MemoryMax` to the machine. Packet capture (`PCAP_ENABLED=true`) needs the
+`CAP_NET_RAW`/`CAP_NET_ADMIN` + `AF_PACKET` drop-in documented at the bottom of
+the unit file. Honeypot ports below 1024 (22, 80, …) are not bound directly —
+the unit has no `CAP_NET_BIND_SERVICE`; deploy on a high port and redirect
+(`iptables -t nat -A PREROUTING -p tcp --dport 22 -j REDIRECT --to-port 2222`),
+or add `CAP_NET_BIND_SERVICE` to both capability lines in a drop-in.
+
+> **The `docker` group is root-equivalent.** Anyone who can talk to the Docker
+> socket can start a privileged container that mounts `/`. The daemon parses
+> attacker payloads all day, so a bug that reaches Docker calls is root on the
+> host — the systemd sandbox does not change that. If you don't need SSH/Telnet
+> (Cowrie) honeypots, skip the `usermod` and drop `docker.service` from the
+> unit's `Requires=`. A socket proxy (`tecnativa/docker-socket-proxy`, as in
+> `docker/docker-compose.yml`) restricts API *endpoints* but not request bodies,
+> so it narrows the exposure rather than removing it. Use a dedicated host.
+
+The daemon serves the MCP endpoint at `http://127.0.0.1:8000/mcp`, plus the
+canary callback (`:8888`) and Prometheus `/metrics` (`127.0.0.1:9090`).
 
 ### 6. Open the firewall (1 min)
 
@@ -231,6 +266,13 @@ ufw allow 53/udp
 ufw --force enable
 # NB: 8000 (MCP control) and 9090 (metrics) are deliberately NOT opened.
 ```
+
+> **ufw does not protect Docker-published ports.** Docker inserts its own
+> iptables rules ahead of ufw's, so a container port published as
+> `-p 3000:3000` is reachable from the internet even with ufw denying it. That
+> is why every non-honeypot port in this repo's compose files is published on
+> `127.0.0.1` only (Grafana, Prometheus, metrics, console). Keep it that way;
+> to filter Docker traffic use the `DOCKER-USER` chain, not ufw.
 
 ### 7. Connect your MCP client over an SSH tunnel (2 min)
 
@@ -275,13 +317,20 @@ honeypots keep collecting after your chat and your SSH tunnel close.
 
 ```bash
 cd /opt/honeypot-mcp/docker
-HONEYPOT_DB_DIR=/opt/honeypot-mcp \
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, no default — keep it
+HONEYPOT_DB_DIR=/opt/honeypot-mcp/data \
   docker compose -f docker-compose.observability.yml up -d
 ```
 
 This starts Prometheus + Grafana pointed at the daemon's SQLite DB and
-`/metrics` endpoint (both read-only). Tunnel `-L 3000:127.0.0.1:3000` to view
-it; don't expose 3000 publicly. Dashboards: Overview, Threat Map, MITRE
+`/metrics` endpoint (both read-only). `HONEYPOT_DB_DIR` is required and must be
+a directory holding only the database — never the repo root, which contains
+`.env` and `tls/` keys. Grafana binds `127.0.0.1:3000`, with anonymous access
+off; tunnel `-L 3000:127.0.0.1:3000` and log in as `admin`. Its SQLite
+datasource can read the whole database (captured credentials, honeytoken
+values), so never publish it. For Prometheus (in a container) to scrape the
+host daemon, set `METRICS_HOST` to the Docker bridge gateway (e.g.
+`172.17.0.1`) rather than `0.0.0.0`. Dashboards: Overview, Threat Map, MITRE
 Coverage.
 
 ### 10. Wait

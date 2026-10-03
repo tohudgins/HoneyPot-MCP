@@ -25,6 +25,7 @@ so the flusher knows to mark the token as TRIGGERED.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
 
@@ -56,13 +58,28 @@ _file_uid_index: dict[str, int] = {}  # token_uid → token_id (FILE tokens)
 # with Azure GUIDs).
 _cloud_cred_index: dict[str, int] = {}
 _loaded_at: float = 0.0
+_refresh_lock: LoopBound[asyncio.Lock] = LoopBound(asyncio.Lock)
+_refresh_failing = False
+# After a failed refresh, retry this many seconds later instead of on the next event.
+_REFRESH_RETRY_SECONDS = 5
+# TRIGGERED tokens stay matchable: a first (possibly benign) hit must not
+# disarm the token against the attacker who uses it later.
+_MATCHABLE_STATUSES = (HoneytokenStatus.ACTIVE, HoneytokenStatus.TRIGGERED)
+
+# Every scanned string is clipped to this many characters first. Payload
+# values are attacker-authored and the scan runs on the ingest hot path.
+_MAX_SCAN_CHARS = 8192
 
 # OpenSSH fingerprint pattern: SHA256:<43 base64url chars>
 _SSH_FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/=]{40,50}")
 
-# Compact JWT pattern (three base64url segments joined by dots). Loose match
-# is fine — _decode_jwt validates structure when we attempt extraction.
-_JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b")
+# JWT detection is done without a backtracking regex: the old pattern
+# `\b[..]{6,}\.[..]{8,}\.[..]{6,}\b` was quadratic on long runs like
+# `a-a-a-…`. Instead, maximal runs of base64url-or-dot characters are found
+# (one linear pass) and each run is split on dots; three consecutive segments
+# of at least 6 / 8 / 6 characters form a candidate (header.payload.signature).
+_JWT_RUN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+_JWT_SEGMENT_MIN = (6, 8, 6)
 
 # Canary email pattern — we own the local-part prefix `canary-<hex16>`, so
 # this match is very specific.
@@ -75,80 +92,102 @@ def invalidate_cache() -> None:
     _loaded_at = 0.0
 
 
+def _cache_fresh() -> bool:
+    return time.monotonic() - _loaded_at < CACHE_REFRESH_SECONDS
+
+
 async def _load_indices() -> None:
-    global _ssh_key_index, _jwt_index, _dbrow_index, _cloud_cred_index, _file_uid_index, _loaded_at
-    now = time.monotonic()
-    if now - _loaded_at < CACHE_REFRESH_SECONDS:
+    """Refresh the indices if they have expired.
+
+    Double-checked under a lock so a burst of events at expiry costs one
+    SELECT. A failed refresh keeps the previous indices (stale beats empty) and
+    lets the event continue to the queue rather than raising out of
+    `submit_event` and losing it.
+    """
+    global _ssh_key_index, _jwt_index, _dbrow_index, _cloud_cred_index, _file_uid_index
+    global _loaded_at, _refresh_failing
+    if _cache_fresh():
         return
+    async with _refresh_lock.get():
+        if _cache_fresh():
+            return
+        now = time.monotonic()
+        try:
+            async with get_session() as session:
+                result = await session.execute(
+                    select(Honeytoken).where(
+                        Honeytoken.status.in_(_MATCHABLE_STATUSES),
+                        Honeytoken.type.in_(
+                            [
+                                HoneytokenType.SSH_KEY,
+                                HoneytokenType.JWT,
+                                HoneytokenType.DB_ROW,
+                                HoneytokenType.API_KEY,
+                                HoneytokenType.AZURE_CREDENTIAL,
+                                HoneytokenType.GCP_SERVICE_ACCOUNT,
+                                HoneytokenType.FILE,
+                            ]
+                        ),
+                    )
+                )
+                tokens = list(result.scalars().all())
+        except Exception as e:
+            if not _refresh_failing:
+                log.warning("Honeytoken index refresh failed (%s) — keeping the previous index.", e)
+            _refresh_failing = True
+            _loaded_at = now - CACHE_REFRESH_SECONDS + _REFRESH_RETRY_SECONDS
+            return
+        _refresh_failing = False
 
-    async with get_session() as session:
-        result = await session.execute(
-            select(Honeytoken).where(
-                Honeytoken.status == HoneytokenStatus.ACTIVE,
-                Honeytoken.type.in_(
-                    [
-                        HoneytokenType.SSH_KEY,
-                        HoneytokenType.JWT,
-                        HoneytokenType.DB_ROW,
-                        HoneytokenType.API_KEY,
-                        HoneytokenType.AZURE_CREDENTIAL,
-                        HoneytokenType.GCP_SERVICE_ACCOUNT,
-                        HoneytokenType.FILE,
-                    ]
-                ),
-            )
-        )
-        tokens = list(result.scalars().all())
+        ssh: dict[str, int] = {}
+        jwt: dict[str, int] = {}
+        dbr: dict[str, int] = {}
+        cloud: dict[str, int] = {}
+        file_uid: dict[str, int] = {}
+        for t in tokens:
+            meta = t.token_meta or {}
+            if t.type == HoneytokenType.SSH_KEY:
+                fp = meta.get("fingerprint")
+                if isinstance(fp, str) and fp:
+                    ssh[fp] = t.id
+            elif t.type == HoneytokenType.JWT:
+                jti = meta.get("jti")
+                if isinstance(jti, str) and jti:
+                    jwt[jti] = t.id
+            elif t.type == HoneytokenType.DB_ROW:
+                email = meta.get("canary_email")
+                if isinstance(email, str) and email:
+                    dbr[email.lower()] = t.id
+            elif t.type == HoneytokenType.API_KEY:
+                # AWS access_key_id is the identifying field in CloudTrail.
+                akid = meta.get("access_key_id")
+                if isinstance(akid, str) and akid:
+                    cloud[akid] = t.id
+            elif t.type == HoneytokenType.AZURE_CREDENTIAL:
+                cid = meta.get("client_id")
+                if isinstance(cid, str) and cid:
+                    cloud[cid] = t.id
+            elif t.type == HoneytokenType.GCP_SERVICE_ACCOUNT:
+                # GCP audit logs surface the principalEmail (the service-account
+                # email). The private_key_id is also distinctive but rarely
+                # appears in audit logs.
+                email = meta.get("client_email")
+                if isinstance(email, str) and email:
+                    cloud[email.lower()] = t.id
+                pkid = meta.get("private_key_id")
+                if isinstance(pkid, str) and pkid:
+                    cloud[pkid] = t.id
+            elif t.type == HoneytokenType.FILE:
+                uid = meta.get("token_uid")
+                if isinstance(uid, str) and uid:
+                    file_uid[uid] = t.id
 
-    ssh: dict[str, int] = {}
-    jwt: dict[str, int] = {}
-    dbr: dict[str, int] = {}
-    cloud: dict[str, int] = {}
-    file_uid: dict[str, int] = {}
-    for t in tokens:
-        meta = t.token_meta or {}
-        if t.type == HoneytokenType.SSH_KEY:
-            fp = meta.get("fingerprint")
-            if isinstance(fp, str) and fp:
-                ssh[fp] = t.id
-        elif t.type == HoneytokenType.JWT:
-            jti = meta.get("jti")
-            if isinstance(jti, str) and jti:
-                jwt[jti] = t.id
-        elif t.type == HoneytokenType.DB_ROW:
-            email = meta.get("canary_email")
-            if isinstance(email, str) and email:
-                dbr[email.lower()] = t.id
-        elif t.type == HoneytokenType.API_KEY:
-            # AWS access_key_id is the identifying field in CloudTrail.
-            akid = meta.get("access_key_id")
-            if isinstance(akid, str) and akid:
-                cloud[akid] = t.id
-        elif t.type == HoneytokenType.AZURE_CREDENTIAL:
-            cid = meta.get("client_id")
-            if isinstance(cid, str) and cid:
-                cloud[cid] = t.id
-        elif t.type == HoneytokenType.GCP_SERVICE_ACCOUNT:
-            # GCP audit logs surface the principalEmail (the service-account
-            # email). The private_key_id is also distinctive but rarely
-            # appears in audit logs.
-            email = meta.get("client_email")
-            if isinstance(email, str) and email:
-                cloud[email.lower()] = t.id
-            pkid = meta.get("private_key_id")
-            if isinstance(pkid, str) and pkid:
-                cloud[pkid] = t.id
-        elif t.type == HoneytokenType.FILE:
-            uid = meta.get("token_uid")
-            if isinstance(uid, str) and uid:
-                file_uid[uid] = t.id
-
-    _ssh_key_index = ssh
-    _jwt_index = jwt
-    _dbrow_index = dbr
-    _cloud_cred_index = cloud
-    _file_uid_index = file_uid
-    _loaded_at = now
+        _ssh_key_index = ssh
+        _jwt_index = jwt
+        _dbrow_index = dbr
+        _cloud_cred_index = cloud
+        _file_uid_index = file_uid
+        _loaded_at = now
 
 
 async def match_file_uid(labels: list[str]) -> int | None:
@@ -240,8 +279,25 @@ def _decode_jwt_jti(jwt: str) -> str | None:
         claims = json.loads(decoded)
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+    if not isinstance(claims, dict):
+        return None
     jti = claims.get("jti")
     return jti if isinstance(jti, str) else None
+
+
+def _find_jwt(text: str) -> str | None:
+    """Return the first `header.payload.signature`-shaped token in `text`.
+
+    Linear in the (clipped) input: one pass to find runs of base64url/dot
+    characters, then a split per run — no backtracking regex."""
+    for m in _JWT_RUN_RE.finditer(text[:_MAX_SCAN_CHARS]):
+        segments = m.group(0).split(".")
+        for i in range(len(segments) - 2):
+            a, b, c = segments[i], segments[i + 1], segments[i + 2]
+            min_a, min_b, min_c = _JWT_SEGMENT_MIN
+            if len(a) >= min_a and len(b) >= min_b and len(c) >= min_c:
+                return f"{a}.{b}.{c}"
+    return None
 
 
 def _scan_for_fingerprint(payload: dict) -> str | None:
@@ -252,7 +308,7 @@ def _scan_for_fingerprint(payload: dict) -> str | None:
     # Cowrie embeds the fingerprint in the `key` or `kex` event payload.
     for value in payload.values():
         if isinstance(value, str):
-            m = _SSH_FINGERPRINT_RE.search(value)
+            m = _SSH_FINGERPRINT_RE.search(value[:_MAX_SCAN_CHARS])
             if m:
                 return m.group(0)
     return None
@@ -268,25 +324,25 @@ def _scan_for_jwt(payload: dict) -> str | None:
                 continue
             # Authorization: Bearer <jwt>
             if header_name.lower() == "authorization":
-                parts = header_value.split(None, 1)
+                parts = header_value[:_MAX_SCAN_CHARS].split(None, 1)
                 if len(parts) == 2 and parts[0].lower() == "bearer":
                     return parts[1].strip()
             # Or scan any header value for JWT-shaped strings
-            m = _JWT_RE.search(header_value)
-            if m:
-                return m.group(0)
+            found = _find_jwt(header_value)
+            if found:
+                return found
     # Scan post_data and any other top-level string values
     for value in payload.values():
         if isinstance(value, str):
-            m = _JWT_RE.search(value)
-            if m:
-                return m.group(0)
+            found = _find_jwt(value)
+            if found:
+                return found
         elif isinstance(value, dict):
             for v in value.values():
                 if isinstance(v, str):
-                    m = _JWT_RE.search(v)
-                    if m:
-                        return m.group(0)
+                    found = _find_jwt(v)
+                    if found:
+                        return found
     return None
 
 
@@ -295,13 +351,13 @@ def _scan_for_canary_email(payload: dict, event_type: str) -> str | None:
     # SMTP commands ship in payload.command — "RCPT TO:<canary-...@dom>"
     cmd = payload.get("command")
     if isinstance(cmd, str):
-        m = _CANARY_EMAIL_RE.search(cmd)
+        m = _CANARY_EMAIL_RE.search(cmd[:_MAX_SCAN_CHARS])
         if m:
             return m.group(0).lower()
     # Scan all string values — covers email-bearing payload shapes.
     for value in payload.values():
         if isinstance(value, str):
-            m = _CANARY_EMAIL_RE.search(value)
+            m = _CANARY_EMAIL_RE.search(value[:_MAX_SCAN_CHARS])
             if m:
                 return m.group(0).lower()
     return None

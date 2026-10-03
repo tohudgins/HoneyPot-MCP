@@ -12,41 +12,59 @@ matches on `token_meta.token_id`. No new infrastructure required.
 
 from __future__ import annotations
 
+import re
 import secrets
 import uuid
 from typing import Any
 
+import yaml
+
 from honeypot_mcp.tokens.base import HoneytokenProvider
 
-# A throwaway base64-ish blob that LOOKS like a CA bundle without containing
-# any real key material. Real kubeconfigs embed a base64-encoded PEM cert.
-_FAKE_CA_BUNDLE = (
-    "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURIRENDQWdTZ0F3SUJBZ0lVU"
-    "FlBVUNQVTBaaFRSQUVURFlxV1RKWlpkcWh3Z2dPQ0EwR0NTcUdTSWIzRFFFQkN3VU"
-    "FNQjB4R3pBWkJnTlZCQU1NRWtSbApabUYxYkhRZ1FYVjBhRzl5YVhSNU1CNFhEVE0"
-    "wTURFd01UQXdNREF3TUZvWERUTTBNREV3TVRBd01EQXdNRm93RXpFUk1BOEdBMVVF"
-)
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_MAX_CLUSTER_NAME_LEN = 253
 
 
-def _kubeconfig_yaml(cluster_name: str, server_url: str, ca_bundle: str, bearer_token: str) -> str:
-    return (
-        "apiVersion: v1\n"
-        "kind: Config\n"
-        "clusters:\n"
-        f"- name: {cluster_name}\n"
-        "  cluster:\n"
-        f"    server: {server_url}\n"
-        f"    certificate-authority-data: {ca_bundle}\n"
-        "contexts:\n"
-        f"- name: {cluster_name}\n"
-        "  context:\n"
-        f"    cluster: {cluster_name}\n"
-        "    user: admin\n"
-        f"current-context: {cluster_name}\n"
-        "users:\n"
-        "- name: admin\n"
-        "  user:\n"
-        f"    token: {bearer_token}\n"
+def _validate_cluster_name(name: Any) -> str:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("kubeconfig cluster_name must be a non-empty string")
+    if len(name) > _MAX_CLUSTER_NAME_LEN:
+        raise ValueError(f"kubeconfig cluster_name must be at most {_MAX_CLUSTER_NAME_LEN} chars")
+    if _CONTROL_CHARS.search(name):
+        raise ValueError("kubeconfig cluster_name must not contain control characters")
+    return name
+
+
+def _kubeconfig_yaml(cluster_name: str, server_url: str, bearer_token: str) -> str:
+    """Render the kubeconfig through a YAML serialiser, never by interpolation.
+
+    `cluster_name` is operator/model supplied; spliced into a template, a value
+    containing a newline or `: ` rewrites the document structure.
+
+    TLS: the canary callback server speaks plain HTTP and, in production, sits
+    behind whatever `CANARY_PUBLIC_URL` points at — often a reverse proxy with a
+    publicly trusted certificate. `certificate-authority-data` would *replace*
+    the system trust store and make kubectl abort the handshake against such a
+    proxy before a single request (and so a single alert) was sent, while a
+    bogus/truncated blob fails even earlier at parse time. `insecure-skip-tls-verify`
+    works for every scheme and certificate the operator might front the canary
+    with, so the first `kubectl` call always reaches us.
+    """
+    config = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [
+            {
+                "name": cluster_name,
+                "cluster": {"server": server_url, "insecure-skip-tls-verify": True},
+            }
+        ],
+        "contexts": [{"name": cluster_name, "context": {"cluster": cluster_name, "user": "admin"}}],
+        "current-context": cluster_name,
+        "users": [{"name": "admin", "user": {"token": bearer_token}}],
+    }
+    return yaml.safe_dump(
+        config, default_flow_style=False, sort_keys=False, allow_unicode=True, width=4096
     )
 
 
@@ -56,21 +74,18 @@ class KubeconfigProvider(HoneytokenProvider):
 
         settings = get_settings()
         token_id = str(uuid.uuid4())
-        # `/kubeconfig/<token_id>` path is captured by the existing
-        # `/t/{token_id}` route — we point kubectl at it directly via
-        # the trailing token_id in the path. kubectl makes a GET on
-        # `/version` or `/api` after the URL — both 200 OK from the
-        # canary server suffice for it to consider the cluster reachable
-        # long enough to record the access.
+        # kubectl appends its request paths to this base (`/version`, `/api`,
+        # `/apis`, `/api/v1/...`); the canary server's `/t/{token_id}/{tail}`
+        # catch-all answers those with minimal Kubernetes discovery documents
+        # and fires the token on each.
         canary_base = settings.canary_public_url.rstrip("/")
         server_url = f"{canary_base}/t/{token_id}"
-        cluster_name = options.get("cluster_name", "production-cluster")
+        cluster_name = _validate_cluster_name(options.get("cluster_name", "production-cluster"))
         bearer_token = secrets.token_urlsafe(48)
 
         yaml_body = _kubeconfig_yaml(
             cluster_name=cluster_name,
             server_url=server_url,
-            ca_bundle=_FAKE_CA_BUNDLE,
             bearer_token=bearer_token,
         )
 

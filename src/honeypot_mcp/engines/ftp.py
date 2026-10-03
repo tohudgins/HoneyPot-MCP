@@ -36,7 +36,16 @@ import logging
 import secrets
 from typing import Any
 
+from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    close_after_error,
+    extract_lines,
+    limited_factory,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -53,6 +62,19 @@ _MAX_UPLOAD_BYTES = 1_048_576
 # syscalls needed, a Slowloris-style memory-exhaustion DoS against the whole
 # process. Real FTP command lines are short; this is a generous ceiling.
 _MAX_LINE_BYTES = 8192
+# Commands handled per network read; more than this in one read is a flood
+# (no FTP client pipelines dozens of commands) and the connection is closed.
+_MAX_LINES_PER_READ = 64
+# PASV listeners a single session may open. Each is a real listening socket,
+# so an unbounded count is a file-descriptor/port exhaustion primitive.
+_MAX_PASV_PER_SESSION = 64
+# Attacker-chosen strings (command lines, credentials, filenames) placed in
+# events are clipped to this many characters.
+_MAX_EVENT_STRING = 256
+
+
+def _clip(value: str) -> str:
+    return value[:_MAX_EVENT_STRING]
 
 
 def _classify_upload(filename: str, data: bytes) -> str | None:
@@ -112,6 +134,19 @@ _FAKE_LISTING = (
 )
 
 
+def _pasv_address(transport: asyncio.Transport) -> str:
+    """The control socket's own local IPv4 address in PASV `h1,h2,h3,h4` form —
+    the address the client reached us on, which is the one it can reach again.
+    Falls back to loopback only when it is unavailable or not IPv4."""
+    sockname = transport.get_extra_info("sockname")
+    if isinstance(sockname, tuple) and sockname:
+        host = str(sockname[0]).removeprefix("::ffff:")
+        parts = host.split(".")
+        if len(parts) == 4 and all(p.isdigit() and int(p) < 256 for p in parts):
+            return ",".join(parts)
+    return "127,0,0,1"
+
+
 class _FTPProtocol(asyncio.Protocol):
     """ProFTPD-flavoured FTP control-channel handler."""
 
@@ -135,28 +170,41 @@ class _FTPProtocol(asyncio.Protocol):
         self._pasv_data_queue: (
             asyncio.Queue[tuple[asyncio.StreamReader, asyncio.StreamWriter]] | None
         ) = None
+        # Pipelined PASVs used to each open a listener concurrently, and only
+        # the last one was ever closed. The lock serialises them so each tears
+        # down its predecessor before opening; the count caps them per session.
+        self._pasv_lock = asyncio.Lock()
+        self._pasv_count = 0
+        self._closed = False
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         transport.write(f"220 {self._banner}\r\n".encode())
-        asyncio.create_task(self._record("ftp_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("ftp_connection", AlertSeverity.LOW, {}), name="ftp-record")
 
     def data_received(self, data: bytes) -> None:
-        self._buf += data
-        if len(self._buf) > _MAX_LINE_BYTES and b"\r\n" not in self._buf:
-            # Real ProFTPD enforces a line-length limit too — refusing here
-            # is protocol-faithful, not just a safety measure.
-            if self._transport is not None:
-                self._transport.write(b"500 Command too long\r\n")
-                self._transport.close()
-            return
-        while b"\r\n" in self._buf:
-            line, self._buf = self._buf.split(b"\r\n", 1)
+        # The line cap applies to every extracted line, not only to a buffer
+        # with no CRLF in it: previously up to 256 KB of short-and-long lines
+        # passed, and the split loop re-copied the buffer once per line.
+        lines, self._buf, problem = extract_lines(
+            self._buf + data, max_lines=_MAX_LINES_PER_READ, max_line=_MAX_LINE_BYTES
+        )
+        for line in lines:
+            if self._transport is None or self._transport.is_closing():
+                return
             cmd = line.decode("utf-8", errors="replace").strip()
             if cmd:
                 self._handle_command(cmd)
+        if problem and self._transport is not None and not self._transport.is_closing():
+            # Real ProFTPD enforces a line-length limit too — refusing here
+            # is protocol-faithful, not just a safety measure.
+            if problem == "too_long":
+                self._transport.write(b"500 Command too long\r\n")
+            else:
+                self._transport.write(b"421 Too many commands, closing control connection\r\n")
+            close_after_error(self._transport)
 
     def _handle_command(self, cmd: str) -> None:
         parts = cmd.split(" ", 1)
@@ -222,19 +270,26 @@ class _FTPProtocol(asyncio.Protocol):
                 if self._pasv_data_queue is None:
                     t.write(b"425 Use PORT or PASV first.\r\n")
                 else:
-                    asyncio.create_task(self._serve_listing(verb))
+                    spawn(self._serve_listing(verb), name="ftp-list")
 
         elif verb == "PASV":
             self._require_auth_or(t)
             if self._authed:
-                asyncio.create_task(self._setup_pasv())
+                self._pasv_count += 1
+                if self._pasv_count > _MAX_PASV_PER_SESSION:
+                    t.write(b"425 Cannot open passive data connection.\r\n")
+                else:
+                    spawn(self._setup_pasv(), name="ftp-pasv")
 
         elif verb == "PORT":
             self._require_auth_or(t)
             if self._authed:
                 t.write(b"200 PORT command successful.\r\n")
-                asyncio.create_task(
-                    self._record("ftp_port_command", AlertSeverity.MEDIUM, {"argument": arg})
+                spawn(
+                    self._record(
+                        "ftp_port_command", AlertSeverity.MEDIUM, {"argument": _clip(arg)}
+                    ),
+                    name="ftp-record",
                 )
 
         elif verb == "STOR" or verb == "APPE":
@@ -247,24 +302,28 @@ class _FTPProtocol(asyncio.Protocol):
                 if self._pasv_data_queue is None:
                     t.write(b"425 Use PORT or PASV first.\r\n")
                 else:
-                    asyncio.create_task(self._receive_upload(verb, arg))
+                    spawn(self._receive_upload(verb, arg), name="ftp-stor")
 
         elif verb == "RETR" or verb == "DELE":
             self._require_auth_or(t)
             if self._authed:
                 # We don't serve real files or delete anything; log the intent.
                 t.write(b"550 Permission denied.\r\n")
-                asyncio.create_task(
+                spawn(
                     self._record(
                         "ftp_file_op_blocked",
                         AlertSeverity.HIGH,
-                        {"verb": verb, "argument": arg},
-                    )
+                        {"verb": verb, "argument": _clip(arg)},
+                    ),
+                    name="ftp-record",
                 )
 
         else:
             t.write(b"502 Command not implemented.\r\n")
-            asyncio.create_task(self._record("ftp_command", AlertSeverity.LOW, {"command": cmd}))
+            spawn(
+                self._record("ftp_command", AlertSeverity.LOW, {"command": _clip(cmd)}),
+                name="ftp-record",
+            )
 
     def _handle_pass(self, password: str) -> None:
         t = self._transport
@@ -278,22 +337,24 @@ class _FTPProtocol(asyncio.Protocol):
             self._authed = True
             self._anonymous = True
             t.write(b"230 Anonymous access granted, restrictions apply.\r\n")
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "ftp_anonymous_login",
                     AlertSeverity.MEDIUM,
-                    {"username": user, "password": password},
-                )
+                    {"username": _clip(user), "password": _clip(password)},
+                ),
+                name="ftp-record",
             )
             return
 
         # Authenticated login attempt — record the credential pair and reject.
-        asyncio.create_task(
+        spawn(
             self._record(
                 "ftp_login_attempt",
                 AlertSeverity.HIGH,
-                {"username": user, "password": password},
-            )
+                {"username": _clip(user), "password": _clip(password)},
+            ),
+            name="ftp-record",
         )
         t.write(b"530 Login incorrect.\r\n")
 
@@ -309,35 +370,49 @@ class _FTPProtocol(asyncio.Protocol):
         if t is None:
             return
 
-        # Tear down any prior PASV state.
-        await self._teardown_pasv()
+        # Pipelined PASVs must not each open a listener concurrently: the lock
+        # makes every one tear down its predecessor before opening its own.
+        async with self._pasv_lock:
+            if self._closed or t.is_closing():
+                return
 
-        queue: asyncio.Queue[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = asyncio.Queue(
-            maxsize=1
-        )
-        self._pasv_data_queue = queue
+            # Tear down any prior PASV state.
+            await self._teardown_pasv()
 
-        async def _accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            queue: asyncio.Queue[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = asyncio.Queue(
+                maxsize=1
+            )
+            self._pasv_data_queue = queue
+            control_ip = self._peer[0]
+
+            async def _accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                # A data connection must come from the same host as the control
+                # connection; anyone else is probing the port, not transferring.
+                peer = writer.get_extra_info("peername")
+                if not peer or peer[0] != control_ip:
+                    writer.close()
+                    return
+                try:
+                    queue.put_nowait((reader, writer))
+                except asyncio.QueueFull:
+                    # Already have an inbound connection for this PASV — close
+                    # the duplicate so we don't leak sockets.
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+
             try:
-                queue.put_nowait((reader, writer))
-            except asyncio.QueueFull:
-                # Already have an inbound connection for this PASV — close
-                # the duplicate so we don't leak sockets.
-                writer.close()
-                with contextlib.suppress(Exception):
-                    await writer.wait_closed()
+                self._pasv_server = await asyncio.start_server(_accept, "0.0.0.0", 0)
+            except OSError as e:
+                log.warning("PASV listener could not bind: %s", e)
+                t.write(b"425 Cannot open passive data connection.\r\n")
+                self._pasv_data_queue = None
+                return
 
-        try:
-            self._pasv_server = await asyncio.start_server(_accept, "0.0.0.0", 0)
-        except OSError as e:
-            log.warning("PASV listener could not bind: %s", e)
-            t.write(b"425 Cannot open passive data connection.\r\n")
-            self._pasv_data_queue = None
-            return
-
-        sock_port: int = self._pasv_server.sockets[0].getsockname()[1]
-        p1, p2 = divmod(sock_port, 256)
-        t.write(f"227 Entering Passive Mode (127,0,0,1,{p1},{p2}).\r\n".encode())
+            sock_port: int = self._pasv_server.sockets[0].getsockname()[1]
+            p1, p2 = divmod(sock_port, 256)
+            addr = _pasv_address(t)
+            t.write(f"227 Entering Passive Mode ({addr},{p1},{p2}).\r\n".encode())
         await self._record("ftp_passive_attempt", AlertSeverity.MEDIUM, {"port": sock_port})
 
     async def _serve_listing(self, verb: str) -> None:
@@ -432,15 +507,24 @@ class _FTPProtocol(asyncio.Protocol):
         await self._teardown_pasv()
 
     async def _teardown_pasv(self) -> None:
-        """Close any active PASV listener — safe to call multiple times."""
+        """Close any active PASV listener and any data connection that arrived
+        on it but was never claimed — safe to call multiple times."""
         server = self._pasv_server
+        queue = self._pasv_data_queue
         self._pasv_server = None
         self._pasv_data_queue = None
+        if queue is not None:
+            while True:
+                try:
+                    _reader, queued_writer = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                queued_writer.close()
         if server is None:
             return
         server.close()
         with contextlib.suppress(Exception):
-            await server.wait_closed()
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
 
     def _require_auth_or(self, t: asyncio.Transport) -> None:
         """Emit `530 Please login with USER and PASS` for unauthenticated calls.
@@ -462,15 +546,17 @@ class _FTPProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        # Reap any orphan PASV listener so port-leaks don't accumulate over
-        # the lifetime of the honeypot under sustained scanning.
-        if self._pasv_server is not None:
-            asyncio.create_task(self._teardown_pasv())
+        # Reap any orphan PASV listener (and any data connection queued on it)
+        # so port/fd leaks don't accumulate under sustained scanning.
+        self._closed = True
+        if self._pasv_server is not None or self._pasv_data_queue is not None:
+            spawn(self._teardown_pasv(), name="ftp-pasv-teardown")
 
 
 class FTPEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._servers: dict[str, asyncio.AbstractServer] = {}
+        self._limiter = ConnectionLimiter(get_settings().max_connections_per_ip)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         banner = config.get("fake_banner", "ProFTPD 1.3.5 Server (Debian) ready")
@@ -483,7 +569,7 @@ class FTPEngine(HoneypotEngine):
 
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            lambda: _FTPProtocol(name, hp_id, banner),
+            limited_factory(lambda: _FTPProtocol(name, hp_id, banner), self._limiter),
             host="0.0.0.0",
             port=port,
         )
@@ -495,8 +581,7 @@ class FTPEngine(HoneypotEngine):
     async def stop(self, container_id: str, remove: bool = False) -> None:
         server = self._servers.pop(container_id, None)
         if server:
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_ftp"}

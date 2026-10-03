@@ -4,6 +4,44 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Security audit remediation — hangs, ReDoS, fail-open paths
+
+A read-only audit found that one unauthenticated packet could freeze the whole
+process and that several guard rails were decorative. All of it is fixed, with a
+bounded regression test per finding (`tests/unit/test_audit_*.py`).
+
+- **Event-loop freezers.** MongoDB's BSON walk and Redis's RESP parser made no
+  forward progress on a negative length (a 33-byte packet hung all 25 engines);
+  catastrophic-backtracking regexes in the Docker/K8s/HTTP/SIP engines,
+  `intel/mitre.py` and the JWT matcher ran synchronously on the shared loop. All
+  parsers now bound lengths, depth and counts and move strictly forward; every
+  regex has bounded gaps and runs over clipped input.
+- **Bounded engines.** Per-connection buffers, message counts and write
+  backlogs are capped; `conn_limit` adds a central idle timeout, session
+  lifetime and process-wide connection ceiling, and `stop()` no longer hangs on a
+  live client. UDP replies (SNMP, SIP, DNS) never exceed the request and are
+  rate limited per source, matching the "never amplifies" rule.
+- **Ingest pipeline.** Payloads are clamped and the queue is bounded
+  (`event_queue_max`, LOW shed first, drops counted); one poison event drops only
+  itself; matcher caches refresh under a lock and keep serving stale data on a DB
+  error; triggered honeytokens stay armed and keep a capped `triggers` history;
+  retention archives in chunks off the loop and a failed archive deletes nothing.
+- **Control plane.** `alerts_prune` no longer deletes after a failed archive;
+  `MCP_AUTH_TOKENS=","` no longer fails open; `alert_subscribe`/`unsubscribe` are
+  admin-only, refuse metadata/link-local/internal destinations (re-checked at
+  delivery) and the viewer-tier list redacts URLs; suppression rules reject
+  match-everything patterns without `confirm_match_all`; webhook output escapes
+  attacker strings, the delivery queue is bounded and one slow subscription no
+  longer blocks the rest.
+- **Canary.** Canary, Slack and cloud triggers now reach webhook delivery; kubectl
+  paths (`/t/<id>/version`) fire the token; triggered tokens re-arm.
+- **Infra.** Grafana binds loopback with no anonymous access or default password;
+  the Docker socket proxy sits on an internal network; containers are
+  resource-capped and capability-dropped; the image installs from the lock;
+  vulnerable `pyjwt`/`urllib3` floors raised; the systemd unit is sandboxed.
+- `tests/unit/test_security_boundaries.py` now exports into a temp reports dir:
+  caller-named exports refuse to overwrite an existing file.
+
 ## Housekeeping — remove what was never wired up
 
 A custodial pass over the repository, looking for things that were outdated,

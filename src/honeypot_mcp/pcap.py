@@ -32,10 +32,10 @@ import asyncio
 import contextlib
 import ipaddress
 import logging
-import os
 import shutil
 import struct
 import subprocess
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -389,8 +389,15 @@ class PcapCapture:
             return {"error": resolved}
         destination = resolved
         pieces: list[Path] = []
-        scratch = destination.parent / f".extract-{os.getpid()}"
-        scratch.mkdir(parents=True, exist_ok=True)
+        # A private scratch directory per call. A shared `.extract-<pid>` let
+        # one finishing extract rmtree the parts a concurrent one was merging.
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            scratch = Path(tempfile.mkdtemp(dir=destination.parent, prefix=".extract-"))
+        except OSError as e:
+            log.warning("pcap extract could not create scratch space: %s", e)
+            return {"error": "could not create scratch space in the reports directory"}
+        preexisting = destination.exists()
         try:
             for index, source in enumerate(sources):
                 piece = scratch / f"part-{index}.pcap"
@@ -409,6 +416,14 @@ class PcapCapture:
                 if piece.exists() and piece.stat().st_size > _PCAP_GLOBAL_HEADER_LEN:
                     pieces.append(piece)
             packets = merge_pcaps(pieces, destination)
+        except OSError as e:
+            # Disk full or unwritable destination: report it rather than
+            # raising, and never leave a half-written extract behind.
+            log.warning("pcap extract for %s failed: %s", source_ip, e)
+            if not preexisting:
+                with contextlib.suppress(OSError):
+                    destination.unlink()
+            return {"error": f"pcap extract failed while writing: {e.strerror or type(e).__name__}"}
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 

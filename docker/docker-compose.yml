@@ -10,19 +10,28 @@
 # and use docker-compose.observability.yml for the dashboards. See docs/DEPLOY.md.
 services:
   # ── Docker socket proxy ─────────────────────────────────────────────────────
-  # The MCP server uses Docker to manage Cowrie containers. Giving the MCP
-  # container direct access to /var/run/docker.sock is container-escape-equivalent
-  # root — if the MCP process is ever exploited (and it processes untrusted
-  # attacker payloads all day), the attacker walks straight to root-on-host.
+  # The MCP server uses Docker to manage Cowrie containers. Mounting
+  # /var/run/docker.sock into it directly would hand the full Docker API to a
+  # process that parses untrusted attacker payloads all day.
   #
-  # Instead, the proxy mounts the host socket read-only and re-exposes it over
-  # TCP on an internal Docker network with a restricted API surface:
-  #   CONTAINERS=1  list / inspect / run / stop / remove / pause / unpause / logs
+  # The proxy narrows that to a whitelist of API *endpoints* over TCP:
+  #   CONTAINERS=1  list / inspect / create / start / stop / remove / logs
   #   IMAGES=1      get / pull (needed for first-run Cowrie image pull)
   #   POST=1        allow POST verbs (create/start/stop)
-  # Everything else (networks, volumes, secrets, system, exec, swarm) stays off.
-  # This is the same pattern used by Traefik / Watchtower / Portainer-agent
-  # deployments that need controlled Docker API access.
+  # Everything else (networks, volumes, secrets, system, exec, swarm) is off.
+  #
+  # What this does NOT do — be clear-eyed about it: the proxy filters by URL
+  # path and HTTP verb, never by request body. `POST /containers/create` is
+  # allowed, and a create body can say `Privileged: true` or bind-mount `/`,
+  # which is root on the host. The `:ro` on the socket mount below only
+  # protects the socket *file*; it does not restrict the API. So anything that
+  # can reach socket-proxy:2375 is effectively root on the host.
+  #
+  # The real control is therefore *who can reach the proxy*: it sits alone on
+  # the `internal: true` control-net with the MCP server, and no honeypot,
+  # Grafana or Prometheus container joins that network. If you do not need
+  # dynamically-managed Cowrie containers at all, delete this service and the
+  # DOCKER_HOST variable and the host socket is never exposed.
   socket-proxy:
     image: tecnativa/docker-socket-proxy:0.3
     container_name: honeypot-socket-proxy
@@ -55,7 +64,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - honeypot-net
+      - control-net
     # NOT read_only: the entrypoint renders /usr/local/etc/haproxy/haproxy.cfg
     # from the env vars above at every boot, and that directory also holds the
     # image's own haproxy.cfg.template — so it can be neither read-only nor
@@ -140,6 +149,8 @@ services:
       - "3389:3389"   # demo-rdp
     networks:
       - honeypot-net
+      - monitor-net
+      - control-net
     labels:
       - "honeypot-mcp=server"
     # Readiness, not liveness. A honeypot whose database has gone away keeps
@@ -165,7 +176,9 @@ services:
 
   # ── SSH Honeypot (Cowrie) ─────────────────────────────────────────────────
   cowrie-ssh:
-    image: cowrie/cowrie:latest
+    # Pinned to a release tag (keep in step with COWRIE_IMAGE in
+    # src/honeypot_mcp/engines/ssh.py).
+    image: cowrie/cowrie:3.0.15
     container_name: honeypot-ssh
     restart: unless-stopped
     ports:
@@ -186,6 +199,25 @@ services:
     labels:
       - "honeypot-mcp=true"
       - "honeypot-name=cowrie-ssh"
+    # Attacker-facing: an interactive emulator the attacker drives. Cowrie
+    # listens on unprivileged ports (2222/2223) so it needs no capabilities.
+    # read_only is deliberately NOT set: Cowrie writes under /cowrie/var
+    # (downloads, tty logs, state) and the image has no documented set of
+    # writable paths to tmpfs, so an immutable rootfs would risk a crash loop.
+    mem_limit: 256m
+    pids_limit: 128
+    cpus: 0.5
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The JSON event stream is on stdout, so the json-file log is the evidence
+    # channel — and unbounded by default.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── HTTP Honeypot ─────────────────────────────────────────────────────────
   http-honeypot:
@@ -200,6 +232,23 @@ services:
     labels:
       - "honeypot-mcp=true"
       - "honeypot-name=http-honeypot"
+    # Attacker-facing: bounded, unprivileged, immutable rootfs. The server
+    # needs no writable path and listens on an unprivileged port.
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: 0.25
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Prometheus (scrapes /metrics) ──────────────────────────────────────────
   # Bound to localhost only — same as the MCP /metrics endpoint. SSH-tunnel
@@ -216,11 +265,10 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=30d"
-      - "--web.enable-lifecycle"
     ports:
       - "127.0.0.1:9091:9090"
     networks:
-      - honeypot-net
+      - monitor-net
     security_opt:
       - no-new-privileges:true
 
@@ -237,13 +285,17 @@ services:
     depends_on:
       - prometheus
     environment:
-      # Anonymous read access so a recruiter opening the screenshot-link URL
-      # doesn't hit a login wall. Admin is still required to edit.
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      # Anonymous access is OFF by default: this Grafana can query the whole
+      # SQLite DB (captured credentials, honeytoken values, API-key hashes,
+      # webhook secrets). Opt in with GRAFANA_ANONYMOUS_ENABLED=true only for a
+      # throwaway demo that holds no real data.
+      GF_AUTH_ANONYMOUS_ENABLED: "${GRAFANA_ANONYMOUS_ENABLED:-false}"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_AUTH_DISABLE_LOGIN_FORM: "false"
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-honeypot}
-      # Auto-install SQLite plugin so dashboards can query alerts directly.
+      # No default password: set GRAFANA_ADMIN_PASSWORD in .env.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      # The dashboards' SQLite panels need the frser-sqlite-datasource plugin;
+      # it is a community plugin and Grafana only loads it when allowed.
       GF_INSTALL_PLUGINS: frser-sqlite-datasource
       GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: frser-sqlite-datasource
       GF_USERS_DEFAULT_THEME: dark
@@ -255,9 +307,9 @@ services:
       # MCP writes; mount is :ro because dashboards should never mutate.
       - mcp-data:/mcp-data:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     networks:
-      - honeypot-net
+      - monitor-net
     security_opt:
       - no-new-privileges:true
 
@@ -270,8 +322,23 @@ volumes:
   grafana-data:
 
 networks:
+  # Attacker-facing: Cowrie and the HTTP honeypot live here. They share it with
+  # the MCP server (which probes and ingests from them) and nothing else.
   honeypot-net:
     driver: bridge
     ipam:
       config:
         - subnet: 172.20.0.0/24
+  # Observability: Prometheus, Grafana and the MCP /metrics endpoint. Kept off
+  # honeypot-net so a compromised decoy cannot reach Grafana's login page or
+  # Prometheus. Not `internal` because Grafana's published port and plugin
+  # install both need a routable network.
+  monitor-net:
+    driver: bridge
+  # Control plane: the Docker socket proxy and its only client, the MCP server.
+  # `internal: true` = no external routing; no honeypot, Grafana or Prometheus
+  # container is attached, so none of them can even open a TCP connection to
+  # the Docker API.
+  control-net:
+    driver: bridge
+    internal: true

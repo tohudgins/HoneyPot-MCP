@@ -197,6 +197,7 @@ def write_artifact(
     prefix: str,
     extension: str,
     output_path: str | None = None,
+    overwrite: bool | None = None,
 ) -> dict[str, Any]:
     """Write bulk tool output to disk and describe it, instead of returning it.
 
@@ -205,14 +206,36 @@ def write_artifact(
     grows a line per offending IP. Returning that inline spends the whole
     budget on content destined for a firewall or a TIP, not for reading.
 
-    Returns the path plus size metadata, or an `error` key if the write failed.
+    `overwrite=None` (the default) means: auto-generated, timestamped names may
+    be replaced (a same-second collision is the same export), but a
+    caller-supplied `output_path` is created exclusively and refuses to
+    replace an existing file. The name can originate from a model that has
+    been reading attacker-authored payloads, and "overwrite whatever is already
+    in reports/" would let it destroy an alert archive or a previous export.
+
+    **Returns a dict with an `error` key — it does not raise — when the write
+    fails.** Callers MUST check for it before acting on the artifact (e.g.
+    before deleting the data it was meant to preserve).
     """
     dest = resolve_artifact_path(output_path, prefix=prefix, extension=extension)
     if isinstance(dest, str):
         return {"error": dest}
+    if overwrite is None:
+        overwrite = output_path is None
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
+        if overwrite:
+            dest.write_text(content, encoding="utf-8")
+        else:
+            with dest.open("x", encoding="utf-8") as fh:
+                fh.write(content)
+    except FileExistsError:
+        return {
+            "error": (
+                f"{dest.name!r} already exists in the reports directory; "
+                "refusing to overwrite it. Pick another output_path."
+            )
+        }
     except OSError as e:
         return {"error": f"Could not write {dest}: {e}"}
 

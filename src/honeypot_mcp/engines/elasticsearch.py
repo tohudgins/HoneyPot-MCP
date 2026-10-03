@@ -33,7 +33,16 @@ from typing import Any
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.http_identity import NGINX_BANNER, identity_runner, server_identity_middleware
+from honeypot_mcp.http_identity import (
+    MAX_REQUEST_BYTES,
+    NGINX_BANNER,
+    clip,
+    identity_runner,
+    read_body,
+    safe_headers,
+    safe_query,
+    server_identity_middleware,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -138,7 +147,7 @@ class ElasticsearchEngine(HoneypotEngine):
         hp_id: int | None,
         identity: dict[str, str],
     ) -> web.Application:
-        app = web.Application(middlewares=[_elastic_headers])
+        app = web.Application(middlewares=[_elastic_headers], client_max_size=MAX_REQUEST_BYTES)
 
         async def _record(
             request: web.Request,
@@ -148,10 +157,10 @@ class ElasticsearchEngine(HoneypotEngine):
         ) -> None:
             payload: dict[str, Any] = {
                 "method": request.method,
-                "path": request.path,
-                "query": dict(request.query),
-                "user_agent": request.headers.get("User-Agent", ""),
-                "headers": dict(request.headers),
+                "path": clip(request.path, 2048),
+                "query": safe_query(request),
+                "user_agent": clip(request.headers.get("User-Agent", ""), 2048),
+                "headers": safe_headers(request),
             }
             if extra:
                 payload.update(extra)
@@ -168,14 +177,10 @@ class ElasticsearchEngine(HoneypotEngine):
         async def _read_body(request: web.Request) -> str:
             """Read up to 64 KB of body. Elasticsearch query bodies above
             that size are unusual on the wild internet — scanners send
-            short probes."""
-            if request.body_exists:
-                try:
-                    raw = await request.read()
-                    return raw[:65536].decode("utf-8", errors="replace")
-                except Exception:
-                    return ""
-            return ""
+            short probes. The stream is read in a bounded loop under the body
+            deadline, so a sender that trickles bytes can't hold the handler."""
+            body = await read_body(request, 65536)
+            return body.data.decode("utf-8", errors="replace")
 
         async def _handle_root(request: web.Request) -> web.Response:
             await _record(request, "elasticsearch_recon_probe", AlertSeverity.LOW)

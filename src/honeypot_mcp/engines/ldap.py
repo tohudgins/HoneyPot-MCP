@@ -36,6 +36,8 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -73,6 +75,9 @@ _SUCCESS = 0
 _INVALID_CREDENTIALS = 49
 
 _MAX_MESSAGE_BYTES = 65536
+_MAX_MESSAGES_PER_CONN = 512
+_MAX_INVALID_PROBES = 5
+_MAX_WRITE_BUFFER = 64 * 1024
 
 # A JNDI lookup base DN is an opaque token, not a directory path: Log4Shell
 # payloads end in something like `/a`, `/Basic/Command/Base64/...` or a random
@@ -181,7 +186,7 @@ def parse_ldap_message(data: bytes) -> dict[str, Any] | None:
                     except ValueError:
                         break
                     if t == _OCTET_STRING:
-                        attributes.append(raw_attr.decode("utf-8", errors="replace"))
+                        attributes.append(raw_attr[:256].decode("utf-8", errors="replace"))
             result["attributes"] = attributes
         return result
     except (ValueError, IndexError):
@@ -228,42 +233,91 @@ class _LDAPProtocol(asyncio.Protocol):
         self._hp_id = hp_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
+        self._messages = 0
+        self._invalid = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
-        asyncio.create_task(self._record("ldap_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("ldap_connection", AlertSeverity.LOW, {}), name="ldap-event")
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
         self._buf += data
         if len(self._buf) > _MAX_MESSAGE_BYTES:
             self._close()
             return
-        while self._buf:
-            message = parse_ldap_message(self._buf)
-            if message is None:
-                # Either incomplete or garbage. Record garbage once and drop it.
-                if len(self._buf) > 8 and self._buf[0] != _SEQUENCE:
-                    asyncio.create_task(
-                        self._record(
-                            "ldap_invalid_probe",
-                            AlertSeverity.LOW,
-                            {"bytes": len(self._buf), "head_hex": self._buf[:32].hex()},
-                        )
-                    )
-                    self._buf = b""
-                return
-            self._buf = self._buf[message["consumed"] :]
-            self._dispatch(message)
+        buf = self._buf
+        pos = 0
+        try:
+            while pos < len(buf) and not t.is_closing():
+                if write_backlogged(t, _MAX_WRITE_BUFFER):
+                    self._close()  # peer is not reading its replies
+                    return
+                frame_len = self._frame_length(buf, pos)
+                if frame_len is None:
+                    # Either incomplete or garbage. Record garbage once and drop it.
+                    if len(buf) - pos > 8 and buf[pos] != _SEQUENCE:
+                        self._note_invalid(len(buf) - pos, bytes(buf[pos : pos + 32]))
+                        pos = len(buf)
+                    break
+                if frame_len > len(buf) - pos:
+                    break
+                message = parse_ldap_message(bytes(buf[pos : pos + frame_len]))
+                pos += frame_len
+                self._messages += 1
+                if self._messages > _MAX_MESSAGES_PER_CONN:
+                    self._close()
+                    return
+                if message is None:
+                    self._note_invalid(frame_len, b"")
+                    continue
+                self._dispatch(message)
+        except Exception:
+            log.exception("ldap protocol error")
+            self._close()
+            return
+        del buf[:pos]
+
+    @staticmethod
+    def _frame_length(buf: bytearray, pos: int) -> int | None:
+        """Total byte length (header + body) of the BER TLV at `pos`, or None if
+        the header is not (yet) readable. Lets us slice exactly one message
+        instead of re-parsing or re-slicing the whole buffer per message."""
+        if len(buf) - pos < 2 or buf[pos] != _SEQUENCE:
+            return None
+        first = buf[pos + 1]
+        if first < 0x80:
+            return 2 + first
+        count = first & 0x7F
+        if count == 0 or count > 4 or len(buf) - pos < 2 + count:
+            return None
+        return 2 + count + int.from_bytes(buf[pos + 2 : pos + 2 + count], "big")
+
+    def _note_invalid(self, size: int, head: bytes) -> None:
+        self._invalid += 1
+        spawn(
+            self._record(
+                "ldap_invalid_probe",
+                AlertSeverity.LOW,
+                {"bytes": size, "head_hex": head.hex()},
+            ),
+            name="ldap-event",
+        )
+        if self._invalid > _MAX_INVALID_PROBES:
+            self._close()
 
     def _send(self, payload: bytes) -> None:
         if self._transport is not None and not self._transport.is_closing():
             self._transport.write(payload)
 
     def _close(self) -> None:
-        if self._transport is not None:
+        self._buf.clear()
+        if self._transport is not None and not self._transport.is_closing():
             self._transport.close()
 
     def _dispatch(self, message: dict[str, Any]) -> None:
@@ -276,8 +330,9 @@ class _LDAPProtocol(asyncio.Protocol):
                 # Anonymous bind. Real directories often permit it, and it is
                 # the first step of unauthenticated enumeration — so accept it.
                 self._send(build_bind_response(message["message_id"], _SUCCESS))
-                asyncio.create_task(
-                    self._record("ldap_anonymous_bind", AlertSeverity.MEDIUM, {"bind_dn": ""})
+                spawn(
+                    self._record("ldap_anonymous_bind", AlertSeverity.MEDIUM, {"bind_dn": ""}),
+                    name="ldap-event",
                 )
                 return
             # Reject with invalidCredentials, exactly as a real directory would
@@ -288,7 +343,7 @@ class _LDAPProtocol(asyncio.Protocol):
                     message["message_id"], _INVALID_CREDENTIALS, "80090308: LdapErr: DSID-0C090447"
                 )
             )
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "ldap_bind_attempt",
                     AlertSeverity.HIGH,
@@ -300,7 +355,8 @@ class _LDAPProtocol(asyncio.Protocol):
                         "ldap_version": message.get("version"),
                         "auth": message.get("auth"),
                     },
-                )
+                ),
+                name="ldap-event",
             )
             return
 
@@ -308,7 +364,7 @@ class _LDAPProtocol(asyncio.Protocol):
             base_dn = message.get("base_dn", "")
             attributes = message.get("attributes", [])
             if looks_like_jndi(base_dn, attributes):
-                asyncio.create_task(
+                spawn(
                     self._record(
                         "ldap_jndi_lookup",
                         AlertSeverity.CRITICAL,
@@ -320,15 +376,17 @@ class _LDAPProtocol(asyncio.Protocol):
                                 "stage; the connecting host may be compromised"
                             ),
                         },
-                    )
+                    ),
+                    name="ldap-event",
                 )
             else:
-                asyncio.create_task(
+                spawn(
                     self._record(
                         "ldap_search",
                         AlertSeverity.MEDIUM,
                         {"base_dn": base_dn[:256], "attributes": attributes[:20]},
-                    )
+                    ),
+                    name="ldap-event",
                 )
             # No entries, clean done — the client gets a valid, empty result.
             self._send(build_search_done(message["message_id"]))
@@ -341,13 +399,17 @@ class _LDAPProtocol(asyncio.Protocol):
         if op == _EXTENDED_REQUEST:
             # StartTLS and friends. Decline so the client stays in the clear.
             self._send(build_bind_response(message["message_id"], 2, "unwilling to perform"))
-            asyncio.create_task(
-                self._record("ldap_extended_request", AlertSeverity.LOW, {"op": message["op_name"]})
+            spawn(
+                self._record(
+                    "ldap_extended_request", AlertSeverity.LOW, {"op": message["op_name"]}
+                ),
+                name="ldap-event",
             )
             return
 
-        asyncio.create_task(
-            self._record("ldap_command", AlertSeverity.LOW, {"op": message["op_name"]})
+        spawn(
+            self._record("ldap_command", AlertSeverity.LOW, {"op": message["op_name"]}),
+            name="ldap-event",
         )
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
@@ -364,7 +426,7 @@ class _LDAPProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        self._buf = b""
+        self._buf.clear()
 
 
 class LDAPEngine(HoneypotEngine):

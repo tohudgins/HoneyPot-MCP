@@ -33,16 +33,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import logging
 import random
 import re
 import secrets
 import string
 import time
-from typing import Any
+from collections import OrderedDict
+from typing import Any, Protocol
 from urllib.parse import unquote
 
 from aiohttp import web
+from aiohttp.web_request import FileField
 from sqlalchemy import update
 
 from honeypot_mcp.engines import http_endpoints
@@ -53,7 +56,15 @@ from honeypot_mcp.engines.http_personas import (
     pick_random_persona_id,
 )
 from honeypot_mcp.engines.http_templates import get_template
-from honeypot_mcp.http_identity import identity_runner, server_identity_middleware
+from honeypot_mcp.http_identity import (
+    MAX_REQUEST_BYTES,
+    clip,
+    identity_runner,
+    read_body,
+    safe_headers,
+    server_identity_middleware,
+    with_body_timeout,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -87,6 +98,10 @@ _RECON_THRESHOLD = 5
 # in-memory map doesn't grow unbounded under sustained scanning.
 _SESSION_TTL_SECONDS = 3600
 
+# Hard cap on each in-memory session table. Every cookie-less request mints a
+# session, so an uncapped table is ~1 GB/hour under a sustained scan.
+_MAX_SESSIONS = 10_000
+
 # Cap raw bodies at 64 KB so a single 10 MB upload from a scanner can't
 # bloat the alert payload. Real exploit payloads (webshells, RCE chains)
 # almost always fit well under this.
@@ -97,7 +112,47 @@ _MAX_RAW_BODY_BYTES = 65_536
 # headers, User-Agent, body). Ordered high-to-low so the first hit sets the
 # floor; all matches are recorded. Honeypot traffic has no legit users, so the
 # false-positive cost of broad patterns is near zero.
-_HTTP_ATTACK_SIGNATURES: list[tuple[str, re.Pattern[str], AlertSeverity]] = [
+#
+# These run on attacker-controlled text *on the event loop, before the event is
+# submitted*, so a pattern that backtracks is a denial of service that also
+# erases the alert: `ognl_struts` used `%\{[^}]*(…)`, quadratic — `'%{' * 16384`
+# pinned the loop for ~20 s. Rules for anything added here: no unbounded gap
+# before an alternation, whitespace is collapsed before matching (`_Scan`), and
+# a rule that needs a "marker within N characters of an opener" relationship is
+# a function, not a regex (`_OgnlMatcher`).
+
+
+class _Matcher(Protocol):
+    def search(self, text: str, /) -> object: ...
+
+
+class _OgnlMatcher:
+    r"""`%{` followed by an OGNL marker with no `}` in between, within a window.
+
+    Equivalent to `%\{[^}]{0,N}(#context|#_memberAccess|ognl|Runtime@getRuntime)`
+    but linear: it walks the (few) marker occurrences and looks *back* a bounded
+    distance for the nearest opener, instead of retrying a gap scan from every
+    `%{`.
+    """
+
+    _MARKERS = ("#context", "#_memberaccess", "ognl", "runtime@getruntime")
+    _LOOKBACK = 1024
+
+    def search(self, text: str, /) -> bool:
+        lowered = text.lower()
+        if "%{" not in lowered:
+            return False
+        for marker in self._MARKERS:
+            pos = lowered.find(marker)
+            while pos != -1:
+                opener = lowered.rfind("%{", max(0, pos - self._LOOKBACK), pos)
+                if opener != -1 and lowered.find("}", opener, pos) == -1:
+                    return True
+                pos = lowered.find(marker, pos + 1)
+        return False
+
+
+_HTTP_ATTACK_SIGNATURES: list[tuple[str, _Matcher, AlertSeverity]] = [
     (
         "log4shell",
         re.compile(r"\$\{jndi:(ldap|ldaps|rmi|dns|iiop|corba|nis|nds)", re.I),
@@ -120,11 +175,7 @@ _HTTP_ATTACK_SIGNATURES: list[tuple[str, re.Pattern[str], AlertSeverity]] = [
         ),
         AlertSeverity.CRITICAL,
     ),
-    (
-        "ognl_struts",
-        re.compile(r"%\{[^}]*(#context|#_memberAccess|ognl|Runtime@getRuntime)", re.I),
-        AlertSeverity.CRITICAL,
-    ),
+    ("ognl_struts", _OgnlMatcher(), AlertSeverity.CRITICAL),
     ("spring4shell", re.compile(r"class\.module\.classLoader", re.I), AlertSeverity.CRITICAL),
     (
         "sqli",
@@ -174,22 +225,189 @@ _SEV_RANK = {
     AlertSeverity.CRITICAL: 3,
 }
 
-# Upper bound on the request surface fed to the exploit regexes, so a large
-# POST body can't turn every request into an oversized scan.
-_MAX_SCAN_SURFACE = 32_768
+# Per-field scan windows. Each header / form value / the path is scanned as its
+# first `_SCAN_HEAD_CHARS` and last `_SCAN_TAIL_CHARS` characters; the body gets
+# its full captured 64 KB plus a tail. Padding can push a payload out of one
+# end of a field but not both, and a field is never allowed to consume another
+# field's budget (the old design joined everything and cut at 32 KB, so a few
+# padded headers hid a body payload). Anything clipped is reported as
+# `scan_truncated` in the event payload.
+_SCAN_HEAD_CHARS = 16_384
+_SCAN_TAIL_CHARS = 8_192
+_SCAN_BODY_TAIL_CHARS = 16_384
+
+# Event-payload bounds for attacker-controlled form data.
+_MAX_POST_FIELDS = 64
+_MAX_POST_VALUE_CHARS = 4_096
+_MAX_USER_AGENT_CHARS = 2_048
+_MAX_PATH_CHARS = 2_048
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+class _Scan:
+    """Accumulates exploit-signature hits over the fields of one request."""
+
+    def __init__(self) -> None:
+        self.matched: set[str] = set()
+        self.truncated = False
+
+    def feed(
+        self,
+        text: str,
+        head: int = _SCAN_HEAD_CHARS,
+        tail: int = _SCAN_TAIL_CHARS,
+    ) -> None:
+        """Scan one field. Whitespace runs are collapsed first (so the `\\s*`
+        in several rules never has a long run to backtrack over), and a
+        `%`-decoded copy is scanned too so encoded payloads don't slip past."""
+        if not text:
+            return
+        if len(text) > head + tail:
+            windows: tuple[str, ...] = (text[:head], text[-tail:])
+            self.truncated = True
+        else:
+            windows = (text,)
+        for window in windows:
+            variants = [_WHITESPACE.sub(" ", window)]
+            if "%" in window:
+                variants.append(_WHITESPACE.sub(" ", unquote(window)))
+            for label, matcher, _ in _HTTP_ATTACK_SIGNATURES:
+                if label in self.matched:
+                    continue
+                if any(matcher.search(v) for v in variants):
+                    self.matched.add(label)
+
+    def result(self) -> tuple[list[str], AlertSeverity | None]:
+        """Matched labels (in signature order) and the highest severity."""
+        matched: list[str] = []
+        top: AlertSeverity | None = None
+        for label, _, sev in _HTTP_ATTACK_SIGNATURES:
+            if label in self.matched:
+                matched.append(label)
+                if top is None or _SEV_RANK[sev] > _SEV_RANK[top]:
+                    top = sev
+        return matched, top
 
 
 def _classify_http_attack(surface: str) -> tuple[list[str], AlertSeverity | None]:
-    """Scan the request surface for exploit signatures. Returns the matched
-    category labels and the highest matched severity (or None if clean)."""
-    matched: list[str] = []
-    top: AlertSeverity | None = None
-    for label, pattern, sev in _HTTP_ATTACK_SIGNATURES:
-        if pattern.search(surface):
-            matched.append(label)
-            if top is None or _SEV_RANK[sev] > _SEV_RANK[top]:
-                top = sev
-    return matched, top
+    """Scan one string for exploit signatures. Returns the matched category
+    labels and the highest matched severity (or None if clean)."""
+    scan = _Scan()
+    scan.feed(surface)
+    return scan.result()
+
+
+def _summarise_form(form: Any, scan: _Scan) -> tuple[dict[str, Any], bool]:
+    """A parsed form as a JSON-safe, bounded dict, feeding every field to `scan`.
+
+    `request.post()` can return `FileField` (multipart uploads) and bytes
+    values, none of which JSON-encode. One such value failed the whole flush
+    batch — dropping up to 49 unrelated events — so a webshell upload erased
+    its own evidence. Files become `{filename, content_type, size, sha256,
+    preview}`; everything else becomes a clipped str. Returns the dict and
+    whether fields beyond `_MAX_POST_FIELDS` were left out (they are still
+    scanned). The first value of a repeated key wins, as `dict(form)` did.
+    """
+    out: dict[str, Any] = {}
+    overflow = False
+    for key, value in form.items():
+        name = clip(key, 256)
+        if isinstance(value, FileField):
+            data = b""
+            with contextlib.suppress(Exception):
+                data = value.file.read(MAX_REQUEST_BYTES)
+            with contextlib.suppress(Exception):
+                value.file.close()
+            scan.feed(str(value.filename))
+            scan.feed(
+                data.decode("utf-8", errors="replace"),
+                _MAX_RAW_BODY_BYTES,
+                _SCAN_BODY_TAIL_CHARS,
+            )
+            entry: Any = {
+                "filename": clip(value.filename, 256),
+                "content_type": clip(value.content_type, 128),
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "preview": clip(data[:256].decode("utf-8", errors="replace"), 256),
+            }
+            text_for_scan = ""
+        else:
+            full = (
+                bytes(value).decode("utf-8", errors="replace")
+                if isinstance(value, bytes | bytearray)
+                else str(value)
+            )
+            text_for_scan = f"{key}={full}"
+            entry = clip(full, _MAX_POST_VALUE_CHARS)
+        scan.feed(text_for_scan)
+        if name in out:
+            continue
+        if len(out) >= _MAX_POST_FIELDS:
+            overflow = True
+            continue
+        out[name] = entry
+    return out, overflow
+
+
+class _SessionTable:
+    """Bounded in-memory session store for one honeypot.
+
+    Two `OrderedDict`s kept in least-recently-seen order, each hard-capped at
+    `_MAX_SESSIONS`: expiry only ever inspects the oldest entry (amortised
+    O(1) per request — the old design scanned every session on every request,
+    13 ms at 200k entries) and overflow evicts with `popitem`.
+
+    Sessions are keyed by cookie value. A request with no usable cookie also
+    bumps a per-source-IP counter, and the session it mints starts from that
+    count — so a scanner that never returns the cookie still reaches the
+    recon threshold instead of being a fresh `hits=1` visitor every time.
+    """
+
+    def __init__(self, cap: int = _MAX_SESSIONS, ttl: float = _SESSION_TTL_SECONDS) -> None:
+        self._cap = cap
+        self._ttl = ttl
+        self._sessions: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._by_ip: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+    def _expire(self, table: OrderedDict[str, dict[str, Any]], now: float) -> None:
+        while table:
+            key = next(iter(table))
+            if now - table[key]["last_seen"] <= self._ttl:
+                break
+            del table[key]
+
+    def touch(self, cookie: str | None, ip: str) -> tuple[str, dict[str, Any], bool]:
+        """Return `(session_id, session_dict, is_new)`."""
+        now = time.monotonic()
+        self._expire(self._sessions, now)
+        self._expire(self._by_ip, now)
+
+        if cookie:
+            existing = self._sessions.get(cookie)
+            if existing is not None:
+                existing["last_seen"] = now
+                existing["hits"] += 1
+                self._sessions.move_to_end(cookie)
+                return cookie, existing, False
+
+        bucket = self._by_ip.get(ip)
+        if bucket is None:
+            bucket = {"created": now, "last_seen": now, "hits": 0}
+            self._by_ip[ip] = bucket
+        bucket["hits"] += 1
+        bucket["last_seen"] = now
+        self._by_ip.move_to_end(ip)
+
+        new_sid = secrets.token_hex(13)  # PHPSESSID-shaped length
+        session = {"created": now, "last_seen": now, "hits": bucket["hits"]}
+        self._sessions[new_sid] = session
+        while len(self._sessions) > self._cap:
+            self._sessions.popitem(last=False)
+        while len(self._by_ip) > self._cap:
+            self._by_ip.popitem(last=False)
+        return new_sid, session, True
 
 
 # Auth-failed response variants. The previous engine returned the SAME
@@ -382,9 +600,9 @@ class HTTPEngine(HoneypotEngine):
         if tls_enabled:
             # Lazy import — keeps the cryptography dep optional for HTTP-only
             # deployments. ImportError fails loudly so the operator sees why.
-            from honeypot_mcp.engines.tls import build_server_ssl_context
+            from honeypot_mcp.engines.tls import build_server_ssl_context_async
 
-            ssl_context = build_server_ssl_context(name, common_name=name)
+            ssl_context = await build_server_ssl_context_async(name, common_name=name)
 
         site = web.TCPSite(runner, "0.0.0.0", port, ssl_context=ssl_context)
         await site.start()
@@ -442,32 +660,18 @@ class HTTPEngine(HoneypotEngine):
         # fall back to aiohttp's own `Server` banner and expose the stack.
         _persona_extra = {k: v for k, v in _persona_headers().items() if k != "Server"}
         app = web.Application(
-            middlewares=[server_identity_middleware(persona.server_header, _persona_extra)]
+            middlewares=[server_identity_middleware(persona.server_header, _persona_extra)],
+            client_max_size=MAX_REQUEST_BYTES,
         )
         # Per-honeypot in-memory session store. Keyed by session_id (cookie
         # value). Two honeypots don't share state.
-        sessions: dict[str, dict[str, Any]] = {}
+        session_table = _SessionTable()
 
         def _get_or_create_session(request: web.Request) -> tuple[str, dict[str, Any], bool]:
-            """Return `(session_id, session_dict, is_new)`. Prunes expired
-            sessions opportunistically — keeps the dict bounded under
-            sustained scanning without a separate sweeper task."""
-            now = time.monotonic()
-            # Cheap LRU-ish prune: drop anything past TTL.
-            expired = [
-                sid for sid, s in sessions.items() if now - s["last_seen"] > _SESSION_TTL_SECONDS
-            ]
-            for sid in expired:
-                sessions.pop(sid, None)
-
-            sid_opt = request.cookies.get(persona.cookie_name)
-            if sid_opt and sid_opt in sessions:
-                sessions[sid_opt]["last_seen"] = now
-                sessions[sid_opt]["hits"] += 1
-                return sid_opt, sessions[sid_opt], False
-            new_sid = secrets.token_hex(13)  # PHPSESSID-shaped length
-            sessions[new_sid] = {"created": now, "last_seen": now, "hits": 1}
-            return new_sid, sessions[new_sid], True
+            """Return `(session_id, session_dict, is_new)`."""
+            return session_table.touch(
+                request.cookies.get(persona.cookie_name), request.remote or ""
+            )
 
         async def _record(
             request: web.Request,
@@ -477,9 +681,9 @@ class HTTPEngine(HoneypotEngine):
         ) -> None:
             payload = {
                 "method": request.method,
-                "path": request.path,
-                "user_agent": request.headers.get("User-Agent", ""),
-                "headers": dict(request.headers),
+                "path": clip(request.path, _MAX_PATH_CHARS),
+                "user_agent": clip(request.headers.get("User-Agent", ""), _MAX_USER_AGENT_CHARS),
+                "headers": safe_headers(request),
                 "persona": persona.id,
                 "tls": bool(config.get("tls")),
             }
@@ -582,7 +786,8 @@ class HTTPEngine(HoneypotEngine):
             GET → curl poke at the endpoint (MEDIUM)."""
             body_text = ""
             if request.method == "POST":
-                body_text = await request.text()
+                body = await read_body(request, _MAX_RAW_BODY_BYTES)
+                body_text = body.data.decode("utf-8", errors="replace")
 
             severity = AlertSeverity.MEDIUM
             if "__schema" in body_text or "IntrospectionQuery" in body_text:
@@ -611,24 +816,43 @@ class HTTPEngine(HoneypotEngine):
             # `post_data` dict; non-form bodies (JSON, binary, raw exploit
             # payloads) get captured as base64-encoded raw bytes, capped, so
             # webshell uploads + RCE chains aren't silently lost.
-            post_data: dict = {}
+            post_data: dict[str, Any] = {}
             raw_body_b64: str | None = None
             raw_content_type: str | None = None
-            raw_body_scan = ""
+            scan = _Scan()
+            body_flags: dict[str, Any] = {}
             if method in ("POST", "PUT", "PATCH"):
                 ct = (request.headers.get("Content-Type") or "").lower()
                 is_form = "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct
                 if is_form:
-                    with contextlib.suppress(Exception):
-                        post_data = dict(await request.post())
+                    try:
+                        form = await with_body_timeout(request.post())
+                    except TimeoutError:
+                        body_flags["body_timed_out"] = True
+                    except web.HTTPRequestEntityTooLarge:
+                        body_flags["body_too_large"] = True
+                    except Exception:
+                        pass
+                    else:
+                        post_data, overflow = _summarise_form(form, scan)
+                        if overflow:
+                            body_flags["post_data_truncated"] = True
                 else:
-                    with contextlib.suppress(Exception):
-                        raw = await request.read()
-                        if raw:
-                            capped = raw[:_MAX_RAW_BODY_BYTES]
-                            raw_body_b64 = base64.b64encode(capped).decode("ascii")
-                            raw_body_scan = capped.decode("utf-8", errors="replace")
-                            raw_content_type = ct or "application/octet-stream"
+                    body = await read_body(request, MAX_REQUEST_BYTES)
+                    if body.data:
+                        capped = body.data[:_MAX_RAW_BODY_BYTES]
+                        raw_body_b64 = base64.b64encode(capped).decode("ascii")
+                        raw_content_type = ct or "application/octet-stream"
+                        scan.feed(
+                            body.data.decode("utf-8", errors="replace"),
+                            _MAX_RAW_BODY_BYTES,
+                            _SCAN_BODY_TAIL_CHARS,
+                        )
+                    if body.truncated:
+                        body_flags["body_truncated"] = True
+                        scan.truncated = True
+                    if body.timed_out:
+                        body_flags["body_timed_out"] = True
 
             matched_template = path_to_template.get(path)
             severity = _PATH_SEVERITY.get(path, AlertSeverity.LOW)
@@ -652,47 +876,30 @@ class HTTPEngine(HoneypotEngine):
                     severity = AlertSeverity.MEDIUM
 
             # Exploit-signature scan across the whole request surface (path +
-            # query + headers + UA + body), with the surface also URL-decoded so
-            # %-encoded payloads don't slip past. Any hit re-tags the event and
+            # query + headers + UA + body), each field scanned on its own so no
+            # field can crowd another out of the scan, with a %-decoded copy so
+            # encoded payloads don't slip past. Any hit re-tags the event and
             # raises severity to at least the matched level — this is the intel
             # a SOC actually wants (which CVE/technique was thrown at you).
             #
-            # Body and form data come FIRST, not last: they're the
-            # highest-payload-density fields, and the joined string is
-            # truncated to a total budget below. Putting them last meant an
-            # attacker could pad an earlier field (a handful of near-max-size
-            # headers is enough) to push a real exploit payload in the body
-            # out of the scanned window entirely — a real Log4Shell/webshell/
-            # SQLi payload would then classify as ordinary traffic instead of
-            # http_exploit_attempt. Path/UA/headers fill whatever budget the
-            # body doesn't use.
-            surface_parts = []
-            if raw_body_scan:
-                surface_parts.append(raw_body_scan)
-            surface_parts.extend(f"{k}={v}" for k, v in post_data.items())
-            surface_parts.append(request.path_qs)
-            surface_parts.append(user_agent)
-            surface_parts.extend(str(v) for v in request.headers.values())
-            # Bound the scanned surface: exploit strings (jndi, <?php, ../,
-            # UNION SELECT) are short, so scanning the first 32 KB catches
-            # them without letting a large POST turn each request into a big
-            # regex sweep. The full body is still captured verbatim in
-            # raw_body_b64 for forensics.
-            surface = " ".join(surface_parts)[:_MAX_SCAN_SURFACE]
-            exploit_categories, exploit_sev = _classify_http_attack(
-                surface + " " + unquote(surface)
-            )
+            # The body (fed above, in full up to its 64 KB capture plus a
+            # tail) and form fields are already in `scan`; the rest follows.
+            scan.feed(request.path_qs)
+            scan.feed(user_agent)
+            for header_value in request.headers.values():
+                scan.feed(header_value)
+            exploit_categories, exploit_sev = scan.result()
             if exploit_sev is not None:
                 event_type = "http_exploit_attempt"
                 if _SEV_RANK[exploit_sev] > _SEV_RANK[severity]:
                     severity = exploit_sev
 
-            payload = {
+            payload: dict[str, Any] = {
                 "method": method,
-                "path": path,
-                "user_agent": user_agent,
-                "headers": dict(request.headers),
-                "post_data": dict(post_data),
+                "path": clip(path, _MAX_PATH_CHARS),
+                "user_agent": clip(user_agent, _MAX_USER_AGENT_CHARS),
+                "headers": safe_headers(request),
+                "post_data": post_data,
                 "has_credentials": bool(post_data),
                 "matched_endpoint": matched_template is not None,
                 "persona": persona.id,
@@ -700,6 +907,9 @@ class HTTPEngine(HoneypotEngine):
                 "session_hits": sess["hits"],
                 "tls": bool(config.get("tls")),
             }
+            payload.update(body_flags)
+            if scan.truncated:
+                payload["scan_truncated"] = True
             if raw_body_b64 is not None:
                 payload["raw_body_b64"] = raw_body_b64
                 payload["raw_content_type"] = raw_content_type

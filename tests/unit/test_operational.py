@@ -331,7 +331,7 @@ def test_networked_without_token_is_refused():
 def test_networked_with_token_is_allowed():
     from honeypot_mcp.server import _networked_auth_error
 
-    assert _networked_auth_error(_settings_ns("http", token="s3cret")) is None
+    assert _networked_auth_error(_settings_ns("http", token="s3cret-" * 3)) is None
 
 
 def test_networked_unauthenticated_override_is_allowed():

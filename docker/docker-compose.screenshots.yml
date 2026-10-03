@@ -4,10 +4,12 @@
 # from the command line instead of by hand. Kept out of docker-compose.yml
 # because it pulls a ~400 MB image that a normal demo run has no use for.
 #
+#   export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, no default
 #   docker compose -f docker-compose.yml -f docker-compose.screenshots.yml up -d
 #   ../scripts/capture_screenshots.sh
 #
-# See scripts/capture_screenshots.sh — it drives both steps for you.
+# See scripts/capture_screenshots.sh — it drives both steps for you and
+# generates a throwaway password when GRAFANA_ADMIN_PASSWORD is unset.
 services:
   renderer:
     image: grafana/grafana-image-renderer:3.11.6
@@ -20,7 +22,7 @@ services:
       RENDERING_MODE: default
     shm_size: 1gb
     networks:
-      - honeypot-net
+      - monitor-net
     security_opt:
       - no-new-privileges:true
 

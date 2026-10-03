@@ -41,6 +41,8 @@ import struct
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -49,6 +51,11 @@ from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
+
+_MAX_TYPED_MESSAGE = 1024 * 1024
+_MAX_MESSAGES_PER_CONN = 1024
+_MAX_WRITE_BUFFER = 256 * 1024
+_MAX_STR = 2048
 
 _SSL_REQUEST_CODE = 80877103
 _PROTOCOL_V3 = 196608
@@ -61,8 +68,8 @@ def _parse_startup_params(body: bytes) -> dict[str, str]:
     params: dict[str, str] = {}
     parts = body.split(b"\x00")
     # Drop trailing empties from the terminator.
-    tokens = [p.decode("utf-8", errors="replace") for p in parts if p != b""]
-    for i in range(0, len(tokens) - 1, 2):
+    tokens = [p[:_MAX_STR].decode("utf-8", errors="replace") for p in parts if p != b""]
+    for i in range(0, min(len(tokens) - 1, 64), 2):
         params[tokens[i]] = tokens[i + 1]
     return params
 
@@ -182,7 +189,8 @@ class _PGProtocol(asyncio.Protocol):
         self._hp_id = honeypot_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
+        self._messages = 0
         self._startup_done = False
         self._authed = False
         self._params: dict[str, str] = {}
@@ -191,46 +199,70 @@ class _PGProtocol(asyncio.Protocol):
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
-        asyncio.create_task(self._record("postgresql_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("postgresql_connection", AlertSeverity.LOW, {}), name="postgresql-event")
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
         self._buf += data
-        # First, handle the un-typed startup/SSL packets (Int32 length prefix,
-        # no type byte). After startup, messages are type-tagged.
-        while True:
-            if not self._startup_done:
-                if len(self._buf) < 4:
+        buf = self._buf
+        pos = 0
+        try:
+            # First, handle the un-typed startup/SSL packets (Int32 length prefix,
+            # no type byte). After startup, messages are type-tagged. Parsing walks
+            # an offset and stops the moment the connection is closing, so
+            # pipelined messages behind a close never yield further events.
+            while not t.is_closing():
+                if write_backlogged(t, _MAX_WRITE_BUFFER):
+                    self._close()  # peer is not reading its replies
                     return
-                length = struct.unpack("!I", self._buf[:4])[0]
-                if length < 8 or length > 65535:
-                    # Real PostgreSQL answers a malformed startup packet with a
-                    # FATAL ErrorResponse rather than hanging up silently, and
-                    # that reply is precisely how scanners identify the service
-                    # — an HTTP probe's "GET " reads as a 1.2-billion-byte
-                    # length and lands here. Closing mutely left the port
-                    # unidentifiable, which is itself conspicuous.
-                    if self._transport is not None:
-                        self._transport.write(
+                if not self._startup_done:
+                    if len(buf) - pos < 4:
+                        break
+                    length = struct.unpack_from("!I", buf, pos)[0]
+                    if length < 8 or length > 65535:
+                        # Real PostgreSQL answers a malformed startup packet with a
+                        # FATAL ErrorResponse rather than hanging up silently, and
+                        # that reply is precisely how scanners identify the service
+                        # — an HTTP probe's "GET " reads as a 1.2-billion-byte
+                        # length and lands here. Closing mutely left the port
+                        # unidentifiable, which is itself conspicuous.
+                        t.write(
                             _error_response("FATAL", "08P01", "invalid length of startup packet")
                         )
+                        self._close()
+                        return
+                    if len(buf) - pos < length:
+                        break
+                    payload = bytes(buf[pos + 4 : pos + length])
+                    pos += length
+                else:
+                    # Typed message: 1 byte type + Int32 length (which counts itself).
+                    if len(buf) - pos < 5:
+                        break
+                    length = struct.unpack_from("!I", buf, pos + 1)[0]
+                    if length < 4 or length > _MAX_TYPED_MESSAGE:
+                        self._close()
+                        return
+                    if len(buf) - pos < 1 + length:
+                        break
+                    msg_type = bytes(buf[pos : pos + 1])
+                    payload = bytes(buf[pos + 5 : pos + 1 + length])
+                    pos += 1 + length
+                self._messages += 1
+                if self._messages > _MAX_MESSAGES_PER_CONN:
                     self._close()
                     return
-                if len(self._buf) < length:
-                    return
-                payload = self._buf[4:length]
-                self._buf = self._buf[length:]
-                self._handle_startup_packet(payload)
-            else:
-                # Typed message: 1 byte type + Int32 length.
-                if len(self._buf) < 5:
-                    return
-                msg_type = self._buf[0:1]
-                length = struct.unpack("!I", self._buf[1:5])[0]
-                if len(self._buf) < 1 + length:
-                    return
-                payload = self._buf[5 : 1 + length]
-                self._buf = self._buf[1 + length :]
-                self._handle_message(msg_type, payload)
+                if not self._startup_done:
+                    self._handle_startup_packet(payload)
+                else:
+                    self._handle_message(msg_type, payload)
+        except Exception:
+            log.exception("postgresql protocol error")
+            self._close()
+            return
+        del buf[:pos]
 
     def _handle_startup_packet(self, payload: bytes) -> None:
         t = self._transport
@@ -245,7 +277,7 @@ class _PGProtocol(asyncio.Protocol):
         if code == _PROTOCOL_V3:
             self._params = _parse_startup_params(payload[4:])
             self._startup_done = True
-            asyncio.create_task(
+            spawn(
                 self._record(
                     "postgresql_startup",
                     AlertSeverity.MEDIUM,
@@ -254,7 +286,8 @@ class _PGProtocol(asyncio.Protocol):
                         "database": self._params.get("database", ""),
                         "params": self._params,
                     },
-                )
+                ),
+                name="postgresql-event",
             )
             t.write(_auth_cleartext_request())
             return
@@ -276,9 +309,9 @@ class _PGProtocol(asyncio.Protocol):
             return
         if msg_type == b"p" and not self._authed:
             # PasswordMessage: password is a null-terminated string.
-            password = payload.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            password = payload.split(b"\x00", 1)[0][:_MAX_STR].decode("utf-8", errors="replace")
             user = self._params.get("user", "")
-            asyncio.create_task(self._record_login(user, password))
+            spawn(self._record_login(user, password), name="postgresql-event")
             # Accept the login and open the query phase — a fake datastore with
             # no real data loses nothing by granting access, and the post-auth
             # SQL is where the objective shows (COPY ... FROM PROGRAM RCE,
@@ -289,8 +322,9 @@ class _PGProtocol(asyncio.Protocol):
         if self._authed and msg_type == b"Q":
             sql = payload.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
             event_type, severity = _classify_pg_query(sql)
-            asyncio.create_task(
-                self._record(event_type, severity, {"query": sql[:4096], "service": "postgresql"})
+            spawn(
+                self._record(event_type, severity, {"query": sql[:4096], "service": "postgresql"}),
+                name="postgresql-event",
             )
             self._respond_to_query(sql)
             return
@@ -319,6 +353,7 @@ class _PGProtocol(asyncio.Protocol):
             t.write(_msg(b"C", b"OK\x00") + _ready_for_query())
 
     def _close(self) -> None:
+        self._buf.clear()
         if self._transport is not None:
             with contextlib.suppress(Exception):
                 self._transport.close()
@@ -355,7 +390,7 @@ class _PGProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        self._buf.clear()
 
 
 class PostgreSQLEngine(HoneypotEngine):

@@ -29,13 +29,42 @@ import secrets
 from typing import Any
 
 from honeypot_mcp import self_probe
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.conn_limit import UdpReplyLimiter
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
+
+# Classic DNS-over-UDP message limit (RFC 1035 §4.2.1). Queries are a few dozen
+# bytes even with an EDNS OPT record; anything larger is not a query.
+_MAX_QUERY_BYTES = 512
+# A synthesized answer may be at most this many times the query's size. Real
+# answers are necessarily somewhat larger than the question (an A record adds
+# 16 bytes), so the strict "never larger" rule of SNMP/SIP would leave plain
+# `dig` lookups unanswered; this keeps the factor small while staying
+# believable. Answers are dropped from the end until the reply fits.
+_MAX_REPLY_FACTOR = 2
+
+
+def _is_plain_query(data: bytes) -> bool:
+    """Cheap header gate, run before dnslib parses anything.
+
+    Only a standard query with exactly one question is answered: QR=1 is a
+    response (answering it lets two reflectors ping-pong forever), a non-zero
+    opcode is NOTIFY/UPDATE/IQUERY, and qdcount != 1 is never sent by a
+    resolver.
+    """
+    if len(data) < 12 or len(data) > _MAX_QUERY_BYTES:
+        return False
+    flags = data[2]
+    qr = flags >> 7
+    opcode = (flags >> 3) & 0x0F
+    qdcount = int.from_bytes(data[4:6], "big")
+    return qr == 0 and opcode == 0 and qdcount == 1
 
 
 def _looks_like_tunneling(qname: str) -> bool:
@@ -74,6 +103,7 @@ class _DNSProtocol(asyncio.DatagramProtocol):
         self._name = honeypot_name
         self._hp_id = honeypot_id
         self._transport: asyncio.DatagramTransport | None = None
+        self._reply_limiter = UdpReplyLimiter()
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
         self._transport = transport
@@ -82,19 +112,25 @@ class _DNSProtocol(asyncio.DatagramProtocol):
         src_ip, src_port = addr
         request = None
         qclass = "IN"
-        try:
-            import dnslib
+        qname = data[:64].hex()
+        qtype = "UNKNOWN"
+        # Anything that is not a plain single-question query is recorded the
+        # way an unparseable packet always was, but never parsed or answered.
+        if _is_plain_query(data):
+            try:
+                import dnslib
 
-            request = dnslib.DNSRecord.parse(data)
-            qname = str(request.q.qname).rstrip(".")
-            qtype = dnslib.QTYPE[request.q.qtype]
-            with contextlib.suppress(Exception):
-                qclass = dnslib.CLASS[request.q.qclass]
-        except Exception:
-            qname = data[:64].hex()
-            qtype = "UNKNOWN"
+                request = dnslib.DNSRecord.parse(data)
+                qname = str(request.q.qname).rstrip(".")
+                qtype = dnslib.QTYPE[request.q.qtype]
+                with contextlib.suppress(Exception):
+                    qclass = dnslib.CLASS[request.q.qclass]
+            except Exception:
+                request = None
+                qname = data[:64].hex()
+                qtype = "UNKNOWN"
 
-        asyncio.create_task(self._record(src_ip, src_port, qname, qtype, qclass))
+        spawn(self._record(src_ip, src_port, qname, qtype, qclass), name="dns-record")
 
         # Return a believable response for common query types — uniform
         # NXDOMAIN against any A query is itself a fingerprint (real
@@ -102,19 +138,29 @@ class _DNSProtocol(asyncio.DatagramProtocol):
         # parse failures still get NXDOMAIN.
         if request is None or self._transport is None:
             return
+        if not self._reply_limiter.allow(src_ip):
+            return
+        limit = len(data) * _MAX_REPLY_FACTOR
         try:
             import dnslib
 
             reply = _build_realistic_reply(request, qname, qtype)
-            self._transport.sendto(reply.pack(), addr)
+            packed = reply.pack()
+            while len(packed) > limit and reply.rr:
+                reply.rr.pop()
+                packed = reply.pack()
         except Exception:
             # On any synthesis error, fall back to NXDOMAIN.
             try:
                 fallback = request.reply()
                 fallback.header.rcode = dnslib.RCODE.NXDOMAIN
-                self._transport.sendto(fallback.pack(), addr)
+                packed = fallback.pack()
             except Exception:
-                pass
+                return
+        if len(packed) > limit:
+            return
+        with contextlib.suppress(Exception):
+            self._transport.sendto(packed, addr)
 
     async def _record(
         self, src_ip: str, src_port: int, qname: str, qtype: str, qclass: str = "IN"

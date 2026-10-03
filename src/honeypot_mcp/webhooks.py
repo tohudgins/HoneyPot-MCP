@@ -43,12 +43,25 @@ than no integration because everyone then believes they are covered:
 * `email` — SMTP via `asyncio.to_thread`. The URL carries everything:
   `smtp://user:pw@host:587/?from=…&to=a@x,b@y&tls=starttls|implicit|none`.
 
-Delivery runs in a background asyncio task drained from a queue so slow
-webhook endpoints can never back-pressure the honeypot data path. HTTP
-deliveries retry with exponential backoff (1s, 5s, 30s); UDP syslog is
-fire-and-forget (UDP has no retry semantics) but failures are still
-recorded against `failure_count`. The `last_error` column gives operators
-a one-line failure reason without needing log access.
+Delivery runs in background asyncio tasks drained from a bounded queue so slow
+webhook endpoints can never back-pressure the honeypot data path. The global
+queue fans out into one bounded queue per subscription, each delivered with
+its own small concurrency budget, so one dead endpoint stalls only itself.
+When a queue is full the oldest lowest-severity event is shed first and
+counted (`WebhookDelivery.dropped_count`). HTTP deliveries retry with
+exponential backoff (1s, 5s, 30s); UDP syslog is fire-and-forget (UDP has no
+retry semantics) but failures are still recorded against `failure_count`. The
+`last_error` column gives operators a one-line failure reason without needing
+log access.
+
+**Destinations are policed.** A subscription streams captured attack data to
+an address of the caller's choosing, so it is an SSRF/exfiltration primitive
+unless the address is checked. Link-local (cloud metadata), unspecified,
+multicast and reserved addresses are always refused; loopback and private
+ranges are refused unless `webhook_allow_private_destinations` is set. The
+check runs at subscribe time and again before every delivery (hostnames are
+re-resolved and every returned address must pass), and syslog connects to the
+exact address that was validated.
 """
 
 from __future__ import annotations
@@ -57,9 +70,14 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import html
+import ipaddress
 import json
 import logging
+import re
+import socket
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -163,6 +181,190 @@ def sign_body(secret: str, body: bytes) -> str:
 
 def _meets_threshold(event_severity: AlertSeverity, threshold: AlertSeverity) -> bool:
     return _SEVERITY_RANK[event_severity] >= _SEVERITY_RANK[threshold]
+
+
+# ── Destination policy ──────────────────────────────────────────────────────
+#
+# A subscription points a stream of captured attack data — and, through the
+# HTTP/SMTP/syslog transports, outbound connections from this host — at an
+# address of the caller's choosing. Unchecked, that is an SSRF primitive
+# against the cloud metadata service and anything else on the host's network,
+# reachable by whoever can call `alert_subscribe` (and, because the control
+# plane is driven by a model that reads attacker-authored strings, potentially
+# by an attacker who never authenticated).
+
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+_DEFAULT_PORTS = {"http": 80, "https": 443, "udp": 514, "tcp": 514, "smtp": 587, "smtps": 465}
+# RFC 6052 well-known NAT64 prefix: the low 32 bits are an IPv4 destination the
+# translator will connect to, so `64:ff9b::a9fe:a9fe` is the metadata service.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+_RESOLVE_TIMEOUT = 5.0
+
+
+class DestinationRefusedError(ValueError):
+    """The destination resolves to an address captured data must not be sent to."""
+
+
+def redact_url(url: str) -> str:
+    """`scheme://host[:port]` only — never userinfo, path or query.
+
+    Webhook URLs routinely carry their credential in the path (Slack, Teams)
+    or userinfo (SMTP), and email URLs carry recipient addresses in the query.
+    Anything shown to a viewer-tier caller or written to the audit log goes
+    through here.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "[unparseable url]"
+    scheme = (parsed.scheme or "").lower()
+    if not host:
+        return f"{scheme}://[no host]" if scheme else "[unparseable url]"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
+def destination_refusal(ip: _IPAddress, *, allow_private: bool) -> str | None:
+    """Why `ip` must not receive deliveries, or None if it may."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        # The kernel connects `::ffff:127.0.0.1` to loopback; judge the
+        # embedded IPv4 address, not the wrapper.
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip in _NAT64_PREFIX:
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+            reason = destination_refusal(embedded, allow_private=allow_private)
+            if reason is not None:
+                return f"NAT64 address embedding a {reason}"
+    if ip.is_unspecified:
+        return "unspecified address"
+    if ip.is_link_local:
+        return "link-local address (cloud metadata services live here)"
+    if ip.is_multicast:
+        return "multicast address"
+    if ip.is_reserved:
+        return "reserved address"
+    if ip.is_global or allow_private:
+        return None
+    kind = "loopback" if ip.is_loopback else "private/non-public"
+    return f"{kind} address (set WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true to allow internal targets)"
+
+
+def destination_endpoint(url: str, fmt: str) -> tuple[str, int, int]:
+    """(host, port, socket type) a subscription will actually connect to.
+
+    Raises ValueError for a URL that names no usable host or port.
+    """
+    fmt = (fmt or "json").lower()
+    if fmt == "email":
+        cfg = _parse_smtp_url(url)
+        return str(cfg["host"]), int(cfg["port"]), socket.SOCK_STREAM
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no host")
+    scheme = (parsed.scheme or "").lower()
+    port = parsed.port or _DEFAULT_PORTS.get(scheme, 443)
+    socktype = socket.SOCK_DGRAM if fmt == "syslog" and scheme == "udp" else socket.SOCK_STREAM
+    return host, port, socktype
+
+
+async def resolve_destination(
+    host: str,
+    port: int,
+    *,
+    socktype: int = socket.SOCK_STREAM,
+    allow_private: bool | None = None,
+) -> list[str]:
+    """Every address `host` resolves to, after checking each one.
+
+    ALL addresses must pass: a DNS name answering with one public and one
+    internal address would otherwise let the connecting library pick the
+    internal one. Raises `DestinationRefusedError` on a policy refusal and
+    `OSError` (incl. `TimeoutError`) if the name cannot be resolved.
+    """
+    if allow_private is None:
+        allow_private = get_settings().webhook_allow_private_destinations
+    addresses: list[_IPAddress] = []
+    try:
+        addresses.append(ipaddress.ip_address(host))
+    except ValueError:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, port, type=socktype), timeout=_RESOLVE_TIMEOUT
+        )
+        for info in infos:
+            raw = str(info[4][0])
+            try:
+                addresses.append(ipaddress.ip_address(raw))
+            except ValueError:
+                raise DestinationRefusedError(
+                    f"{host} resolved to an unparseable address {raw!r}"
+                ) from None
+    if not addresses:
+        raise OSError(f"{host} did not resolve to any address")
+    for address in addresses:
+        reason = destination_refusal(address, allow_private=allow_private)
+        if reason is not None:
+            shown = host if host == str(address) else f"{host} -> {address}"
+            raise DestinationRefusedError(f"{shown} is a {reason}")
+    return list(dict.fromkeys(str(a) for a in addresses))
+
+
+async def check_destination(url: str, fmt: str) -> tuple[str | None, list[str]]:
+    """(refusal-or-None, validated addresses) for a subscription URL.
+
+    The delivery-time gate. Never raises: a refusal or an unresolvable name is
+    returned as the error string `_record_outcome` stores in `last_error`.
+    """
+    try:
+        host, port, socktype = destination_endpoint(url, fmt)
+        addresses = await resolve_destination(host, port, socktype=socktype)
+    except DestinationRefusedError as e:
+        return f"destination refused: {e}"[:200], []
+    except (OSError, ValueError) as e:
+        return f"destination unresolvable: {e}"[:200], []
+    return None, addresses
+
+
+# ── Escaping for human channels and CEF ─────────────────────────────────────
+#
+# Everything a notification shows about an event is attacker-chosen: the
+# username, the path, the User-Agent. Interpolated raw, a username of
+# `<!channel>` pings a whole Slack workspace, a backtick closes the code span
+# and turns the rest into formatting, and a CR/LF in an email value forges
+# lines ("Severity : low") an on-call reader trusts.
+
+_LINE_BREAKS = re.compile(r"[\r\n\x0b\x0c\x85\u2028\u2029]+")
+
+
+def _one_line(value: object) -> str:
+    """Collapse every line break to a single space."""
+    return _LINE_BREAKS.sub(" ", str(value))
+
+
+def _slack_escape(value: object) -> str:
+    """Slack's three mandatory escapes, plus the backtick.
+
+    Slack documents `&`, `<` and `>` as the characters to escape in mrkdwn
+    (`<…>` is how mentions and links are written). Captured values are shown
+    inside a code span, so a backtick would end the span early; it is swapped
+    for the look-alike U+02CB.
+    """
+    text = _one_line(value)
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "\u02cb")
+    )
+
+
+def _teams_escape(value: object) -> str:
+    """Teams cards are sent with markdown off, so only HTML and line breaks
+    remain to neutralise — MessageCard fields still honour a subset of HTML."""
+    return html.escape(_one_line(value), quote=False)
 
 
 # ── Format renderers ────────────────────────────────────────────────────────
@@ -494,13 +696,17 @@ def render_elastic_ecs(event: PendingEvent, sub: Subscription) -> tuple[bytes, d
 
 
 def _cef_escape(value: str) -> str:
-    """CEF header values escape `|` and `\\`; extension values escape `=`."""
-    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "\\n")
+    """CEF header values escape `|` and `\\`, and may not contain line breaks.
+
+    A raw CR or LF ends the record in every line-oriented CEF receiver, so an
+    attacker-chosen value carrying one could forge a whole second event.
+    """
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\r", "\\r").replace("\n", "\\n")
 
 
 def _cef_ext_escape(value: str) -> str:
-    """CEF extension values escape `=`, `\\`, and newlines."""
-    return value.replace("\\", "\\\\").replace("=", "\\=").replace("\n", "\\n")
+    """CEF extension values escape `=`, `\\`, and both line-break characters."""
+    return value.replace("\\", "\\\\").replace("=", "\\=").replace("\r", "\\r").replace("\n", "\\n")
 
 
 # Protocol names a plain `.title()` mangles. "Ssh Login Attempt" in an ArcSight
@@ -734,22 +940,64 @@ class _NotifyThrottle:
     window. The suppressed count rides along on the next message that does go
     out, so volume is still visible; it just is not the delivery mechanism.
 
-    CRITICAL is deliberately exempt. It is rare by construction — a triggered
-    honeytoken, a container escape, a ransom note — and those are precisely
-    the events someone must see immediately even if the same IP already fired
-    something a minute ago.
+    CRITICAL is exempt from that per-IP window. It is rare by construction — a
+    triggered honeytoken, a container escape, a ransom note — and those are
+    precisely the events someone must see immediately even if the same IP
+    already fired something a minute ago. It is not unlimited, though: spoofed
+    UDP sources rotate `source_ip`, so each (subscription, event_type) is
+    capped per minute and the suppressed count rides on the next message.
     """
 
-    def __init__(self, window_seconds: float = 300.0, max_keys: int = 4096) -> None:
+    def __init__(
+        self,
+        window_seconds: float = 300.0,
+        max_keys: int = 4096,
+        critical_cap: int = 30,
+        critical_window: float = 60.0,
+    ) -> None:
         self._window = window_seconds
         self._max_keys = max_keys
         self._last_sent: dict[tuple[int, str, str], float] = {}
         self._suppressed: dict[tuple[int, str, str], int] = {}
+        # CRITICAL is exempt from the per-IP window, but spoofed-source UDP
+        # CRITICALs rotate source_ip, so the same event_type could otherwise
+        # page a channel without limit. A generous per-(subscription,
+        # event_type) cap keeps that bounded; the suppressed count rides on
+        # the next message that does go out.
+        self._critical_cap = critical_cap
+        self._critical_window = critical_window
+        self._critical_sent: dict[tuple[int, str], deque[float]] = {}
+        self._critical_suppressed: dict[tuple[int, str], int] = {}
+
+    def _check_critical(self, sub_id: int, event: PendingEvent) -> tuple[bool, int]:
+        key = (sub_id, event.event_type)
+        now = time.monotonic()
+        sent = self._critical_sent.get(key)
+        if sent is None:
+            if len(self._critical_sent) >= self._max_keys:
+                victims = sorted(
+                    self._critical_sent,
+                    key=lambda k: (
+                        self._critical_suppressed.get(k, 0) > 0,
+                        self._critical_sent[k][-1] if self._critical_sent[k] else 0.0,
+                    ),
+                )[: max(self._max_keys // 4, 1)]
+                for stale in victims:
+                    self._critical_sent.pop(stale, None)
+                    self._critical_suppressed.pop(stale, None)
+            sent = self._critical_sent[key] = deque()
+        while sent and now - sent[0] >= self._critical_window:
+            sent.popleft()
+        if self._critical_cap and len(sent) >= self._critical_cap:
+            self._critical_suppressed[key] = self._critical_suppressed.get(key, 0) + 1
+            return False, 0
+        sent.append(now)
+        return True, self._critical_suppressed.pop(key, 0)
 
     def check(self, sub_id: int, event: PendingEvent) -> tuple[bool, int]:
         """Returns (should_send, suppressed_since_last_send)."""
         if event.severity is AlertSeverity.CRITICAL:
-            return True, 0
+            return self._check_critical(sub_id, event)
         key = (sub_id, event.event_type, event.source_ip or "")
         now = time.monotonic()
         last = self._last_sent.get(key)
@@ -834,7 +1082,14 @@ def _notify_facts(event: PendingEvent) -> list[tuple[str, str]]:
 
 
 def _notify_title(event: PendingEvent) -> str:
-    return f"{event.severity.value.upper()} · {_humanize_event_type(event.event_type)}"
+    return f"{event.severity.value.upper()} · {_humanize_event_type(_one_line(event.event_type))}"
+
+
+def _honeypot_label(event: PendingEvent) -> str:
+    """Canary, Slack and cloud-audit triggers have no honeypot behind them."""
+    if event.honeypot_id is None:
+        return "no honeypot (canary / token trigger)"
+    return f"honeypot #{event.honeypot_id}"
 
 
 def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
@@ -845,8 +1100,10 @@ def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
     arrives on a phone as "This content can't be displayed", which defeats the
     purpose of alerting someone who is away from their desk.
     """
-    facts = _notify_facts(event)
-    fallback = f"{_NOTIFY_EMOJI[event.severity]} {_notify_title(event)} from {event.source_ip}"
+    facts = [(label, _slack_escape(value)) for label, value in _notify_facts(event)]
+    source_ip = _slack_escape(event.source_ip or "unknown")
+    title = _slack_escape(_notify_title(event))
+    fallback = f"{_NOTIFY_EMOJI[event.severity]} {title} from {source_ip}"
 
     blocks: list[dict[str, Any]] = [
         {
@@ -860,7 +1117,7 @@ def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
         {
             "type": "section",
             "fields": [
-                {"type": "mrkdwn", "text": f"*Source IP*\n`{event.source_ip}`"},
+                {"type": "mrkdwn", "text": f"*Source IP*\n`{source_ip}`"},
                 {
                     "type": "mrkdwn",
                     "text": f"*Time*\n{event.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC",
@@ -919,8 +1176,11 @@ def render_teams(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
     "Summary or Text is required"), which is an easy way to ship a notifier
     that silently never posts.
     """
-    facts = [{"name": label, "value": value} for label, value in _notify_facts(event)]
-    facts.insert(0, {"name": "Source IP", "value": event.source_ip})
+    facts = [
+        {"name": label, "value": _teams_escape(value)} for label, value in _notify_facts(event)
+    ]
+    source_ip = _teams_escape(event.source_ip or "unknown")
+    facts.insert(0, {"name": "Source IP", "value": source_ip})
     facts.insert(1, {"name": "Time", "value": f"{event.timestamp.isoformat()}"})
     if event.honeytoken_id is not None:
         facts.append({"name": "Honeytoken", "value": f"#{event.honeytoken_id} triggered"})
@@ -933,10 +1193,13 @@ def render_teams(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
         "title": f"{_NOTIFY_EMOJI[event.severity]} {_notify_title(event)}",
         "sections": [
             {
-                "activityTitle": f"Attacker `{event.source_ip}`",
-                "activitySubtitle": f"honeypot #{event.honeypot_id}",
+                "activityTitle": f"Attacker {source_ip}",
+                "activitySubtitle": _honeypot_label(event),
                 "facts": facts,
-                "markdown": True,
+                # Off: every fact value is attacker-chosen, and with markdown
+                # on a username like `[reset password](https://evil)` renders
+                # as a live link in the SOC channel.
+                "markdown": False,
             }
         ],
     }
@@ -951,17 +1214,27 @@ def render_email(event: PendingEvent, sub: Subscription) -> tuple[str, str]:
     phone lock screens with wildly different HTML support, and the content is
     attacker-controlled — rendering it as HTML would be an injection surface
     for no benefit a honeypot alert actually needs.
+
+    Every attacker-derived value is collapsed to one line: a CR/LF inside a
+    captured username would otherwise forge body lines ("Severity : low") that
+    a reader trusts, and in the subject would make the header unsendable.
     """
-    subject = f"[HoneyPot {event.severity.value.upper()}] {_humanize_event_type(event.event_type)} from {event.source_ip}"
+    source_ip = _one_line(event.source_ip or "unknown")
+    event_type = _one_line(event.event_type)
+    subject = (
+        f"[HoneyPot {event.severity.value.upper()}] "
+        f"{_humanize_event_type(event_type)} from {source_ip}"
+    )
     lines = [
         _notify_title(event),
         "",
-        f"Source IP   : {event.source_ip}"
+        f"Source IP   : {source_ip}"
         + (f":{event.source_port}" if event.source_port is not None else ""),
-        f"Event type  : {event.event_type}",
+        f"Event type  : {event_type}",
         f"Severity    : {event.severity.value}",
         f"Time (UTC)  : {event.timestamp.isoformat()}",
-        f"Honeypot ID : {event.honeypot_id}",
+        "Honeypot ID : "
+        + (str(event.honeypot_id) if event.honeypot_id is not None else "none (canary trigger)"),
     ]
     if event.honeytoken_id is not None:
         lines += [
@@ -970,7 +1243,7 @@ def render_email(event: PendingEvent, sub: Subscription) -> tuple[str, str]:
     facts = _notify_facts(event)
     if facts:
         lines += ["", "Captured details:"]
-        lines += [f"  {label:<12}: {value}" for label, value in facts]
+        lines += [f"  {label:<12}: {_one_line(value)}" for label, value in facts]
     lines += [
         "",
         "--",
@@ -1003,6 +1276,9 @@ async def _post_with_retry(
     return False, last_err
 
 
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
 def _parse_smtp_url(url: str) -> dict[str, Any]:
     """`smtp://user:pass@host:587/?from=a@b&to=c@d,e@f&tls=starttls` → kwargs.
 
@@ -1033,6 +1309,13 @@ def _parse_smtp_url(url: str) -> dict[str, Any]:
     # smtps:// means implicit TLS on connect (usually 465); smtp:// upgrades
     # with STARTTLS unless explicitly disabled for a local relay that has none.
     mode = (query.get("tls") or ["starttls" if scheme == "smtp" else "implicit"])[0].lower()
+    if mode not in ("starttls", "implicit", "none"):
+        raise ValueError(f"email URL tls= must be starttls, implicit or none (got {mode!r})")
+    if mode == "none" and parsed.username and parsed.hostname not in _LOOPBACK_NAMES:
+        raise ValueError(
+            "refusing SMTP AUTH over tls=none to a non-loopback host: the password "
+            "would cross the network in clear text. Use tls=starttls or tls=implicit."
+        )
     default_port = 465 if mode == "implicit" else 587
     return {
         "host": parsed.hostname,
@@ -1166,15 +1449,54 @@ class _Job:
     enqueued_at: float = field(default_factory=time.monotonic)
 
 
+# One subscription may have this many deliveries running at once, and this many
+# waiting. A slow destination then costs only itself: the worker never waits on
+# it, and anything beyond the backlog is counted and skipped rather than piling
+# up in memory.
+_SUB_CONCURRENCY = 4
+_MAX_SUB_BACKLOG = 64
+
+
 class WebhookDelivery:
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[_Job] = asyncio.Queue()
+        # Two lanes so overflow can shed LOW-severity events in O(1): the
+        # worker drains `_high` first, and a full queue discards from `_low`
+        # before it ever discards anything that matters.
+        self._high: deque[_Job] = deque()
+        self._low: deque[_Job] = deque()
+        self._wakeup = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._client: httpx.AsyncClient | None = None
         self._throttle = _NotifyThrottle(
             window_seconds=get_settings().notify_throttle_seconds,
         )
+        self._sub_sems: dict[int, asyncio.Semaphore] = {}
+        self._sub_backlog: dict[int, int] = {}
+        self._inflight: set[asyncio.Task[None]] = set()
+        self.dropped = 0
+        self._dropped_since_log = 0
+        self._last_drop_log = 0.0
+
+    @property
+    def pending(self) -> int:
+        """Events queued for delivery and not yet handed to a subscription."""
+        return len(self._high) + len(self._low)
+
+    def _note_drop(self) -> None:
+        self.dropped += 1
+        self._dropped_since_log += 1
+        now = time.monotonic()
+        if now - self._last_drop_log >= 10.0:
+            log.warning(
+                "Webhook delivery is shedding events (%d in the last interval, %d total): "
+                "a destination is slower than the event rate. Raise `webhook_queue_max` "
+                "or fix the slow subscription.",
+                self._dropped_since_log,
+                self.dropped,
+            )
+            self._last_drop_log = now
+            self._dropped_since_log = 0
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -1182,32 +1504,63 @@ class WebhookDelivery:
             # Drop any cache from a previous run / test so the first delivery
             # reflects the current DB.
             invalidate_subscription_cache()
+            self._sub_sems.clear()
             self._client = httpx.AsyncClient()
             self._task = asyncio.create_task(self._run(), name="webhook-delivery")
 
     async def stop(self) -> None:
         self._stop.set()
+        self._wakeup.set()
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=10.0)
             except TimeoutError:
                 log.warning("Webhook delivery worker did not exit cleanly.")
             self._task = None
+        if self._inflight:
+            _done, pending = await asyncio.wait(set(self._inflight), timeout=10.0)
+            for task in pending:
+                task.cancel()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
 
     async def enqueue_batch(self, events: list[PendingEvent]) -> None:
+        cap = max(int(get_settings().webhook_queue_max), 0)
         for ev in events:
-            await self._queue.put(_Job(event=ev))
+            low = ev.severity is AlertSeverity.LOW
+            if cap and self.pending >= cap:
+                if self._low:
+                    self._low.popleft()
+                    self._note_drop()
+                elif low:
+                    self._note_drop()
+                    continue
+                else:
+                    self._high.popleft()
+                    self._note_drop()
+            (self._low if low else self._high).append(_Job(event=ev))
+        if events:
+            self._wakeup.set()
+
+    def _pop(self) -> _Job | None:
+        if self._high:
+            return self._high.popleft()
+        if self._low:
+            return self._low.popleft()
+        return None
 
     async def _run(self) -> None:
         while True:
-            try:
-                job = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-            except TimeoutError:
-                if self._stop.is_set() and self._queue.empty():
+            job = self._pop()
+            if job is None:
+                if self._stop.is_set():
                     return
+                self._wakeup.clear()
+                if self.pending:
+                    continue
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._wakeup.wait(), timeout=1.0)
                 continue
             try:
                 await self._deliver(job.event)
@@ -1215,6 +1568,8 @@ class WebhookDelivery:
                 log.warning("Webhook delivery error: %s", e)
 
     async def _deliver(self, event: PendingEvent) -> None:
+        """Fan an event out to every matching subscription without waiting on
+        any of them — each delivery runs as its own bounded task."""
         subs = await _active_subscriptions()
         if not subs:
             return
@@ -1222,11 +1577,32 @@ class WebhookDelivery:
         for sub in subs:
             if not _meets_threshold(event.severity, sub.severity_threshold):
                 continue
-            try:
-                ok, err = await self._dispatch(event, sub)
-            except Exception as e:
-                ok, err = False, f"renderer failure: {e!s}"[:200]
-            await self._record_outcome(sub.id, ok, err)
+            backlog = self._sub_backlog.get(sub.id, 0)
+            if backlog >= _MAX_SUB_BACKLOG:
+                self._note_drop()
+                continue
+            self._sub_backlog[sub.id] = backlog + 1
+            task = asyncio.create_task(self._deliver_one(event, sub), name=f"webhook-{sub.id}")
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
+
+    async def _deliver_one(self, event: PendingEvent, sub: Subscription) -> None:
+        try:
+            sem = self._sub_sems.setdefault(sub.id, asyncio.Semaphore(_SUB_CONCURRENCY))
+            async with sem:
+                try:
+                    ok, err = await self._dispatch(event, sub)
+                except Exception as e:
+                    ok, err = False, f"renderer failure: {e!s}"[:200]
+                await self._record_outcome(sub.id, ok, err)
+        except Exception as e:
+            log.warning("Webhook delivery to subscription %s failed: %s", sub.id, e)
+        finally:
+            left = self._sub_backlog.get(sub.id, 1) - 1
+            if left > 0:
+                self._sub_backlog[sub.id] = left
+            else:
+                self._sub_backlog.pop(sub.id, None)
 
     async def _dispatch(self, event: PendingEvent, sub: Subscription) -> tuple[bool, str | None]:
         """Pick the renderer + transport for this subscription's format."""
@@ -1345,6 +1721,13 @@ class WebhookDelivery:
 
 
 _delivery: WebhookDelivery | None = None
+
+
+def webhook_dropped_count() -> int:
+    """Events the delivery layer has shed (queue overflow or a backlogged
+    subscription). Counterpart to the event buffer's dropped counter, for the
+    metrics endpoint."""
+    return get_delivery().dropped
 
 
 def get_delivery() -> WebhookDelivery:

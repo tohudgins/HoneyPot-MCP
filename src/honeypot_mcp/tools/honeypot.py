@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -16,6 +17,13 @@ from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_honeypot_name
+
+log = logging.getLogger(__name__)
+
+# Upper bound on one engine's stop. An in-process engine's server.wait_closed()
+# can wait on a lingering attacker connection indefinitely, and retiring a
+# sensor must not depend on the attacker hanging up.
+_ENGINE_STOP_TIMEOUT_SECONDS = 15.0
 
 
 @mcp.tool(auth=require_role("operator"))
@@ -321,13 +329,27 @@ async def honeypot_stop(
 
         stopped: list[str] = []
         failed: list[dict[str, str]] = []
+        timed_out: list[str] = []
         for hp in targets:
             if hp.status == HoneypotStatus.STOPPED:
                 continue
             try:
                 engine = get_engine(hp.type)
                 if hp.container_id:
-                    await engine.stop(hp.container_id, remove=remove)
+                    await asyncio.wait_for(
+                        engine.stop(hp.container_id, remove=remove),
+                        timeout=_ENGINE_STOP_TIMEOUT_SECONDS,
+                    )
+            except TimeoutError:
+                # A lingering peer must not keep the sensor alive in the DB:
+                # leaving it RUNNING would let reconcile restart it on the
+                # next boot. The operator sees the overrun in `timed_out`.
+                log.warning(
+                    "Engine stop for honeypot %r exceeded %gs; marking it stopped anyway",
+                    hp.name,
+                    _ENGINE_STOP_TIMEOUT_SECONDS,
+                )
+                timed_out.append(hp.name)
             except Exception as e:
                 failed.append({"name": hp.name, "error": str(e)})
                 continue
@@ -354,13 +376,20 @@ async def honeypot_stop(
     from honeypot_mcp.pcap import refresh_capture
 
     await refresh_capture()
-    return {
+    result: dict[str, Any] = {
         "action": "removed" if remove else "stopped",
         "stopped": stopped,
         "count": len(stopped),
         "failed": failed,
         "status": "ok" if not failed else "partial",
     }
+    if timed_out:
+        result["timed_out"] = timed_out
+        result["note"] = (
+            f"Engine teardown exceeded {_ENGINE_STOP_TIMEOUT_SECONDS:g}s for "
+            f"{', '.join(timed_out)}; marked stopped anyway."
+        )
+    return result
 
 
 @mcp.tool(auth=require_role("operator"))
@@ -382,6 +411,12 @@ async def honeypot_pause(name: str) -> dict[str, Any]:
             await engine.pause(hp.container_id)
         hp.status = HoneypotStatus.PAUSED
 
+    await record_action(
+        "honeypot_pause",
+        summary=f"paused honeypot '{name}' — collection suspended",
+        arguments={"name": name},
+        target=name,
+    )
     return {"name": name, "status": "paused"}
 
 
@@ -404,6 +439,12 @@ async def honeypot_resume(name: str) -> dict[str, Any]:
             await engine.resume(hp.container_id)
         hp.status = HoneypotStatus.RUNNING
 
+    await record_action(
+        "honeypot_resume",
+        summary=f"resumed honeypot '{name}'",
+        arguments={"name": name},
+        target=name,
+    )
     return {"name": name, "status": "running"}
 
 
@@ -416,13 +457,116 @@ async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any
         name: The honeypot name.
         config: Key-value pairs to merge into the current config.
     """
+    if not isinstance(config, dict):
+        return {"error": "config must be an object of key/value pairs."}
+
     async with get_session() as session:
         hp = await queries.get_honeypot_by_name(session, name)
         if not hp:
             return {"error": f"No honeypot named '{name}' found."}
+        if err := _validate_config(hp.type.value, config):
+            return {"error": err}
+        if "telnet_port" in config:
+            telnet_port = config["telnet_port"]
+            if telnet_port == hp.port:
+                return {
+                    "error": (
+                        f"telnet_port {telnet_port} is this honeypot's own port — "
+                        "pick a different one."
+                    )
+                }
+            conflict = await queries.get_honeypot_by_port(session, telnet_port)
+            if conflict and conflict.id != hp.id and conflict.status == HoneypotStatus.RUNNING:
+                return {
+                    "error": (
+                        f"Port {telnet_port} is already used by honeypot "
+                        f"'{conflict.name}' ({conflict.type.value}, id={conflict.id})."
+                    ),
+                    "hint": "Pick a different port, or stop that honeypot first.",
+                }
         hp.config = {**hp.config, **config}
+        new_config = hp.config
 
-    return {"name": name, "config": hp.config, "note": "Restart honeypot to apply changes."}
+    await record_action(
+        "honeypot_configure",
+        summary=f"reconfigured honeypot '{name}' ({', '.join(sorted(config)) or 'no keys'})",
+        arguments={"name": name, "config": config},
+        target=name,
+    )
+    return {"name": name, "config": new_config, "note": "Restart honeypot to apply changes."}
+
+
+def _is_text(value: Any, max_len: int = 255) -> bool:
+    """A single-line string. These values land in protocol banners and in
+    container environment variables, where a CR/LF would inject a line."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= max_len
+        and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+    )
+
+
+def _is_port(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
+
+
+def _is_endpoints(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) > 200:
+        return False
+    for ep in value:
+        if not isinstance(ep, dict) or not _is_text(ep.get("path"), 1024):
+            return False
+        if not str(ep["path"]).startswith("/"):
+            return False
+        if "template" in ep and not _is_text(ep["template"], 64):
+            return False
+    return True
+
+
+_CHECKS: dict[str, tuple[Any, str]] = {
+    "ssh_persona": (_is_text, "a persona id string"),
+    "ssh_hostname": (_is_text, "a single-line string"),
+    "fake_hostname": (_is_text, "a single-line string"),
+    "fake_kernel": (_is_text, "a single-line string"),
+    "telnet_enabled": (lambda v: isinstance(v, bool), "true or false"),
+    "telnet_port": (_is_port, "an integer port between 1 and 65535"),
+    "persona": (_is_text, "a persona id string"),
+    "tls": (lambda v: isinstance(v, bool), "true or false"),
+    "endpoints": (_is_endpoints, 'a list of {"path": "/...", "template": "..."} objects'),
+    "fake_banner": (_is_text, "a single-line string"),
+    "smtp_hostname": (_is_text, "a single-line string"),
+    "fake_banner_hostname": (_is_text, "a single-line string"),
+}
+
+# The keys each engine actually reads from `Honeypot.config` (grep the engines
+# for `config.get(` when adding one). Anything else would be stored and then
+# silently ignored, which reads as "configured" while changing nothing.
+_COWRIE_KEYS = frozenset(
+    {"ssh_persona", "ssh_hostname", "fake_hostname", "fake_kernel", "telnet_enabled", "telnet_port"}
+)
+_CONFIG_KEYS: dict[str, frozenset[str]] = {
+    "ssh": _COWRIE_KEYS,
+    "telnet": _COWRIE_KEYS,
+    "http": frozenset({"persona", "tls", "endpoints"}),
+    "ftp": frozenset({"fake_banner"}),
+    "smtp": frozenset({"smtp_hostname", "fake_banner_hostname"}),
+}
+
+
+def _validate_config(hp_type: str, config: dict[str, Any]) -> str | None:
+    """Return an error for keys the engine does not read or values of the wrong shape."""
+    allowed = _CONFIG_KEYS.get(hp_type, frozenset())
+    unknown = sorted(str(k) for k in config if k not in allowed)
+    if unknown:
+        return (
+            f"Unsupported config key(s) for {hp_type}: {', '.join(unknown)}. "
+            f"Supported: {', '.join(sorted(allowed)) or 'none'}."
+        )
+    for key, value in config.items():
+        check, expected = _CHECKS[key]
+        if not check(value):
+            return f"Invalid value for '{key}': expected {expected}."
+    return None
 
 
 @mcp.tool

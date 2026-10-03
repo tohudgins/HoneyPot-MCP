@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -103,35 +105,50 @@ def _bson_first_key(data: bytes) -> str:
         return ""
 
 
+_BSON_MAX_DEPTH = 8
+_BSON_MAX_ELEMENTS = 4096
+_MAX_STR = 2048
+_MAX_WIRE_MESSAGE = 1024 * 1024
+_MAX_MESSAGES_PER_CONN = 512
+_MAX_WRITE_BUFFER = 256 * 1024
+
+
 def _bson_collect_strings(data: bytes, limit: int = 40) -> list[str]:
     """Best-effort recursive pull of string values from a BSON doc — captures
-    ransom-note text, target db names, filter values. Bounded, never raises."""
+    ransom-note text, target db names, filter values. Bounded (depth, element
+    count, forward progress on every step), never raises."""
     found: list[str] = []
+    budget = [_BSON_MAX_ELEMENTS]
 
-    def _walk(buf: bytes) -> None:
-        if len(buf) < 5 or len(found) >= limit:
+    def _walk(buf: bytes, start: int, end: int, depth: int) -> None:
+        if depth > _BSON_MAX_DEPTH or end - start < 5:
             return
-        pos = 4
-        while pos < len(buf) - 1 and len(found) < limit:
+        pos = start + 4
+        while pos < end - 1 and len(found) < limit and budget[0] > 0:
+            budget[0] -= 1
             etype = buf[pos]
             pos += 1
-            name_end = buf.find(b"\x00", pos)
+            name_end = buf.find(b"\x00", pos, end)
             if name_end == -1:
                 return
             pos = name_end + 1
             if etype == 0x02:  # string
-                if pos + 4 > len(buf):
+                if pos + 4 > end:
                     return
-                slen = struct.unpack("<i", buf[pos : pos + 4])[0]
+                slen = struct.unpack_from("<i", buf, pos)[0]
                 pos += 4
-                val = buf[pos : pos + max(0, slen - 1)]
+                if slen < 1 or pos + slen > end:
+                    return
+                val = buf[pos : pos + min(slen - 1, _MAX_STR)]
                 found.append(val.decode("utf-8", errors="replace"))
                 pos += slen
             elif etype in (0x03, 0x04):  # embedded doc / array
-                if pos + 4 > len(buf):
+                if pos + 4 > end:
                     return
-                dlen = struct.unpack("<i", buf[pos : pos + 4])[0]
-                _walk(buf[pos : pos + dlen])
+                dlen = struct.unpack_from("<i", buf, pos)[0]
+                if dlen < 5 or pos + dlen > end:
+                    return
+                _walk(buf, pos, pos + dlen, depth + 1)
                 pos += dlen
             elif etype in (0x01, 0x12):  # double / int64
                 pos += 8
@@ -139,15 +156,13 @@ def _bson_collect_strings(data: bytes, limit: int = 40) -> list[str]:
                 pos += 4
             elif etype == 0x08:  # bool
                 pos += 1
-            elif etype == 0x00:
-                return
             else:
-                return  # unknown type — stop rather than misparse
+                return  # 0x00 or unknown type — stop rather than misparse
 
     import contextlib
 
     with contextlib.suppress(Exception):
-        _walk(data)
+        _walk(data, 0, len(data), 0)
     return found
 
 
@@ -267,35 +282,58 @@ class _MongoProtocol(asyncio.Protocol):
         self._hp_id = honeypot_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
         self._reqcounter = 0
+        self._messages = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
-        asyncio.create_task(self._record("mongodb_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("mongodb_connection", AlertSeverity.LOW, {}), name="mongodb-event")
+
+    def _close(self) -> None:
+        self._buf.clear()
+        if self._transport is not None and not self._transport.is_closing():
+            self._transport.close()
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
         self._buf += data
-        while len(self._buf) >= 16:
-            length = struct.unpack("<i", self._buf[:4])[0]
-            if length < 16 or length > 48_000_000:
-                self._buf = b""
-                return
-            if len(self._buf) < length:
-                return
-            msg = self._buf[:length]
-            self._buf = self._buf[length:]
-            self._handle_message(msg)
+        try:
+            pos = 0
+            buf = self._buf
+            while len(buf) - pos >= 16:
+                if t.is_closing():
+                    return
+                length = struct.unpack_from("<i", buf, pos)[0]
+                if length < 16 or length > _MAX_WIRE_MESSAGE:
+                    self._close()
+                    return
+                if len(buf) - pos < length:
+                    break
+                self._messages += 1
+                if self._messages > _MAX_MESSAGES_PER_CONN:
+                    self._close()
+                    return
+                msg = bytes(buf[pos : pos + length])
+                pos += length
+                self._handle_message(msg)
+            del buf[:pos]
+        except Exception:
+            log.exception("mongodb protocol error")
+            self._close()
 
     def _handle_message(self, msg: bytes) -> None:
         t = self._transport
-        if t is None:
+        if t is None or t.is_closing():
             return
         request_id, _response_to, opcode = struct.unpack("<iii", msg[4:16])
         command, doc = _extract_command(msg[16:], opcode)
         if command:
+            command = command[:_MAX_STR]
             cmd_lower = command.lower()
             strings = _bson_collect_strings(doc)
             severity = AlertSeverity.MEDIUM
@@ -309,14 +347,18 @@ class _MongoProtocol(asyncio.Protocol):
             ):
                 severity = AlertSeverity.CRITICAL
                 event_type = "mongodb_ransom_note"
-            asyncio.create_task(
+            spawn(
                 self._record(
                     event_type,
                     severity,
                     {"command": command, "strings": strings[:20]},
-                )
+                ),
+                name="mongodb-event",
             )
 
+        if write_backlogged(t, _MAX_WRITE_BUFFER):
+            self._close()  # peer is not reading its replies
+            return
         self._reqcounter += 1
         with __import__("contextlib").suppress(Exception):
             t.write(_build_reply(command, self._reqcounter, request_id, opcode))
@@ -334,7 +376,7 @@ class _MongoProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        self._buf.clear()
 
 
 class MongoDBEngine(HoneypotEngine):

@@ -15,6 +15,7 @@ admin-tier action, the same reasoning that puts `audit_log_search` at admin.
 
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -24,6 +25,8 @@ from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import ApiKey
 from honeypot_mcp.tools._audit import record_action
+
+_LABEL_RE = re.compile(r"[A-Za-z0-9_.@ -]{1,64}")
 
 
 @mcp.tool(auth=require_role("admin"))
@@ -53,10 +56,36 @@ async def api_key_create(
               days, checked on every use. Omit for a key valid until
               explicitly revoked.
     """
-    if not label.strip():
+    label = label.strip()
+    if not label:
         return {"error": "label must not be empty."}
+    if not _LABEL_RE.fullmatch(label):
+        return {
+            "error": (
+                "label may only contain letters, digits, space and ._@- (max 64 characters) — "
+                "it is written into the audit log as the actor, and a label with parentheses "
+                "or control characters could impersonate another actor there."
+            )
+        }
     if expires_in_days is not None and expires_in_days <= 0:
         return {"error": "expires_in_days must be greater than 0."}
+
+    from sqlalchemy import select
+
+    async with get_session() as session:
+        taken = (
+            await session.execute(
+                select(ApiKey.id).where(ApiKey.label == label, ApiKey.revoked_at.is_(None))
+            )
+        ).first()
+    if taken is not None:
+        return {
+            "error": (
+                f"An active API key labelled {label!r} already exists. Labels identify the "
+                "actor in the audit log, so they must be unique among non-revoked keys — "
+                "pick another label or revoke the existing key first."
+            )
+        }
 
     token = secrets.token_hex(32)
     expires_at = datetime.now(UTC) + timedelta(days=expires_in_days) if expires_in_days else None

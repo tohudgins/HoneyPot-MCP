@@ -47,7 +47,12 @@ from typing import Any
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.http_identity import identity_runner, server_identity_middleware
+from honeypot_mcp.http_identity import (
+    MAX_REQUEST_BYTES,
+    identity_runner,
+    read_body,
+    server_identity_middleware,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -62,20 +67,44 @@ _GO_VERSION = "go1.20.8"
 # is by far the most common thing on 6443 that does.
 _SERVER_BANNER = "nginx/1.25.3"
 
-_MAX_BODY_BYTES = 128 * 1024
+# Reading is bounded by the request cap (also the Application `client_max_size`),
+# so a manifest padded past 128 KB is still parsed instead of silently ignored.
+_MAX_BODY_BYTES = MAX_REQUEST_BYTES
+
+# Kubernetes object names cap at 253 characters, so only an image reference's
+# head is ever matched or echoed.
+_MAX_IMAGE_CHARS = 256
+
+# Window fed to the command regex: a long command keeps its head and tail,
+# which is where padding-based evasion has to put the payload.
+_SCAN_WINDOW_CHARS = 4096
+
+# A hostile manifest can name tens of thousands of containers or volumes; the
+# indicators beyond this many say nothing the first ones did not.
+_MAX_REASONS = 64
 
 _MINER_IMAGE = re.compile(
     r"(xmrig|monero|minerd|cpuminer|kinsing|kdevtmpfsi|teamtnt|coinhive|nanopool|"
     r"minergate|stratum)",
     re.I,
 )
+# Every gap is bounded and the input is clipped (`_scan_window`) before matching:
+# `kubectl\s+.*cluster-admin` and `curl[^|]*\|…` are quadratic on attacker input,
+# which at 128 KB held the event loop for ~11 s before anything was recorded.
 _PAYLOAD_COMMAND = re.compile(
-    r"(chroot\s+/host|nsenter|curl[^|]*\|\s*(sh|bash)|wget[^|]*\|\s*(sh|bash)|"
-    r"base64\s+-d[^|]*\|\s*(sh|bash)|/etc/shadow|authorized_keys|crontab|"
-    r"kubectl\s+.*cluster-admin)",
+    r"(chroot\s+/host|nsenter|curl[^|]{0,512}\|\s*(sh|bash)|wget[^|]{0,512}\|\s*(sh|bash)|"
+    r"base64\s+-d[^|]{0,512}\|\s*(sh|bash)|/etc/shadow|authorized_keys|crontab|"
+    r"kubectl\s+.{0,200}cluster-admin)",
     re.I,
 )
 _SENSITIVE_HOST_PATHS = ("/", "/etc", "/root", "/var/run", "/var/lib/kubelet", "/proc", "/sys")
+
+
+def _scan_window(text: str) -> str:
+    """`text` clipped to its head and tail windows, for regex matching."""
+    if len(text) <= 2 * _SCAN_WINDOW_CHARS:
+        return text
+    return text[:_SCAN_WINDOW_CHARS] + " " + text[-_SCAN_WINDOW_CHARS:]
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -89,6 +118,19 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _as_list(value: Any) -> list[Any]:
+    """The list-typed counterpart of `_as_dict`: `volumes: 5` or
+    `containers: 5` made `list(...)`/`for` raise TypeError before `_record()`."""
+    return value if isinstance(value, list) else []
+
+
+def _command_words(value: Any) -> list[Any]:
+    """A `command`/`args` field as a list: a bare string is one word."""
+    if isinstance(value, str):
+        return [value]
+    return _as_list(value)
+
+
 def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     """Named reasons a pod definition is an escape, or an empty list.
 
@@ -98,7 +140,7 @@ def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     spec = _as_dict(body.get("spec"))
 
-    for volume in spec.get("volumes") or []:
+    for volume in _as_list(spec.get("volumes")):
         if not isinstance(volume, dict):
             continue
         host_path = _as_dict(volume.get("hostPath")).get("path")
@@ -116,7 +158,7 @@ def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     if spec.get("hostIPC"):
         reasons.append("host IPC namespace")
 
-    containers = list(spec.get("containers") or []) + list(spec.get("initContainers") or [])
+    containers = _as_list(spec.get("containers")) + _as_list(spec.get("initContainers"))
     for container in containers:
         if not isinstance(container, dict):
             continue
@@ -127,20 +169,22 @@ def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
             reasons.append("allowPrivilegeEscalation enabled")
         if security.get("runAsUser") == 0:
             reasons.append("runs as root (runAsUser: 0)")
-        capabilities = _as_dict(security.get("capabilities")).get("add") or []
+        capabilities = _as_list(_as_dict(security.get("capabilities")).get("add"))
         dangerous = {"SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "NET_ADMIN", "ALL"}
         hit = sorted({c for c in capabilities if isinstance(c, str) and c.upper() in dangerous})
         if hit:
             reasons.append(f"dangerous capabilities added ({', '.join(hit)})")
 
-        image = str(container.get("image", ""))
+        image = str(container.get("image", ""))[:_MAX_IMAGE_CHARS]
         if _MINER_IMAGE.search(image):
             reasons.append(f"known mining image ({image[:80]})")
 
-        command = list(container.get("command") or []) + list(container.get("args") or [])
-        joined = " ".join(str(c) for c in command)
-        if _PAYLOAD_COMMAND.search(joined):
+        command = _command_words(container.get("command")) + _command_words(container.get("args"))
+        joined = " ".join(str(c)[:_SCAN_WINDOW_CHARS] for c in command)
+        if _PAYLOAD_COMMAND.search(_scan_window(joined)):
             reasons.append(f"payload-stage command ({joined[:120]})")
+        if len(reasons) >= _MAX_REASONS:
+            break
 
     # Not an escape on its own, so only noted when something else already is.
     if reasons and spec.get("serviceAccountName") in (
@@ -150,7 +194,7 @@ def analyse_pod_spec(body: dict[str, Any]) -> list[str]:
     ):
         reasons.append(f"runs as service account '{spec.get('serviceAccountName')}'")
 
-    return reasons
+    return reasons[:_MAX_REASONS]
 
 
 def _now_iso() -> str:
@@ -176,11 +220,14 @@ class KubernetesEngine(HoneypotEngine):
 
     @staticmethod
     async def _read_json(request: web.Request) -> dict[str, Any]:
+        # Loop to EOF: `content.read(n)` returns after the first chunk, so a
+        # manifest sent in two writes arrived as half a JSON document and the
+        # escape it carried was filed as an ordinary pod create.
         try:
-            raw = await request.content.read(_MAX_BODY_BYTES)
-            if not raw:
+            body = await read_body(request, _MAX_BODY_BYTES)
+            if not body.data:
                 return {}
-            parsed = json.loads(raw)
+            parsed = json.loads(body.data)
             return parsed if isinstance(parsed, dict) else {"_body": parsed}
         except Exception:
             return {}
@@ -380,8 +427,14 @@ class KubernetesEngine(HoneypotEngine):
         async def create_pod(request: web.Request) -> web.Response:
             body = await self._read_json(request)
             namespace = request.match_info.get("ns", "default")
-            reasons = analyse_pod_spec(body)
-            pod_name = (body.get("metadata") or {}).get("name") or f"pod-{secrets.token_hex(4)}"
+            try:
+                reasons = analyse_pod_spec(body)
+            except Exception:
+                # Analysis is a bonus on top of capture: a manifest that trips it
+                # must still reach `_record()`, never a raw 500.
+                log.exception("analyse_pod_spec failed; recording the attempt unanalysed")
+                reasons = []
+            pod_name = _as_dict(body.get("metadata")).get("name") or f"pod-{secrets.token_hex(4)}"
             await self._record(
                 hp_id,
                 request,
@@ -444,7 +497,10 @@ class KubernetesEngine(HoneypotEngine):
                 headers=headers(),
             )
 
-        app = web.Application(middlewares=[server_identity_middleware(_SERVER_BANNER)])
+        app = web.Application(
+            middlewares=[server_identity_middleware(_SERVER_BANNER)],
+            client_max_size=MAX_REQUEST_BYTES,
+        )
         router = app.router
         router.add_get("/version", version)
         router.add_get("/api", api_root)

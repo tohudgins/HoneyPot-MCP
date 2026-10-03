@@ -16,7 +16,6 @@ from honeypot_mcp.storage.models import AlertDisposition, AlertSeverity
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import (
     digest_payload,
-    resolve_artifact_path,
     truncate_payload,
     write_artifact,
 )
@@ -368,9 +367,21 @@ async def alerts_prune(
                     extension="jsonl",
                     output_path=archive_path,
                 )
+                # write_artifact reports failure as a returned {"error": ...},
+                # not an exception — a bad path or full disk used to sail past
+                # the guard and the delete ran with no archive on disk.
+                if "error" in archive_info:
+                    raise OSError(archive_info["error"])
         except Exception as e:
             # Refusing to delete is the safe failure. Pruning anyway would
             # destroy exactly the data the archive existed to keep.
+            await record_action(
+                "alerts_prune",
+                summary=f"refused to prune alerts older than {older_than_days}d: archive failed",
+                arguments={"older_than_days": older_than_days, "archive_path": archive_path},
+                outcome="error",
+                error=str(e),
+            )
             return {
                 "error": f"Archive failed, so nothing was deleted: {e}",
                 "hint": "Fix the archive destination, or pass archive=False to delete regardless.",
@@ -460,17 +471,12 @@ async def alerts_export(
             writer.writerows(rows)
         content = buf.getvalue()
 
-    dest = resolve_artifact_path(output_path, prefix="alerts", extension=format)
-    if isinstance(dest, str):
-        return {"error": dest}
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-    except OSError as e:
-        return {"error": f"Could not write export to {dest}: {e}"}
+    written = write_artifact(content, prefix="alerts", extension=format, output_path=output_path)
+    if "error" in written:
+        return written
 
     return {
-        "path": str(dest),
+        "path": written["path"],
         "format": format,
         "alerts_exported": len(rows),
         "bytes": len(content.encode("utf-8")),

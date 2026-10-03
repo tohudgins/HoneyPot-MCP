@@ -10,11 +10,30 @@ each reader imposes.
 from __future__ import annotations
 
 import contextlib
+import re
 import uuid
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import quoteattr
 
 from honeypot_mcp.tokens.base import HoneytokenProvider
+
+# `file_type` becomes part of an output filename, so it must not be able to
+# carry path separators or `..` out of the generated-files directory.
+_FILE_TYPE_RE = re.compile(r"^[A-Za-z0-9]{1,8}$")
+
+
+def _pdf_string(text: str) -> str:
+    """Escape `text` for use inside a PDF literal string `( … )`.
+
+    Unescaped, a `)` in an operator-supplied title closes the string early and
+    the remainder is parsed as PDF operators; a raw newline ends the line the
+    string sits on. Characters outside Latin-1 cannot be represented by the
+    standard Helvetica font used here, so they are replaced.
+    """
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    cleaned = cleaned.encode("latin-1", errors="replace").decode("latin-1")
+    return cleaned.replace("\\", "\\\\").replace("(", r"\(").replace(")", r"\)")
 
 
 class FileTokenProvider(HoneytokenProvider):
@@ -24,6 +43,8 @@ class FileTokenProvider(HoneytokenProvider):
         settings = get_settings()
         token_uid = uuid.uuid4().hex
         file_type = options.get("file_type", "pdf")
+        if not isinstance(file_type, str) or not _FILE_TYPE_RE.match(file_type):
+            raise ValueError("file token file_type must be 1-8 alphanumeric characters")
         title = options.get("document_title", "Confidential Report")
 
         # The URL embedded in the document must point at the canary server that
@@ -185,8 +206,6 @@ def _inject_open_action_uri(path: str, url: str) -> None:
     prevent token creation entirely, which is worse than slightly weaker
     coverage on edge-case viewers.
     """
-    import re
-
     try:
         data = Path(path).read_bytes()
     except OSError:
@@ -233,7 +252,7 @@ def _write_minimal_pdf_with_uri_action(path: str, title: str, url: str) -> None:
         f"/OpenAction << /Type /Action /S /URI /URI ({safe_url}) >> >>\nendobj\n"
     ).encode()
     obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-    page_content = (f"BT /F1 14 Tf 72 720 Td ({title}) Tj ET\n").encode()
+    page_content = (f"BT /F1 14 Tf 72 720 Td ({_pdf_string(title)}) Tj ET\n").encode("latin-1")
     obj4 = (
         b"4 0 obj\n<< /Length "
         + str(len(page_content)).encode()
@@ -315,7 +334,6 @@ def _inject_external_image_rel(path: str, image_url: str) -> None:
          in the document body. The `r:link` (not `r:embed`) is what makes
          Word treat it as an external resource and fetch it on open.
     """
-    import re
     import shutil
     import tempfile
     import zipfile
@@ -327,7 +345,7 @@ def _inject_external_image_rel(path: str, image_url: str) -> None:
     new_rel = (
         f'<Relationship Id="{rel_id}" '
         f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
-        f'Target="{image_url}" TargetMode="External"/>'
+        f'Target={quoteattr(image_url)} TargetMode="External"/>'
     )
 
     # The drawing block — 1x1 EMU is too small; Word uses 9525 EMU per pixel.

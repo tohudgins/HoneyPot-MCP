@@ -44,7 +44,12 @@ from typing import Any
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.http_identity import ExactHeaderResponse, identity_runner
+from honeypot_mcp.http_identity import (
+    MAX_REQUEST_BYTES,
+    ExactHeaderResponse,
+    identity_runner,
+    read_body,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -61,22 +66,48 @@ _SERVER_BANNER = f"Docker/{_DOCKER_VERSION} (linux)"
 
 # Image names that only appear in cryptomining and botnet campaigns. Matching
 # the image is what separates "pulled alpine" from "pulled a miner".
+#
+# Attacker-controlled strings reach these patterns, so every gap is bounded and
+# the input is clipped first (`_MAX_IMAGE_CHARS` / `_scan_window`): an unbounded
+# `docker\.io/alpine.*(curl|wget).*sh` is cubic, and a 64 KB image name pinned
+# the event loop for minutes — before the event was recorded.
 _MALICIOUS_IMAGE = re.compile(
     r"(xmrig|monero|minerd|cpuminer|kinsing|kdevtmpfsi|teamtnt|watchdog|"
-    r"docker\.io/alpine.*(curl|wget).*sh|pocosow|coinhive|nanopool|minergate|"
+    r"docker\.io/alpine.{0,64}(curl|wget).{0,64}sh|pocosow|coinhive|nanopool|minergate|"
     r"cetus|dofloo|tornado|zoolu)",
     re.I,
 )
 
 # Commands that indicate the payload stage rather than legitimate use.
 _MALICIOUS_COMMAND = re.compile(
-    r"(chroot\s+/mnt|nsenter|curl[^|]*\|\s*(sh|bash)|wget[^|]*\|\s*(sh|bash)|"
-    r"base64\s+-d[^|]*\|\s*(sh|bash)|/etc/shadow|authorized_keys|crontab|"
+    r"(chroot\s+/mnt|nsenter|curl[^|]{0,512}\|\s*(sh|bash)|wget[^|]{0,512}\|\s*(sh|bash)|"
+    r"base64\s+-d[^|]{0,512}\|\s*(sh|bash)|/etc/shadow|authorized_keys|crontab|"
     r"xmrig|stratum\+tcp)",
     re.I,
 )
 
-_MAX_BODY_BYTES = 64 * 1024
+# Reading is bounded by the request cap (also the Application `client_max_size`),
+# so a payload padded past 64 KB is still parsed instead of silently ignored.
+_MAX_BODY_BYTES = MAX_REQUEST_BYTES
+
+# Docker caps image references at 255 characters; anything longer is not a
+# real reference, so only the head is ever matched or echoed.
+_MAX_IMAGE_CHARS = 256
+
+# Window fed to the command regex: long command strings keep their head and
+# tail, which is where padding-based evasion has to put the payload.
+_SCAN_WINDOW_CHARS = 4096
+
+# A hostile body can list tens of thousands of binds; the indicators past this
+# many say nothing the first ones did not, and `escape_indicators` is stored.
+_MAX_REASONS = 64
+
+
+def _scan_window(text: str) -> str:
+    """`text` clipped to its head and tail windows, for regex matching."""
+    if len(text) <= 2 * _SCAN_WINDOW_CHARS:
+        return text
+    return text[:_SCAN_WINDOW_CHARS] + " " + text[-_SCAN_WINDOW_CHARS:]
 
 
 class _DaemonNotFound(ExactHeaderResponse):
@@ -116,11 +147,11 @@ def analyse_container_create(spec: dict[str, Any]) -> list[str]:
                 continue
             source = bind.split(":", 1)[0]
             if source == "/":
-                reasons.append(f"mounts host root filesystem ({bind})")
+                reasons.append(f"mounts host root filesystem ({bind[:200]})")
             elif source in ("/etc", "/root", "/home", "/var/run", "/proc", "/sys", "/boot"):
-                reasons.append(f"mounts sensitive host path ({bind})")
+                reasons.append(f"mounts sensitive host path ({bind[:200]})")
             elif source.endswith("docker.sock"):
-                reasons.append(f"mounts the Docker socket ({bind}) — daemon takeover")
+                reasons.append(f"mounts the Docker socket ({bind[:200]}) — daemon takeover")
 
     mounts = spec.get("Mounts") or host_config.get("Mounts") or []
     if isinstance(mounts, list):
@@ -143,7 +174,7 @@ def analyse_container_create(spec: dict[str, Any]) -> list[str]:
         if hit:
             reasons.append(f"dangerous capabilities added ({', '.join(hit)})")
 
-    image = str(spec.get("Image", ""))
+    image = str(spec.get("Image", ""))[:_MAX_IMAGE_CHARS]
     if _MALICIOUS_IMAGE.search(image):
         reasons.append(f"known malicious/mining image ({image[:80]})")
 
@@ -151,11 +182,11 @@ def analyse_container_create(spec: dict[str, Any]) -> list[str]:
     if isinstance(command, str):
         command = [command]
     if isinstance(command, list):
-        joined = " ".join(str(c) for c in command)
-        if _MALICIOUS_COMMAND.search(joined):
+        joined = " ".join(str(c)[:_SCAN_WINDOW_CHARS] for c in command)
+        if _MALICIOUS_COMMAND.search(_scan_window(joined)):
             reasons.append(f"payload-stage command ({joined[:120]})")
 
-    return reasons
+    return reasons[:_MAX_REASONS]
 
 
 class DockerAPIEngine(HoneypotEngine):
@@ -166,11 +197,14 @@ class DockerAPIEngine(HoneypotEngine):
 
     @staticmethod
     async def _read_json(request: web.Request) -> dict[str, Any]:
+        # Loop to EOF: `content.read(n)` returns after the first chunk, so a
+        # body sent in two writes arrived as half a JSON document and the
+        # escape it carried was filed as an ordinary container create.
         try:
-            raw = await request.content.read(_MAX_BODY_BYTES)
-            if not raw:
+            body = await read_body(request, _MAX_BODY_BYTES)
+            if not body.data:
                 return {}
-            parsed = json.loads(raw)
+            parsed = json.loads(body.data)
             return parsed if isinstance(parsed, dict) else {"_body": parsed}
         except Exception:
             return {}
@@ -339,8 +373,8 @@ class DockerAPIEngine(HoneypotEngine):
             )
 
         async def create_image(request: web.Request) -> web.Response:
-            image = request.query.get("fromImage", "") + (
-                f":{request.query['tag']}" if request.query.get("tag") else ""
+            image = request.query.get("fromImage", "")[:_MAX_IMAGE_CHARS] + (
+                f":{request.query['tag'][:_MAX_IMAGE_CHARS]}" if request.query.get("tag") else ""
             )
             malicious = bool(_MALICIOUS_IMAGE.search(image))
             await self._record(
@@ -404,9 +438,11 @@ class DockerAPIEngine(HoneypotEngine):
             spec = await self._read_json(request)
             command = spec.get("Cmd") or []
             joined = (
-                " ".join(str(c) for c in command) if isinstance(command, list) else str(command)
+                " ".join(str(c)[:_SCAN_WINDOW_CHARS] for c in command)
+                if isinstance(command, list)
+                else str(command)
             )
-            malicious = bool(_MALICIOUS_COMMAND.search(joined))
+            malicious = bool(_MALICIOUS_COMMAND.search(_scan_window(joined)))
             await self._record(
                 hp_id,
                 request,
@@ -442,7 +478,7 @@ class DockerAPIEngine(HoneypotEngine):
         # break nmap's byte-exact Docker signature. Real API responses set
         # their own headers below, and `identity_runner` still covers
         # protocol-level errors that never reach the app.
-        app = web.Application()
+        app = web.Application(client_max_size=MAX_REQUEST_BYTES)
         router = app.router
         # Docker clients prefix every call with /v1.43; both forms must work.
         for prefix in ("", "/v{api:[0-9.]+}"):

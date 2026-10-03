@@ -45,8 +45,15 @@ import secrets
 from typing import Any, cast
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    LineWorker,
+    UdpReplyLimiter,
+    limited_factory,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -55,8 +62,28 @@ from honeypot_mcp.storage.models import AlertSeverity
 log = logging.getLogger(__name__)
 
 _PBX_NAME = "Asterisk PBX 18.10.0"
+# A SIP request over UDP fits in one MTU in practice (RFC 3261 §18.1.1 moves
+# anything near 1300 bytes to TCP). Larger datagrams are dropped unparsed.
+_MAX_UDP_DATAGRAM = 4096
+# TCP framing buffer. A message that has not completed within this many bytes
+# is not SIP; the connection is closed.
+_MAX_TCP_MESSAGE = 65_535
+# Framing boundaries handled per read (blank keepalives included), messages
+# queued at once, and messages per connection. Past any of them the peer is
+# flooding, not signalling, and the connection is closed.
+_MAX_FRAMES_PER_READ = 64
+_MAX_TCP_PENDING = 16
+_MAX_TCP_MESSAGES = 256
+# Digest parameters are a few hundred bytes. Parsing is bounded to this many
+# so a giant header cannot cost more than a fixed amount of regex work.
+_MAX_AUTH_HEADER = 1024
+# Echoed correlation headers (Via/From/To/Call-ID/CSeq) are attacker-chosen;
+# each is clipped so the reply cannot be inflated through them.
+_MAX_ECHO = 256
+# Key length is bounded so a long run of word characters with no `=` costs
+# linear, not quadratic, time (each start position scans at most 32 chars).
+_DIGEST_FIELD = re.compile(r'([A-Za-z][\w-]{0,31})\s*=\s*(?:"([^"]{0,512})"|([^,\s"]{1,512}))')
 _REALM = "asterisk"
-_MAX_DATAGRAM = 65_535
 
 # Scanners that announce themselves. Naming the tool in the alert saves an
 # analyst a lookup and distinguishes commodity sweeps from targeted probing.
@@ -140,11 +167,16 @@ def extract_extension(uri_or_header: str) -> str:
 
 
 def parse_digest(authorization: str) -> dict[str, str]:
-    """Parse a `Digest` Authorization header into its fields."""
+    """Parse a `Digest` Authorization header into its fields.
+
+    Input is clipped to `_MAX_AUTH_HEADER` and parsed with a bounded pattern:
+    the previous unbounded `(\\w+)\\s*=` was quadratic on a long run of word
+    characters, and a single 65 KB datagram held the event loop for ~30 s.
+    """
     if not authorization.lower().startswith("digest"):
         return {}
     fields: dict[str, str] = {}
-    for key, quoted, bare in re.findall(r'(\w+)\s*=\s*(?:"([^"]*)"|([^,\s]+))', authorization[6:]):
+    for key, quoted, bare in _DIGEST_FIELD.findall(authorization[6:_MAX_AUTH_HEADER]):
         fields[key.lower()] = quoted or bare
     return fields
 
@@ -216,19 +248,27 @@ def _response_line(status: int, reason: str) -> str:
     return f"SIP/2.0 {status} {reason}"
 
 
-def build_response(request: dict[str, Any], status: int, reason: str, extra: str = "") -> str:
-    """Echo the correlation headers a real UA requires, or it ignores us."""
+def build_response(
+    request: dict[str, Any], status: int, reason: str, extra: str = "", minimal: bool = False
+) -> str:
+    """Echo the correlation headers a real UA requires, or it ignores us.
+
+    Echoed values are clipped to `_MAX_ECHO`. `minimal` drops everything but
+    the correlation headers — the shape used when a full reply would be larger
+    than the UDP request it answers.
+    """
     lines = [
         _response_line(status, reason),
-        f"Via: {request.get('via', '')}",
-        f"From: {request.get('from', '')}",
-        f"To: {request.get('to', '')}",
-        f"Call-ID: {request.get('call_id', '')}",
-        f"CSeq: {request.get('cseq', '')}",
-        f"Server: {_PBX_NAME}",
+        f"Via: {request.get('via', '')[:_MAX_ECHO]}",
+        f"From: {request.get('from', '')[:_MAX_ECHO]}",
+        f"To: {request.get('to', '')[:_MAX_ECHO]}",
+        f"Call-ID: {request.get('call_id', '')[:_MAX_ECHO]}",
+        f"CSeq: {request.get('cseq', '')[:_MAX_ECHO]}",
     ]
-    if extra:
-        lines.append(extra)
+    if not minimal:
+        lines.append(f"Server: {_PBX_NAME}")
+        if extra:
+            lines.append(extra)
     lines.extend(["Content-Length: 0", "", ""])
     return "\r\n".join(lines)
 
@@ -258,7 +298,15 @@ class _SIPHandler:
         self._name = honeypot_name
         self._hp_id = hp_id
 
-    async def handle(self, data: bytes, peer: tuple[str, int]) -> bytes | None:
+    async def handle(
+        self, data: bytes, peer: tuple[str, int], max_reply: int | None = None
+    ) -> bytes | None:
+        """Record the request and return the reply to send (None = silence).
+
+        `max_reply` bounds the reply size: when the faithful reply is longer,
+        a minimal one (correlation headers only) is returned instead, and if
+        even that does not fit, nothing. The event is recorded either way.
+        """
         message = data.decode("utf-8", errors="replace")
         request = parse_sip(message)
         if request is None:
@@ -285,24 +333,33 @@ class _SIPHandler:
         )
 
         method = request["method"]
+        if method in ("ACK", "CANCEL"):
+            return None
         if method == "OPTIONS":
             # A real PBX answers OPTIONS with 200 and an Allow list; silence
             # would just make the scanner move on without revealing itself.
-            return build_response(
+            status, reason = 200, "OK"
+            reply = build_response(
                 request,
-                200,
-                "OK",
+                status,
+                reason,
                 "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, SUBSCRIBE, NOTIFY, INFO",
             ).encode()
-        if method == "REGISTER":
+        elif method in ("REGISTER", "INVITE"):
             # Always challenge. The first REGISTER never carries credentials,
             # and the challenge is what makes the tool send them.
-            return build_auth_challenge(request, 401).encode()
-        if method == "INVITE":
-            return build_auth_challenge(request, 407).encode()
-        if method in ("ACK", "CANCEL"):
-            return None
-        return build_response(request, 200, "OK").encode()
+            status = 401 if method == "REGISTER" else 407
+            reason = "Unauthorized" if status == 401 else "Proxy Authentication Required"
+            reply = build_auth_challenge(request, status).encode()
+        else:
+            status, reason = 200, "OK"
+            reply = build_response(request, status, reason).encode()
+
+        if max_reply is not None and len(reply) > max_reply:
+            reply = build_response(request, status, reason, minimal=True).encode()
+            if len(reply) > max_reply:
+                return None
+        return reply
 
     async def _record(
         self, peer: tuple[str, int], event_type: str, severity: AlertSeverity, payload: dict
@@ -320,9 +377,14 @@ class _SIPHandler:
 
 
 class _SIPDatagramProtocol(asyncio.DatagramProtocol):
+    """UDP SIP. Source addresses are spoofable, so a reply is never larger
+    than the request it answers and replies per source are rate-limited;
+    the request is recorded regardless."""
+
     def __init__(self, handler: _SIPHandler) -> None:
         self._handler = handler
         self._transport: asyncio.DatagramTransport | None = None
+        self._reply_limiter = UdpReplyLimiter()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         # Cast, never isinstance — `_SelectorDatagramTransport` is not a
@@ -331,13 +393,14 @@ class _SIPDatagramProtocol(asyncio.DatagramProtocol):
         self._transport = cast(asyncio.DatagramTransport, transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        if len(data) > _MAX_DATAGRAM:
+        if len(data) > _MAX_UDP_DATAGRAM:
             return
-        asyncio.create_task(self._respond(data, addr))
+        may_reply = self._reply_limiter.allow(addr[0])
+        spawn(self._respond(data, addr, may_reply), name="sip-udp")
 
-    async def _respond(self, data: bytes, addr: tuple[str, int]) -> None:
-        reply = await self._handler.handle(data, addr)
-        if reply and self._transport is not None:
+    async def _respond(self, data: bytes, addr: tuple[str, int], may_reply: bool) -> None:
+        reply = await self._handler.handle(data, addr, max_reply=len(data))
+        if reply and may_reply and self._transport is not None:
             try:
                 self._transport.sendto(reply, addr)
             except Exception as e:  # pragma: no cover - transport teardown race
@@ -350,22 +413,53 @@ class _SIPStreamProtocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
+        # One ordered worker per connection instead of a task per message:
+        # 60 KB of bare `\r\n\r\n` used to spawn ~15,000 tasks.
+        self._worker = LineWorker(
+            self._respond,
+            name="sip-tcp",
+            max_pending=_MAX_TCP_PENDING,
+            max_total=_MAX_TCP_MESSAGES,
+        )
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
 
+    def _abort(self) -> None:
+        # Messages already queued are still handled (they are evidence); the
+        # replies are simply not written once the transport is closing.
+        self._buf = b""
+        if self._transport is not None:
+            self._transport.close()
+
     def data_received(self, data: bytes) -> None:
-        self._buf += data
-        if len(self._buf) > _MAX_DATAGRAM:
-            self._buf = b""
+        if self._transport is None or self._transport.is_closing():
             return
+        buf = self._buf + data
         # SIP over TCP frames on the blank line ending the headers; we have no
-        # bodies to read, so that boundary is the whole message.
-        while b"\r\n\r\n" in self._buf:
-            message, self._buf = self._buf.split(b"\r\n\r\n", 1)
-            asyncio.create_task(self._respond(message + b"\r\n\r\n"))
+        # bodies to read, so that boundary is the whole message. One linear
+        # pass with a moving index; blank frames (CRLF keepalives) are skipped
+        # but still count toward the per-read bound.
+        messages: list[bytes] = []
+        pos = 0
+        frames = 0
+        while True:
+            i = buf.find(b"\r\n\r\n", pos)
+            if i < 0:
+                break
+            frames += 1
+            if frames > _MAX_FRAMES_PER_READ:
+                self._worker.submit(messages)
+                self._abort()
+                return
+            if buf[pos:i].strip():
+                messages.append(buf[pos : i + 4])
+            pos = i + 4
+        self._buf = buf[pos:]
+        if not self._worker.submit(messages) or len(self._buf) > _MAX_TCP_MESSAGE:
+            self._abort()
 
     async def _respond(self, data: bytes) -> None:
         reply = await self._handler.handle(data, self._peer)
@@ -409,9 +503,8 @@ class SIPEngine(HoneypotEngine):
         entry = self._servers.pop(container_id, None)
         if entry:
             tcp_server, udp_transport = entry
-            tcp_server.close()
-            await tcp_server.wait_closed()
             udp_transport.close()
+            await shutdown_server(tcp_server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_sip"}

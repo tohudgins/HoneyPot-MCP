@@ -17,6 +17,7 @@ pair across multiple decoy surfaces.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.credential_verify import verify_mysql, verify_vnc
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
@@ -49,6 +51,11 @@ _index: dict[tuple[str, str, str], int] = {}
 # non-empty password (VNC has no username), so it's a looser superset.
 _candidates: dict[str, list[tuple[str, str, int]]] = {}
 _loaded_at: float = 0.0
+_refresh_lock: LoopBound[asyncio.Lock] = LoopBound(asyncio.Lock)
+_refresh_failing = False
+# After a failed refresh, retry this many seconds later instead of on the next event.
+_REFRESH_RETRY_SECONDS = 5
+_MATCHABLE_STATUSES = (HoneytokenStatus.ACTIVE, HoneytokenStatus.TRIGGERED)
 
 
 def invalidate_cache() -> None:
@@ -57,38 +64,66 @@ def invalidate_cache() -> None:
     _loaded_at = 0.0
 
 
+def _cache_fresh() -> bool:
+    return time.monotonic() - _loaded_at < CRED_REFRESH_SECONDS
+
+
 async def _load_index() -> None:
-    global _index, _candidates, _loaded_at
-    now = time.monotonic()
-    if now - _loaded_at < CRED_REFRESH_SECONDS:
+    """Refresh the credential index if it has expired.
+
+    Double-checked under a lock so a burst of events at expiry costs one SELECT.
+    A failed refresh keeps the previous index (stale beats empty) and lets the
+    event through to the queue — the matcher is an enrichment of ingest, and a
+    database hiccup must not discard the event it was about to classify.
+    """
+    global _index, _candidates, _loaded_at, _refresh_failing
+    if _cache_fresh():
         return
+    async with _refresh_lock.get():
+        if _cache_fresh():
+            return
+        now = time.monotonic()
+        try:
+            async with get_session() as session:
+                # TRIGGERED tokens stay indexed: the first hit (often a benign
+                # scanner or the operator's own test) must not disarm the token
+                # against the real attacker who uses it later. REVOKED ones are
+                # the only retired state.
+                result = await session.execute(
+                    select(Honeytoken).where(
+                        Honeytoken.status.in_(_MATCHABLE_STATUSES),
+                        Honeytoken.type == HoneytokenType.CREDENTIAL,
+                    )
+                )
+                tokens = list(result.scalars().all())
+        except Exception as e:
+            if not _refresh_failing:
+                log.warning(
+                    "Credential honeytoken index refresh failed (%s) — keeping the previous index.",
+                    e,
+                )
+            _refresh_failing = True
+            _loaded_at = now - CRED_REFRESH_SECONDS + _REFRESH_RETRY_SECONDS
+            return
 
-    async with get_session() as session:
-        result = await session.execute(
-            select(Honeytoken).where(
-                Honeytoken.status == HoneytokenStatus.ACTIVE,
-                Honeytoken.type == HoneytokenType.CREDENTIAL,
-            )
-        )
-        tokens = list(result.scalars().all())
+        _refresh_failing = False
+        new_index: dict[tuple[str, str, str], int] = {}
+        new_candidates: dict[str, list[tuple[str, str, int]]] = {}
+        for t in tokens:
+            meta = t.token_meta or {}
+            service = (meta.get("service") or "any").lower()
+            for pair in meta.get("credentials") or []:
+                u = (pair.get("username") or "").strip().lower()
+                p = pair.get("password") or ""
+                if not p:
+                    continue
+                if u:
+                    new_index[(service, u, p)] = t.id
+                new_candidates.setdefault(service, []).append((u, p, t.id))
 
-    new_index: dict[tuple[str, str, str], int] = {}
-    new_candidates: dict[str, list[tuple[str, str, int]]] = {}
-    for t in tokens:
-        meta = t.token_meta or {}
-        service = (meta.get("service") or "any").lower()
-        for pair in meta.get("credentials") or []:
-            u = (pair.get("username") or "").strip().lower()
-            p = pair.get("password") or ""
-            if not p:
-                continue
-            if u:
-                new_index[(service, u, p)] = t.id
-            new_candidates.setdefault(service, []).append((u, p, t.id))
-
-    _index = new_index
-    _candidates = new_candidates
-    _loaded_at = now
+        _index = new_index
+        _candidates = new_candidates
+        _loaded_at = now
 
 
 # Event-type prefix → service label the operator picked when planting the

@@ -24,6 +24,7 @@ run manually against their own DB.
 from __future__ import annotations
 
 import random
+import re
 import uuid
 from typing import Any
 
@@ -59,6 +60,17 @@ _LAST_NAMES = (
 )
 
 
+# The table name is spliced into the INSERT statement shown to the operator, and
+# the domain into the canary address — both must be inert identifiers.
+_TABLE_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_DOMAIN_RE = re.compile(rf"^{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})*$")
+
+
+def _valid_domain(domain: Any) -> bool:
+    return isinstance(domain, str) and len(domain) <= 253 and _DOMAIN_RE.match(domain) is not None
+
+
 def _fake_identity(seed: str) -> tuple[str, str]:
     rnd = random.Random(seed)
     return rnd.choice(_FIRST_NAMES), rnd.choice(_LAST_NAMES)
@@ -68,6 +80,8 @@ class DBRowProvider(HoneytokenProvider):
     async def create(self, options: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         token_uid = uuid.uuid4().hex[:16]  # 16 chars is plenty for uniqueness
         domain = options.get("domain")
+        if domain and not _valid_domain(domain):
+            raise ValueError("db_row domain must be a hostname such as 'corp.example'")
         if not domain:
             from honeypot_mcp.config import get_settings
 
@@ -79,7 +93,7 @@ class DBRowProvider(HoneytokenProvider):
                 .split(":")[0]
                 .split("/")[0]
             )
-            domain = base or "example.com"
+            domain = base if _valid_domain(base) else "example.com"
 
         first, last = _fake_identity(token_uid)
         canary_email = f"canary-{token_uid}@{domain}"
@@ -99,6 +113,8 @@ class DBRowProvider(HoneytokenProvider):
         }
 
         table_hint = options.get("table", "users")
+        if not isinstance(table_hint, str) or not _TABLE_RE.match(table_hint):
+            raise ValueError("db_row table must be 1-64 characters of letters, digits or '_'")
 
         meta = {
             "token_uid": token_uid,

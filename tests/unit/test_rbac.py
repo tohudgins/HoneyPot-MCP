@@ -200,7 +200,7 @@ def test_networked_auth_error_accepts_mcp_auth_tokens_alone():
     settings = SimpleNamespace(
         mcp_transport="http",
         mcp_auth_token="",
-        mcp_auth_tokens="tok:viewer",
+        mcp_auth_tokens="tok-0123456789abcdef:viewer",
         mcp_allow_unauthenticated=False,
     )
     assert _networked_auth_error(settings) is None

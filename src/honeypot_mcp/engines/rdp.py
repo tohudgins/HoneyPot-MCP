@@ -41,8 +41,11 @@ import logging
 import secrets
 from typing import Any
 
+from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.tls import build_server_ssl_context
+from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_handler, shutdown_server
+from honeypot_mcp.engines.tls import build_server_ssl_context_async
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -315,7 +318,10 @@ async def _handle_rdp_client(
 
     # Always log the initial connection at LOW severity (matches the previous
     # banner-only engine's behaviour so dashboards don't drift).
-    asyncio.create_task(_record_event(honeypot_id, peer, "rdp_connection", AlertSeverity.LOW, {}))
+    spawn(
+        _record_event(honeypot_id, peer, "rdp_connection", AlertSeverity.LOW, {}),
+        name="rdp-record",
+    )
 
     try:
         first = await asyncio.wait_for(reader.read(4096), timeout=10.0)
@@ -332,8 +338,9 @@ async def _handle_rdp_client(
     parsed = _parse_x224_cr(first)
     sev = AlertSeverity.HIGH if "x224_code" in parsed else AlertSeverity.LOW
     et = "rdp_handshake" if "x224_code" in parsed else "rdp_invalid_probe"
-    asyncio.create_task(
-        _record_event(honeypot_id, peer, et, sev, {**parsed, "raw_bytes": len(first)})
+    spawn(
+        _record_event(honeypot_id, peer, et, sev, {**parsed, "raw_bytes": len(first)}),
+        name="rdp-record",
     )
 
     requested = parsed.get("requested_protocols", 0)
@@ -360,7 +367,7 @@ async def _handle_rdp_client(
             writer.close()
         return
 
-    ssl_ctx = build_server_ssl_context(honeypot_name)
+    ssl_ctx = await build_server_ssl_context_async(honeypot_name)
 
     try:
         # `StreamWriter.start_tls` lands cleanly in Python 3.11+. The new
@@ -389,8 +396,9 @@ async def _handle_rdp_client(
         "requested_protocols": requested,
         "selected_protocol": _PROTOCOL_SSL,
     }
-    asyncio.create_task(
-        _record_event(honeypot_id, peer, "rdp_mcs_handshake", AlertSeverity.HIGH, payload)
+    spawn(
+        _record_event(honeypot_id, peer, "rdp_mcs_handshake", AlertSeverity.HIGH, payload),
+        name="rdp-record",
     )
 
     # Closing now looks like a transient server failure to the attacker —
@@ -404,6 +412,7 @@ async def _handle_rdp_client(
 class RDPEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._servers: dict[str, asyncio.AbstractServer] = {}
+        self._limiter = ConnectionLimiter(get_settings().max_connections_per_ip)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         hp_id: int | None = None
@@ -418,7 +427,9 @@ class RDPEngine(HoneypotEngine):
             except Exception as e:
                 log.warning("RDP handler error: %s", e)
 
-        server = await asyncio.start_server(_handler, host="0.0.0.0", port=port)
+        server = await asyncio.start_server(
+            limited_handler(_handler, self._limiter), host="0.0.0.0", port=port
+        )
         cid = f"rdp-{secrets.token_hex(8)}"
         self._servers[cid] = server
         log.info("RDP honeypot '%s' listening on port %d", name, port)
@@ -427,8 +438,7 @@ class RDPEngine(HoneypotEngine):
     async def stop(self, container_id: str, remove: bool = False) -> None:
         server = self._servers.pop(container_id, None)
         if server:
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_rdp"}

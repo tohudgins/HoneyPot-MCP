@@ -36,6 +36,8 @@ import struct
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -60,6 +62,11 @@ _ENCRYPT_NOT_SUP = 0x02
 
 # Advertised server build: SQL Server 2019 RTM (15.0.2000).
 _SQL_VERSION = (15, 0, 2000, 0)
+
+# Pre-auth, a real client sends one PRELOGIN and one LOGIN7. Anything past a few
+# packets is a peer wasting our time, not a handshake.
+_MAX_PACKETS_PER_CONN = 16
+_MAX_WRITE_BUFFER = 64 * 1024
 
 
 def _tds_packet(pkt_type: int, payload: bytes) -> bytes:
@@ -131,7 +138,7 @@ def _parse_login7(body: bytes) -> dict[str, str]:
     def _field(table_index: int, deobfuscate: bool = False) -> str:
         pos = 36 + table_index * 4
         ib, cch = struct.unpack_from("<HH", body, pos)
-        nbytes = cch * 2
+        nbytes = min(cch * 2, 4096)  # clip attacker-chosen field length (2 KB of text)
         if ib == 0 or nbytes == 0 or ib + nbytes > len(body):
             return ""
         chunk = body[ib : ib + nbytes]
@@ -174,39 +181,63 @@ class _MSSQLProtocol(asyncio.Protocol):
         self._hp_id = honeypot_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
+        self._packets = 0
+        self._prelogin_seen = False
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
-        asyncio.create_task(self._record("mssql_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("mssql_connection", AlertSeverity.LOW, {}), name="mssql-event")
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
         self._buf += data
-        # Drain complete TDS packets (8-byte header, length is bytes 2-3 BE).
-        while len(self._buf) >= 8:
-            length = struct.unpack_from(">H", self._buf, 2)[0]
-            if length < 8 or length > 65535:
-                self._close()
-                return
-            if len(self._buf) < length:
-                return
-            pkt_type = self._buf[0]
-            body = self._buf[8:length]
-            self._buf = self._buf[length:]
-            self._handle_packet(pkt_type, body)
+        buf = self._buf
+        pos = 0
+        try:
+            # Drain complete TDS packets (8-byte header, length is bytes 2-3 BE).
+            # Walk an offset, and stop the instant the connection is closing so a
+            # pipelined LOGIN7 behind a rejection never yields a second event.
+            while len(buf) - pos >= 8 and not t.is_closing():
+                if write_backlogged(t, _MAX_WRITE_BUFFER):
+                    self._close()  # peer is not reading its replies
+                    return
+                length = struct.unpack_from(">H", buf, pos + 2)[0]
+                if length < 8:
+                    self._close()
+                    return
+                if len(buf) - pos < length:
+                    break
+                self._packets += 1
+                if self._packets > _MAX_PACKETS_PER_CONN:
+                    self._close()
+                    return
+                pkt_type = buf[pos]
+                body = bytes(buf[pos + 8 : pos + length])
+                pos += length
+                self._handle_packet(pkt_type, body)
+        except Exception:
+            log.exception("mssql protocol error")
+            self._close()
+            return
+        del buf[:pos]
 
     def _handle_packet(self, pkt_type: int, body: bytes) -> None:
         t = self._transport
-        if t is None:
+        if t is None or t.is_closing():
             return
-        if pkt_type == _TDS_PRELOGIN:
+        if pkt_type == _TDS_PRELOGIN and not self._prelogin_seen:
+            # One PRELOGIN is part of every real handshake; a second is not.
+            self._prelogin_seen = True
             t.write(_build_prelogin_response())
             return
         if pkt_type == _TDS_LOGIN7:
             fields = _parse_login7(body)
-            asyncio.create_task(self._record_login(fields))
+            spawn(self._record_login(fields), name="mssql-event")
             with contextlib.suppress(Exception):
                 t.write(_build_login_error())
             self._close()
@@ -215,6 +246,7 @@ class _MSSQLProtocol(asyncio.Protocol):
         self._close()
 
     def _close(self) -> None:
+        self._buf.clear()
         if self._transport is not None:
             with contextlib.suppress(Exception):
                 self._transport.close()
@@ -251,7 +283,7 @@ class _MSSQLProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        self._buf.clear()
 
 
 class MSSQLEngine(HoneypotEngine):

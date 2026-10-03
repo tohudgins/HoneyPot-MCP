@@ -38,8 +38,16 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    LineWorker,
+    close_after_error,
+    extract_lines,
+    limited_factory,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -57,6 +65,9 @@ _CAPABILITIES = (
 )
 
 _MAX_LINE = 8192
+# Lines processed per network read. A real client pipelines a handful of
+# commands; more than this in one read is a flood and the connection is closed.
+_MAX_LINES_PER_READ = 16
 # Real servers pause before rejecting a bad password. Instant rejection makes
 # brute-forcing cheap and identifies the server as fake.
 _AUTH_FAIL_DELAY = 1.2
@@ -69,6 +80,7 @@ class _IMAPProtocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
+        self._worker = LineWorker(self._handle_raw, name="imap-lines")
         self._authenticated = False
         # Set while waiting for the base64 payload of a multi-line
         # `AUTHENTICATE PLAIN` exchange.
@@ -79,25 +91,31 @@ class _IMAPProtocol(asyncio.Protocol):
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
         self._send(f"* OK [CAPABILITY {_CAPABILITIES}] Dovecot ready.\r\n")
-        asyncio.create_task(self._record("imap_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("imap_connection", AlertSeverity.LOW, {}), name="imap-connect")
 
     def _send(self, text: str) -> None:
         if self._transport is not None and not self._transport.is_closing():
             self._transport.write(text.encode("utf-8", errors="replace"))
 
     def data_received(self, data: bytes) -> None:
-        self._buf += data
-        if len(self._buf) > _MAX_LINE * 4:
-            self._buf = b""
-            self._send("* BYE Line too long\r\n")
-            self._close()
-            return
-        while b"\r\n" in self._buf or b"\n" in self._buf:
-            sep = b"\r\n" if b"\r\n" in self._buf else b"\n"
-            raw, self._buf = self._buf.split(sep, 1)
-            asyncio.create_task(self._handle(raw.decode("utf-8", errors="replace")))
+        lines, self._buf, problem = extract_lines(
+            self._buf + data, max_lines=_MAX_LINES_PER_READ, max_line=_MAX_LINE * 4
+        )
+        accepted = self._worker.submit(lines)
+        if problem or not accepted:
+            # Flood or oversized line: keep what was already queued (it is
+            # evidence), refuse the rest and hang up.
+            self._send("* BYE Line too long\r\n" if problem == "too_long" else "* BYE Too fast\r\n")
+            if self._transport is not None:
+                close_after_error(self._transport)
+
+    async def _handle_raw(self, raw: bytes) -> None:
+        await self._handle(raw.decode("utf-8", errors="replace"))
 
     def _close(self) -> None:
+        # The session is ending on our side (LOGOUT, flood): lines still queued
+        # behind the one being handled are dropped, not answered into a dead socket.
+        self._worker.stop()
         if self._transport is not None:
             self._transport.close()
 
@@ -188,7 +206,8 @@ class _IMAPProtocol(asyncio.Protocol):
                 "method": method,
             },
         )
-        await asyncio.sleep(_AUTH_FAIL_DELAY)
+        if self._transport is not None and not self._transport.is_closing():
+            await asyncio.sleep(_AUTH_FAIL_DELAY)
         self._send(f"{tag} NO [AUTHENTICATIONFAILED] Authentication failed.\r\n")
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
@@ -285,8 +304,7 @@ class IMAPEngine(HoneypotEngine):
     async def stop(self, container_id: str, remove: bool = False) -> None:
         server = self._servers.pop(container_id, None)
         if server:
-            server.close()
-            await server.wait_closed()
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
         return {"running": container_id in self._servers, "type": "asyncio_imap"}

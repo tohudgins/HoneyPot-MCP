@@ -41,6 +41,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_handler
 from honeypot_mcp.storage import queries
@@ -287,7 +288,7 @@ async def _handle_smb_client(
     honeypot_id: int | None,
 ) -> None:
     peer = writer.get_extra_info("peername") or ("0.0.0.0", 0)
-    asyncio.create_task(_record(honeypot_id, peer, "smb_connection", AlertSeverity.LOW, {}))
+    spawn(_record(honeypot_id, peer, "smb_connection", AlertSeverity.LOW, {}), name="smb-event")
 
     first = await _read_frame(reader, timeout=10.0)
     if first is None:
@@ -298,7 +299,11 @@ async def _handle_smb_client(
     info = _classify_first_packet(first)
     # SMB1 negotiate on 445 is itself notable; SMB2 is normal.
     severity = AlertSeverity.MEDIUM if info.get("smb_version") == "SMB1" else AlertSeverity.LOW
-    asyncio.create_task(_record(honeypot_id, peer, "smb_negotiate", severity, info))
+    event_info = dict(info)
+    if "dialects" in event_info:
+        # The full list drives dialect selection; the event only needs a sample.
+        event_info["dialects"] = [d[:64] for d in event_info["dialects"][:32]]
+    spawn(_record(honeypot_id, peer, "smb_negotiate", severity, event_info), name="smb-event")
 
     # Respond to an SMB1 negotiate so the exploit tool proceeds. (For SMB2 we
     # just capture and close — real SMB2 exploitation is rarer and a full SMB2
@@ -306,7 +311,7 @@ async def _handle_smb_client(
     if info.get("smb_version") == "SMB1":
         with contextlib.suppress(Exception):
             writer.write(_build_smb1_negotiate_response(first, info.get("dialects") or []))
-            await writer.drain()
+            await asyncio.wait_for(writer.drain(), timeout=5.0)
 
         # Read up to a few follow-up packets looking for the exploit/backdoor
         # signature or session-setup credentials.
@@ -316,30 +321,32 @@ async def _handle_smb_client(
                 break
             ioc = _looks_like_doublepulsar_or_eternalblue(pkt)
             if ioc:
-                asyncio.create_task(
+                spawn(
                     _record(
                         honeypot_id,
                         peer,
                         "smb_exploit_attempt",
                         AlertSeverity.CRITICAL,
                         {"ioc": ioc, "raw_bytes": len(pkt)},
-                    )
+                    ),
+                    name="smb-event",
                 )
                 break
             if pkt[:4] == _SMB1_MAGIC and len(pkt) >= 5 and pkt[4] == _SMB_COM_SESSION_SETUP_ANDX:
-                asyncio.create_task(
+                spawn(
                     _record(
                         honeypot_id,
                         peer,
                         "smb_session_setup",
                         AlertSeverity.HIGH,
                         {"detail": "SMB1 session setup", **_extract_session_setup(pkt)},
-                    )
+                    ),
+                    name="smb-event",
                 )
 
     with contextlib.suppress(Exception):
         writer.close()
-        await writer.wait_closed()
+        await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
 
 
 def _extract_session_setup(pkt: bytes) -> dict[str, Any]:
@@ -353,7 +360,7 @@ def _extract_session_setup(pkt: bytes) -> dict[str, Any]:
         text = tail.decode("utf-16-le", errors="ignore")
         tokens = [t for t in text.split("\x00") if t.isprintable() and len(t) >= 2]
         if tokens:
-            out["strings"] = tokens[:12]
+            out["strings"] = [t[:120] for t in tokens[:12]]
     except Exception:
         pass
     return out

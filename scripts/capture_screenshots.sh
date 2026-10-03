@@ -17,7 +17,18 @@ OUT_DIR="$REPO_ROOT/docs/screenshots"
 
 GRAFANA_URL="${GRAFANA_URL:-http://localhost:3000}"
 GRAFANA_USER="${GRAFANA_USER:-admin}"
-GRAFANA_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-honeypot}"
+# The compose file has no default Grafana password. For this throwaway demo,
+# generate one when the caller did not provide it, and export it so
+# `docker compose` interpolates the same value. NB: Grafana only applies
+# GF_SECURITY_ADMIN_PASSWORD when it first creates its database — if a
+# `grafana-data` volume from an earlier run exists, pass that run's password
+# (or `docker compose down -v` first).
+if [ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]; then
+  GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  echo "==> GRAFANA_ADMIN_PASSWORD not set — using a generated throwaway password"
+fi
+export GRAFANA_ADMIN_PASSWORD
+GRAFANA_PASSWORD="$GRAFANA_ADMIN_PASSWORD"
 WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
 

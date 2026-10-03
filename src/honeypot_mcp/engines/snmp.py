@@ -40,7 +40,9 @@ import logging
 import secrets
 from typing import Any, cast
 
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.conn_limit import UdpReplyLimiter
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -61,6 +63,12 @@ _GET_NEXT_REQUEST = 0xA1
 _GET_RESPONSE = 0xA2
 _SET_REQUEST = 0xA3
 _GET_BULK_REQUEST = 0xA5
+
+# error-status values (RFC 3416 §3).
+_ERR_TOO_BIG = 1
+
+# Attacker-chosen strings placed in events are clipped to this many chars.
+_MAX_EVENT_STRING = 256
 
 _PDU_NAMES = {
     _GET_REQUEST: "GetRequest",
@@ -231,7 +239,7 @@ def _encode_value(tag: int, value: Any) -> bytes:
     return _tlv(_NULL, b"")
 
 
-def build_response(request: dict[str, Any]) -> bytes:
+def build_response(request: dict[str, Any], max_varbinds: int = 8) -> bytes:
     """Build a GetResponse for a parsed request.
 
     GetBulk is answered with the same single-varbind shape as a Get rather than
@@ -239,7 +247,7 @@ def build_response(request: dict[str, Any]) -> bytes:
     faithful GetBulk reply is the amplification.
     """
     varbinds = b""
-    for oid in request["oids"][:8] or ["1.3.6.1.2.1.1.1.0"]:
+    for oid in request["oids"][:max_varbinds] or ["1.3.6.1.2.1.1.1.0"]:
         lookup = oid
         if request["pdu_type"] == _GET_NEXT_REQUEST:
             # Walkers start at 1.3.6.1.2.1.1 and expect the first scalar back.
@@ -259,6 +267,42 @@ def build_response(request: dict[str, Any]) -> bytes:
         + _tlv(_GET_RESPONSE, pdu)
     )
     return _tlv(_SEQUENCE, message)
+
+
+def build_too_big_response(request: dict[str, Any]) -> bytes:
+    """A `tooBig` GetResponse with an empty varbind list (RFC 3416 §4.2.1 —
+    what an agent sends when the real response would not fit). Never longer
+    than the request it answers: same version, community and request-id,
+    one-byte error fields, and no varbinds."""
+    pdu = (
+        _encode_int(request["request_id"])
+        + _encode_int(_ERR_TOO_BIG)
+        + _encode_int(0)  # error-index
+        + _tlv(_SEQUENCE, b"")
+    )
+    message = (
+        _encode_int(request["version"])
+        + _tlv(_OCTET_STRING, request["community"].encode())
+        + _tlv(_GET_RESPONSE, pdu)
+    )
+    return _tlv(_SEQUENCE, message)
+
+
+def build_bounded_response(request: dict[str, Any], limit: int) -> bytes | None:
+    """The most faithful response no longer than `limit` bytes, or None.
+
+    UDP sources are spoofable, so an answer larger than the question is a
+    reflection primitive. Tries the full response, then a single varbind, then
+    `tooBig`; a request too small even for that gets silence.
+    """
+    for candidate in (
+        build_response(request),
+        build_response(request, max_varbinds=1),
+        build_too_big_response(request),
+    ):
+        if len(candidate) <= limit:
+            return candidate
+    return None
 
 
 def build_get_request(oid: str, community: str = "public", request_id: int = 1) -> bytes:
@@ -291,6 +335,7 @@ class _SNMPProtocol(asyncio.DatagramProtocol):
         self._name = honeypot_name
         self._hp_id = hp_id
         self._transport: asyncio.DatagramTransport | None = None
+        self._reply_limiter = UdpReplyLimiter()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         # Cast, never isinstance. On Python 3.11 `_SelectorDatagramTransport`
@@ -306,41 +351,53 @@ class _SNMPProtocol(asyncio.DatagramProtocol):
             return
         request = parse_snmp(data)
         if request is None:
-            asyncio.create_task(
+            spawn(
                 self._record(
                     addr,
                     "snmp_invalid_probe",
                     AlertSeverity.LOW,
                     {"bytes": len(data), "head_hex": data[:32].hex()},
-                )
+                ),
+                name="snmp-record",
             )
             return
 
         event_type, severity = classify(request)
-        asyncio.create_task(
+        community = request["community"][:_MAX_EVENT_STRING]
+        spawn(
             self._record(
                 addr,
                 event_type,
                 severity,
                 {
-                    "community": request["community"],
-                    "username": request["community"],
-                    "password": request["community"],
+                    "community": community,
+                    "username": community,
+                    "password": community,
                     "service": "snmp",
                     "version": request["version_name"],
                     "pdu": request["pdu_name"],
-                    "oids": request["oids"][:10],
+                    "oids": [oid[:_MAX_EVENT_STRING] for oid in request["oids"][:10]],
                 },
-            )
+            ),
+            name="snmp-record",
         )
 
         # Only a valid community gets an answer; a real agent stays silent
-        # otherwise, and answering everything would be a fingerprint.
-        if request["community"] in _ACCEPTED_COMMUNITIES and self._transport is not None:
-            try:
-                self._transport.sendto(build_response(request), addr)
-            except Exception as e:  # pragma: no cover - transport teardown race
-                log.debug("SNMP response failed for %s: %s", addr, e)
+        # otherwise, and answering everything would be a fingerprint. The reply
+        # is never longer than the request (UDP sources are spoofable — see the
+        # module docstring) and is rate-limited per source; the request above
+        # is recorded either way.
+        if request["community"] not in _ACCEPTED_COMMUNITIES or self._transport is None:
+            return
+        if not self._reply_limiter.allow(addr[0]):
+            return
+        reply = build_bounded_response(request, len(data))
+        if reply is None:
+            return
+        try:
+            self._transport.sendto(reply, addr)
+        except Exception as e:  # pragma: no cover - transport teardown race
+            log.debug("SNMP response failed for %s: %s", addr, e)
 
     async def _record(
         self, addr: tuple[str, int], event_type: str, severity: AlertSeverity, payload: dict

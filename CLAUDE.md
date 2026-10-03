@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (842 unit tests covering security-critical paths)
+# Tests (1036 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -1317,3 +1317,25 @@ test that waits for a flush, prefer polling until the row appears (see
 
 The interval is a real setting, not a test-only hook — operators can lower it
 to reduce alert latency.
+
+### Audit hardening invariants (2026-10)
+
+- **Nothing parses attacker bytes without a bound.** Every length field is
+  checked against the buffer and a hard cap before use, loops must advance
+  `pos` strictly, and regexes run only over clipped input with bounded gaps
+  (`.{0,40}`, never `.*`). `contextlib.suppress(Exception)` cannot catch an
+  infinite loop; a regex cannot be interrupted either.
+- **Shared helpers:** `engines/_tasks.spawn` (retained fire-and-forget tasks),
+  `engines/_bounds.write_backlogged`, `engines/conn_limit` (per-IP cap, idle and
+  lifetime timeouts, `extract_lines`, `LineWorker`, `UdpReplyLimiter`,
+  `close_after_error`, `shutdown_server`), `secure_io` (private files are created
+  0600, never chmod'd afterwards) and `_loop_bound.LoopBound` (loop-safe locks).
+- **UDP replies are never larger than the request** and are rate limited per
+  source; the event is recorded either way.
+- **Write helpers that return `{"error": ...}` do not raise.** Callers must
+  check the result (`alerts_prune` deletes nothing unless the archive succeeded);
+  caller-named artifact paths refuse to overwrite.
+- **Webhook destinations are policed** (`webhook_allow_private_destinations`,
+  default off) at subscribe and delivery time; `alert_subscribe` is admin-tier.
+- Canary/token triggers are submitted through the event buffer so they reach
+  webhook delivery; the metrics/console servers bind loopback by default.

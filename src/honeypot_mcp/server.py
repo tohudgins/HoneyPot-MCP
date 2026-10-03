@@ -239,17 +239,61 @@ async def resource_stats_dashboard() -> str:
     )
 
 
+# Static bearer tokens shorter than this are refused on networked transports.
+# 16 chars is a floor, not a recommendation: `openssl rand -hex 32` is 64.
+_MIN_STATIC_TOKEN_LENGTH = 16
+
+
 def _networked_auth_error(settings: Any) -> str | None:
     """Return a fail-closed error message if a networked control plane would be
-    exposed without authentication, else None. stdio needs no auth, and `none`
-    exposes no control plane to authenticate."""
+    exposed without authentication (or with unusably weak/malformed
+    authentication), else None. stdio needs no auth, and `none` exposes no
+    control plane to authenticate.
+
+    The decision is made on the *parsed* token map, never on whether the
+    environment strings are non-empty: `MCP_AUTH_TOKENS=","` or whitespace is a
+    truthy string that parses to zero tokens, so a check on the string alone
+    reported "authenticated" while `_build_auth()` built no verifier at all.
+    """
     if settings.mcp_transport in ("stdio", "none"):
         return None
-    if settings.mcp_auth_token or settings.mcp_auth_tokens or settings.mcp_allow_unauthenticated:
+
+    from honeypot_mcp.rbac import parse_auth_tokens
+
+    try:
+        tokens = parse_auth_tokens(settings.mcp_auth_token, settings.mcp_auth_tokens)
+    except ValueError as exc:
+        return (
+            f"Refusing to start the '{settings.mcp_transport}' control plane: {exc}.\n"
+            "MCP_AUTH_TOKENS is 'token:role,token:role' with role one of "
+            "viewer/operator/admin."
+        )
+
+    if tokens:
+        too_short = sorted(t for t in tokens if len(t) < _MIN_STATIC_TOKEN_LENGTH)
+        if too_short:
+            return (
+                f"Refusing to start the '{settings.mcp_transport}' control plane: "
+                f"{len(too_short)} configured bearer token(s) are shorter than "
+                f"{_MIN_STATIC_TOKEN_LENGTH} characters.\n"
+                "A guessable static token on a networked control plane is an open control "
+                "plane. Generate a strong one with `openssl rand -hex 32` and set it as "
+                "MCP_AUTH_TOKEN (or per-role in MCP_AUTH_TOKENS)."
+            )
         return None
+
+    if settings.mcp_allow_unauthenticated:
+        return None
+
+    configured = (
+        " MCP_AUTH_TOKEN / MCP_AUTH_TOKENS is set but contains no usable token.\n"
+        if (settings.mcp_auth_token or settings.mcp_auth_tokens)
+        else ""
+    )
     return (
         f"Refusing to start the '{settings.mcp_transport}' control plane without "
         "authentication.\n"
+        f"{configured}"
         "Set MCP_AUTH_TOKEN (generate one with `openssl rand -hex 32`) for a single\n"
         "full-access token, or MCP_AUTH_TOKENS ('token:role,token:role', role one of\n"
         "viewer/operator/admin) for multiple role-scoped tokens — see rbac.py. Clients\n"
@@ -301,7 +345,10 @@ def main() -> None:
     gate_error = _networked_auth_error(settings)
     if gate_error is not None:
         raise SystemExit(gate_error)
-    if not settings.mcp_auth_token and not settings.mcp_auth_tokens:
+    from honeypot_mcp.rbac import parse_auth_tokens
+
+    token_roles = parse_auth_tokens(settings.mcp_auth_token, settings.mcp_auth_tokens)
+    if not token_roles:
         log.warning(
             "MCP control plane running WITHOUT authentication (MCP_ALLOW_UNAUTHENTICATED=true). "
             "Ensure an external auth layer protects %s:%d.",
@@ -309,13 +356,11 @@ def main() -> None:
             settings.mcp_port,
         )
     else:
-        from honeypot_mcp.rbac import parse_auth_tokens
-
-        roles = sorted(
-            set(parse_auth_tokens(settings.mcp_auth_token, settings.mcp_auth_tokens).values())
-        )
+        roles = sorted(set(token_roles.values()))
         log.info(
-            "MCP control plane authentication enabled (bearer token, roles: %s).",
+            "MCP control plane authentication enabled (bearer token, %d static token(s), "
+            "roles: %s).",
+            len(token_roles),
             ", ".join(roles),
         )
 

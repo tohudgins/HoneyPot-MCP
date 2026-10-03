@@ -36,6 +36,8 @@ import struct
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory
 from honeypot_mcp.storage import queries
@@ -63,6 +65,9 @@ ACCEPT_SUCCESS, ACCEPT_PROG_UNAVAIL, ACCEPT_PROC_UNAVAIL = 0, 1, 3
 
 _NFS_PORT = 2049
 _MAX_RECORD = 256 * 1024
+_MAX_RECORDS_PER_CONN = 256
+_MAX_INVALID_PROBES = 5
+_MAX_WRITE_BUFFER = 256 * 1024
 
 # The fiction. A host with a root export shared to the world is exactly what
 # scanners hunt for, and `*` is the detail that makes it worth their time.
@@ -165,37 +170,79 @@ class _NFSProtocol(asyncio.Protocol):
         self._hp_id = hp_id
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
-        self._buf = b""
+        self._buf = bytearray()
+        self._records = 0
+        self._invalid = 0
+        self._pending: list[tuple[str, AlertSeverity, dict]] = []
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
         self._transport = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
-        asyncio.create_task(self._record("nfs_connection", AlertSeverity.LOW, {}))
+        spawn(self._record("nfs_connection", AlertSeverity.LOW, {}), name="nfs-event")
 
     def _send(self, payload: bytes) -> None:
         if self._transport is not None and not self._transport.is_closing():
             self._transport.write(framed(payload))
 
-    def data_received(self, data: bytes) -> None:
-        self._buf += data
-        while len(self._buf) >= 4:
-            (marker,) = struct.unpack(">I", self._buf[:4])
-            length = marker & 0x7FFFFFFF
-            if length > _MAX_RECORD:
-                self._buf = b""
-                if self._transport is not None:
-                    self._transport.close()
-                return
-            if len(self._buf) < 4 + length:
-                return
-            record, self._buf = self._buf[4 : 4 + length], self._buf[4 + length :]
-            asyncio.create_task(self._dispatch(record))
+    def _close(self) -> None:
+        self._buf.clear()
+        if self._transport is not None and not self._transport.is_closing():
+            self._transport.close()
 
-    async def _dispatch(self, record: bytes) -> None:
+    def _emit(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
+        self._pending.append((event_type, severity, payload))
+
+    async def _flush_events(self, events: list[tuple[str, AlertSeverity, dict]]) -> None:
+        for event_type, severity, payload in events:
+            await self._record(event_type, severity, payload)
+
+    def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
+        self._buf += data
+        buf = self._buf
+        pos = 0
+        try:
+            # Records are handled inline — one background task per *batch* of
+            # events, never one per record — and the per-connection record and
+            # invalid-probe counts bound how much work a single peer can queue.
+            while len(buf) - pos >= 4 and not t.is_closing():
+                if write_backlogged(t, _MAX_WRITE_BUFFER):
+                    self._close()  # peer is not reading its replies
+                    break
+                (marker,) = struct.unpack_from(">I", buf, pos)
+                length = marker & 0x7FFFFFFF
+                if length > _MAX_RECORD:
+                    self._close()
+                    break
+                if len(buf) - pos < 4 + length:
+                    break
+                record = bytes(buf[pos + 4 : pos + 4 + length])
+                pos += 4 + length
+                self._records += 1
+                if self._records > _MAX_RECORDS_PER_CONN:
+                    self._close()
+                    break
+                if length == 0 or parse_rpc_call(record) is None:
+                    self._invalid += 1
+                    if self._invalid > _MAX_INVALID_PROBES:
+                        self._close()
+                        break
+                self._dispatch(record)
+        except Exception:
+            log.exception("nfs protocol error")
+            self._close()
+        del buf[:pos]
+        if self._pending:
+            events, self._pending = self._pending, []
+            spawn(self._flush_events(events), name="nfs-event")
+
+    def _dispatch(self, record: bytes) -> None:
         call = parse_rpc_call(record)
         if call is None:
-            await self._record(
+            self._emit(
                 "nfs_invalid_probe",
                 AlertSeverity.LOW,
                 {"bytes": len(record), "head_hex": record[:32].hex()},
@@ -209,7 +256,7 @@ class _NFSProtocol(asyncio.Protocol):
                 # `showmount -e`. One call, and the attacker knows everything.
                 world_readable = [p for p, groups in _EXPORTS if "*" in groups]
                 self._send(build_reply(xid, build_export_list()))
-                await self._record(
+                self._emit(
                     "nfs_export_enumeration",
                     AlertSeverity.HIGH,
                     {
@@ -223,7 +270,7 @@ class _NFSProtocol(asyncio.Protocol):
                 path = _read_xdr_string(call["args"])
                 exported_to_world = any(p == path and "*" in g for p, g in _EXPORTS)
                 self._send(build_reply(xid, build_mount_reply(exported_to_world)))
-                await self._record(
+                self._emit(
                     "nfs_mount_attempt",
                     AlertSeverity.CRITICAL if exported_to_world else AlertSeverity.HIGH,
                     {
@@ -239,7 +286,7 @@ class _NFSProtocol(asyncio.Protocol):
                 return
             if procedure in (MOUNT_NULL, MOUNT_DUMP):
                 self._send(build_reply(xid, b"" if procedure == MOUNT_NULL else _u32(0)))
-                await self._record(
+                self._emit(
                     "nfs_mount_probe",
                     AlertSeverity.MEDIUM,
                     {"procedure": "NULL" if procedure == MOUNT_NULL else "DUMP"},
@@ -254,7 +301,7 @@ class _NFSProtocol(asyncio.Protocol):
                 # portmapper that advertises services on ports nothing is
                 # listening on is trivially detectable.
                 self._send(build_reply(xid, _u32(_NFS_PORT)))
-                await self._record(
+                self._emit(
                     "nfs_portmap_query",
                     AlertSeverity.MEDIUM,
                     {"requested_program": _decode_getport(call["args"])},
@@ -262,19 +309,19 @@ class _NFSProtocol(asyncio.Protocol):
                 return
             if procedure == PMAP_DUMP:
                 self._send(build_reply(xid, _build_portmap_dump()))
-                await self._record(
+                self._emit(
                     "nfs_portmap_dump",
                     AlertSeverity.MEDIUM,
                     {"note": "rpcinfo -p equivalent — RPC service inventory disclosed"},
                 )
                 return
             self._send(build_reply(xid, b""))
-            await self._record("nfs_portmap_probe", AlertSeverity.LOW, {"procedure": procedure})
+            self._emit("nfs_portmap_probe", AlertSeverity.LOW, {"procedure": procedure})
             return
 
         if program == PROG_NFS:
             self._send(build_reply(xid, _u32(0)))
-            await self._record(
+            self._emit(
                 "nfs_request",
                 AlertSeverity.MEDIUM,
                 {"procedure": procedure, "version": call["version"]},
@@ -282,7 +329,7 @@ class _NFSProtocol(asyncio.Protocol):
             return
 
         self._send(build_reply(xid, b"", ACCEPT_PROG_UNAVAIL))
-        await self._record(
+        self._emit(
             "nfs_unknown_program",
             AlertSeverity.LOW,
             {"program": program, "procedure": procedure},
@@ -302,13 +349,13 @@ class _NFSProtocol(asyncio.Protocol):
         )
 
     def connection_lost(self, exc: Exception | None) -> None:
-        self._buf = b""
+        self._buf.clear()
 
 
 def _read_xdr_string(data: bytes) -> str:
     try:
         (length,) = struct.unpack(">I", data[:4])
-        return data[4 : 4 + length].decode("utf-8", errors="replace")
+        return data[4 : 4 + min(length, 2048)].decode("utf-8", errors="replace")
     except (struct.error, IndexError):
         return ""
 
