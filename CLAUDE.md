@@ -1350,8 +1350,10 @@ to reduce alert latency.
 - Launch with `honeypot-mcp` or `python -m honeypot_mcp.server`; the latter
   delegates to the canonical module because the tool modules register on
   `honeypot_mcp.server.mcp`, not on `__main__.mcp`.
-- Cowrie's root filesystem is read-only; its wget/curl emulation makes real
-  outbound requests, so egress control is a host-firewall concern.
+- Cowrie's root filesystem is read-only. Its wget/curl/tftp/nc emulation makes
+  real outbound requests, so `COWRIE_HONEYPOT_OUT_ADDR=127.0.0.1` (default;
+  `cowrie_allow_egress` / `COWRIE_OUT_ADDR=0.0.0.0` to opt out) makes every such
+  connect fail in-process — no host firewall needed.
 - **Honeytoken matching runs on the payload before it is clamped** (the clamp
   drops whole keys over budget, and a planted credential inside a dropped
   `post_data` must still escalate). The HTTP engine keeps credential-aliased form

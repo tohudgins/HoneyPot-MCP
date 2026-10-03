@@ -15,6 +15,7 @@ import docker.types
 
 import docker
 from honeypot_mcp import self_probe
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.storage import queries
@@ -190,7 +191,7 @@ class SSHEngine(HoneypotEngine):
         if "fake_hostname" in config:
             hostname = config["fake_hostname"]
 
-        env = cowrie_env_vars(persona, hostname)
+        env = cowrie_env_vars(persona, hostname, allow_egress=get_settings().cowrie_allow_egress)
         if "fake_kernel" in config:
             env["COWRIE_KERNEL_VERSION"] = config["fake_kernel"]
             env["COWRIE_HONEYPOT_KERNEL_VERSION"] = config["fake_kernel"]

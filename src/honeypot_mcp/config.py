@@ -229,6 +229,14 @@ class Settings(BaseSettings):
     # everyone believes they are covered. 0 disables coalescing.
     notify_throttle_seconds: float = 300.0
 
+    # ── Cowrie ──────────────────────────────────────────────────────────────
+    # Cowrie's emulated wget/curl/tftp/nc make REAL outbound connections to
+    # whatever an attacker names, so by default their source address is bound to
+    # loopback, which makes every such connect fail (EINVAL) — no firewall needed,
+    # and it works on Docker Desktop where DOCKER-USER rules do not. Set true to
+    # let it fetch malware samples; then block or monitor egress at the host.
+    cowrie_allow_egress: bool = False
+
     # ── Packet capture ──────────────────────────────────────────────────────
     # Off by default: it needs elevated privileges, and on a public IP it
     # writes continuously. Enable deliberately.

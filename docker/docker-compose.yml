@@ -194,6 +194,11 @@ services:
       - COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1
       # Bound what an attacker-directed wget/curl can pull (Cowrie's default is 10 MiB).
       - COWRIE_HONEYPOT_DOWNLOAD_LIMIT_SIZE=2097152
+      # Egress off: Cowrie's emulated wget/curl/tftp/nc bind their outgoing socket
+      # to this address, and loopback makes every connect to a real host fail.
+      # Set COWRIE_OUT_ADDR=0.0.0.0 to let it download malware samples (then
+      # firewall egress at the host).
+      - COWRIE_HONEYPOT_OUT_ADDR=${COWRIE_OUT_ADDR:-127.0.0.1}
     volumes:
       - cowrie-logs:/cowrie/var/log/cowrie
       - cowrie-state:/cowrie/var/lib/cowrie
@@ -210,12 +215,11 @@ services:
     # /cowrie/var/log/cowrie (the `cowrie-logs` volume); /tmp is a small tmpfs.
     # Verified by driving real login, shell and wget sessions against it.
     #
-    # Egress is NOT blocked here and cannot be from compose: Cowrie's wget/curl
-    # emulation really fetches public addresses (that is how it captures
-    # malware), so an attacker can make this container request URLs of their
-    # choosing. Cowrie refuses private ranges and rate-limits per host; the
-    # download size is capped below. To forbid it outright, drop outbound
-    # traffic from this container's subnet in the host firewall (DOCKER-USER).
+    # Egress: Cowrie's wget/curl emulation really fetches public addresses (that
+    # is how it captures malware), which would let an attacker make this container
+    # request URLs of their choosing. COWRIE_HONEYPOT_OUT_ADDR above blocks that
+    # in-process (verified: wget/curl to 1.1.1.1 fail with EINVAL), so no host
+    # firewall rule is needed. Private ranges are refused by Cowrie regardless.
     read_only: true
     tmpfs:
       - /tmp:size=16m

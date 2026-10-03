@@ -102,7 +102,9 @@ def pick_hostname(persona: SSHPersona) -> str:
     return secrets.choice(persona.hostname_pool)
 
 
-def cowrie_env_vars(persona: SSHPersona, hostname: str) -> dict[str, str]:
+def cowrie_env_vars(
+    persona: SSHPersona, hostname: str, *, allow_egress: bool = False
+) -> dict[str, str]:
     """Build the `COWRIE_*` environment dict that Cowrie reads at container
     start. Sets both `COWRIE_HOSTNAME` (legacy) and `COWRIE_HONEYPOT_HOSTNAME`
     (modern) for compatibility across Cowrie versions."""
@@ -133,4 +135,5 @@ def cowrie_env_vars(persona: SSHPersona, hostname: str) -> dict[str, str]:
         # malware), so an attacker chooses what this container fetches. Cap the
         # size of what it will keep; the default is 10 MiB.
         "COWRIE_HONEYPOT_DOWNLOAD_LIMIT_SIZE": "2097152",
+        **({} if allow_egress else {"COWRIE_HONEYPOT_OUT_ADDR": "127.0.0.1"}),
     }
