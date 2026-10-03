@@ -192,8 +192,11 @@ services:
       - COWRIE_HONEYPOT_LOGTYPE=plain
       - COWRIE_OUTPUT_JSONLOG_ENABLED=true
       - COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1
+      # Bound what an attacker-directed wget/curl can pull (Cowrie's default is 10 MiB).
+      - COWRIE_HONEYPOT_DOWNLOAD_LIMIT_SIZE=2097152
     volumes:
       - cowrie-logs:/cowrie/var/log/cowrie
+      - cowrie-state:/cowrie/var/lib/cowrie
     networks:
       - honeypot-net
     labels:
@@ -201,9 +204,21 @@ services:
       - "honeypot-name=cowrie-ssh"
     # Attacker-facing: an interactive emulator the attacker drives. Cowrie
     # listens on unprivileged ports (2222/2223) so it needs no capabilities.
-    # read_only is deliberately NOT set: Cowrie writes under /cowrie/var
-    # (downloads, tty logs, state) and the image has no documented set of
-    # writable paths to tmpfs, so an immutable rootfs would risk a crash loop.
+    # The root filesystem is read-only: everything Cowrie writes lives under
+    # /cowrie/var/lib/cowrie (downloaded samples, tty replays — the
+    # `cowrie-state` volume, so captures survive a restart) and
+    # /cowrie/var/log/cowrie (the `cowrie-logs` volume); /tmp is a small tmpfs.
+    # Verified by driving real login, shell and wget sessions against it.
+    #
+    # Egress is NOT blocked here and cannot be from compose: Cowrie's wget/curl
+    # emulation really fetches public addresses (that is how it captures
+    # malware), so an attacker can make this container request URLs of their
+    # choosing. Cowrie refuses private ranges and rate-limits per host; the
+    # download size is capped below. To forbid it outright, drop outbound
+    # traffic from this container's subnet in the host firewall (DOCKER-USER).
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
     mem_limit: 256m
     pids_limit: 128
     cpus: 0.5
@@ -315,6 +330,7 @@ services:
 
 volumes:
   cowrie-logs:
+  cowrie-state:
   mcp-data:
   mcp-reports:
   mcp-tls:

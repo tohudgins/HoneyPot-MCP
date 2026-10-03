@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +70,9 @@ async def test_readyz_does_not_leak_exception_detail():
     client = await _metrics_client()
     try:
         async with get_session() as session:
-            await session.execute(text("DROP TABLE honeypots"))
+            # PostgreSQL refuses to drop a table other tables reference.
+            cascade = " CASCADE" if session.get_bind().dialect.name == "postgresql" else ""
+            await session.execute(text(f"DROP TABLE honeypots{cascade}"))
         response = await client.get("/readyz")
         assert response.status == 503
         body = await response.json()

@@ -61,7 +61,7 @@ skip_docker = pytest.mark.skipif(
 
 def _free_port() -> int:
     s = socket.socket()
-    s.bind(("127.0.0.1", 0))
+    s.bind(("0.0.0.0", 0))
     port = s.getsockname()[1]
     s.close()
     return port

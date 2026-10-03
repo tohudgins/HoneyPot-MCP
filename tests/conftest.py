@@ -29,3 +29,41 @@ def _fast_flush():
     if settings.event_flush_interval_seconds > 0.2:
         settings.event_flush_interval_seconds = 0.05
     yield
+
+
+def _reset_postgres_schema(dsn: str) -> None:
+    import asyncio
+
+    import asyncpg
+
+    async def _reset() -> None:
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+        finally:
+            await conn.close()
+
+    asyncio.run(_reset())
+
+
+@pytest.fixture(autouse=True)
+def _fresh_postgres_schema():
+    """Give each test an empty PostgreSQL schema when the suite is pointed at
+    one (`TEST_DATABASE_URL=postgresql+asyncpg://...`).
+
+    Test modules default to an in-memory SQLite database, which is born empty
+    per test. A shared PostgreSQL database is not, so without this every test
+    would see its predecessors' rows. Opt-in, and keyed to a variable the
+    modules read themselves, so a stray `DATABASE_URL` in a developer's shell
+    can never point the suite at a real database.
+    """
+    url = os.environ.get("TEST_DATABASE_URL", "")
+    if url.startswith("postgresql"):
+        import concurrent.futures
+
+        dsn = url.replace("postgresql+asyncpg://", "postgresql://", 1)
+        # A separate thread: asyncio.run() would otherwise close and unset the
+        # event loop that pytest-asyncio expects to manage.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_reset_postgres_schema, dsn).result(timeout=60)
+    yield

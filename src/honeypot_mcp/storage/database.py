@@ -184,16 +184,23 @@ async def close_db() -> None:
     new one start something.
     """
     global _engine, _session_factory
-    if _engine is None:
-        _session_factory = None
-        return
 
     # Yield first. A fire-and-forget write is *scheduled*, not running, so at
     # this instant its session does not exist yet and the counter below would
     # read zero and dispose straight through it. A couple of loop turns let
     # every already-created task reach its `get_session()` and register.
+    #
+    # This comes before the "no engine" check on purpose: with a persistent
+    # database `init_db()` migrates over a separate synchronous connection and
+    # the async engine is only created by the first session, so a scheduled
+    # write may be the very thing that creates it. Returning early would leave
+    # that task to run afterwards and build a fresh engine nobody disposes.
     for _ in range(3):
         await asyncio.sleep(0)
+
+    if _engine is None:
+        _session_factory = None
+        return
 
     deadline = asyncio.get_event_loop().time() + _CLOSE_GRACE_SECONDS
     while _active_sessions > 0 and asyncio.get_event_loop().time() < deadline:

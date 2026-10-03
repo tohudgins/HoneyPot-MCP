@@ -23,7 +23,7 @@ import os
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
 
@@ -106,6 +106,9 @@ async def test_close_gives_up_rather_than_hanging_on_a_leaked_session(monkeypatc
 
     event_buffer.reset_for_tests()
     await init_db()
+    # A persistent database only creates its async engine on first use; a leaked
+    # session implies the engine exists, so make it so before simulating one.
+    database._get_engine()
     monkeypatch.setattr(database, "_CLOSE_GRACE_SECONDS", 0.2)
     monkeypatch.setattr(database, "_active_sessions", 1)  # simulate the leak
 

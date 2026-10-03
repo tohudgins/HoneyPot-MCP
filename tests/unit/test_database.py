@@ -5,7 +5,7 @@ import os
 import pytest
 
 # Use in-memory SQLite for tests
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 @pytest.fixture(autouse=True)

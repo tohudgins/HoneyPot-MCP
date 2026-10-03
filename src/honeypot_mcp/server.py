@@ -370,4 +370,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # `python -m honeypot_mcp.server` runs this file as `__main__`, a different
+    # module object from `honeypot_mcp.server`. The tool modules do
+    # `from honeypot_mcp.server import mcp`, so they register on *that* copy's
+    # FastMCP instance — and `main()` here would serve an `mcp` with no tools at
+    # all (every call: "Unknown tool"). Delegate to the canonical module so the
+    # instance that is served is the one the tools registered on.
+    from honeypot_mcp.server import main as _canonical_main
+
+    _canonical_main()

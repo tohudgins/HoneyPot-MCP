@@ -7,7 +7,7 @@ protocol sees it.
 
 import os
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from honeypot_mcp.engines.conn_limit import (  # noqa: E402
     ConnectionLimiter,

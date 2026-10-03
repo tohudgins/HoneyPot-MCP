@@ -142,8 +142,11 @@ jobs:
           echo "second startup was a no-op"
 
       - name: Full unit suite against PostgreSQL
+        # Test modules read TEST_DATABASE_URL, not DATABASE_URL: they used to
+        # hard-assign an in-memory SQLite URL at import, so this step silently
+        # ran on SQLite. tests/conftest.py gives each test an empty schema.
         env:
-          DATABASE_URL: postgresql+asyncpg://postgres:honeypot@localhost:5432/honeypot_test
+          TEST_DATABASE_URL: postgresql+asyncpg://postgres:honeypot@localhost:5432/honeypot_test
         run: pytest tests/unit/ -q
 
   typecheck:

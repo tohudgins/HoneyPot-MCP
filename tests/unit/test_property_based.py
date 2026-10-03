@@ -24,7 +24,7 @@ import os
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 # Deadline off: some of these touch the filesystem (resolve_artifact_path
 # calls .resolve(), which is a real syscall) and CI runners are slower than

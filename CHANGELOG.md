@@ -4,6 +4,38 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Closing the verification gaps
+
+Follow-up to the audit remediation: the things that were only unit-tested were
+run for real, and that turned up more.
+
+- **`python -m honeypot_mcp.server` served no tools.** Running the file with
+  `-m` makes it `__main__`, a different module object from
+  `honeypot_mcp.server`; the tool modules register on the latter's FastMCP
+  instance, so the served instance answered every call "Unknown tool" with no
+  error at startup. The `__main__` guard now delegates to the canonical module.
+  Found by driving a real streamable-HTTP server with an MCP client; pinned by
+  `test_audit_launch.py`.
+- **`close_db()` returned early when no async engine existed yet**, which is the
+  normal state for a persistent database (migrations use a separate sync
+  connection). A write scheduled just before shutdown then built an engine
+  nobody disposed. It now yields first, then checks.
+- **CI's "full unit suite against PostgreSQL" ran on SQLite.** 73 test files
+  hard-assigned an in-memory URL at import. They now read `TEST_DATABASE_URL`
+  (opt-in, deliberately not `DATABASE_URL`, so a stray shell variable can never
+  point the suite at a real database) and `tests/conftest.py` gives each test an
+  empty schema. The whole suite passes on PostgreSQL 16.
+- **Cowrie runs with a read-only root filesystem** (compose: persistent
+  `cowrie-state` volume for samples and tty replays; SDK deploys: bounded
+  tmpfs). Its emulated `wget`/`curl` really fetch public addresses — verified
+  by downloading from 1.1.1.1 inside the container — so downloads are capped at
+  2 MiB; blocking egress needs a host firewall rule (DOCKER-USER), and disabling
+  masquerade on the bridge does not do it under Docker Desktop.
+- Verified live: RBAC tool visibility per role, SSRF refusal, redacted
+  subscription list, canary hits reaching a real webhook receiver (and re-arming),
+  kubectl `/version`, UDP reply sizes and rate limits against a running server,
+  and the hostile Mongo/Redis packets with the control plane still responsive.
+
 ## Security audit remediation — hangs, ReDoS, fail-open paths
 
 A read-only audit found that one unauthenticated packet could freeze the whole

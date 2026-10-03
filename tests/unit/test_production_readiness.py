@@ -18,7 +18,7 @@ import stat
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
 
@@ -81,7 +81,8 @@ async def test_readyz_fails_when_the_schema_is_gone_but_healthz_still_passes():
     client = await _client()
     try:
         async with get_session() as session:
-            await session.execute(text("DROP TABLE honeypots"))
+            cascade = " CASCADE" if session.get_bind().dialect.name == "postgresql" else ""
+            await session.execute(text(f"DROP TABLE honeypots{cascade}"))
 
         live = await client.get("/healthz")
         assert live.status == 200, "the process really is alive; liveness should not flap"

@@ -40,6 +40,16 @@ COWRIE_NANO_CPUS = 500_000_000  # 0.5 CPU
 # the evidence channel; cap it or a long brute-force run fills the disk.
 COWRIE_LOG_MAX_SIZE = "10m"
 COWRIE_LOG_MAX_FILES = "3"
+# Read-only root filesystem; the only writable paths are small tmpfs mounts.
+# uid/gid 999 is the image's `cowrie` user. SDK-deployed honeypots are
+# ephemeral, so samples and tty replays living in memory is acceptable here
+# (the event stream, including each sample's hash, is already in the logs); the
+# compose stack mounts a persistent volume for them instead.
+COWRIE_TMPFS = {
+    "/tmp": "rw,size=16m",
+    "/cowrie/var/lib/cowrie": "rw,size=64m,uid=999,gid=999,mode=0755",
+    "/cowrie/var/log/cowrie": "rw,size=32m,uid=999,gid=999,mode=0755",
+}
 # Ports Cowrie listens on inside the container, before any host publishing.
 COWRIE_INTERNAL_PORT = 2222
 COWRIE_TELNET_PORT = 2223
@@ -237,6 +247,8 @@ class SSHEngine(HoneypotEngine):
                 pids_limit=COWRIE_PIDS_LIMIT,
                 nano_cpus=COWRIE_NANO_CPUS,
                 cap_drop=["ALL"],
+                read_only=True,
+                tmpfs=COWRIE_TMPFS,
                 security_opt=["no-new-privileges:true"],
                 log_config=docker.types.LogConfig(
                     type=docker.types.LogConfig.types.JSON,

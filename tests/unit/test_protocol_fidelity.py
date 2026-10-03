@@ -17,7 +17,7 @@ import struct
 import pytest
 from aiohttp import web
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 # ── Redis: the RESP3 HELLO handshake ─────────────────────────────────────────

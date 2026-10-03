@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,7 @@ def _free_port() -> int:
     import socket
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
+    s.bind(("0.0.0.0", 0))
     port = s.getsockname()[1]
     s.close()
     return port

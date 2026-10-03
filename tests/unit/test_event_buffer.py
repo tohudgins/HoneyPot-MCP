@@ -11,7 +11,7 @@ from datetime import UTC
 import pytest
 
 # In-memory DB; must be set before any honeypot_mcp imports
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 @pytest.fixture(autouse=True)

@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1036 unit tests covering security-critical paths)
+# Tests (1037 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -1339,3 +1339,13 @@ to reduce alert latency.
   default off) at subscribe and delivery time; `alert_subscribe` is admin-tier.
 - Canary/token triggers are submitted through the event buffer so they reach
   webhook delivery; the metrics/console servers bind loopback by default.
+- **Tests run on SQLite by default; `TEST_DATABASE_URL=postgresql+asyncpg://...`
+  runs the same suite on PostgreSQL** (each test gets an empty schema). Test
+  modules must read that variable rather than hard-assigning a URL, or the CI
+  PostgreSQL job silently tests SQLite again.
+- Launch with `honeypot-mcp` or `python -m honeypot_mcp.server`; the latter
+  delegates to the canonical module because the tool modules register on
+  `honeypot_mcp.server.mcp`, not on `__main__.mcp`.
+- Cowrie's root filesystem is read-only; its wget/curl emulation makes real
+  outbound requests, so egress control is a host-firewall concern.
+

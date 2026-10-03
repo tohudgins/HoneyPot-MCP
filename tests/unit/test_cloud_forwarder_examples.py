@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 _EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "cloud-forwarders"
 _TEST_SECRET = "shared-secret-for-tests"

@@ -129,4 +129,8 @@ def cowrie_env_vars(persona: SSHPersona, hostname: str) -> dict[str, str]:
         "COWRIE_HONEYPOT_LOGTYPE": "plain",
         "COWRIE_OUTPUT_JSONLOG_ENABLED": "true",
         "COWRIE_OUTPUT_JSONLOG_LOGFILE": "/proc/self/fd/1",
+        # Cowrie's wget/curl emulation really downloads (that is how it captures
+        # malware), so an attacker chooses what this container fetches. Cap the
+        # size of what it will keep; the default is 10 MiB.
+        "COWRIE_HONEYPOT_DOWNLOAD_LIMIT_SIZE": "2097152",
     }

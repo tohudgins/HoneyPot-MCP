@@ -11,7 +11,7 @@ exercises the synthesis function in isolation.
 
 import os
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 def _build_query(qname: str, qtype_name: str):

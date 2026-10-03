@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 def _event(severity: str = "high", event_type: str = "ssh_login_failed", **overrides):

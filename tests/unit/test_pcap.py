@@ -16,7 +16,7 @@ import subprocess
 
 import pytest
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 _HAS_TCPDUMP = shutil.which("tcpdump") is not None
 
