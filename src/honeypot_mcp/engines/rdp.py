@@ -45,6 +45,7 @@ from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_handler, shutdown_server
+from honeypot_mcp.engines.rdp_nla import hashcat_line, identity_for, run_credssp
 from honeypot_mcp.engines.tls import build_server_ssl_context_async
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -188,17 +189,20 @@ def _build_neg_success_response(selected_protocol: int = _PROTOCOL_SSL) -> bytes
     """TPKT + X.224 Connection Confirm carrying a negotiation success.
 
     Used when the client requested SSL or HYBRID and we want to continue the
-    handshake into TLS. We always echo `_PROTOCOL_SSL` because we implement
-    the SSL upgrade path; if the client wanted HYBRID, the SSL response is
-    still valid — modern clients downgrade or close cleanly.
+    handshake into TLS. `selected_protocol` is HYBRID for a client that asked for
+    CredSSP (the NLA exchange runs after the TLS upgrade) and SSL otherwise.
 
     Wire layout matches `_build_neg_failure_response` except the inner block
     is NegRSP (0x02) instead of NegFailure (0x03), and the payload is the
     selectedProtocol bitmask.
     """
+    # Flags: EXTENDED_CLIENT_DATA_SUPPORTED | DYNVC_GFX_PROTOCOL_SUPPORTED |
+    # RESTRICTED_ADMIN_MODE_SUPPORTED | REDIRECTED_AUTHENTICATION_MODE_SUPPORTED
+    # = 0x1f is what Windows Server 2016+ sends (older ones 0x0f). A zero here is
+    # something no Windows host does, and `nmap -sV` keys on it.
     x224 = (
         bytes([14, 0xD0, 0x00, 0x00, 0x12, 0x34, 0x00])
-        + bytes([_RDP_NEG_RSP, 0x00])
+        + bytes([_RDP_NEG_RSP, 0x1F])
         + (8).to_bytes(2, "little")
         + selected_protocol.to_bytes(4, "little")
     )
@@ -311,9 +315,11 @@ async def _handle_rdp_client(
     *,
     honeypot_name: str,
     honeypot_id: int | None,
+    config: dict[str, Any] | None = None,
 ) -> None:
-    """Drive one RDP connection from the X.224 banner to (optionally) the
-    MCS Connect Initial capture, then close."""
+    """Drive one RDP connection from the X.224 banner through TLS and either the
+    MCS Connect Initial capture (SSL) or the CredSSP/NTLM exchange (NLA), then close."""
+    config = config or {}
     peer = writer.get_extra_info("peername") or ("0.0.0.0", 0)
 
     # Always log the initial connection at LOW severity (matches the previous
@@ -360,7 +366,10 @@ async def _handle_rdp_client(
     # Client wants TLS. Send Connection Confirm + NegRSP(success, SSL), then
     # upgrade the stream.
     try:
-        writer.write(_build_neg_success_response(_PROTOCOL_SSL))
+        # NLA clients (mstsc, FreeRDP, scanners) ask for CredSSP; answer in kind
+        # and run it after the TLS upgrade. Asking for SSL alone still gets SSL.
+        selected = _PROTOCOL_HYBRID if requested & _PROTOCOL_HYBRID else _PROTOCOL_SSL
+        writer.write(_build_neg_success_response(selected))
         await writer.drain()
     except Exception:
         with contextlib.suppress(Exception):
@@ -385,6 +394,18 @@ async def _handle_rdp_client(
         log.debug("RDP TLS upgrade failed for %s:%d — %s", peer[0], peer[1], e)
         with contextlib.suppress(Exception):
             writer.close()
+        return
+
+    if requested & _PROTOCOL_HYBRID:
+        await _handle_nla(
+            reader,
+            writer,
+            honeypot_name=honeypot_name,
+            honeypot_id=honeypot_id,
+            config=config,
+            peer=peer,
+            requested=requested,
+        )
         return
 
     # Read the MCS Connect Initial PDU. Most clients send it within ~10
@@ -417,6 +438,71 @@ async def _handle_rdp_client(
         await writer.wait_closed()
 
 
+async def _handle_nla(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    honeypot_name: str,
+    honeypot_id: int | None,
+    config: dict[str, Any],
+    peer: tuple[str, int],
+    requested: int,
+) -> None:
+    """The CredSSP exchange after the TLS upgrade, and what it captured."""
+    ident = identity_for(honeypot_name, config)
+    result = await run_credssp(reader, writer, ident)
+    base = {
+        "tls_negotiated": True,
+        "requested_protocols": requested,
+        "selected_protocol": _PROTOCOL_HYBRID,
+        "target_computer": ident.computer,
+        "target_domain": ident.domain,
+        "credssp_stage": result["stage"],
+    }
+    if result["stage"] == "negotiate":
+        # The client took the CHALLENGE and left: the signature of `nmap
+        # rdp-ntlm-info` and similar host-identification sweeps.
+        spawn(
+            _record_event(
+                honeypot_id,
+                peer,
+                "rdp_nla_negotiate",
+                AlertSeverity.MEDIUM,
+                {**base, **result["negotiate"], "credssp_version": result.get("client_version")},
+            ),
+            name="rdp-record",
+        )
+    elif result["stage"] == "authenticate":
+        auth = result["auth"]
+        challenge = result["server_challenge"]
+        cracked = hashcat_line(auth, challenge)
+        payload = {
+            **base,
+            **result["negotiate"],
+            "username": auth.username,
+            "domain": auth.domain,
+            "workstation": auth.workstation,
+            "ntlm_version": "v2" if len(auth.nt_response) > 24 else "v1",
+            "service": "rdp",
+            "server_challenge_hex": challenge.hex(),
+            "nt_response_hex": auth.nt_response.hex(),
+        }
+        if cracked is not None:
+            payload["hashcat_mode"], payload["hashcat_line"] = cracked
+        spawn(
+            _record_event(honeypot_id, peer, "rdp_nla_auth", AlertSeverity.HIGH, payload),
+            name="rdp-record",
+        )
+    else:
+        spawn(
+            _record_event(honeypot_id, peer, "rdp_nla_probe", AlertSeverity.LOW, base),
+            name="rdp-record",
+        )
+    with contextlib.suppress(Exception):
+        writer.close()
+        await writer.wait_closed()
+
+
 class RDPEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._servers: dict[str, asyncio.AbstractServer] = {}
@@ -431,7 +517,9 @@ class RDPEngine(HoneypotEngine):
 
         async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
-                await _handle_rdp_client(reader, writer, honeypot_name=name, honeypot_id=hp_id)
+                await _handle_rdp_client(
+                    reader, writer, honeypot_name=name, honeypot_id=hp_id, config=config
+                )
             except Exception as e:
                 log.warning("RDP handler error: %s", e)
 

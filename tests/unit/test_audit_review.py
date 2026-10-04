@@ -883,3 +883,202 @@ async def test_collector_mode_does_not_crash_on_a_malformed_auth_token_setting(m
     monkeypatch.setattr(settings, "mcp_transport", "none")
     monkeypatch.setattr(settings, "mcp_auth_tokens", "garbage-without-a-role")
     assert server._build_auth() is None
+
+
+# ── Transient database errors must not cost events ──────────────────────────
+
+
+async def test_a_transient_database_error_is_retried_not_treated_as_a_refused_event(monkeypatch):
+    """An OperationalError is a locked file / dropped connection / deadlock: the
+    database did not reject the data. The old flusher retried immediately and then
+    dropped each event as 'refused', losing events nothing was wrong with."""
+    from sqlalchemy.exc import OperationalError
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.event_buffer import PendingEvent
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    buf = event_buffer.get_buffer()
+    real_write = buf._write
+    failures = {"left": 4}
+
+    async def flaky(events):
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+        return await real_write(events)
+
+    monkeypatch.setattr(buf, "_write", flaky)
+    events = [
+        PendingEvent(
+            honeypot_id=None,
+            source_ip="203.0.113.50",
+            event_type=f"transient_{i}",
+            payload={},
+            severity=AlertSeverity.LOW,
+        )
+        for i in range(3)
+    ]
+    written = await buf._flush(events)
+    assert [e.event_type for e in written] == ["transient_0", "transient_1", "transient_2"]
+    assert failures["left"] == 0
+
+
+async def test_a_permanent_database_error_still_costs_only_the_poison_event(monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.event_buffer import PendingEvent
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    buf = event_buffer.get_buffer()
+    real_write = buf._write
+
+    async def picky(events):
+        if any(e.event_type == "poison" for e in events):
+            raise IntegrityError("INSERT", {}, Exception("constraint failed"))
+        return await real_write(events)
+
+    monkeypatch.setattr(buf, "_write", picky)
+
+    def ev(name: str):
+        return PendingEvent(
+            honeypot_id=None,
+            source_ip="203.0.113.51",
+            event_type=name,
+            payload={},
+            severity=AlertSeverity.LOW,
+        )
+
+    start = time.monotonic()
+    written = await buf._flush([ev("a"), ev("poison"), ev("b")])
+    assert [e.event_type for e in written] == ["a", "b"]
+    assert time.monotonic() - start < 1.0, "a permanent error must not be backed off"
+
+
+# ── Data directories follow settings, not the directory the server was started in ──
+
+
+async def test_certificate_and_generated_keys_do_not_depend_on_the_launch_directory(
+    tmp_path, monkeypatch
+):
+    """A scanner pinning a honeypot's certificate must see the same one however the
+    server was started. `tls/` and `reports/generated/` used to be relative to the
+    working directory, so each launch directory got its own certificate and its own
+    copy of generated honeytoken private keys."""
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.engines.tls import ensure_cert
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tls_dir", tmp_path / "data" / "tls")
+    monkeypatch.setattr(settings, "reports_dir", tmp_path / "data" / "reports")
+
+    first_dir = tmp_path / "launched-here"
+    second_dir = tmp_path / "launched-there"
+    first_dir.mkdir()
+    second_dir.mkdir()
+
+    monkeypatch.chdir(first_dir)
+    cert_a, key_a = ensure_cert("pinned-sensor")
+    monkeypatch.chdir(second_dir)
+    cert_b, key_b = ensure_cert("pinned-sensor")
+
+    assert cert_a == cert_b and key_a == key_b, "a second launch directory minted a new certificate"
+    assert cert_a.is_relative_to(tmp_path / "data" / "tls")
+    assert not (first_dir / "tls").exists() and not (second_dir / "tls").exists()
+
+    token = await honeytoken_create(type="ssh_key", label="launch-dir")
+    assert "error" not in token, token
+    private_keys = list((tmp_path / "data" / "reports" / "generated").glob("id_rsa_*"))
+    assert len(private_keys) == 1
+    assert not (second_dir / "reports").exists()
+
+
+# ── Packet capture ring files are private ───────────────────────────────────
+
+
+async def test_capture_ring_is_owner_only_even_under_a_permissive_umask(tmp_path, monkeypatch):
+    """tcpdump creates ring files with the umask it inherits — 0644 under the usual
+    022 — and they hold raw attacker sessions. The capture directory is private and
+    the child runs under umask 077, whatever the server's own umask is."""
+    import os
+    import stat
+
+    from honeypot_mcp import pcap
+    from honeypot_mcp.config import get_settings
+
+    fake = tmp_path / "bin" / "tcpdump"
+    fake.parent.mkdir()
+    # Creates its -w file the way tcpdump does (inheriting the umask), then waits.
+    fake.write_text(
+        '#!/bin/sh\nwhile [ "$1" != "-w" ]; do shift; done\n'
+        'out="$2"; : > "${out}0"\nexec sleep 30\n'
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(pcap, "probe_capability", lambda: pcap.Capability(True, "", str(fake)))
+    ring = tmp_path / "ring"
+    monkeypatch.setattr(get_settings(), "pcap_dir", ring)
+
+    previous = os.umask(0o022)  # the permissive umask a default service inherits
+    capture = pcap.PcapCapture()
+    try:
+        result = await capture.start([(2222, "tcp")])
+        assert result["started"] is True, result
+        await asyncio.sleep(0.3)
+        files = list(ring.glob("honeypot.pcap*"))
+        assert files, "the fake tcpdump never created its output"
+        assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
+        assert stat.S_IMODE(ring.stat().st_mode) == 0o700
+    finally:
+        await capture.stop()
+        os.umask(previous)
+
+
+def test_a_root_started_capture_drops_to_a_user_that_owns_the_directory(tmp_path, monkeypatch):
+    """Started as root, tcpdump drops privileges after opening the interface and then
+    writes as that user — so the private directory has to belong to it, or the capture
+    dies at its first rotation."""
+    import os
+    import pwd
+    from types import SimpleNamespace
+
+    from honeypot_mcp import pcap
+
+    chowned: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "chown", lambda p, u, g: chowned.append((str(p), u, g)))
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda name: (
+            SimpleNamespace(pw_uid=777, pw_gid=778)
+            if name == "tcpdump"
+            else (_ for _ in ()).throw(KeyError(name))
+        ),
+    )
+    assert pcap.capture_drop_args(tmp_path) == ["-Z", "tcpdump"]
+    assert chowned == [(str(tmp_path), 777, 778)]
+
+    # No such user on this host: fall through to the next candidate, then to nothing.
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda name: (
+            SimpleNamespace(pw_uid=65534, pw_gid=65534)
+            if name == "nobody"
+            else (_ for _ in ()).throw(KeyError(name))
+        ),
+    )
+    assert pcap.capture_drop_args(tmp_path) == ["-Z", "nobody"]
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
+    assert pcap.capture_drop_args(tmp_path) == []
+
+
+def test_a_capture_started_without_root_needs_no_privilege_drop(tmp_path, monkeypatch):
+    import os
+
+    from honeypot_mcp import pcap
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    assert pcap.capture_drop_args(tmp_path) == []

@@ -67,7 +67,7 @@ class FileTokenProvider(HoneytokenProvider):
         )
         dns_canary = f"{token_uid}.canary.{callback_host}"
 
-        output_dir = Path("reports/generated")
+        output_dir = get_settings().reports_dir / "generated"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{token_uid}.{file_type}"
 
@@ -91,7 +91,7 @@ class FileTokenProvider(HoneytokenProvider):
         return token_uid, meta
 
     def plant_instructions(self, token_value: str, metadata: dict[str, Any]) -> str:
-        file_path = metadata.get("file_path", "reports/generated/<token>.pdf")
+        file_path = metadata.get("file_path", "<reports_dir>/generated/<token>.pdf")
         tracking_url = metadata.get("tracking_url", "")
         return (
             f"File honeytoken created at: {file_path}\n\n"

@@ -66,6 +66,13 @@ services:
       # no default: the old default of `..` mounted the whole repo — .env (auth
       # tokens, API keys), tls/ private keys and reports/ — into Grafana.
       - ${HONEYPOT_DB_DIR:?set HONEYPOT_DB_DIR to a directory containing only honeypot_mcp.db}:/mcp-data:ro
+    # The daemon keeps its data directory private (0700 by default), which Grafana
+    # (uid 472) cannot traverse. Grant it read access through ONE dedicated group
+    # instead of loosening the directory for everyone: create the group, give it
+    # the directory (setgid, 2750) and have the service write group-readable files
+    # (deploy/grafana-readable.conf). docs/DEPLOY.md step 9 has the commands.
+    group_add:
+      - "${HONEYPOT_DB_GID:?set HONEYPOT_DB_GID to the numeric gid of the group that owns HONEYPOT_DB_DIR (see docs/DEPLOY.md step 9)}"
     ports:
       - "${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     security_opt:

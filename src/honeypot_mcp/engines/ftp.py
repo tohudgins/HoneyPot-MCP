@@ -47,6 +47,7 @@ from honeypot_mcp.engines.conn_limit import (
     limited_factory,
     shutdown_server,
 )
+from honeypot_mcp.engines.ftp_fs import FakeFS, Node
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -120,20 +121,19 @@ _FEAT_RESPONSE = (
 # pseudo-account.
 _ANONYMOUS_USERS = {"anonymous", "ftp"}
 
-# ProFTPD-flavoured `ls -l` output served when an authenticated session
-# issues LIST or NLST. Previously the engine returned `425 Use PORT or PASV
-# first.` regardless of state — a single LIST attempt confirmed the server
-# never served data and is therefore a honeypot. Returning a believable
-# listing keeps scanners engaged (they often follow LIST with RETR / SIZE /
-# MDTM on the named files) which gives us deeper TTP data.
-_FAKE_LISTING = (
-    b"total 142\r\n"
-    b"drwxr-xr-x   2 ftp      ftp           512 Mar 15 14:23 pub\r\n"
-    b"drwxr-xr-x   2 ftp      ftp           512 Feb 02 09:14 incoming\r\n"
-    b"-rw-r--r--   1 ftp      ftp        102400 Feb 28 09:11 backup.tar.gz\r\n"
-    b"-rw-r--r--   1 ftp      ftp          4096 Feb 28 09:11 passwords.txt\r\n"
-    b"-rw-r--r--   1 ftp      ftp           256 Jan 12 16:45 README.txt\r\n"
-    b"-rw-r--r--   1 ftp      ftp         32768 Dec 04 11:02 db_dump.sql.gz\r\n"
+_MAX_OVERLAY_FILES = 16
+
+# ProFTPD's HELP reply (abridged to the commands this server really handles).
+_HELP_RESPONSE = (
+    b"214-The following commands are recognized (* =>'s unimplemented):\r\n"
+    b" CWD     XCWD    CDUP    XCUP    SMNT*   QUIT    PORT    PASV\r\n"
+    b" EPRT*   EPSV    ALLO*   RNFR    RNTO    DELE    MDTM    RMD\r\n"
+    b" XRMD    MKD     XMKD    PWD     XPWD    SIZE    SYST    HELP\r\n"
+    b" NOOP    FEAT    OPTS    AUTH*   CCC*    CONF*   ENC*    MIC*\r\n"
+    b" PBSZ*   PROT*   TYPE    STRU    MODE    RETR    STOR    STOU*\r\n"
+    b" APPE    REST    ABOR    USER    PASS    ACCT*   REIN*   LIST\r\n"
+    b" NLST    STAT    SITE    MLSD*   MLST*\r\n"
+    b"214 Direct comments to root@localhost\r\n"
 )
 
 
@@ -153,7 +153,9 @@ def _pasv_address(transport: asyncio.Transport) -> str:
 class _FTPProtocol(asyncio.Protocol):
     """ProFTPD-flavoured FTP control-channel handler."""
 
-    def __init__(self, honeypot_name: str, honeypot_id: int | None, banner: str) -> None:
+    def __init__(
+        self, honeypot_name: str, honeypot_id: int | None, banner: str, fs: FakeFS
+    ) -> None:
         self._name = honeypot_name
         self._hp_id = honeypot_id
         self._banner = banner
@@ -179,6 +181,10 @@ class _FTPProtocol(asyncio.Protocol):
         self._pasv_lock = asyncio.Lock()
         self._pasv_count = 0
         self._closed = False
+        self._fs = fs
+        self._rest = 0  # REST offset, consumed by the next RETR
+        # Files this session uploaded, shown by its later LIST/SIZE/RETR.
+        self._overlay: dict[str, Node] = {}
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -255,17 +261,17 @@ class _FTPProtocol(asyncio.Protocol):
             if self._authed:
                 t.write(f'257 "{self._cwd}" is the current directory.\r\n'.encode())
 
-        elif verb == "CWD":
+        elif verb in ("CWD", "XCWD", "CDUP", "XCUP"):
             self._require_auth_or(t)
             if self._authed:
-                target = arg if arg.startswith("/") else f"{self._cwd.rstrip('/')}/{arg}"
-                # Pretend the directory exists for shallow paths; deny anything
-                # that looks like a brute-force traversal beyond a few levels.
-                if target.count("/") > 8:
-                    t.write(b"550 Failed to change directory.\r\n")
+                target = self._fs.normalise(self._cwd, ".." if verb in ("CDUP", "XCUP") else arg)
+                if self._fs.is_dir(target):
+                    self._cwd = target
+                    t.write(
+                        f"250 {'CDUP' if verb in ('CDUP', 'XCUP') else 'CWD'} command successful\r\n".encode()
+                    )
                 else:
-                    self._cwd = target.rstrip("/") or "/"
-                    t.write(b"250 Directory successfully changed.\r\n")
+                    t.write(f"550 {arg}: No such file or directory\r\n".encode())
 
         elif verb == "LIST" or verb == "NLST":
             self._require_auth_or(t)
@@ -276,16 +282,16 @@ class _FTPProtocol(asyncio.Protocol):
                 if self._pasv_data_queue is None:
                     t.write(b"425 Use PORT or PASV first.\r\n")
                 else:
-                    spawn(self._serve_listing(verb), name="ftp-list")
+                    spawn(self._serve_listing(verb, arg), name="ftp-list")
 
-        elif verb == "PASV":
+        elif verb in ("PASV", "EPSV"):
             self._require_auth_or(t)
             if self._authed:
                 self._pasv_count += 1
                 if self._pasv_count > _MAX_PASV_PER_SESSION:
                     t.write(b"425 Cannot open passive data connection.\r\n")
                 else:
-                    spawn(self._setup_pasv(), name="ftp-pasv")
+                    spawn(self._setup_pasv(extended=verb == "EPSV"), name="ftp-pasv")
 
         elif verb == "PORT":
             self._require_auth_or(t)
@@ -310,11 +316,20 @@ class _FTPProtocol(asyncio.Protocol):
                 else:
                     spawn(self._receive_upload(verb, arg), name="ftp-stor")
 
-        elif verb == "RETR" or verb == "DELE":
+        elif verb == "RETR":
             self._require_auth_or(t)
             if self._authed:
-                # We don't serve real files or delete anything; log the intent.
-                t.write(b"550 Permission denied.\r\n")
+                if self._pasv_data_queue is None:
+                    t.write(b"425 Use PORT or PASV first.\r\n")
+                else:
+                    spawn(self._serve_download(arg), name="ftp-retr")
+
+        elif verb in ("DELE", "MKD", "XMKD", "RMD", "XRMD", "RNFR", "RNTO"):
+            self._require_auth_or(t)
+            if self._authed:
+                # Nothing is ever deleted or renamed; log the intent. ProFTPD
+                # words the refusal with the argument, as below.
+                t.write(f"550 {arg}: Permission denied\r\n".encode())
                 spawn(
                     self._record(
                         "ftp_file_op_blocked",
@@ -324,8 +339,56 @@ class _FTPProtocol(asyncio.Protocol):
                     name="ftp-record",
                 )
 
+        elif verb == "SIZE":
+            self._require_auth_or(t)
+            if self._authed:
+                node = self._node_for(self._fs.normalise(self._cwd, arg))
+                if node is None:
+                    t.write(f"550 {arg}: No such file or directory\r\n".encode())
+                elif node.is_dir:
+                    t.write(f"550 {arg}: not a regular file\r\n".encode())
+                else:
+                    t.write(f"213 {node.size}\r\n".encode())
+
+        elif verb == "MDTM":
+            self._require_auth_or(t)
+            if self._authed:
+                node = self._node_for(self._fs.normalise(self._cwd, arg))
+                if node is None:
+                    t.write(f"550 {arg}: No such file or directory\r\n".encode())
+                elif node.is_dir:
+                    t.write(f"550 {arg}: not a regular file\r\n".encode())
+                else:
+                    t.write(f"213 {node.mtime_mdtm}\r\n".encode())
+
+        elif verb == "REST":
+            self._require_auth_or(t)
+            if self._authed:
+                if arg.isdigit() and int(arg) < 2**40:
+                    self._rest = int(arg)
+                    t.write(
+                        f"350 Restarting at {self._rest}. "
+                        "Send STORE or RETRIEVE to initiate transfer\r\n".encode()
+                    )
+                else:
+                    t.write(b"501 REST requires a value greater than or equal to 0.\r\n")
+
+        elif verb == "OPTS":
+            if arg.upper().startswith("UTF8"):
+                t.write(b"200 UTF8 set to on\r\n")
+            else:
+                t.write(f"501 OPTS {arg.split(' ')[0]} not understood\r\n".encode())
+
+        elif verb == "ABOR":
+            t.write(b"226 Abort successful\r\n")
+
+        elif verb == "HELP":
+            t.write(_HELP_RESPONSE)
+
         else:
-            t.write(b"502 Command not implemented.\r\n")
+            # ProFTPD answers a command it has never heard of with 500 and the
+            # verb echoed back, not "502 not implemented".
+            t.write(f"500 {verb} not understood\r\n".encode())
             spawn(
                 self._record("ftp_command", AlertSeverity.LOW, {"command": _clip(cmd)}),
                 name="ftp-record",
@@ -364,7 +427,7 @@ class _FTPProtocol(asyncio.Protocol):
         )
         t.write(b"530 Login incorrect.\r\n")
 
-    async def _setup_pasv(self) -> None:
+    async def _setup_pasv(self, extended: bool = False) -> None:
         """Open a real listening socket for the upcoming data transfer.
 
         Each PASV is one-shot: any prior PASV server is torn down first so
@@ -418,45 +481,133 @@ class _FTPProtocol(asyncio.Protocol):
             sock_port: int = self._pasv_server.sockets[0].getsockname()[1]
             p1, p2 = divmod(sock_port, 256)
             addr = _pasv_address(t)
-            t.write(f"227 Entering Passive Mode ({addr},{p1},{p2}).\r\n".encode())
+            if extended:
+                t.write(f"229 Entering Extended Passive Mode (|||{sock_port}|)\r\n".encode())
+            else:
+                t.write(f"227 Entering Passive Mode ({addr},{p1},{p2}).\r\n".encode())
         await self._record("ftp_passive_attempt", AlertSeverity.MEDIUM, {"port": sock_port})
 
-    async def _serve_listing(self, verb: str) -> None:
-        """Accept the client's data connection, write a fake directory listing,
-        close the data channel, then send 226 on the control channel."""
+    async def _open_data(self, intro: bytes) -> asyncio.StreamWriter | None:
+        """Send the 150 reply and wait for the client's data connection."""
         t = self._transport
         if t is None or self._pasv_data_queue is None:
-            return
-
-        t.write(b"150 Opening ASCII mode data connection for file list\r\n")
+            return None
+        t.write(intro)
         try:
-            reader, writer = await asyncio.wait_for(self._pasv_data_queue.get(), timeout=10.0)
+            _reader, writer = await asyncio.wait_for(self._pasv_data_queue.get(), timeout=10.0)
         except TimeoutError:
             t.write(b"425 No data connection received.\r\n")
             await self._teardown_pasv()
-            return
+            return None
+        return writer
 
+    async def _send_data(self, writer: asyncio.StreamWriter, payload: bytes) -> None:
         try:
-            writer.write(_FAKE_LISTING)
-            await writer.drain()
+            writer.write(payload)
+            await asyncio.wait_for(writer.drain(), timeout=10.0)
         except Exception as e:
-            log.debug("LIST data write failed: %s", e)
+            log.debug("FTP data write failed: %s", e)
         finally:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    def _overlay_in(self, directory: str) -> list[Node]:
+        return [n for p, n in self._overlay.items() if (p.rpartition("/")[0] or "/") == directory]
+
+    def _remember_upload(self, filename: str, data: bytes) -> None:
+        """Make an uploaded file visible to this session's later LIST/SIZE/RETR, as
+        on a real server. Per connection and bounded: it is a convincing echo, not
+        storage."""
+        path = self._fs.normalise(self._cwd, filename)
+        name = path.rpartition("/")[2]
+        if not name or len(self._overlay) >= _MAX_OVERLAY_FILES:
+            return
+        self._overlay[path] = Node(name, False, "Oct 04 12:00", "20261004120000", data)
+
+    def _node_for(self, path: str) -> Node | None:
+        return self._overlay.get(path) or self._fs.lookup(path)
+
+    async def _serve_listing(self, verb: str, arg: str) -> None:
+        """Accept the client's data connection, write the directory listing, close
+        the data channel, then send 226 on the control channel."""
+        t = self._transport
+        # `LIST -la /pub`: option words are ignored, the rest is the path.
+        words = [w for w in arg.split() if not w.startswith("-")]
+        target = self._fs.normalise(self._cwd, words[0] if words else "")
+        nodes = self._fs.listdir(target)
+        if t is None or self._pasv_data_queue is None:
+            return
+        if nodes is None:
+            single = self._node_for(target)
+            if single is None:
+                t.write(f"550 {arg or target}: No such file or directory\r\n".encode())
+                await self._teardown_pasv()
+                return
+            nodes = [single]
+        extra = self._overlay_in(target)
+        payload = (
+            self._fs.render_nlst(nodes, extra)
+            if verb == "NLST"
+            else self._fs.render_list(nodes, extra)
+        )
+        writer = await self._open_data(b"150 Opening ASCII mode data connection for file list\r\n")
+        if writer is None:
+            return
+        await self._send_data(writer, payload)
+        await self._teardown_pasv()  # before the 226; see _receive_upload
         t.write(b"226 Transfer complete.\r\n")
         await self._record(
             "ftp_list_served",
             AlertSeverity.MEDIUM,
             {
                 "verb": verb,
-                "bytes_sent": len(_FAKE_LISTING),
-                "entry_count": _FAKE_LISTING.count(b"\r\n"),
+                "path": _clip(target),
+                "bytes_sent": len(payload),
+                "entry_count": payload.count(b"\r\n"),
             },
         )
-        await self._teardown_pasv()
+        # (The data listener was already torn down before the 226, above.)
+
+    async def _serve_download(self, arg: str) -> None:
+        """RETR: send the named file's bytes — the same bytes whose length LIST and
+        SIZE reported."""
+        t = self._transport
+        if t is None or self._pasv_data_queue is None:
+            return
+        path = self._fs.normalise(self._cwd, arg)
+        node = self._node_for(path)
+        offset, self._rest = self._rest, 0
+        if node is None:
+            t.write(f"550 {arg}: No such file or directory\r\n".encode())
+            await self._teardown_pasv()
+            await self._record(
+                "ftp_file_probe", AlertSeverity.MEDIUM, {"verb": "RETR", "path": _clip(path)}
+            )
+            return
+        if node.is_dir:
+            t.write(f"550 {arg}: not a regular file\r\n".encode())
+            await self._teardown_pasv()
+            return
+        payload = node.content[offset:]
+        writer = await self._open_data(
+            f"150 Opening BINARY mode data connection for {arg} ({len(payload)} bytes)\r\n".encode()
+        )
+        if writer is None:
+            return
+        await self._send_data(writer, payload)
+        await self._teardown_pasv()  # before the 226; see _receive_upload
+        t.write(b"226 Transfer complete.\r\n")
+        await self._record(
+            "ftp_file_download",
+            AlertSeverity.HIGH,
+            {
+                "path": _clip(path),
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        )
+        # (The data listener was already torn down before the 226, above.)
 
     async def _receive_upload(self, verb: str, filename: str) -> None:
         """Accept the client's data connection for a STOR/APPE and capture the
@@ -492,7 +643,12 @@ class _FTPProtocol(asyncio.Protocol):
                 await writer.wait_closed()
 
         data = b"".join(chunks)
+        # Tear down BEFORE the 226: once the client sees it, it may immediately send
+        # the next PASV, and a teardown that ran afterwards would close the
+        # listener that PASV just opened (ConnectionRefused on the data channel).
+        await self._teardown_pasv()
         t.write(b"226 Transfer complete.\r\n")
+        self._remember_upload(filename, data)
 
         kind = _classify_upload(filename, data)
         severity = AlertSeverity.CRITICAL if kind else AlertSeverity.HIGH
@@ -510,7 +666,7 @@ class _FTPProtocol(asyncio.Protocol):
                 "preview": data[:512].decode("utf-8", errors="replace"),
             },
         )
-        await self._teardown_pasv()
+        # (The data listener was already torn down before the 226, above.)
 
     async def _teardown_pasv(self) -> None:
         """Close any active PASV listener and any data connection that arrived
@@ -574,8 +730,9 @@ class FTPEngine(HoneypotEngine):
                 hp_id = hp.id
 
         loop = asyncio.get_event_loop()
+        fs = FakeFS(name)  # one tree per honeypot: stable across connections
         server = await loop.create_server(
-            limited_factory(lambda: _FTPProtocol(name, hp_id, banner), self._limiter),
+            limited_factory(lambda: _FTPProtocol(name, hp_id, banner, fs), self._limiter),
             host="0.0.0.0",
             port=port,
         )

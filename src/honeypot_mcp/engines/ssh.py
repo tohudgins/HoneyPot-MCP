@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import ipaddress
 import json
 import logging
+import tarfile
 import time
 from collections import deque
 from datetime import UTC, datetime
@@ -19,12 +22,49 @@ from honeypot_mcp import self_probe
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.cowrie_fs import (
+    BASE_PICKLE_PATH,
+    PERSONA_DIR,
+    PERSONA_PICKLE_PATH,
+    build_persona_fs,
+    persona_tar,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
 from honeypot_mcp.storage.models import AlertSeverity
 
 log = logging.getLogger(__name__)
+
+# The bundled filesystem is ~1.2 MB; anything much larger is not the file we expect.
+_MAX_BASE_PICKLE_BYTES = 16 * 1024 * 1024
+
+
+def _deliver_persona_fs(container: Any, persona: Any, hostname: str, seed: str) -> None:
+    """Copy a persona-specific filesystem into a created (not yet started) container.
+
+    Reads Cowrie's own bundled `fs.pickle` out of the container, rewrites it so
+    /etc/hostname, /etc/issue, /etc/os-release, /proc/version, the accounts and
+    /home describe `persona` (see `cowrie_fs`), and puts the result back under
+    `PERSONA_PICKLE_PATH`, which `COWRIE_SHELL_FILESYSTEM` points at. Raises on any
+    problem; the caller falls back to Cowrie's default rather than failing a deploy.
+    """
+    stream, _stat = container.get_archive(BASE_PICKLE_PATH)
+    raw = b""
+    for chunk in stream:
+        raw += chunk
+        if len(raw) > _MAX_BASE_PICKLE_BYTES + 1_000_000:
+            raise ValueError("Cowrie's filesystem pickle is far larger than expected")
+    with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+        member = next((m for m in tar.getmembers() if m.isfile()), None)
+        extracted = tar.extractfile(member) if member is not None else None
+        if extracted is None or member is None or member.size > _MAX_BASE_PICKLE_BYTES:
+            raise ValueError("no usable filesystem pickle in the Cowrie image")
+        base = extracted.read()
+    built = build_persona_fs(base, persona, hostname, seed)
+    if not container.put_archive(PERSONA_DIR, persona_tar(built)):
+        raise RuntimeError("Docker refused the persona filesystem archive")
+
 
 # Pinned to an explicit release (3.0.15 is what `latest` and `3.0` resolved to
 # when this was pinned). `:latest` meant every fresh host — and every
@@ -200,8 +240,11 @@ class SSHEngine(HoneypotEngine):
 
         env = cowrie_env_vars(persona, hostname, allow_egress=get_settings().cowrie_allow_egress)
         if "fake_kernel" in config:
-            env["COWRIE_KERNEL_VERSION"] = config["fake_kernel"]
-            env["COWRIE_HONEYPOT_KERNEL_VERSION"] = config["fake_kernel"]
+            env["COWRIE_SHELL_KERNEL_VERSION"] = config["fake_kernel"]
+        # Cowrie reads the persona's filesystem (hostname, issue, os-release,
+        # /proc/version, accounts, home directory) from here once it is delivered
+        # into the container; see `_deliver_persona_fs`.
+        env["COWRIE_SHELL_FILESYSTEM"] = PERSONA_PICKLE_PATH
 
         log.info(
             "SSH honeypot '%s' deploying as persona=%s hostname=%s",
@@ -235,39 +278,81 @@ class SSHEngine(HoneypotEngine):
                 log.info("Pulling Cowrie image (first run — this may take a minute)…")
                 self._client.images.pull(COWRIE_IMAGE)
 
-            container = self._client.containers.run(
-                COWRIE_IMAGE,
-                detach=True,
-                name=f"honeypot-{name}",
-                ports=port_map,
-                environment=env,
-                labels={
-                    "honeypot-mcp": "true",
-                    "honeypot-name": name,
-                    "honeypot-persona": persona.id,
-                    "honeypot-telnet": "yes" if telnet_enabled else "no",
-                },
-                restart_policy={"Name": "unless-stopped"},
-                # Attacker-facing: bound what a compromised/abused Cowrie can
-                # consume or do. Cowrie listens on unprivileged ports, so it
-                # needs no capabilities at all.
-                mem_limit=COWRIE_MEM_LIMIT,
-                pids_limit=COWRIE_PIDS_LIMIT,
-                nano_cpus=COWRIE_NANO_CPUS,
-                cap_drop=["ALL"],
-                # With egress closed, also stop wget/curl from emitting real DNS
-                # queries (a side channel: the sensor's resolver becomes visible and
-                # internal names probe-able by output differences) by pointing the
-                # container's resolver at its own loopback, where nothing listens.
-                **({} if get_settings().cowrie_allow_egress else {"dns": ["127.0.0.1"]}),
-                read_only=True,
-                tmpfs=COWRIE_TMPFS,
-                security_opt=["no-new-privileges:true"],
-                log_config=docker.types.LogConfig(
-                    type=docker.types.LogConfig.types.JSON,
-                    config={"max-size": COWRIE_LOG_MAX_SIZE, "max-file": COWRIE_LOG_MAX_FILES},
-                ),
-            )
+            def _create(container_env: dict[str, str], persona_volume: bool) -> Any:
+                return self._client.containers.create(
+                    COWRIE_IMAGE,
+                    **(
+                        {
+                            "mounts": [
+                                # An anonymous volume: writable to the Docker API (an
+                                # archive cannot be extracted into a read-only rootfs),
+                                # removed with the container by `remove(v=True)`.
+                                docker.types.Mount(
+                                    target=PERSONA_DIR,
+                                    source=None,  # type: ignore[arg-type]
+                                    type="volume",
+                                )
+                            ]
+                        }
+                        if persona_volume
+                        else {}
+                    ),
+                    name=f"honeypot-{name}",
+                    ports=port_map,
+                    environment=container_env,
+                    labels={
+                        "honeypot-mcp": "true",
+                        "honeypot-name": name,
+                        "honeypot-persona": persona.id,
+                        "honeypot-telnet": "yes" if telnet_enabled else "no",
+                    },
+                    restart_policy={"Name": "unless-stopped"},
+                    # Attacker-facing: bound what a compromised/abused Cowrie can
+                    # consume or do. Cowrie listens on unprivileged ports, so it
+                    # needs no capabilities at all.
+                    mem_limit=COWRIE_MEM_LIMIT,
+                    pids_limit=COWRIE_PIDS_LIMIT,
+                    nano_cpus=COWRIE_NANO_CPUS,
+                    cap_drop=["ALL"],
+                    # With egress closed, also stop wget/curl from emitting real DNS
+                    # queries (a side channel: the sensor's resolver becomes visible and
+                    # internal names probe-able by output differences) by pointing the
+                    # container's resolver at its own loopback, where nothing listens.
+                    **({} if get_settings().cowrie_allow_egress else {"dns": ["127.0.0.1"]}),
+                    read_only=True,
+                    tmpfs=COWRIE_TMPFS,
+                    security_opt=["no-new-privileges:true"],
+                    log_config=docker.types.LogConfig(
+                        type=docker.types.LogConfig.types.JSON,
+                        config={"max-size": COWRIE_LOG_MAX_SIZE, "max-file": COWRIE_LOG_MAX_FILES},
+                    ),
+                )
+
+            # Created first, started after: the persona filesystem is copied in
+            # while the container is stopped, so it is in place from Cowrie's first
+            # instruction. It goes onto an anonymous volume, not the root filesystem:
+            # Docker refuses to extract an archive into a read-only rootfs ("container
+            # rootfs is marked read-only"), and a volume is writable to the Docker API
+            # while Cowrie itself can still not alter its own root.
+            container = _create(env, persona_volume=True)
+            try:
+                _deliver_persona_fs(container, persona, hostname, name)
+            except Exception as e:
+                log.warning(
+                    "Could not install the persona filesystem for SSH honeypot '%s' (%s). "
+                    "Falling back to Cowrie's bundled one: its /etc and /home will not "
+                    "match the %s persona.",
+                    name,
+                    e,
+                    persona.id,
+                )
+                with contextlib.suppress(Exception):
+                    container.remove(force=True, v=True)
+                container = _create(
+                    {k: v for k, v in env.items() if k != "COWRIE_SHELL_FILESYSTEM"},
+                    persona_volume=False,
+                )
+            container.start()
             return container.id
 
         container_id = await loop.run_in_executor(None, _run)
@@ -344,7 +429,7 @@ class SSHEngine(HoneypotEngine):
                 c = self._client.containers.get(container_id)
                 c.stop(timeout=5)
                 if remove:
-                    c.remove()
+                    c.remove(v=True)  # also drops the anonymous persona volume
             except docker.errors.NotFound:
                 pass
 

@@ -22,11 +22,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy.exc import OperationalError
+
 from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert, AlertSeverity, AttackerEvent
 
 log = logging.getLogger(__name__)
+
+# Transient database errors (a locked SQLite file, a dropped connection, a
+# PostgreSQL deadlock) are retried with backoff — about 1.5 s in all — before an
+# event is treated as refused. See `EventBuffer._write_retrying`.
+_TRANSIENT_RETRY_ATTEMPTS = 6
+_TRANSIENT_RETRY_START = 0.05
 
 # Fraction of the queue high-water mark at which each severity starts being
 # shed. LOW goes first; HIGH/CRITICAL only once the backlog is twice the mark.
@@ -387,7 +395,7 @@ class EventBuffer:
         innocent neighbours.
         """
         try:
-            targets = await self._write(batch)
+            targets = await self._write_retrying(batch)
             written = batch
         except Exception as first_error:
             log.warning(
@@ -402,7 +410,7 @@ class EventBuffer:
                 written, targets = [], []
                 for ev in batch:
                     try:
-                        targets.extend(await self._write([ev]))
+                        targets.extend(await self._write_retrying([ev]))
                         written.append(ev)
                     except Exception as e:
                         log.error(
@@ -419,6 +427,29 @@ class EventBuffer:
         for alert_id, ip in targets:
             _schedule_enrichment(alert_id, ip)
         return written
+
+    async def _write_retrying(self, events: list[PendingEvent]) -> list[tuple[int, str]]:
+        """`_write`, riding out transient database errors.
+
+        An `OperationalError` is how SQLAlchemy reports a locked SQLite file, a
+        dropped connection, a PostgreSQL deadlock or serialization failure: the
+        database did not reject the data, it was briefly unavailable. Retrying
+        immediately (the old behaviour) races the same condition, and falling
+        through to "drop the event, the database refused it" lost events that
+        nothing was wrong with. So wait, with backoff, and only give up after
+        about 1.5 s. Anything else — a value the database rejects — is raised at
+        once, so a poison row still costs only itself."""
+        delay = _TRANSIENT_RETRY_START
+        for attempt in range(_TRANSIENT_RETRY_ATTEMPTS):
+            try:
+                return await self._write(events)
+            except OperationalError as e:
+                if attempt == _TRANSIENT_RETRY_ATTEMPTS - 1:
+                    raise
+                log.warning("Transient database error writing events (%s) — backing off.", e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 1.0)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def _write(self, events: list[PendingEvent]) -> list[tuple[int, str]]:
         """One transaction for `events`; returns `(alert_id, ip)` pairs to enrich."""

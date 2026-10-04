@@ -111,11 +111,14 @@ def cowrie_env_vars(
     return {
         "COWRIE_HOSTNAME": hostname,
         "COWRIE_HONEYPOT_HOSTNAME": hostname,
-        "COWRIE_KERNEL_VERSION": persona.kernel_version,
-        "COWRIE_HONEYPOT_KERNEL_VERSION": persona.kernel_version,
-        "COWRIE_HONEYPOT_KERNEL_BUILD_STRING": persona.kernel_build_string,
-        "COWRIE_HONEYPOT_HARDWARE_PLATFORM": persona.hardware_platform,
-        "COWRIE_HONEYPOT_OPERATING_SYSTEM": persona.operating_system,
+        # Kernel / platform / OS identity live in Cowrie's [shell] section. They
+        # were once set as COWRIE_HONEYPOT_* (the wrong section), which Cowrie
+        # ignores, so `uname` kept reporting the image's own Debian kernel whatever
+        # persona was chosen — verified against a live container.
+        "COWRIE_SHELL_KERNEL_VERSION": persona.kernel_version,
+        "COWRIE_SHELL_KERNEL_BUILD_STRING": persona.kernel_build_string,
+        "COWRIE_SHELL_HARDWARE_PLATFORM": persona.hardware_platform,
+        "COWRIE_SHELL_OPERATING_SYSTEM": persona.operating_system,
         "COWRIE_SSH_VERSION": persona.ssh_version_string,
         # ── Route Cowrie's JSON event stream to stdout ──────────────────
         # `SSHEngine._ingest_logs` reads `docker logs` and parses each line as

@@ -26,7 +26,6 @@ import base64
 import hashlib
 import re
 import uuid
-from pathlib import Path
 from typing import Any
 
 from honeypot_mcp.secure_io import ensure_private_dir, write_private_file
@@ -102,10 +101,12 @@ class SSHKeyProvider(HoneytokenProvider):
         # Append the comment to the public key like real ssh-keygen output.
         public_openssh = f"{public_openssh.strip()} {comment}\n"
 
-        # Write the private key to reports/generated/ so the operator can
+        # Write the private key under reports_dir/generated so the operator can
         # actually plant it. The path is the token_value so the operator can
         # find it again via honeytoken_export.
-        out_dir = Path("reports/generated")
+        from honeypot_mcp.config import get_settings
+
+        out_dir = get_settings().reports_dir / "generated"
         ensure_private_dir(out_dir)
         key_path = out_dir / f"id_rsa_{token_uid}"
         # Created 0600 from the first instant — chmod-after-write leaves a

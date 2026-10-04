@@ -174,6 +174,37 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # ── Cowrie persona filesystem ────────────────────────────────────────────
+  # Cowrie's bundled filesystem is a fixed Debian image: `cat /etc/hostname` says
+  # svr04, /etc/issue names another distro, /etc/os-release is a dangling symlink and
+  # `ls /home` shows `phil` — each contradicting the persona and each a one-command
+  # tell. This one-shot job rewrites it for the persona (the same code the MCP
+  # `honeypot_deploy` tool uses) into a volume the sensor then mounts read-only.
+  # It runs inside the Cowrie image, which has the pickle and a Python.
+  cowrie-persona-init:
+    image: cowrie/cowrie:3.0.15
+    container_name: honeypot-ssh-persona-init
+    entrypoint: ["/cowrie/cowrie-env/bin/python3", "/hp-src/build_persona_fs.py"]
+    environment:
+      PERSONA: ubuntu_22_04
+      COWRIE_HOSTNAME: ubuntu-server
+    volumes:
+      - cowrie-persona:/persona
+      - ./cowrie/build_persona_fs.py:/hp-src/build_persona_fs.py:ro
+      - ../src/honeypot_mcp/engines/cowrie_fs.py:/hp-src/cowrie_fs.py:ro
+      - ../src/honeypot_mcp/engines/ssh_personas.py:/hp-src/ssh_personas.py:ro
+    restart: "no"
+    # Root, so it can write the fresh (root-owned) volume; harmless otherwise — no
+    # capabilities, no network, read-only root filesystem, and it exits in a second.
+    # The sensor itself mounts the result read-only and runs unprivileged.
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+
   # ── SSH Honeypot (Cowrie) ─────────────────────────────────────────────────
   cowrie-ssh:
     # Pinned to a release tag (keep in step with COWRIE_IMAGE in
@@ -183,8 +214,24 @@ services:
     restart: unless-stopped
     ports:
       - "${DEFAULT_SSH_PORT:-2222}:2222"
+    depends_on:
+      cowrie-persona-init:
+        condition: service_completed_successfully
     environment:
+      # Identity: keep in step with the `ubuntu_22_04` persona in
+      # engines/ssh_personas.py (a test fails if they drift) and with PERSONA /
+      # COWRIE_HOSTNAME on cowrie-persona-init above.
       - COWRIE_HOSTNAME=ubuntu-server
+      - COWRIE_HONEYPOT_HOSTNAME=ubuntu-server
+      # Kernel / platform / OS are Cowrie [shell] settings. This file once set them
+      # as COWRIE_HONEYPOT_* (the wrong section), which Cowrie ignores.
+      - COWRIE_SHELL_KERNEL_VERSION=5.15.0-91-generic
+      - COWRIE_SHELL_KERNEL_BUILD_STRING=#91-Ubuntu SMP Mon Aug 14 12:51:52 UTC 2023
+      - COWRIE_SHELL_HARDWARE_PLATFORM=x86_64
+      - COWRIE_SHELL_OPERATING_SYSTEM=GNU/Linux
+      - COWRIE_SSH_VERSION=SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.4
+      # The persona filesystem built by cowrie-persona-init.
+      - COWRIE_SHELL_FILESYSTEM=/cowrie/persona/fs.pickle
       # Cowrie's JSON event stream has to reach stdout for the MCP server to
       # ingest it — see the note in engines/ssh_personas.py:cowrie_env_vars.
       # `plain` is required alongside the path: the default `rotating` logtype
@@ -202,6 +249,7 @@ services:
     volumes:
       - cowrie-logs:/cowrie/var/log/cowrie
       - cowrie-state:/cowrie/var/lib/cowrie
+      - cowrie-persona:/cowrie/persona:ro
     networks:
       - honeypot-net
     labels:
@@ -341,6 +389,7 @@ services:
 volumes:
   cowrie-logs:
   cowrie-state:
+  cowrie-persona:
   mcp-data:
   mcp-reports:
   mcp-tls:
@@ -350,11 +399,13 @@ volumes:
 networks:
   # Attacker-facing: Cowrie and the HTTP honeypot live here. They share it with
   # the MCP server (which probes and ingests from them) and nothing else.
+  # No pinned subnet: Docker picks a free range. It used to be 172.20.0.0/24, which
+  # overlaps the range Docker auto-assigns to the *other* networks below, so
+  # whether `up` worked depended on the order they were created in and on whatever
+  # networks the host already had ("Pool overlaps with other one"). Nothing
+  # depends on a fixed address.
   honeypot-net:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
   # Observability: Prometheus, Grafana and the MCP /metrics endpoint. Kept off
   # honeypot-net so a compromised decoy cannot reach Grafana's login page or
   # Prometheus. Not `internal` because Grafana's published port and plugin

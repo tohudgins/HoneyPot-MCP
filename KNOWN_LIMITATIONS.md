@@ -140,15 +140,18 @@ subclasses the runner, server and request handler so each listener stamps its
 own banner on protocol errors too. Verified: malformed and well-formed requests
 now return identical `Server` headers on all five aiohttp listeners.
 
-**Memcached and SNMP deliberately never amplify.** Both are reflection
-vectors, and both engines are built to watch the reconnaissance rather than
-take part in it. `memcached` speaks TCP only — UDP/11211 is where reflection
-actually happens, and a UDP listener that answered spoofed traffic would enlist
-the honeypot in someone else's DDoS. SNMP answers `GetBulkRequest` with the
-same single-varbind shape as a `Get` rather than the large multi-varbind reply
-a real agent sends, for the same reason. Both still record the probe, and both
-report a measured amplification factor, so the intent is captured; what is
-withheld is the traffic. This is a design decision, not an omission.
+**Memcached never amplifies; SNMP, SIP and DNS are bounded.** All are reflection
+vectors, and the engines are built to watch the reconnaissance rather than take
+part in it. `memcached` speaks TCP only — UDP/11211 is where reflection actually
+happens, and a UDP listener that answered spoofed traffic would enlist the
+honeypot in someone else's DDoS. The UDP engines (SNMP, SIP, DNS) do answer, but
+a reply is capped at a small multiple of the request (SNMP 4x, SIP 3x, DNS 2x —
+a `GetBulk` is cut back to a single varbind) and replies per source address are
+token-bucket rate limited, so the traffic they could add to a reflection is a few
+KB/s per victim. The cap is not 1x on purpose: at 1x an ordinary `snmpget` came
+back `tooBig` and a short SIP REGISTER got a 401 with no digest challenge, both
+of which identify the decoy and capture nothing. Every probe is recorded either
+way. This is a design decision, not an omission.
 
 **The Docker API engine identifies as Docker, byte-for-byte.** `nmap -sV`
 returns `docker  Docker 24.0.7` — a hard match, not a softmatch. Getting there
@@ -185,33 +188,43 @@ there's no signal back to HoneyPot MCP. Worth it for trip-wire deception
 inside the honeypot stack; not a substitute for real credential canaries that
 hook into an identity provider's audit log.
 
-**SMTP / FTP engines.** They catch automated traffic — open-relay scanners,
-FTP credential brute force, port-scanner banner grabs. Post-fidelity-upgrade,
-they advertise realistic feature sets (Postfix-style EHLO, ProFTPD-style FEAT,
-anonymous FTP flow). SMTP STARTTLS completes a real TLS handshake using the
-per-honeypot self-signed cert **and continues the protocol over TLS** —
-scanners that EHLO-after-STARTTLS see the same extension list and can
-follow through to AUTH or DATA. FTP `LIST` over PASV actually opens a
-listening data port, accepts the client's connection, and serves a
-believable ProFTPD-flavoured `ls -l` listing — scanners that hammer LIST
-get fed real directory bytes. A skilled human probing manually will still
-identify the SMTP engine because we don't implement a real mail queue or
-DSN delivery, and FTP because RETR / STOR still return 550. Comparable to
-OpenCanary fidelity, not a real Postfix or ProFTPD deployment.
+**SMTP engine.** Speaks Postfix's dialect rather than accepting everything:
+commands out of sequence get the 503 Postfix gives (`RCPT` before `MAIL`, nested
+`MAIL`, `DATA` with no recipients), a mailbox the host does not have is
+`550 5.1.1 User unknown in local recipient table` while `postmaster`, `root`,
+`info` and friends are accepted, `VRFY` distinguishes the two, and an external
+sender mailing an external recipient is still accepted — that is the open-relay
+behaviour the engine exists to observe. `nmap --script smtp-enum-users`
+therefore finds the real mailboxes and only those. STARTTLS completes a real TLS
+handshake and the protocol continues over it. What it does not do is deliver
+mail: there is no queue, so a completed `DATA` is acknowledged and recorded but
+never bounces or relays, and a patient human watching for a delivery failure
+notice will not get one.
 
-**RDP honeypot.** Parses the X.224 Connection Request (TPKT layer) and
-extracts the leaked `Cookie: mstshash=user@DOMAIN` field that virtually
-every RDP scanner and brute-force tool sends in the clear. When the client
-requests SSL or HYBRID/CredSSP (most modern clients and tools do), the
-engine upgrades the connection to TLS and parses the MCS Connect Initial
-PDU — capturing the attacker's `clientName`, `clientBuild`, keyboard
-layout, screen resolution, and requested encryption methods as an
-`rdp_mcs_handshake` event. RDP brute-force is one of the largest
-categories of public-internet attack traffic, so this catches real
-traffic immediately on a public IP. We do NOT implement the rest of the
-protocol stack (no MCS Connect Response, no channel join, no CredSSP), so
-the connection closes after the MCS capture — CredSSP would let us
-capture NTLM hashes but is a large implementation for marginal gain.
+**FTP engine.** Backed by a small, internally consistent file tree
+(`engines/ftp_fs.py`): `LIST`, `NLST`, `SIZE`, `MDTM`, `CWD`, `REST` and `RETR`
+all derive from the same nodes, so the size in a listing is the length of the
+bytes `RETR` then serves, and the archives are real gzip/tar files that
+extract. A file an attacker uploads is visible to the rest of that session.
+Downloads are recorded with a SHA-256 of what was served. `DELE`, `MKD`, `RMD`
+and `RNFR` answer `550 Permission denied` and are recorded; nothing is ever
+changed. The tree is the same for every connection to one honeypot, and
+different between honeypots.
+
+**RDP engine.** Answers the way a Windows host does. A client that asks for
+Network Level Authentication is given CredSSP (the negotiation response carries
+the flags Windows sends, which is what makes `nmap -sV` report `Microsoft
+Terminal Services`), and the NTLM exchange runs for real: the CHALLENGE discloses
+a stable Windows identity (NetBIOS/DNS names, build, time — exactly what `nmap
+--script rdp-ntlm-info` reads), the client's AUTHENTICATE is parsed, and the
+NetNTLMv2 response is recorded as a ready-to-crack `hashcat -m 5600` line
+(`-m 5500` for NTLMv1). The capture was checked against an independent NTLM
+implementation (pyspnego): the right password reproduces the response, a wrong
+one does not — which is also how a planted honeytoken password is recognised from
+the response alone, with no plaintext on the wire. Authentication then fails with
+`STATUS_LOGON_FAILURE`. A client that asks only for plain TLS still gets the MCS
+Connect Initial capture (`clientName`, build, layout). There is no RDP session
+beyond authentication: no MCS Connect Response, no channel join, no desktop.
 
 ---
 
@@ -262,22 +275,37 @@ token's `plant_instructions` text says this explicitly.
 These are choices, with the reasoning, not things left undone. Changing any of
 them is a product decision rather than a bug fix.
 
-**HTTP — no authenticated session flow.** Sessions are issued and tracked
-(cookie persistence + repeat-visit escalation), and `POST /login` now
-rotates across six plausible auth-failed wordings with variable per-
-request timing (see above), so a single diff-the-responses probe no
-longer confirms the absence of an auth backend. But we still never
-accept a login — every credential is rejected. A determined attacker
-who tries enough username/password combinations and observes that none
-ever succeed will eventually infer there's no real backend. Accepting
-some logins (selective acceptance) is possible but increases the risk
-of the honeypot itself becoming a useful login surface for attackers.
+**HTTP — a narrow authenticated area, on purpose.** `POST /login` used to reject
+everything, which meant a credential-spraying bot (it moves on only after a
+success) never showed us what it does with a foothold. Now a planted honeytoken
+credential, or the single weak username/password pair derived from the honeypot's
+name, logs in and is redirected to a small admin console (users, settings,
+backups, logs, uploads — all decoy, with downloads served from the same file tree
+the FTP engine uses). Everything after the login is recorded as
+`http_authenticated_request`, uploads included. The derived pair differs between
+honeypots so "admin/admin works everywhere" is not a fingerprint, and
+`accepted_logins` in a honeypot's config replaces it (an empty list turns the
+area off). The cost is real: this is a login surface, so it is decoy-only and
+accepts nothing beyond those credentials, and an operator who does not want it
+sets `accepted_logins: []`.
 
-**Cowrie known fingerprints.** Cowrie itself has well-known tells in `df` /
-`uname` / filesystem layout output that experienced attackers check. The
-persona system fixes the deployment-time fingerprint problem but doesn't
-address Cowrie's internal behaviour. That's a Cowrie limitation, not ours;
-covers ~99% of internet attack traffic regardless.
+**Cowrie — what is fixed and what is not.** The persona now covers the whole
+story rather than a few strings. Cowrie's bundled filesystem is rewritten per
+persona (`engines/cowrie_fs.py`): `/etc/hostname`, `/etc/hosts`, `/etc/issue`,
+`/etc/os-release`, `/etc/lsb-release`, `/proc/version`, the MOTD, accounts
+(`passwd`/`group`/`shadow`) and a home directory with history, with Cowrie's own
+`phil` account gone. A live check against a container found the persona's kernel
+settings had never applied at all (they were set in the wrong Cowrie config
+section), so `uname` kept reporting the image's Debian kernel; that is fixed and
+pinned by a Docker-gated test that deploys each persona and compares ten things an
+attacker reads. Cowrie's emulated `wget`/`curl` can no longer reach real hosts
+(outgoing sockets bind to loopback; the resolver is pinned to loopback too). What
+remains is Cowrie's own behaviour, which this project does not patch: `uptime`
+starts from zero at every container start (it counts the Cowrie process, so it is
+only wrong shortly after a restart), `ps`, `df`, `mount` and `free` come from
+Cowrie's canned output and are not tailored per persona, command timing is
+uniform, and the SSH key-exchange offer is Cowrie's. A skilled human who knows
+what to compare will still find it.
 
 ---
 
@@ -306,26 +334,20 @@ gaps, edit the relevant section so it reflects reality. If you discover a new
 limitation, add it — silent rot is the failure mode this document exists to
 prevent.
 
-## Found by the second independent review and left as documented limitations
+## Operational notes
 
-- **`tls/` and `reports/generated/` are relative to the working directory**, while
-  the database, `reports_dir`, `pcap_dir` and `.env` are anchored to the project
-  root (or, for an installed package, the working directory). Launch the server
-  from the project directory — the systemd unit's `WorkingDirectory`, the
-  container's `WORKDIR /app`, and the README's `cwd` setting all do — or each
-  directory you start it from gets its own self-signed certificate (breaking the
-  stable-certificate-pin property) and its own copy of generated honeytoken
-  keys. Making them settings means changing the tests that `chdir` to isolate
-  them.
-- **Packet-capture ring files use tcpdump's default permissions** (usually 0644).
-  The ring holds raw attacker sessions. Tightening it risks the tcpdump
-  privilege-drop user being unable to rotate files, which would end capture, so
-  restrict the directory instead (`chmod 700` the parent, run tcpdump as the
-  server user via `setcap`). Extracts written by `pcap_extract` are created 0600
-  and refuse to overwrite.
-- **Grafana cannot read a 0700 `data/` directory.** `docs/DEPLOY.md` recommends
-  `chmod 700 data` and the unit sets `UMask=0077`, but the observability compose
-  mounts the SQLite file into Grafana (uid 472) read-only, which cannot traverse
-  it. Use a shared group with mode 0750 (`group_add`) if you run the dashboards
-  against the host path.
-
+- **Dashboards against a host daemon need one group, not a looser directory.**
+  The daemon keeps `data/` private (`0700`), which Grafana (a container, uid 472)
+  cannot read. `docs/DEPLOY.md` step 9 gives read access to a dedicated
+  `honeypot-db` group and hands only the Grafana container that group
+  (`HONEYPOT_DB_GID`, required by `docker-compose.observability.yml`); the
+  `deploy/grafana-readable.conf` drop-in makes the daemon write group-readable
+  files. Skip all of it if you do not run the dashboards. The all-in-one compose
+  stack shares a volume and needs none of this.
+- **Packet-capture rings are owner-only.** tcpdump runs under `umask 077` in a
+  private directory, and when started as root it drops to a user that owns the
+  directory. Extracts written by `pcap_extract` are `0600` and refuse to overwrite.
+- **`tls/` and `reports/generated/` follow settings, not the working
+  directory** (`tls_dir`, `reports_dir`), so starting the server from another
+  directory no longer mints a second certificate or a second copy of generated
+  honeytoken keys.

@@ -187,8 +187,9 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "`mstshash` cookie, which nearly every RDP client and brute-force tool "
             "sends in the clear."
         ),
-        signature_events=("rdp_handshake", "rdp_connection"),
-        config_options=(),
+        signature_events=("rdp_handshake", "rdp_connection", "rdp_nla_auth", "rdp_nla_negotiate"),
+        captures_credentials_as="rdp",
+        config_options=("rdp_hostname", "rdp_domain"),
         pairs_well_with=("smb", "ldap"),
         notes="One of the largest brute-force categories on the internet.",
     ),

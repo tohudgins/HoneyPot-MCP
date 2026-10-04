@@ -152,7 +152,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Lateral Movement",
     ),
     (
-        re.compile(r"rdp.{0,40}(handshake|mcs|connection)", re.I),
+        re.compile(r"rdp.{0,40}(handshake|mcs|connection|nla_negotiate|nla_probe)", re.I),
         "T1021.001",
         "Remote Services: Remote Desktop Protocol",
         "Lateral Movement",

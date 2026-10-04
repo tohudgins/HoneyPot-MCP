@@ -18,9 +18,10 @@ them is a single-curl tell.
 Session cookies are issued on every request using the persona's cookie name
 (`PHPSESSID` / `ASP.NET_SessionId` / etc). The session id is tracked
 in-process: repeat visits from the same session bump severity (signals
-active reconnaissance vs one-shot scanner). Sessions are not authenticated
-— we never accept any login because a real hardened login page rejects
-unknown users, and "accepts any password" is itself a fingerprint.
+active reconnaissance vs one-shot scanner). A login succeeds only for a planted
+honeytoken credential or the one weak pair derived from the honeypot's name (see
+`http_admin.py`): "accepts any password" would be a fingerprint, but a login that
+never succeeds means a spraying bot never shows what it does with a foothold.
 
 TLS: setting `config["tls"] = True` at deploy time enables HTTPS on the
 configured port using a self-signed cert generated lazily via
@@ -50,6 +51,14 @@ from sqlalchemy import update
 
 from honeypot_mcp.engines import http_endpoints
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.http_admin import (
+    DASHBOARD,
+    accepted_pairs,
+    backup_download,
+    pick_credentials,
+)
+from honeypot_mcp.engines.http_admin import render as render_admin
+from honeypot_mcp.engines.http_admin import route as admin_route_for
 from honeypot_mcp.engines.http_personas import (
     HTTPPersona,
     get_persona,
@@ -684,6 +693,7 @@ class HTTPEngine(HoneypotEngine):
         # Per-honeypot in-memory session store. Keyed by session_id (cookie
         # value). Two honeypots don't share state.
         session_table = _SessionTable()
+        accepted_logins = accepted_pairs(honeypot_name, config.get("accepted_logins"))
 
         def _get_or_create_session(request: web.Request) -> tuple[str, dict[str, Any], bool]:
             """Return `(session_id, session_dict, is_new)`."""
@@ -823,6 +833,48 @@ class HTTPEngine(HoneypotEngine):
             return await _serve_with_persona(request, payload_body, content_type="application/json")
 
         # ── Main catch-all handler ──────────────────────────────────────
+        async def _serve_admin(
+            request: web.Request,
+            admin_route: tuple[str, str],
+            sess: dict[str, Any],
+            response_headers: dict[str, str],
+        ) -> web.Response:
+            """Answer a request for the admin console, or send the visitor to log in."""
+            username = sess.get("auth")
+            if not username:
+                return web.Response(status=302, headers={**response_headers, "Location": "/login"})
+            kind, target = admin_route
+            if kind == "download":
+                data = backup_download(honeypot_name, target)
+                if data is None:
+                    return web.Response(
+                        text=persona.render_not_found(request.headers.get("Host", "localhost")),
+                        content_type="text/html",
+                        status=404,
+                        headers=response_headers,
+                    )
+                return web.Response(
+                    body=data,
+                    content_type="application/octet-stream",
+                    headers={
+                        **response_headers,
+                        "Content-Disposition": f'attachment; filename="{target}"',
+                    },
+                )
+            page = render_admin(
+                target,
+                seed=honeypot_name,
+                hostname=request.headers.get("Host", "localhost").split(":")[0],
+                username=username,
+                method=request.method,
+            )
+            return web.Response(
+                text=page.body,
+                content_type=page.content_type,
+                status=page.status,
+                headers=response_headers,
+            )
+
         async def _handle(request: web.Request) -> web.Response:
             path = request.path
             method = request.method
@@ -912,7 +964,17 @@ class HTTPEngine(HoneypotEngine):
                 if _SEV_RANK[exploit_sev] > _SEV_RANK[severity]:
                     severity = exploit_sev
 
+            authed_user = sess.get("auth")
+            if authed_user:
+                # Everything a logged-in visitor does is the part we could not see
+                # before; it ranks above a probe whatever it asks for.
+                if event_type in ("http_probe", "http_active_recon"):
+                    event_type = "http_authenticated_request"
+                if _SEV_RANK[AlertSeverity.HIGH] > _SEV_RANK[severity]:
+                    severity = AlertSeverity.HIGH
+
             payload: dict[str, Any] = {
+                "authenticated_as": authed_user,
                 "method": method,
                 "path": clip(path, _MAX_PATH_CHARS),
                 "user_agent": clip(user_agent, _MAX_USER_AGENT_CHARS),
@@ -936,15 +998,14 @@ class HTTPEngine(HoneypotEngine):
             if exploit_categories:
                 payload["exploit_categories"] = exploit_categories
 
-            await submit_event(
-                PendingEvent(
-                    honeypot_id=hp_id,
-                    source_ip=request.remote or "0.0.0.0",
-                    event_type=event_type,
-                    payload=payload,
-                    severity=severity,
-                )
+            submitted_event = PendingEvent(
+                honeypot_id=hp_id,
+                source_ip=request.remote or "0.0.0.0",
+                event_type=event_type,
+                payload=payload,
+                severity=severity,
             )
+            await submit_event(submitted_event)
 
             if persona.jitter_ms_max > 0:
                 delay_s = random.uniform(persona.jitter_ms_min, persona.jitter_ms_max) / 1000.0
@@ -952,12 +1013,28 @@ class HTTPEngine(HoneypotEngine):
 
             response_headers = _persona_headers()
 
-            # POST /login: rotate the auth-failed wording AND add extra
-            # variable timing on top of the persona jitter. A real login
-            # endpoint does a password hash compare (100-500ms); a fixed
-            # sub-ms uniform response is itself a single-probe tell.
+            # POST /login. A credential that is planted (the event buffer marked
+            # it) or in this honeypot's accepted set logs in; anything else gets
+            # the rotating failure page. Extra variable timing sits on top of the
+            # persona jitter either way: a real login endpoint hashes a password
+            # (100-500 ms), and a fixed sub-ms reply is itself a tell.
             if method == "POST" and path == "/login":
                 await asyncio.sleep(random.uniform(0.18, 0.65))
+                user, password = pick_credentials(post_data)
+                planted = submitted_event.honeytoken_id is not None
+                if user and ((user.lower(), password) in accepted_logins or planted):
+                    sess["auth"] = user[:64]
+                    await _record(
+                        request,
+                        "http_login_success",
+                        AlertSeverity.HIGH,
+                        {"username": clip(user, 128), "planted_credential": planted},
+                    )
+                    resp = web.Response(
+                        status=302, headers={**response_headers, "Location": DASHBOARD}
+                    )
+                    _set_session_cookie(resp, sid)
+                    return resp
                 variant = random.choice(_LOGIN_FAILURE_VARIANTS)
                 login_html = (
                     "<!DOCTYPE html><html><head><title>Sign in</title></head><body>"
@@ -976,6 +1053,22 @@ class HTTPEngine(HoneypotEngine):
                     status=401,
                     headers=response_headers,
                 )
+                if is_new:
+                    _set_session_cookie(resp, sid)
+                return resp
+
+            if path == "/logout":
+                sess.pop("auth", None)
+                resp = web.Response(status=302, headers={**response_headers, "Location": "/login"})
+                if is_new:
+                    _set_session_cookie(resp, sid)
+                return resp
+
+            # The admin console: only behind a successful login. Asked for without
+            # one it bounces to the login page, like any application would.
+            admin_route = admin_route_for(path) if accepted_logins or sess.get("auth") else None
+            if admin_route is not None:
+                resp = await _serve_admin(request, admin_route, sess, response_headers)
                 if is_new:
                     _set_session_cookie(resp, sid)
                 return resp

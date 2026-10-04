@@ -280,6 +280,12 @@ class Settings(BaseSettings):
     # /app/reports and mounts a volume over it.
     reports_dir: Path = _PROJECT_ROOT / "reports"
 
+    # Self-signed certificates and their private keys, one directory per honeypot.
+    # Anchored like `reports_dir` (not to the working directory), so launching the
+    # server from another directory does not mint a second certificate per sensor —
+    # a scanner pinning the certificate would see the identity change.
+    tls_dir: Path = _PROJECT_ROOT / "tls"
+
     # ── Control plane / delivery hardening (slice C1) ───────────────────────
     # Webhook/syslog/SMTP destinations are validated at subscribe AND delivery
     # time. Link-local (cloud metadata), unspecified, multicast and reserved
@@ -348,7 +354,12 @@ class Settings(BaseSettings):
         return f"{scheme}:///{(_PROJECT_ROOT / path).as_posix()}"
 
     @field_validator(
-        "geoip_db_path", "geoip_asn_db_path", "mitre_data_path", "reports_dir", mode="after"
+        "geoip_db_path",
+        "geoip_asn_db_path",
+        "mitre_data_path",
+        "reports_dir",
+        "tls_dir",
+        mode="after",
     )
     @classmethod
     def _anchor_to_project_root(cls, v: Path) -> Path:

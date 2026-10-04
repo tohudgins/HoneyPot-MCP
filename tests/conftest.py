@@ -67,3 +67,18 @@ def _fresh_postgres_schema():
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(_reset_postgres_schema, dsn).result(timeout=60)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_data_dirs(tmp_path, monkeypatch):
+    """Point certificate and generated-artifact directories at the test's tmp dir.
+
+    They are settings now (`tls_dir`, `reports_dir`), anchored to the project root
+    rather than the working directory — so a test that used to isolate them with
+    `chdir(tmp_path)` would otherwise write real certificates and private keys into
+    the repository."""
+    from honeypot_mcp.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "tls_dir", tmp_path / "tls")
+    monkeypatch.setattr(settings, "reports_dir", tmp_path / "reports")

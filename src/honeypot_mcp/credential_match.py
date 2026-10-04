@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.credential_verify import verify_mysql, verify_vnc
+from honeypot_mcp.engines.rdp_nla import verify_ntlmv2
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
 
@@ -41,7 +42,7 @@ CRED_REFRESH_SECONDS = 30
 # be matched by exact (service, user, pass) lookup — the engine captures a
 # salted digest instead, verified against candidate passwords in
 # `credential_verify`. See `_match_hashed`.
-_HASHED_SERVICES = {"mysql", "vnc"}
+_HASHED_SERVICES = {"mysql", "vnc", "rdp"}
 
 # (service, username_lower, password) → token_id
 # Usernames are lowercased on insert AND lookup; passwords stay case-sensitive.
@@ -147,6 +148,7 @@ _SERVICE_PREFIXES = {
     "redis_": "redis",
     "mysql_": "mysql",
     "vnc_": "vnc",
+    "rdp_": "rdp",
 }
 
 
@@ -239,6 +241,20 @@ def _match_hashed(service: str, payload: dict) -> int | None:
         # password regardless of the token's username field.
         for _u, pw, token_id in candidates:
             if verify_vnc(challenge, resp, pw):
+                return token_id
+        return None
+
+    if service == "rdp":
+        challenge = _decode_hex(payload.get("server_challenge_hex"))
+        nt_response = _decode_hex(payload.get("nt_response_hex"))
+        if challenge is None or nt_response is None:
+            return None
+        username = str(payload.get("username") or "")
+        domain = str(payload.get("domain") or "")
+        for u, pw, token_id in candidates:
+            if u == username.strip().lower() and verify_ntlmv2(
+                challenge, nt_response, username, domain, pw
+            ):
                 return token_id
         return None
 

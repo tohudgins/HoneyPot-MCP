@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1085 unit tests covering security-critical paths)
+# Tests (1137 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -177,7 +177,7 @@ is the only test that can catch a regression here — unit tests feed synthetic
 JSON to the parser and pass either way.
 
 User escape hatch: explicit `fake_hostname` / `fake_kernel` keys in config
-override the persona-chosen values. The `cowrie.cfg` defaults are the baseline
+override the persona-chosen values. Cowrie's own `cowrie.cfg` defaults are the baseline
 those env vars override.
 
 Adding a persona: append to `_PERSONAS` in `ssh_personas.py`. Keep distro
@@ -869,7 +869,7 @@ a hot path is invisible until the DB is large.
 
 ### Docker
 
-SSH honeypots use Cowrie via Docker (`docker/cowrie/cowrie.cfg`). The HTTP honeypot has a minimal Docker image at `docker/http-honeypot/`. Run the full stack from `docker/`:
+SSH honeypots use Cowrie via Docker (`docker/cowrie/build_persona_fs.py` builds its persona filesystem). The HTTP honeypot has a minimal Docker image at `docker/http-honeypot/`. Run the full stack from `docker/`:
 ```bash
 docker compose up -d
 ```
@@ -1363,4 +1363,17 @@ to reduce alert latency.
   `alert_subscribe`; syslog connects to the validated address.
 - **The canary's global rate ceiling applies only to requests that matched a
   token**, so a flood of random ids cannot starve a real trigger.
+- **Fidelity invariants.** Listing, size and bytes come from one source (FTP file
+  tree; HTTP backups reuse it). SMTP/FTP/HTTP/RDP answer in the dialect of the product
+  they claim, verified with the real client (`ftplib`, `smtplib`, `httpx`, `nmap`,
+  pyspnego), not only unit-level parsers. A new engine behaviour should be checked
+  with the tool an attacker would use.
+- **Cowrie persona = env vars + a rewritten `fs.pickle`.** Kernel/OS/platform are
+  `[shell]` settings (`COWRIE_SHELL_*`); everything else an attacker `cat`s comes from
+  `engines/cowrie_fs.py`. Do not write `/etc/issue.net` (non-empty = pre-auth banner).
+  `ssh.py` creates the container, extracts the rewritten pickle into an anonymous
+  volume at `/cowrie/persona`, then starts it; failure falls back to Cowrie's default
+  with a warning. The compose stack builds the same file in `cowrie-persona-init`.
+- **Transient DB errors are retried, permanent ones are not.** `EventBuffer._write_retrying`.
+- `tls_dir` / `reports_dir` are settings; tests redirect both to `tmp_path` (conftest).
 

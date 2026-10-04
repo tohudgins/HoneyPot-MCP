@@ -315,12 +315,37 @@ honeypots keep collecting after your chat and your SSH tunnel close.
 
 ### 9. (Optional) Bring up the Grafana dashboards
 
+The data directory is private (`0700`), which Grafana (a container, uid 472)
+cannot read. Rather than loosening it for everyone, give read access to one
+dedicated group and give that group only to the Grafana container:
+
 ```bash
+# A group that exists only to read the database.
+sudo groupadd --system honeypot-db
+
+# The directory belongs to the service user as before, but its group is the new one,
+# setgid so every file the daemon creates inherits it. 2750 = owner rwx, group r-x.
+sudo chgrp honeypot-db /opt/honeypot-mcp/data
+sudo chmod 2750 /opt/honeypot-mcp/data
+
+# Files the daemon creates from now on should be group-readable (0640), not 0600.
+sudo mkdir -p /etc/systemd/system/honeypot-mcp.service.d
+sudo cp deploy/grafana-readable.conf /etc/systemd/system/honeypot-mcp.service.d/
+sudo systemctl daemon-reload && sudo systemctl restart honeypot-mcp
+# Existing database files keep their old mode; fix them once:
+sudo chgrp honeypot-db /opt/honeypot-mcp/data/honeypot_mcp.db*
+sudo chmod 0640 /opt/honeypot-mcp/data/honeypot_mcp.db*
+
 cd /opt/honeypot-mcp/docker
 export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, no default — keep it
+HONEYPOT_DB_GID="$(getent group honeypot-db | cut -d: -f3)" \
 HONEYPOT_DB_DIR=/opt/honeypot-mcp/data \
   docker compose -f docker-compose.observability.yml up -d
 ```
+
+`HONEYPOT_DB_GID` is required and gives Grafana that one supplementary group. If
+you skip the dashboards entirely, skip all of this: the unit's `UMask=0077` and the
+`0700` directory stay as they are.
 
 This starts Prometheus + Grafana pointed at the daemon's SQLite DB and
 `/metrics` endpoint (both read-only). `HONEYPOT_DB_DIR` is required and must be

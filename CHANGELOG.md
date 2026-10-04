@@ -4,6 +4,54 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Fidelity: what a human probing by hand would notice
+
+The limitations list named the places a skilled person could tell the engines from
+the real thing. Each was measured against the real tool and fixed, not described.
+
+- **FTP** serves files. `LIST`, `SIZE`, `MDTM`, `CWD`, `REST` and `RETR` come from one
+  file tree (`engines/ftp_fs.py`), so a listed size is the length of the bytes that
+  download; the archives really gunzip/untar; `EPSV` (advertised in FEAT but never
+  implemented) works; unknown commands get ProFTPD's `500`. A data listener closed
+  before the `226` used to be able to kill the client's *next* `PASV`.
+- **SMTP** speaks Postfix: out-of-sequence commands get `503`, an unknown local
+  mailbox is `550 5.1.1`, `VRFY` distinguishes mailboxes (it answered `252` to
+  everything), the EHLO greeting is the bare hostname. `nmap smtp-enum-users` now
+  finds the real mailboxes and only those.
+- **HTTP** has an authenticated area (`engines/http_admin.py`): a planted honeytoken
+  credential or one per-honeypot weak pair logs in; the console, its downloads and
+  uploads are recorded as `http_authenticated_request`. `accepted_logins` overrides it.
+- **RDP** does CredSSP/NTLM. The negotiation response carries Windows' flags
+  (`nmap -sV` now says `Microsoft Terminal Services`), `rdp-ntlm-info` reads a stable
+  Windows identity, and the NetNTLMv2 response is captured as a `hashcat -m 5600` line
+  and verified against an independent client (pyspnego); a planted RDP password trips
+  its honeytoken from the response alone. NTLMv2 maths is checked against MS-NLMP's
+  published vector.
+- **Cowrie persona.** The persona's kernel/OS settings were set in the wrong Cowrie
+  config section (`[honeypot]` instead of `[shell]`), so `uname` kept reporting the
+  image's own Debian kernel whatever persona was chosen — invisible to the unit
+  tests, which pinned the wrong names. Fixed, and the bundled filesystem is now
+  rewritten per persona (`/etc/hostname`, `issue`, `os-release`, `/proc/version`,
+  accounts, MOTD, a home directory; `phil` gone). Delivered into the container through
+  an anonymous volume — Docker refuses to extract an archive into a read-only
+  rootfs — and the compose stack builds the same filesystem with a one-shot init job.
+  A Docker-gated test deploys all four personas and compares what an attacker reads.
+  One mistake worth recording: filling `/etc/issue.net` made Cowrie send it as a
+  pre-auth banner on every connection, which a stock `sshd` does not do; found by
+  reading stderr of a live login, now asserted.
+- `tls/` and `reports/generated/` follow settings instead of the working directory;
+  tcpdump rings are `0600` in a private directory (via an `sh` `umask` wrapper, not
+  `preexec_fn`, which is unsafe with threads); Grafana can read a host database through
+  one dedicated group instead of a looser directory.
+- **Event buffer:** a transient database error (`OperationalError`: a locked SQLite
+  file, a dropped connection, a deadlock) used to be retried immediately and then each
+  event was dropped as "refused by the database". It now backs off for ~1.5 s before
+  giving up; a genuinely rejected row still costs only itself. Found because the new
+  tests flaked on shared in-memory SQLite.
+- **Compose:** `honeypot-net` pinned `172.20.0.0/24`, inside the range Docker
+  auto-assigns to the other networks, so `up` failed on hosts where creation order or
+  existing networks collided. The pin was never needed and is gone.
+
 ## Second independent review, hostile-traffic run, and Cowrie egress
 
 Two more reviewers (control plane/secrets, engines/deployment) and a run of real

@@ -105,6 +105,25 @@ def _domain_of(addr: str) -> str:
     return addr.rsplit("@", 1)[-1].lower() if "@" in addr else ""
 
 
+# `MAIL FROM:<a@b> SIZE=123 BODY=8BITMIME` / `RCPT TO:<a@b>`: the keyword, an
+# optional space (Postfix tolerates `FROM: <a@b>`), the path, then ESMTP params.
+_MAIL_RE = re.compile(r"MAIL\s+FROM\s*:\s*(<[^<>]*>|[^\s<>]*)(.*)", re.I | re.S)
+_RCPT_RE = re.compile(r"RCPT\s+TO\s*:\s*(<[^<>]*>|[^\s<>]+)(.*)", re.I | re.S)
+_MAX_RCPTS = 100  # Postfix's smtpd_recipient_limit default
+
+# Mailboxes that exist on every persona's host. Fixed (not per-honeypot random):
+# a real server's directory is stable, and an attacker who learns that `info@`
+# exists must find it still exists on the next probe.
+_LOCAL_MAILBOXES = frozenset(
+    {
+        "root", "postmaster", "abuse", "webmaster", "hostmaster", "admin",
+        "administrator", "info", "support", "sales", "contact", "mail",
+        "noreply", "no-reply", "security", "billing", "helpdesk", "it",
+        "backup", "test", "user", "ftp", "www", "nobody",
+    }
+)  # fmt: skip
+
+
 # Hostname pool used when a honeypot is deployed without an explicit
 # `smtp_hostname` in its config. A scanner that hits two SMTP honeypots in
 # the same project sees different hostnames — defeats trivial correlation.
@@ -140,7 +159,7 @@ _EHLO_EXTENSIONS = (
 
 def _build_ehlo_response(hostname: str) -> bytes:
     """Build the multi-line `EHLO` response with Postfix-style continuation."""
-    lines = [f"250-{hostname} Hello"]
+    lines = [f"250-{hostname}"]
     for ext in _EHLO_EXTENSIONS[:-1]:
         lines.append(f"250-{ext}")
     lines.append(f"250 {_EHLO_EXTENSIONS[-1]}")
@@ -166,6 +185,9 @@ class _SMTPProtocol(asyncio.Protocol):
         self._auth_username = ""
         # Envelope tracking for open-relay detection.
         self._mail_from = ""
+        self._txn_open = False  # a MAIL FROM has been accepted and not yet completed
+        self._rcpts: list[str] = []
+        self._helo_seen = False
         self._data_preview_len = 0
         self._starttls_pending = False
         self._wrapper: Any = None
@@ -229,11 +251,18 @@ class _SMTPProtocol(asyncio.Protocol):
 
         upper = line.upper()
 
-        if upper.startswith("EHLO"):
-            t.write(_build_ehlo_response(self._hostname))
-        elif upper.startswith("HELO"):
-            # Legacy single-line greeting — Postfix-correct, no extensions.
-            t.write(f"250 {self._hostname}\r\n".encode())
+        if upper.startswith("EHLO") or upper.startswith("HELO"):
+            verb = upper[:4]
+            if len(line.split()) < 2:
+                t.write(f"501 Syntax: {verb} hostname\r\n".encode())
+            else:
+                self._helo_seen = True
+                self._reset_transaction()  # EHLO/HELO abandons any open transaction
+                if verb == "EHLO":
+                    t.write(_build_ehlo_response(self._hostname))
+                else:
+                    # Legacy single-line greeting — Postfix-correct, no extensions.
+                    t.write(f"250 {self._hostname}\r\n".encode())
         elif upper == "STARTTLS":
             if self._tls_active:
                 t.write(b"503 5.5.1 TLS already active\r\n")
@@ -252,34 +281,100 @@ class _SMTPProtocol(asyncio.Protocol):
                 spawn(self._upgrade_to_tls(), name="smtp-starttls")
         elif upper.startswith("AUTH"):
             self._handle_auth(line, upper)
-        elif upper.startswith("MAIL FROM"):
-            self._mail_from = _extract_addr(line)
-            t.write(b"250 2.1.0 Ok\r\n")
+        elif upper.startswith("MAIL"):
+            self._handle_mail(line, upper)
+        elif upper.startswith("RCPT"):
+            self._handle_rcpt(line, upper)
+        elif upper == "DATA":
+            if not self._txn_open:
+                t.write(b"503 5.5.1 Error: need MAIL command\r\n")
+            elif not self._rcpts:
+                # Postfix distinguishes "never sent RCPT" from "every RCPT refused".
+                t.write(b"554 5.5.1 Error: no valid recipients\r\n")
+            else:
+                t.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                self._in_data = True
+                self._data_lines = []
+                self._data_size = 0
+        elif upper.startswith("VRFY"):
+            self._handle_vrfy(line)
+        elif upper.startswith("ETRN"):
+            if upper == "ETRN":
+                t.write(b"500 5.5.2 Syntax: ETRN domain\r\n")
+            else:
+                t.write(f"459 4.7.0 <{_clip(line[4:].strip())}>: service unavailable\r\n".encode())
+        elif upper == "RSET":
+            self._reset_transaction()
+            t.write(b"250 2.0.0 Ok\r\n")
+        elif upper == "NOOP" or upper.startswith("NOOP "):
+            t.write(b"250 2.0.0 Ok\r\n")
+        elif upper == "QUIT":
+            t.write(b"221 2.0.0 Bye\r\n")
+            t.close()
+        else:
+            t.write(b"502 5.5.2 Error: command not recognized\r\n")
+
+    def _handle_mail(self, line: str, upper: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        m = _MAIL_RE.match(line.strip())
+        if not m:
+            t.write(b"501 5.5.4 Syntax: MAIL FROM:<address>\r\n")
+            return
+        if self._txn_open:
+            t.write(b"503 5.5.1 Error: nested MAIL command\r\n")
+            return
+        size = re.search(r"\bSIZE=(\d+)", m.group(2) or "", re.I)
+        if size and int(size.group(1)) > _MAX_MESSAGE_BYTES:
+            t.write(b"552 5.3.4 Error: message size exceeds fixed limit\r\n")
+            return
+        self._mail_from = _extract_addr(line)
+        self._txn_open = True
+        self._rcpts = []
+        t.write(b"250 2.1.0 Ok\r\n")
+        spawn(
+            self._record_event(
+                "smtp_mail_from",
+                AlertSeverity.MEDIUM,
+                {"command": _clip(line), "address": _clip(self._mail_from)},
+            ),
+            name="smtp-record",
+        )
+
+    def _handle_rcpt(self, line: str, upper: str) -> None:
+        t = self._transport
+        if t is None:
+            return
+        m = _RCPT_RE.match(line.strip())
+        if not m:
+            t.write(b"501 5.5.4 Syntax: RCPT TO:<address>\r\n")
+            return
+        if not self._txn_open:
+            t.write(b"503 5.5.1 Error: need MAIL command\r\n")
+            return
+        if len(self._rcpts) >= _MAX_RCPTS:
+            t.write(b"452 4.5.3 Error: too many recipients\r\n")
+            return
+        rcpt = _extract_addr(line)
+        to_dom = _domain_of(rcpt)
+        if not to_dom:
+            t.write(
+                f"504 5.5.2 <{_clip(rcpt)}>: Recipient address rejected: "
+                "need fully-qualified address\r\n".encode()
+            )
+            return
+        if self._is_local_domain(to_dom) and not self._is_known_mailbox(rcpt):
+            # A mailbox this host does not have: what Postfix says, and what a
+            # directory-harvest run needs to keep it enumerating.
+            t.write(
+                f"550 5.1.1 <{_clip(rcpt)}>: Recipient address rejected: "
+                "User unknown in local recipient table\r\n".encode()
+            )
             spawn(
                 self._record_event(
-                    "smtp_mail_from",
+                    "smtp_user_enum",
                     AlertSeverity.MEDIUM,
-                    {"command": _clip(line), "address": _clip(self._mail_from)},
-                ),
-                name="smtp-record",
-            )
-        elif upper.startswith("RCPT TO"):
-            rcpt = _extract_addr(line)
-            t.write(b"250 2.1.5 Ok\r\n")
-            # Open-relay probe: the server is asked to deliver from an external
-            # sender to an external recipient (neither is a domain we host).
-            # Accepting this is the classic open-relay abuse spammers scan for.
-            from_dom = _domain_of(self._mail_from)
-            to_dom = _domain_of(rcpt)
-            is_relay = (
-                bool(from_dom and to_dom)
-                and not self._is_local_domain(to_dom)
-                and not self._is_local_domain(from_dom)
-            )
-            spawn(
-                self._record_event(
-                    "smtp_open_relay" if is_relay else "smtp_rcpt_to",
-                    AlertSeverity.HIGH if is_relay else AlertSeverity.MEDIUM,
                     {
                         "command": _clip(line),
                         "mail_from": _clip(self._mail_from),
@@ -288,32 +383,81 @@ class _SMTPProtocol(asyncio.Protocol):
                 ),
                 name="smtp-record",
             )
-        elif upper == "DATA":
-            t.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
-            self._in_data = True
-            self._data_lines = []
-            self._data_size = 0
-        elif upper.startswith("VRFY"):
-            t.write(b"252 2.5.2 Send some mail, I'll try my best\r\n")
-            spawn(
-                self._record_event("smtp_vrfy", AlertSeverity.LOW, {"command": _clip(line)}),
-                name="smtp-record",
-            )
-        elif upper.startswith("ETRN"):
-            t.write(b"500 5.5.2 Need account name\r\n")
-        elif upper in ("RSET", "NOOP"):
-            t.write(b"250 2.0.0 Ok\r\n")
-        elif upper == "QUIT":
-            t.write(b"221 2.0.0 Bye\r\n")
-            t.close()
+            return
+        self._rcpts.append(rcpt)
+        t.write(b"250 2.1.5 Ok\r\n")
+        # Open-relay probe: the server is asked to deliver from an external
+        # sender to an external recipient (neither is a domain we host).
+        # Accepting this is the classic open-relay abuse spammers scan for.
+        from_dom = _domain_of(self._mail_from)
+        is_relay = (
+            bool(from_dom and to_dom)
+            and not self._is_local_domain(to_dom)
+            and not self._is_local_domain(from_dom)
+        )
+        spawn(
+            self._record_event(
+                "smtp_open_relay" if is_relay else "smtp_rcpt_to",
+                AlertSeverity.HIGH if is_relay else AlertSeverity.MEDIUM,
+                {
+                    "command": _clip(line),
+                    "mail_from": _clip(self._mail_from),
+                    "rcpt_to": _clip(rcpt),
+                },
+            ),
+            name="smtp-record",
+        )
+
+    def _handle_vrfy(self, line: str) -> None:
+        """Postfix's default VRFY: 252 for a mailbox it has, 550 5.1.1 for one it
+        does not — the answer a real server gives, and what an enumeration run
+        needs to see in order to keep going."""
+        t = self._transport
+        if t is None:
+            return
+        arg = line[4:].strip()
+        if not arg:
+            t.write(b"501 5.5.4 Syntax: VRFY address\r\n")
+            return
+        addr = _extract_addr(f"VRFY:{arg}") if "<" in arg else arg
+        domain = _domain_of(addr)
+        if domain and not self._is_local_domain(domain):
+            t.write(f"554 5.7.1 <{_clip(addr)}>: Relay access denied\r\n".encode())
+        elif self._is_known_mailbox(addr):
+            full = addr if "@" in addr else f"{addr}@{self._hostname}"
+            t.write(f"252 2.0.0 {_clip(full)}\r\n".encode())
         else:
-            t.write(b"502 5.5.2 Error: command not recognized\r\n")
+            t.write(
+                f"550 5.1.1 <{_clip(addr)}>: Recipient address rejected: "
+                "User unknown in local recipient table\r\n".encode()
+            )
+        spawn(
+            self._record_event("smtp_vrfy", AlertSeverity.LOW, {"command": _clip(line)}),
+            name="smtp-record",
+        )
+
+    @property
+    def _local_domains(self) -> frozenset[str]:
+        """The domains this host accepts mail for: its own name and the domain
+        above it (`mail.corp.local` hosts `corp.local`)."""
+        host = self._hostname.lower()
+        parent = host.partition(".")[2]
+        return frozenset({host, parent} - {""})
 
     def _is_local_domain(self, domain: str) -> bool:
-        """True if `domain` is one we'd plausibly host (matches our hostname).
-        Anything else is an external destination — the relay signal."""
-        host = self._hostname.lower()
-        return not domain or domain == host or host.endswith("." + domain) or domain in host
+        """True if `domain` is one we host. Anything else is an external
+        destination — the relay signal."""
+        return domain.lower() in self._local_domains
+
+    def _is_known_mailbox(self, addr: str) -> bool:
+        """A local-part that exists on this host (case-insensitively)."""
+        local = addr.rsplit("@", 1)[0].lower() if "@" in addr else addr.lower()
+        return local in _LOCAL_MAILBOXES
+
+    def _reset_transaction(self) -> None:
+        self._txn_open = False
+        self._mail_from = ""
+        self._rcpts = []
 
     def _handle_auth(self, line: str, upper: str) -> None:
         t = self._transport
@@ -417,6 +561,7 @@ class _SMTPProtocol(asyncio.Protocol):
             self._data_lines = []
             self._data_size = 0
             self._data_preview_len = 0
+            self._reset_transaction()  # a completed message ends the transaction
             return
         # SMTP dot-stuffing: a line starting with `..` represents a literal `.`
         if line.startswith(".."):
@@ -460,6 +605,8 @@ class _SMTPProtocol(asyncio.Protocol):
             self._buf = b""
             self._in_data = False
             self._data_lines = []
+            self._reset_transaction()  # RFC 3207: the session is reset after STARTTLS
+            self._helo_seen = False
             self._data_size = 0
             log.info("STARTTLS upgrade succeeded for %s", self._peer[0])
             await self._record_event(

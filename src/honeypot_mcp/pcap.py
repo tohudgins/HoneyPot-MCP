@@ -44,6 +44,50 @@ from pathlib import Path
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.secure_io import ensure_private_dir
+
+
+def _private_launch(command: list[str]) -> list[str]:
+    """Wrap `command` so it runs under umask 077 and its files are owner-only.
+
+    tcpdump creates ring files with whatever umask it inherits (a default 022
+    gives 0644), and they hold raw attacker sessions: cleartext credentials,
+    planted honeytoken values, payloads. A `sh` wrapper that sets the umask and
+    `exec`s the real command does this without `preexec_fn`, which the standard
+    library documents as unsafe in a process that has threads (this one does).
+    Not applied off POSIX, where there is no umask to set.
+    """
+    if os.name != "posix":
+        return command
+    return ["/bin/sh", "-c", 'umask 077 && exec "$@"', "honeypot-capture", *command]
+
+
+def capture_drop_args(directory: Path) -> list[str]:
+    """tcpdump arguments that make a root-started capture drop to a user who can
+    write `directory`, and hand that user the directory.
+
+    Started as root, tcpdump opens the interface and then drops privileges (its
+    default user is `tcpdump` or `nobody`, by build), after which it could not
+    write into a root-owned 0700 directory — the capture would die the moment it
+    first rotates. So pick the user explicitly and give it the directory. Not root
+    (the `setcap` deployment): tcpdump cannot drop anything, the ring is already
+    owned by the server's own user, and no arguments are needed.
+    """
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() != 0:
+        return []
+    import pwd
+
+    for candidate in ("tcpdump", "nobody"):
+        try:
+            entry = pwd.getpwnam(candidate)
+        except KeyError:
+            continue
+        with contextlib.suppress(OSError):
+            os.chown(directory, entry.pw_uid, entry.pw_gid)
+        return ["-Z", candidate]
+    return []
+
 
 log = logging.getLogger(__name__)
 
@@ -246,7 +290,12 @@ class PcapCapture:
             return {"started": False, **capability.as_dict()}
 
         directory = self._directory()
-        directory.mkdir(parents=True, exist_ok=True)
+        # Owner-only, like every other place this server keeps private material.
+        # When we run as root, tcpdump drops privileges to another user *after*
+        # opening the interface and writes the ring as that user, so it has to own
+        # the directory; root can still read it regardless.
+        ensure_private_dir(directory)
+        drop_args = capture_drop_args(directory)
         target = directory / "honeypot.pcap"
 
         command = [
@@ -272,9 +321,10 @@ class PcapCapture:
             "-n",
             bpf,
         ]
+        command[1:1] = drop_args
         try:
             self._process = await asyncio.create_subprocess_exec(
-                *command,
+                *_private_launch(command),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
