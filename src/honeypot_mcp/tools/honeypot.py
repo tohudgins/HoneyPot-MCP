@@ -9,12 +9,14 @@ import secrets
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from sqlalchemy import delete, update
+
 from honeypot_mcp.engines import get_engine
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
+from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_honeypot_name
 
@@ -102,6 +104,13 @@ async def honeypot_deploy(
     resolved_port = port or default_ports[type]
     resolved_name = name or f"{type}-{secrets.token_hex(4)}"
     resolved_config = config or {}
+    # The same allow-list and value checks `honeypot_configure` applies: deploy,
+    # deception_deploy_plan and clone all store this dict verbatim and hand it to
+    # the engine, so a CR/LF in a banner or an unread key slipped in here.
+    if not isinstance(resolved_config, dict):
+        return {"error": "config must be a JSON object."}
+    if err := _validate_config(type, resolved_config):
+        return {"error": err}
 
     if err := validate_honeypot_name(resolved_name):
         return {"error": err}
@@ -355,7 +364,15 @@ async def honeypot_stop(
                 continue
             stopped.append(hp.name)
             if remove:
-                await session.delete(hp)
+                # Never `session.delete(hp)`: with a plain relationship SQLAlchemy
+                # loads every alert the sensor ever captured (full JSON payloads)
+                # just to NULL its honeypot_id one object at a time — gigabytes on a
+                # busy sensor. Two set-based statements do the same in constant memory.
+                await session.execute(
+                    update(Alert).where(Alert.honeypot_id == hp.id).values(honeypot_id=None)
+                )
+                await session.execute(delete(Honeypot).where(Honeypot.id == hp.id))
+                session.expunge(hp)
             else:
                 hp.status = HoneypotStatus.STOPPED
                 hp.container_id = None
@@ -368,7 +385,7 @@ async def honeypot_stop(
         ),
         arguments={"name": name, "names": names, "type": type, "status": status, "remove": remove},
         target=", ".join(stopped)[:128] or None,
-        outcome="error" if failed else "success",
+        outcome="error" if failed else "ok",
         error="; ".join(f["error"] for f in failed) if failed else None,
     )
     # Narrow the capture filter to what is still running — otherwise it keeps

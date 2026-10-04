@@ -220,6 +220,12 @@ services:
     # request URLs of their choosing. COWRIE_HONEYPOT_OUT_ADDR above blocks that
     # in-process (verified: wget/curl to 1.1.1.1 fail with EINVAL), so no host
     # firewall rule is needed. Private ranges are refused by Cowrie regardless.
+    # No resolver either: with egress closed, a hostname fetch would otherwise
+    # still send a real DNS query from this container (visible to the attacker's
+    # resolver, and a way to probe internal names). Set COWRIE_DNS to a real
+    # resolver together with COWRIE_OUT_ADDR=0.0.0.0 to allow downloads.
+    dns:
+      - ${COWRIE_DNS:-127.0.0.1}
     read_only: true
     tmpfs:
       - /tmp:size=16m

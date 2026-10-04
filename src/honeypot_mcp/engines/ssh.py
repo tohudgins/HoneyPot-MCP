@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import time
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
@@ -116,6 +117,9 @@ class SSHEngine(HoneypotEngine):
         # ingestion for. Lets health_check tell "no ingestion expected" from
         # "ingestion died" and respawn it.
         self._ingest_names: dict[str, str] = {}
+        # container_id -> how far its logs have been read. Survives task
+        # restarts so a respawn resumes instead of skipping the gap.
+        self._ingest_cursor: dict[str, datetime] = {}
 
     def _spawn_ingest_task(self, name: str, container_id: str) -> None:
         self._ingest_names[container_id] = name
@@ -145,6 +149,7 @@ class SSHEngine(HoneypotEngine):
         """
         delay = 1.0
         while True:
+            started = time.monotonic()
             try:
                 await self._ingest_logs(name, container_id)
                 return
@@ -154,6 +159,8 @@ class SSHEngine(HoneypotEngine):
                 log.exception(
                     "Log ingestion for SSH honeypot '%s' crashed; restarting in %.0fs", name, delay
                 )
+            if time.monotonic() - started > 60.0:
+                delay = 1.0  # it ran fine for a while: this is a fresh failure, not a crash loop
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60.0)
 
@@ -248,6 +255,11 @@ class SSHEngine(HoneypotEngine):
                 pids_limit=COWRIE_PIDS_LIMIT,
                 nano_cpus=COWRIE_NANO_CPUS,
                 cap_drop=["ALL"],
+                # With egress closed, also stop wget/curl from emitting real DNS
+                # queries (a side channel: the sensor's resolver becomes visible and
+                # internal names probe-able by output differences) by pointing the
+                # container's resolver at its own loopback, where nothing listens.
+                **({} if get_settings().cowrie_allow_egress else {"dns": ["127.0.0.1"]}),
                 read_only=True,
                 tmpfs=COWRIE_TMPFS,
                 security_opt=["no-new-privileges:true"],
@@ -269,6 +281,21 @@ class SSHEngine(HoneypotEngine):
         self._spawn_ingest_task(name, container_id)
         return container_id
 
+    def _warn_if_egress_open(self, container: Any) -> None:
+        """An adopted container keeps the environment it was created with, so one
+        made before the egress control existed still lets an attacker drive its
+        wget/curl at the internet. Say so, once, rather than silently trusting it."""
+        if get_settings().cowrie_allow_egress:
+            return
+        env = (container.attrs.get("Config") or {}).get("Env") or []
+        if not any(str(e).startswith("COWRIE_HONEYPOT_OUT_ADDR=127.") for e in env):
+            log.warning(
+                "Cowrie container %s was created without COWRIE_HONEYPOT_OUT_ADDR=127.0.0.1: "
+                "its wget/curl can still reach the internet. Recreate it (honeypot_stop "
+                "with remove, then redeploy) to apply the egress control.",
+                str(container.id)[:12],
+            )
+
     async def reattach(
         self, name: str, port: int, config: dict[str, Any], container_id: str
     ) -> str:
@@ -280,19 +307,25 @@ class SSHEngine(HoneypotEngine):
             raise RuntimeError("Docker is not available on this system.")
         loop = asyncio.get_event_loop()
 
-        def _container_status() -> str:
+        def _prepare() -> str:
+            """Make the container run again; return its prior status."""
             try:
-                return self._client.containers.get(container_id).status
+                c = self._client.containers.get(container_id)
             except docker.errors.NotFound:
                 return "not_found"
+            previous = str(c.status)
+            if previous == "paused":
+                c.unpause()  # `start` on a paused container is an error
+            elif previous != "running":
+                # exited/created — bring the existing container (and its persona
+                # identity + captured state) back rather than deploying a new one.
+                c.start()
+            self._warn_if_egress_open(c)
+            return previous
 
-        status = await loop.run_in_executor(None, _container_status)
+        status = await loop.run_in_executor(None, _prepare)
         if status == "not_found":
             raise RuntimeError(f"Container {container_id[:12]} no longer exists.")
-        if status != "running":
-            # exited/created — bring the existing container (and its persona
-            # identity + captured state) back rather than deploying a new one.
-            await loop.run_in_executor(None, self._client.containers.get(container_id).start)
         self._spawn_ingest_task(name, container_id)
         log.info(
             "Re-attached log ingestion for SSH honeypot '%s' (container=%s)",
@@ -317,6 +350,7 @@ class SSHEngine(HoneypotEngine):
 
         await loop.run_in_executor(None, _stop)
         self._ingest_names.pop(container_id, None)
+        self._ingest_cursor.pop(container_id, None)
         task = self._ingest_tasks.pop(container_id, None)
         if task is not None and not task.done():
             task.cancel()
@@ -436,9 +470,19 @@ class SSHEngine(HoneypotEngine):
         if not self._client:
             return
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, lambda: self._client.containers.get(container_id).unpause()
-        )
+
+        def _unpause() -> str | None:
+            c = self._client.containers.get(container_id)
+            c.unpause()
+            return str((c.labels or {}).get("honeypot-name") or "") or None
+
+        label_name = await loop.run_in_executor(None, _unpause)
+        # Ingestion must be running after a resume. A server restart while the
+        # container was paused skips it in reconcile, and the old code only
+        # unpaused — the honeypot then read healthy while nothing was recorded.
+        name = self._ingest_names.get(container_id) or label_name
+        if name:
+            self._spawn_ingest_task(name, container_id)
 
     async def _ingest_logs(self, honeypot_name: str, container_id: str) -> None:
         """Background task: tail Cowrie JSON logs and write alerts to the DB.
@@ -477,13 +521,29 @@ class SSHEngine(HoneypotEngine):
         probe_session_order: deque[str] = deque(maxlen=128)
         # Start two seconds in the past to avoid missing logs written between
         # container start and the first poll.
-        last_check = datetime.now(UTC) - timedelta(seconds=2)
+        # Resume where the previous incarnation of this task stopped. A fixed
+        # "two seconds ago" on every (re)start silently skipped everything logged
+        # while the task was down — a Docker hiccup, a pause, a supervisor
+        # restart — which is exactly when attacks are happening.
+        last_check = self._ingest_cursor.get(container_id) or (
+            datetime.now(UTC) - timedelta(seconds=2)
+        )
 
         while True:
             await asyncio.sleep(2)
-            container = await loop.run_in_executor(None, _get_container)
+            try:
+                container = await loop.run_in_executor(None, _get_container)
+            except Exception as e:
+                # A Docker/socket-proxy error is not "the container is gone";
+                # keep the cursor where it is and try again.
+                log.debug("Docker lookup failed for %s: %s", honeypot_name, e)
+                continue
             if container is None:
                 break
+            if container.status in ("paused", "restarting", "created"):
+                # Not producing logs right now, but coming back; stopping here
+                # used to leave ingestion dead until the next health check.
+                continue
             if container.status != "running":
                 break
 
@@ -498,6 +558,7 @@ class SSHEngine(HoneypotEngine):
                 log.debug("Log fetch error for %s: %s", honeypot_name, e)
                 continue
             last_check = now
+            self._ingest_cursor[container_id] = last_check
 
             # Split on "\n" only: str.splitlines() also breaks on \x85, \u2028
             # and friends, which can legitimately sit inside a JSON string

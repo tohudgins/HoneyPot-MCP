@@ -85,7 +85,7 @@ COPY --chown=honeypot:honeypot scripts ./scripts
 # `config/` is for optional operator overrides at runtime (a user-supplied
 # suppression preset, a GeoLite2 database) — the bundled presets and the
 # migrations ship inside the installed package, so nothing is copied into it.
-RUN mkdir -p /app/reports /app/tls /app/data /app/geoip /app/config \
+RUN mkdir -p /app/reports /app/pcap /app/tls /app/data /app/geoip /app/config \
  && chown -R honeypot:honeypot /app
 
 USER honeypot

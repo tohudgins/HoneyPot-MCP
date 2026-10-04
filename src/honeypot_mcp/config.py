@@ -6,10 +6,22 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Project root: src/honeypot_mcp/config.py → parents[2]. Resolves so defaults
-# work no matter what cwd the server was launched from (e.g. Claude Desktop
-# launches MCP servers from C:\WINDOWS\system32, where relative paths fail).
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def _find_project_root(config_file: Path, cwd: Path) -> Path:
+    """The directory defaults (database, reports, pcap, .env) are anchored to.
+
+    A source checkout is recognised by its `pyproject.toml`, and that root is
+    used so the defaults work whatever cwd an MCP client launched the server
+    from (Claude Desktop starts them in C:\\WINDOWS\\system32, where relative
+    paths fail). An *installed* package has no such file: `parents[2]` is then
+    the venv's `lib/pythonX.Y` directory — root-owned in a container, and not
+    somewhere to put a database — so the working directory is used instead."""
+    candidate = config_file.resolve().parents[2]
+    return candidate if (candidate / "pyproject.toml").is_file() else cwd
+
+
+# Project root: src/honeypot_mcp/config.py → parents[2] for a checkout.
+_PROJECT_ROOT = _find_project_root(Path(__file__), Path.cwd())
 
 log = logging.getLogger(__name__)
 

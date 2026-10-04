@@ -115,7 +115,10 @@ def _build_auth() -> Any:
     admin-gated and needs at least one credential to exist first.
     """
     settings = get_settings()
-    if settings.mcp_transport == "stdio":
+    # "none" is collector mode: no control plane is exposed, so no token is
+    # required (see `_networked_auth_error`). Parsing MCP_AUTH_TOKENS here anyway
+    # made a typo in a value the mode never uses crash the import.
+    if settings.mcp_transport in ("stdio", "none"):
         return None
     from honeypot_mcp.rbac import build_combined_verifier, parse_auth_tokens
 

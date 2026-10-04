@@ -92,11 +92,15 @@ async def record_action(
         async with get_session() as session:
             session.add(
                 AuditLog(
-                    tool=tool,
+                    tool=tool[:64],
                     summary=summary,
                     arguments=redact_arguments(arguments or {}),
-                    target=target,
-                    outcome=outcome,
+                    # Column widths PostgreSQL enforces and SQLite ignores: an
+                    # over-long value made the INSERT fail, and `record_action`
+                    # swallows failures — so the action went unaudited.
+                    target=target[:128] if target else None,
+                    # `audit_log_search` filters on exactly "ok" or "error".
+                    outcome="ok" if outcome == "ok" else "error",
                     error=error[:2000] if error else None,
                     actor=current_actor(),
                 )

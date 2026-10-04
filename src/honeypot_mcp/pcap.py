@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import ipaddress
 import logging
+import os
 import shutil
 import struct
 import subprocess
@@ -183,7 +184,11 @@ def merge_pcaps(sources: list[Path], destination: Path) -> int:
     header: bytes | None = None
     total = 0
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as out:
+    # Exclusive create, owner-only: an extract holds raw attacker sessions
+    # (cleartext credentials, replays of planted honeytoken values), and a
+    # caller-chosen name must never truncate an existing archive or export.
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as out:
         for source in sources:
             parsed = _read_pcap(source)
             if parsed is None:
@@ -388,6 +393,13 @@ class PcapCapture:
         if isinstance(resolved, str):
             return {"error": resolved}
         destination = resolved
+        if destination.exists():
+            # Same rule as write_artifact: a model-chosen name must not be able
+            # to overwrite an alert archive or an earlier export.
+            return {
+                "error": f"'{destination.name}' already exists in the reports directory; "
+                "refusing to overwrite it. Pick another output_path."
+            }
         pieces: list[Path] = []
         # A private scratch directory per call. A shared `.extract-<pid>` let
         # one finishing extract rmtree the parts a concurrent one was merging.

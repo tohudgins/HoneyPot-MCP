@@ -265,7 +265,7 @@ def validate_honeypot_name(name: str) -> str | None:
     # but the docstring above promises "'..' are not allowed" outright, and a
     # property-based test holds the code to that literal claim. Reject the
     # substring explicitly rather than loosen the documented contract.
-    if not name or not _NAME_RE.match(name) or ".." in name:
+    if not name or not _NAME_RE.fullmatch(name) or ".." in name:
         return (
             f"Invalid honeypot name {name!r}. Use 1-64 characters: letters, digits, "
             f"dot, dash or underscore, starting with a letter or digit. Names become "
@@ -285,7 +285,15 @@ def validate_ip(ip: str) -> str | None:
     import ipaddress
 
     try:
-        ipaddress.ip_address(ip.strip())
+        addr = ipaddress.ip_address(ip.strip())
+        # `ip_address` accepts IPv6 zone ids ("fe80::1%eth0") whose zone is any
+        # non-empty text — including "..", "?" and "#" — and callers interpolate
+        # the original string into URLs (the VirusTotal request path) and BPF
+        # filters. A zone id has no meaning for a remote attacker, so refuse it,
+        # (Surrounding whitespace stays tolerated, as it always was; the one place
+        # that interpolates the address into a URL normalises it itself.)
+        if getattr(addr, "scope_id", None):
+            raise ValueError("zone id")
     except ValueError:
         return (
             f"'{ip}' is not a valid IPv4 or IPv6 address. Expected something like "

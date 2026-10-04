@@ -305,3 +305,27 @@ This file should stay accurate. If you add a feature that closes one of these
 gaps, edit the relevant section so it reflects reality. If you discover a new
 limitation, add it — silent rot is the failure mode this document exists to
 prevent.
+
+## Found by the second independent review and left as documented limitations
+
+- **`tls/` and `reports/generated/` are relative to the working directory**, while
+  the database, `reports_dir`, `pcap_dir` and `.env` are anchored to the project
+  root (or, for an installed package, the working directory). Launch the server
+  from the project directory — the systemd unit's `WorkingDirectory`, the
+  container's `WORKDIR /app`, and the README's `cwd` setting all do — or each
+  directory you start it from gets its own self-signed certificate (breaking the
+  stable-certificate-pin property) and its own copy of generated honeytoken
+  keys. Making them settings means changing the tests that `chdir` to isolate
+  them.
+- **Packet-capture ring files use tcpdump's default permissions** (usually 0644).
+  The ring holds raw attacker sessions. Tightening it risks the tcpdump
+  privilege-drop user being unable to rotate files, which would end capture, so
+  restrict the directory instead (`chmod 700` the parent, run tcpdump as the
+  server user via `setcap`). Extracts written by `pcap_extract` are created 0600
+  and refuse to overwrite.
+- **Grafana cannot read a 0700 `data/` directory.** `docs/DEPLOY.md` recommends
+  `chmod 700 data` and the unit sets `UMask=0077`, but the observability compose
+  mounts the SQLite file into Grafana (uid 472) read-only, which cannot traverse
+  it. Use a shared group with mode 0750 (`group_add`) if you run the dashboards
+  against the host path.
+

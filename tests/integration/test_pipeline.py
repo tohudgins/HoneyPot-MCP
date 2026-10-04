@@ -199,14 +199,18 @@ async def test_suppression_rule_stops_events_before_the_database():
     assert await _alerts_after_flush(timeout=3.0) == [], "suppressed events reached the database"
 
 
-async def test_webhook_receives_what_the_engine_captured():
+async def test_webhook_receives_what_the_engine_captured(monkeypatch):
     """Alerts must reach subscribers, not just the database. Runs a real HTTP
     receiver so the delivery worker's own serialisation is exercised."""
     from aiohttp import web
 
+    from honeypot_mcp.config import get_settings
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import get_delivery, invalidate_subscription_cache
+
+    # The receiver is on 127.0.0.1, which the destination policy refuses unless opted in.
+    monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", True)
 
     received: list[dict] = []
 

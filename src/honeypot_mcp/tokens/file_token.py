@@ -43,7 +43,7 @@ class FileTokenProvider(HoneytokenProvider):
         settings = get_settings()
         token_uid = uuid.uuid4().hex
         file_type = options.get("file_type", "pdf")
-        if not isinstance(file_type, str) or not _FILE_TYPE_RE.match(file_type):
+        if not isinstance(file_type, str) or not _FILE_TYPE_RE.fullmatch(file_type):
             raise ValueError("file token file_type must be 1-8 alphanumeric characters")
         title = options.get("document_title", "Confidential Report")
 

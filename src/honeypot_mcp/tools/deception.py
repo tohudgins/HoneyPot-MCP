@@ -214,13 +214,17 @@ async def deception_deploy_plan(
             deployed.append(str(name))
 
     rolled_back = False
-    if failures and stop_on_error and deployed:
+    aborted = bool(failures and stop_on_error)
+    if aborted and deployed:
         for name in deployed:
             await honeypot_stop(name=name, remove=True)
         rolled_back = True
         deployed = []
 
-    if not rolled_back:
+    # No tokens after a failed deployment, whether or not anything had been
+    # deployed yet: a credential token whose target service has no sensor can
+    # never fire, and a retry would create a second set.
+    if not aborted:
         for token in tokens or []:
             token_type = token.get("type")
             try:
@@ -257,7 +261,7 @@ async def deception_deploy_plan(
             + (" — rolled back after failure" if rolled_back else "")
         ),
         arguments={"sensor_count": len(sensors), "token_count": len(tokens or [])},
-        outcome="error" if rolled_back else "success",
+        outcome="error" if rolled_back or failures else "ok",
         error="; ".join(f["error"] for f in failures) if failures else None,
     )
 

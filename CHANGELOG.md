@@ -4,6 +4,57 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Second independent review, hostile-traffic run, and Cowrie egress
+
+Two more reviewers (control plane/secrets, engines/deployment) and a run of real
+hostile traffic against the server on its LAN interface. The traffic run was
+clean: `nmap -sV --version-intensity 9` identified every engine as the product it
+imitates, 3,600 fuzzed connections plus 9,000 UDP datagrams left `/readyz` at a
+worst latency of 0.4 s with zero failures, per-IP caps held at exactly 32, and
+memory settled at ~175 MB. The reviewers found real defects:
+
+- **The shipped container could not write exports or retention archives.** The
+  config anchored `reports_dir`/`pcap_dir` to `parents[2]` of `config.py`, which
+  in a non-editable install is `/opt/venv/lib/python3.12` (root-owned, container
+  runs as uid 10001); a failed archive cancels the delete, so retention never
+  pruned. The root is now the checkout if there is a `pyproject.toml`, else the
+  working directory.
+- **Backups ignored `DATABASE_URL`**: the documented cron entry found no file and
+  exited 1 nightly, and a stale `./honeypot_mcp.db` shadowed a PostgreSQL URL.
+  `restore.sh` also never restored `reports/` (honeytoken SSH private keys exist
+  only there). Fixed and round-trip tested.
+- **CI could not fail where it claimed to**: the PostgreSQL fallback detector
+  looked for "fallback" but the log says "falling back", a `| tee` hid crashes,
+  and the integration step failed on every leg (loopback receiver vs. the new
+  SSRF guard). Fixed; a Docker-gated job now exercises real Cowrie.
+- **Cowrie egress is closed** by binding its outgoing sockets to loopback
+  (`cowrie_allow_egress` opts out), its resolver is pinned to loopback so hostname
+  fetches send no DNS query, and adopting an older container logs a warning.
+- **Cowrie log ingestion lost windows**: it quit on a paused/restarting container,
+  restarted from "two seconds ago" after any crash, treated a Docker API error as
+  "container gone", and `resume` never restarted it. It now keeps a cursor across
+  respawns, waits through pause/restart, retries Docker errors, and resume/reattach
+  respawn ingestion (reattach unpauses instead of calling `start`).
+- **Control plane**: IPv6 zone ids (`fe80::1%x?k=1`) passed `validate_ip` and were
+  interpolated into the VirusTotal URL path; `honeypot_stop(remove=True)` loaded
+  every alert the sensor ever captured; a deployment plan whose first sensor
+  failed still created tokens that could never fire; `honeypot_deploy` skipped the
+  config validation `honeypot_configure` does; `pcap_extract` could overwrite an
+  alert archive (now exclusive, 0600); blocklist exports ignored the never-block
+  allowlist; Cloudflare/pfSense pushes raised on network errors without an audit
+  row; a WAFv2 push mixed address families and was rejected whole; triage was
+  attributed to a caller-supplied name; audit rows used four outcome spellings
+  (so `audit_log_search(outcome="ok")` missed most successes) and an over-long
+  target silently dropped the row on PostgreSQL; `$`-anchored validators accepted a
+  trailing newline; collector mode crashed on a malformed `MCP_AUTH_TOKENS` it
+  never uses.
+- Malformed HTTP no longer writes an aiohttp traceback per request (a scanner
+  could flood the log pipeline).
+- Left as documented limitations (`KNOWN_LIMITATIONS.md`): CWD-relative `tls/`,
+  tcpdump ring permissions, Grafana vs. a 0700 data directory.
+- Two reviewer claims did not reproduce (`limited_handler` socket leak; a `/` in an
+  IPv6 zone id) and were not acted on.
+
 ## Independent review of the remediation
 
 A reviewer agent with no stake in the code attacked the two commits and

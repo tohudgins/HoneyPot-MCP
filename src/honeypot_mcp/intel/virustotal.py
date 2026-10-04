@@ -28,7 +28,21 @@ async def lookup_virustotal(ip: str) -> dict[str, Any]:
     Successful responses are cached for 30 minutes per IP; errors and rate
     limits are remembered for a minute so a burst does not retry each time.
     """
+    import ipaddress
+
     from honeypot_mcp.config import get_settings
+
+    # Interpolated into a URL path below, so only a canonical address may pass:
+    # an IPv6 zone id ("::1%../../x") would otherwise steer the authenticated
+    # request to another path on the VirusTotal host. Not every caller is a tool
+    # that ran `validate_ip` first (the ingest path enriches stored source IPs).
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return {"available": False, "note": "not a valid IP address"}
+    if getattr(addr, "scope_id", None):
+        return {"available": False, "note": "scoped (zone-id) addresses are not looked up"}
+    ip = str(addr)
 
     cache_key = f"vt:{ip}"
     cached = _cache.get(cache_key)

@@ -27,9 +27,25 @@ umask 077
 
 # Same override as backup.sh, so a deployment that keeps its DB under ./data
 # (see deploy/honeypot-mcp.service) is restored to where the server reads it.
-DB_PATH="${HONEYPOT_DB_PATH:-./honeypot_mcp.db}"
 
-if [ -f "$SRC/honeypot_mcp.db" ]; then
+# Where is the database? Same answer the server gives, not a guess: an explicit
+# HONEYPOT_DB_PATH wins, then DATABASE_URL (from the environment, or from ./.env
+# when run from cron), then the default. A PostgreSQL URL always means a
+# pg_dump/psql round-trip, even if a stale ./honeypot_mcp.db is lying around.
+if [ -z "${DATABASE_URL:-}" ] && [ -f ./.env ]; then
+  DATABASE_URL="$(grep -E '^DATABASE_URL=' ./.env | tail -n1 | cut -d= -f2- | tr -d "\"'")"
+fi
+DB_PATH="${HONEYPOT_DB_PATH:-}"
+if [ -z "$DB_PATH" ]; then
+  case "${DATABASE_URL:-}" in
+    sqlite*:///*) DB_PATH="${DATABASE_URL#*:///}" ;;
+    *) DB_PATH="./honeypot_mcp.db" ;;
+  esac
+fi
+IS_POSTGRES=0
+case "${DATABASE_URL:-}" in postgresql*) [ -z "${HONEYPOT_DB_PATH:-}" ] && IS_POSTGRES=1 ;; esac
+
+if [ "$IS_POSTGRES" = 0 ] && [ -f "$SRC/honeypot_mcp.db" ]; then
   # Keep whatever is currently there; a restore onto the wrong host is
   # recoverable, an overwrite is not.
   STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -42,7 +58,7 @@ if [ -f "$SRC/honeypot_mcp.db" ]; then
   done
   cp "$SRC/honeypot_mcp.db" "$DB_PATH"
   echo "  database restored"
-elif [ -f "$SRC/honeypot_mcp.sql" ]; then
+elif [ -f "$SRC/honeypot_mcp.sql" ] || [ "$IS_POSTGRES" = 1 ]; then
   [ -n "${DATABASE_URL:-}" ] || { echo "set DATABASE_URL for a PostgreSQL restore" >&2; exit 1; }
   # Password via PGPASSFILE, not argv (visible to every local user in `ps`).
   PGPASSFILE="$(mktemp)"
@@ -61,6 +77,13 @@ if [ -d "$SRC/tls" ]; then
   mkdir -p ./tls
   cp -R "$SRC/tls/." ./tls/
   echo "  tls certs restored"
+fi
+# Generated file-token artefacts (PDF/DOCX trackers, honeytoken SSH private keys
+# exist ONLY here — the database holds just the fingerprint).
+if [ -d "$SRC/reports" ]; then
+  mkdir -p ./reports
+  cp -R "$SRC/reports/." ./reports/
+  echo "  reports restored"
 fi
 [ -f "$SRC/.env" ] && echo "  .env present in the backup — copy it manually once you have checked it"
 

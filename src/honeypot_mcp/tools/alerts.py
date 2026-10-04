@@ -284,13 +284,26 @@ async def alerts_acknowledge(
             return {"error": "since_hours must be greater than 0."}
         since = datetime.now(UTC) - timedelta(hours=since_hours)
 
+    # `triaged_by` is shown on shift handover and by alerts_get, so it must be who
+    # actually made the call. A networked caller is identified by its token; the
+    # free-text `analyst` argument can only name someone else (or be set by an
+    # injected instruction) and is kept as a display note instead. A local stdio
+    # session has one operator, so there the name they give is used.
+    from honeypot_mcp.rbac import current_actor
+
+    actor = current_actor()
+    triaged_by = (analyst or "mcp-client") if actor == "stdio" else actor
+    if analyst and actor != "stdio" and analyst != actor:
+        note = f"{note or ''} [analyst: {analyst}]".strip()
+    triaged_by = triaged_by[:128]  # String(128): longer raises on PostgreSQL
+
     async with get_session() as session:
         result = await queries.triage_alerts(
             session,
             alert_ids=alert_ids,
             disposition=disp,
             note=note,
-            analyst=analyst or "mcp-client",
+            analyst=triaged_by,
             source_ip=source_ip,
             event_type=event_type,
             severity=sev,

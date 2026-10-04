@@ -22,11 +22,27 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$DEST/honeypot-$STAMP"
 mkdir -p "$OUT"
 
-DB_PATH="${HONEYPOT_DB_PATH:-./honeypot_mcp.db}"
-if [ -f "$DB_PATH" ]; then
+
+# Where is the database? Same answer the server gives, not a guess: an explicit
+# HONEYPOT_DB_PATH wins, then DATABASE_URL (from the environment, or from ./.env
+# when run from cron), then the default. A PostgreSQL URL always means a
+# pg_dump/psql round-trip, even if a stale ./honeypot_mcp.db is lying around.
+if [ -z "${DATABASE_URL:-}" ] && [ -f ./.env ]; then
+  DATABASE_URL="$(grep -E '^DATABASE_URL=' ./.env | tail -n1 | cut -d= -f2- | tr -d "\"'")"
+fi
+DB_PATH="${HONEYPOT_DB_PATH:-}"
+if [ -z "$DB_PATH" ]; then
+  case "${DATABASE_URL:-}" in
+    sqlite*:///*) DB_PATH="${DATABASE_URL#*:///}" ;;
+    *) DB_PATH="./honeypot_mcp.db" ;;
+  esac
+fi
+IS_POSTGRES=0
+case "${DATABASE_URL:-}" in postgresql*) [ -z "${HONEYPOT_DB_PATH:-}" ] && IS_POSTGRES=1 ;; esac
+if [ "$IS_POSTGRES" = 0 ] && [ -f "$DB_PATH" ]; then
   sqlite3 "$DB_PATH" ".backup '$OUT/honeypot_mcp.db'"
   echo "  database  -> $OUT/honeypot_mcp.db ($(du -h "$OUT/honeypot_mcp.db" | cut -f1))"
-elif [ -n "${DATABASE_URL:-}" ] && [[ "$DATABASE_URL" == postgresql* ]]; then
+elif [ "$IS_POSTGRES" = 1 ]; then
   # Strip the async driver suffix; pg_dump speaks libpq URLs. The password is
   # moved out of the URL (and so out of argv, where `ps` shows it to every local
   # user) into a mode-0600 PGPASSFILE that is removed on exit.
@@ -37,7 +53,7 @@ elif [ -n "${DATABASE_URL:-}" ] && [[ "$DATABASE_URL" == postgresql* ]]; then
   pg_dump "$PG_CLEAN_URL" > "$OUT/honeypot_mcp.sql"
   echo "  database  -> $OUT/honeypot_mcp.sql ($(du -h "$OUT/honeypot_mcp.sql" | cut -f1))"
 else
-  echo "  !! no database found at $DB_PATH and DATABASE_URL is not PostgreSQL" >&2
+  echo "  !! no database found at $DB_PATH and DATABASE_URL is not PostgreSQL (set HONEYPOT_DB_PATH or DATABASE_URL)" >&2
   exit 1
 fi
 

@@ -90,14 +90,45 @@ async def test_map_to_attack_still_maps_realistic_events():
 
 
 @pytest.mark.asyncio
-async def test_token_matcher_is_linear_on_hostile_jwt_lookalikes():
-    from honeypot_mcp import token_matchers
+async def test_token_matcher_is_linear_on_hostile_jwt_lookalikes_and_still_finds_a_real_jwt():
+    import base64
+    import json
 
-    hostile = "a-" * 32_768
-    ev = _event("http_request", {"headers": {"Authorization": hostile}, "path": hostile})
+    from honeypot_mcp import token_matchers
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
+
+    # An active JWT token must exist, or `match` returns at the empty-index early
+    # exit and never reaches the scan this test is about.
+    async with get_session() as session:
+        token = Honeytoken(
+            type=HoneytokenType.JWT,
+            label="jwt-redos",
+            token_value="jwt:planted",
+            status=HoneytokenStatus.ACTIVE,
+            token_meta={"jti": "planted-jti-0001"},
+        )
+        session.add(token)
+        await session.flush()
+        token_id = token.id
+    token_matchers.invalidate_cache()
+
+    def b64(d: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+
+    real = f"{b64({'alg': 'HS256', 'typ': 'JWT'})}.{b64({'jti': 'planted-jti-0001'})}.c2lnbmF0dXJl"
+    hostile = "a-" * 32_768  # a-a-a-… is the quadratic case for a naive JWT regex
+    ev = _event(
+        "http_request",
+        {
+            "headers": {"X-Junk": hostile, "Authorization": f"Bearer {real}"},
+            "path": hostile,
+        },
+    )
     start = time.monotonic()
-    await token_matchers.match(ev)
+    matched, kind = await token_matchers.match(ev)
     assert time.monotonic() - start < 0.25
+    assert matched == token_id and kind == "jwt"
 
 
 # ── 3. Payload clamp + bounded queue ────────────────────────────────────────

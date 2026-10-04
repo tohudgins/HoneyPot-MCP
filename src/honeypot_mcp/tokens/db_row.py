@@ -68,7 +68,9 @@ _DOMAIN_RE = re.compile(rf"^{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})*$")
 
 
 def _valid_domain(domain: Any) -> bool:
-    return isinstance(domain, str) and len(domain) <= 253 and _DOMAIN_RE.match(domain) is not None
+    return (
+        isinstance(domain, str) and len(domain) <= 253 and _DOMAIN_RE.fullmatch(domain) is not None
+    )
 
 
 def _fake_identity(seed: str) -> tuple[str, str]:
@@ -113,7 +115,7 @@ class DBRowProvider(HoneytokenProvider):
         }
 
         table_hint = options.get("table", "users")
-        if not isinstance(table_hint, str) or not _TABLE_RE.match(table_hint):
+        if not isinstance(table_hint, str) or not _TABLE_RE.fullmatch(table_hint):
             raise ValueError("db_row table must be 1-64 characters of letters, digits or '_'")
 
         meta = {

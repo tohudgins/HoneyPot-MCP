@@ -367,7 +367,15 @@ async def _handle_rdp_client(
             writer.close()
         return
 
-    ssl_ctx = await build_server_ssl_context_async(honeypot_name)
+    try:
+        ssl_ctx = await build_server_ssl_context_async(honeypot_name)
+    except Exception as e:
+        # The handler wrapper swallows exceptions, which would leave this socket
+        # open with no timer: close it ourselves, like a real server that fails
+        # the handshake.
+        log.warning("RDP TLS context unavailable for '%s': %s", honeypot_name, e)
+        writer.close()
+        return
 
     try:
         # `StreamWriter.start_tls` lands cleanly in Python 3.11+. The new

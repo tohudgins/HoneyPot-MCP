@@ -18,10 +18,12 @@ So identity is set explicitly here rather than left to a library default.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from aiohttp import web, web_protocol, web_response, web_server
+from aiohttp.http_exceptions import HttpProcessingError
 
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter
@@ -64,6 +66,30 @@ def _neutralise_aiohttp_default_banner() -> None:
 
 
 _neutralise_aiohttp_default_banner()
+
+
+class _MalformedRequestLogFilter(logging.Filter):
+    """Drop aiohttp's per-request traceback for malformed HTTP.
+
+    When aiohttp rejects a request it cannot parse (an overlong line, a bad
+    method, binary on an HTTP port) it logs `Error handling request` with a full
+    traceback at ERROR. On a honeypot that is the normal state of the internet,
+    so one scanner could write megabytes of tracebacks a minute into the log
+    pipeline — a log flood. The bytes are attacker input, the 400 reply is
+    already sent, and nothing was lost. Real server faults (anything that is not
+    an `HttpProcessingError`) are still logged."""
+
+    suppressed = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, HttpProcessingError):
+            type(self).suppressed += 1
+            return False
+        return True
+
+
+logging.getLogger("aiohttp.server").addFilter(_MalformedRequestLogFilter())
 
 
 def server_identity_middleware(

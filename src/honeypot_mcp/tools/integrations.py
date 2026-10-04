@@ -209,7 +209,7 @@ async def alert_subscribe(
             f"Refused subscription {label!r} to {redact_url(url)}: {refusal}",
             arguments={"label": label, "format": format, "destination": redact_url(url)},
             target=redact_url(url),
-            outcome="refused",
+            outcome="error",
             error=refusal,
         )
         return {"error": refusal}

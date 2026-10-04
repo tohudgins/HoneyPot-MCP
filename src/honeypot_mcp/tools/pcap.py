@@ -146,7 +146,7 @@ async def pcap_control(action: Literal["start", "stop", "restart"]) -> dict[str,
         "pcap_control",
         f"packet capture {normalized}",
         arguments={"action": normalized},
-        outcome="ok" if result.get("started") else "failed",
+        outcome="ok" if result.get("started") else "error",
         error=None if result.get("started") else str(result.get("reason"))[:200],
     )
     return {**result, "status": capture.status()}

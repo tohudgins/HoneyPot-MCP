@@ -51,6 +51,22 @@ IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 _CF_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
+_WAF_IP_SET_LIMIT = 10_000  # AWS WAFv2 addresses per IP set
+
+
+def _push_failed(exc: Exception, dry_run: bool) -> dict[str, Any]:
+    """Uniform failure for a push that died on the network or on a malformed reply.
+
+    Names the exception type only: httpx error text includes the request URL,
+    which for pfSense can carry credentials, and this lands in the audit log."""
+    return {
+        "added": [],
+        "skipped": [],
+        "failed": [{"ip": "*", "error": f"{type(exc).__name__} while contacting the API"}],
+        "dry_run": dry_run,
+    }
+
+
 def _never_push() -> list[IPNetwork]:
     """Networks that must never reach a blocklist: the operator's allowlist plus
     this server's own canary address. The latter matters because a spoofed or
@@ -190,7 +206,12 @@ async def blocklist_push_cloudflare(
     if not offenders:
         result: dict[str, Any] = {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
     else:
-        result = await _cloudflare_push(account_id, list_id, api_token, offenders, hours, dry_run)
+        try:
+            result = await _cloudflare_push(
+                account_id, list_id, api_token, offenders, hours, dry_run
+            )
+        except (httpx.HTTPError, ValueError, AttributeError, KeyError) as e:
+            result = _push_failed(e, dry_run)
     return await _finish(tool, target, args, result, excluded)
 
 
@@ -213,7 +234,10 @@ async def _cloudflare_push(
             params: dict[str, str] = {"per_page": "200"}
             if cursor:
                 params["cursor"] = cursor
-            resp = await client.get(base, headers=headers, params=params)
+            try:
+                resp = await client.get(base, headers=headers, params=params)
+            except httpx.HTTPError as e:
+                return _push_failed(e, dry_run)
             if resp.status_code != 200:
                 return {
                     "added": [],
@@ -243,7 +267,13 @@ async def _cloudflare_push(
         for chunk_start in range(0, len(to_add), 1000):
             chunk = to_add[chunk_start : chunk_start + 1000]
             payload = [{"ip": ip, "comment": f"honeypot-mcp:{hours}h"} for ip in chunk]
-            resp = await client.post(base, headers=headers, json=payload)
+            try:
+                resp = await client.post(base, headers=headers, json=payload)
+            except httpx.HTTPError as e:
+                # Earlier chunks already went through; losing track of them
+                # because a later one timed out would misreport the blocklist.
+                failed.extend({"ip": ip, "error": type(e).__name__} for ip in chunk)
+                continue
             if 200 <= resp.status_code < 300:
                 added.extend(chunk)
             else:
@@ -312,7 +342,12 @@ async def blocklist_push_pfsense(
     if not offenders:
         result: dict[str, Any] = {"added": [], "skipped": [], "failed": [], "dry_run": dry_run}
     else:
-        result = await _pfsense_push(base_url, api_key, alias_name, offenders, dry_run, verify_tls)
+        try:
+            result = await _pfsense_push(
+                base_url, api_key, alias_name, offenders, dry_run, verify_tls
+            )
+        except (httpx.HTTPError, ValueError, AttributeError, KeyError) as e:
+            result = _push_failed(e, dry_run)
     return await _finish(tool, host, args, result, excluded)
 
 
@@ -503,14 +538,36 @@ async def _waf_push(
             "dry_run": dry_run,
         }
 
-    existing = set(current.get("IPSet", {}).get("Addresses") or [])
+    ip_set = current.get("IPSet", {})
+    existing = set(ip_set.get("Addresses") or [])
     lock_token = current.get("LockToken")
+
+    # A WAFv2 IP set holds addresses of ONE family, fixed when it was created; an
+    # update that mixes in the other family is rejected as a whole, which would
+    # report every valid IP as failed. Push only what fits and say what did not.
+    family = {"IPV4": 4, "IPV6": 6}.get(str(ip_set.get("IPAddressVersion") or ""))
+    wrong_family: list[str] = []
+    if family is not None:
+        fitting = [c for c in offender_cidrs if ipaddress.ip_network(c).version == family]
+        wrong_family = [c for c in offender_cidrs if c not in fitting]
+        offender_cidrs = fitting
 
     to_add = [cidr for cidr in offender_cidrs if cidr not in existing]
     skipped = [cidr for cidr in offender_cidrs if cidr in existing]
+    failed_up_front: list[dict[str, str]] = [
+        {"ip": cidr, "error": f"IP set holds IPv{6 if family == 4 else 4} only"}
+        for cidr in wrong_family
+    ]
+    room = _WAF_IP_SET_LIMIT - len(existing)
+    if len(to_add) > max(room, 0):
+        failed_up_front += [
+            {"ip": cidr, "error": f"IP set is at the {_WAF_IP_SET_LIMIT}-address limit"}
+            for cidr in to_add[max(room, 0) :]
+        ]
+        to_add = to_add[: max(room, 0)]
 
     if dry_run or not to_add:
-        return {"added": to_add, "skipped": skipped, "failed": [], "dry_run": dry_run}
+        return {"added": to_add, "skipped": skipped, "failed": failed_up_front, "dry_run": dry_run}
 
     merged = sorted(existing | set(to_add))
     try:
@@ -526,8 +583,9 @@ async def _waf_push(
         return {
             "added": [],
             "skipped": skipped,
-            "failed": [{"ip": cidr, "error": f"update_ip_set: {e!s}"[:200]} for cidr in to_add],
+            "failed": failed_up_front
+            + [{"ip": cidr, "error": f"update_ip_set: {e!s}"[:200]} for cidr in to_add],
             "dry_run": dry_run,
         }
 
-    return {"added": to_add, "skipped": skipped, "failed": [], "dry_run": dry_run}
+    return {"added": to_add, "skipped": skipped, "failed": failed_up_front, "dry_run": dry_run}

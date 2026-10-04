@@ -174,12 +174,12 @@ def build_plan(
         }
 
     prefix = identity_prefix or (profile.hostname_prefix if profile else "srv")
-    if not _PREFIX_RE.match(prefix):
+    if not _PREFIX_RE.fullmatch(prefix):
         return {
             "error": "identity_prefix must be 1-32 letters, digits or '-' "
             "(no leading/trailing '-'), e.g. 'corp'."
         }
-    if domain is not None and (len(domain) > 253 or not _DOMAIN_RE.match(domain)):
+    if domain is not None and (len(domain) > 253 or not _DOMAIN_RE.fullmatch(domain)):
         return {"error": "domain must be a DNS name such as 'corp.local'."}
     resolved_domain = domain or (profile.domain if profile else None)
     if resolved_domain is None and any(BY_TYPE[t].os_family == "windows" for t in types):

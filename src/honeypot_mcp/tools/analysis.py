@@ -643,13 +643,20 @@ def _usable_offenders(
     query (and re-asserted here, so the artifact stays safe even if a caller
     hands in an unfiltered list).
     """
+    # The same never-block set the push tools use (BLOCKLIST_ALLOWLIST plus this
+    # server's own canary address). A ready-made `iptables -A INPUT -s <ip> -j
+    # DROP` file is exactly as dangerous as a push if it contains the operator's
+    # own gateway. A malformed allowlist raises ValueError, as it does for pushes.
+    from honeypot_mcp.tools.blocklist_push import _never_push
+
+    never = _never_push()
     usable: list[tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]] = []
     for raw, count in offenders:
         try:
             addr = ipaddress.ip_address(str(raw).strip())
         except ValueError:
             continue
-        if not addr.is_global:
+        if not addr.is_global or any(addr in net for net in never):
             continue
         usable.append((addr, count))
     return usable
@@ -689,7 +696,10 @@ async def export_blocklist(
         raw_offenders = await queries.get_top_offenders(
             session, hours, min_hits, global_only=True, exclude_udp_only=True
         )
-    offenders = _usable_offenders(raw_offenders)
+    try:
+        offenders = _usable_offenders(raw_offenders)
+    except ValueError as e:
+        return {"error": str(e)}
 
     if not offenders:
         return {
@@ -756,7 +766,10 @@ async def export_stix(
         raw_offenders = await queries.get_top_offenders(
             session, hours, min_hits, global_only=True, exclude_udp_only=True
         )
-    offenders = _usable_offenders(raw_offenders)
+    try:
+        offenders = _usable_offenders(raw_offenders)
+    except ValueError as e:
+        return {"error": str(e)}
 
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     objects = [

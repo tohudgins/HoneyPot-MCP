@@ -10,6 +10,7 @@ import importlib
 import os
 import socket
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -361,3 +362,524 @@ async def test_short_sip_register_still_receives_its_digest_challenge():
     # A 401 with no nonce cannot be answered, so it would capture nothing.
     assert b"nonce=" in reply and b"401" in reply.split(b"\r\n")[0]
     assert len(reply) <= len(request) * _UDP_REPLY_FACTOR
+
+
+# ── Malformed HTTP must not write a traceback per request ───────────────────
+
+
+async def test_malformed_http_does_not_flood_the_log_with_tracebacks(caplog):
+    import logging
+
+    from aiohttp import web
+
+    from honeypot_mcp.http_identity import identity_runner
+
+    async def ok(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    runner = identity_runner(app, "nginx")
+    await runner.setup()
+    port = _free_port()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    try:
+        with caplog.at_level(logging.DEBUG, logger="aiohttp.server"):
+            for payload in (
+                b"GET /" + b"a" * 70_000 + b" HTTP/1.1\r\n\r\n",  # LineTooLong
+                b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03" + b"\x00" * 64,  # TLS on HTTP
+                b"G\x00T / HTTP/1.1\r\n\r\n",  # bad method
+            ):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(payload)
+                with contextlib.suppress(ConnectionError):
+                    await writer.drain()
+                with contextlib.suppress(ConnectionError, TimeoutError):
+                    await asyncio.wait_for(reader.read(1024), timeout=2.0)
+                writer.close()
+        flood = [r for r in caplog.records if r.name == "aiohttp.server" and r.exc_info]
+        assert not flood, f"{len(flood)} traceback record(s) logged for attacker input"
+    finally:
+        await runner.cleanup()
+
+
+# ── Cowrie log ingestion must survive pause, Docker errors and respawns ─────
+
+
+class _FakeContainer:
+    def __init__(self, statuses: list[str], lines: list[str], labels: dict | None = None):
+        self._statuses = statuses
+        self._lines = lines
+        self.labels = labels or {}
+        self.calls: list[str] = []
+        self.since_seen: list[Any] = []
+        self.id = "c" * 64
+        self.attrs = {"Config": {"Env": []}}
+
+    @property
+    def status(self) -> str:
+        return self._statuses.pop(0) if len(self._statuses) > 1 else self._statuses[0]
+
+    def logs(self, since=None, timestamps=False):  # noqa: ARG002
+        self.since_seen.append(since)
+        out, self._lines = "\n".join(self._lines).encode(), []
+        return out
+
+    def pause(self):
+        self.calls.append("pause")
+
+    def unpause(self):
+        self.calls.append("unpause")
+
+    def start(self):
+        self.calls.append("start")
+
+
+def _cowrie_login_line(ip: str = "198.51.100.7") -> str:
+    import json
+
+    return json.dumps(
+        {
+            "eventid": "cowrie.login.failed",
+            "src_ip": ip,
+            "src_port": 4444,
+            "username": "root",
+            "password": "toor",
+            "session": "s1",
+        }
+    )
+
+
+def _engine_with(monkeypatch, container_for_get):
+    import docker.errors
+
+    from honeypot_mcp.engines import ssh
+
+    class _Containers:
+        def get(self, cid):
+            return container_for_get(cid)
+
+    class _Client:
+        containers = _Containers()
+
+    monkeypatch.setattr("docker.from_env", lambda: _Client())
+    engine = ssh.SSHEngine()
+
+    real_sleep = asyncio.sleep  # `ssh.asyncio` is this very module: capture before patching
+
+    async def _fast_sleep(_s):
+        await real_sleep(0)
+
+    monkeypatch.setattr(ssh.asyncio, "sleep", _fast_sleep)
+    return engine, ssh, docker.errors
+
+
+async def test_ingestion_waits_through_a_paused_container_instead_of_quitting(monkeypatch):
+    seen: list[Any] = []
+    box = _FakeContainer(["paused", "paused", "paused", "running"], [_cowrie_login_line()])
+    gone = {"after": 0}
+
+    def get(_cid):
+        gone["after"] += 1
+        if gone["after"] > 8:
+            raise docker_errors.NotFound("gone")
+        return box
+
+    engine, ssh, docker_errors = _engine_with(monkeypatch, get)
+
+    async def capture(event):
+        seen.append(event)
+
+    monkeypatch.setattr(ssh, "submit_event", capture)
+    await asyncio.wait_for(engine._ingest_logs("cw", "c" * 64), timeout=5)
+    # Before the fix `_ingest_logs` returned at the first non-"running" status.
+    assert [e.event_type for e in seen] == ["ssh_login_failed"]
+
+
+async def test_ingestion_survives_a_docker_error_and_keeps_its_cursor(monkeypatch):
+    box = _FakeContainer(["running"], [_cowrie_login_line()])
+    calls = {"n": 0}
+
+    def get(_cid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("socket-proxy hiccup")  # not NotFound
+        if calls["n"] > 6:
+            raise docker_errors.NotFound("gone")
+        return box
+
+    engine, ssh, docker_errors = _engine_with(monkeypatch, get)
+    seen: list[Any] = []
+
+    async def capture(event):
+        seen.append(event)
+
+    monkeypatch.setattr(ssh, "submit_event", capture)
+    await asyncio.wait_for(engine._ingest_logs("cw", "c" * 64), timeout=5)
+    assert len(seen) == 1
+    assert engine._ingest_cursor["c" * 64] is not None
+
+
+async def test_a_respawned_ingestion_task_resumes_from_the_saved_cursor(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    box = _FakeContainer(["running"], [])
+    calls = {"n": 0}
+
+    def get(_cid):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise docker_errors.NotFound("gone")
+        return box
+
+    engine, _ssh, docker_errors = _engine_with(monkeypatch, get)
+    saved = datetime.now(UTC) - timedelta(minutes=5)  # the gap a crash would have skipped
+    engine._ingest_cursor["c" * 64] = saved
+    await asyncio.wait_for(engine._ingest_logs("cw", "c" * 64), timeout=5)
+    assert box.since_seen[0] == saved, "a respawn must not restart from 'two seconds ago'"
+
+
+async def test_resume_restarts_ingestion_and_reattach_unpauses_instead_of_starting(monkeypatch):
+    box = _FakeContainer(["paused"], [], labels={"honeypot-name": "cw-paused"})
+    engine, _ssh, _errors = _engine_with(monkeypatch, lambda _cid: box)
+    spawned: list[tuple[str, str]] = []
+    monkeypatch.setattr(engine, "_spawn_ingest_task", lambda name, cid: spawned.append((name, cid)))
+
+    await engine.resume("c" * 64)
+    assert box.calls == ["unpause"]
+    assert spawned == [("cw-paused", "c" * 64)], "ingestion was not restarted on resume"
+
+    box.calls.clear()
+    spawned.clear()
+    await engine.reattach("cw-paused", 2222, {}, "c" * 64)
+    assert box.calls == ["unpause"], "`start` on a paused container is an error"
+    assert spawned == [("cw-paused", "c" * 64)]
+
+
+async def test_reattach_warns_about_a_container_created_before_the_egress_control(
+    monkeypatch, caplog
+):
+    import logging
+
+    box = _FakeContainer(["running"], [])  # Env has no COWRIE_HONEYPOT_OUT_ADDR
+    engine, _ssh, _errors = _engine_with(monkeypatch, lambda _cid: box)
+    monkeypatch.setattr(engine, "_spawn_ingest_task", lambda *_a: None)
+    with caplog.at_level(logging.WARNING, logger="honeypot_mcp.engines.ssh"):
+        await engine.reattach("cw-old", 2222, {}, "c" * 64)
+    assert any("OUT_ADDR" in r.getMessage() for r in caplog.records)
+
+
+# ═══ Second independent review ═══════════════════════════════════════════════
+
+
+async def _alerts_for(ips: list[str], count: int = 10) -> None:
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    async with get_session() as session:
+        for ip in ips:
+            for _ in range(count):
+                session.add(
+                    Alert(
+                        timestamp=datetime.now(UTC),
+                        source_ip=ip,
+                        event_type="ssh_login_failed",
+                        severity=AlertSeverity.MEDIUM,
+                        payload={},
+                    )
+                )
+
+
+async def _audit(tool: str) -> list[Any]:
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import AuditLog
+
+    async with get_session() as session:
+        return list(
+            (await session.execute(select(AuditLog).where(AuditLog.tool == tool))).scalars()
+        )
+
+
+# ── Packaging: an installed package must not anchor its data to site-packages ──
+
+
+def test_project_root_falls_back_to_cwd_when_installed_not_checked_out(tmp_path):
+    from honeypot_mcp.config import _find_project_root
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "honeypot_mcp").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text("[project]\n")
+    config_file = checkout / "src" / "honeypot_mcp" / "config.py"
+    assert _find_project_root(config_file, tmp_path / "elsewhere") == checkout.resolve()
+
+    # `lib/python3.12/site-packages/honeypot_mcp/config.py`: parents[2] is `lib/python3.12`.
+    installed = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "honeypot_mcp"
+    installed.mkdir(parents=True)
+    cwd = tmp_path / "app"
+    assert _find_project_root(installed / "config.py", cwd) == cwd
+
+
+# ── IP / name validation ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("bad", ["2001:db8::1%..", "fe80::1%x?k=1", "fe80::1%eth0"])
+async def test_validate_ip_rejects_zone_ids(bad):
+    from honeypot_mcp.tools._format import validate_ip
+
+    assert validate_ip(bad) is not None
+    assert validate_ip("2001:db8::1") is None and validate_ip("203.0.113.9") is None
+
+
+async def test_virustotal_lookup_refuses_a_zone_id_instead_of_building_a_url(monkeypatch):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.intel.virustotal import lookup_virustotal
+
+    monkeypatch.setattr(get_settings(), "virustotal_api_key", "k" * 32)
+    result = await lookup_virustotal("fe80::1%x?k=1")
+    assert result["available"] is False and "scoped" in result["note"]
+
+
+@pytest.mark.parametrize("name", ["good-name\n", "good-name\r\n"])
+async def test_trailing_newline_does_not_pass_name_validation(name):
+    from honeypot_mcp.tools._format import validate_honeypot_name
+
+    assert validate_honeypot_name(name) is not None
+    assert validate_honeypot_name("good-name") is None
+
+
+# ── pcap extracts: exclusive and private ────────────────────────────────────
+
+
+async def test_pcap_merge_never_overwrites_and_writes_owner_only(tmp_path):
+    import stat
+    import struct
+
+    from honeypot_mcp.pcap import merge_pcaps
+
+    header = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+    src = tmp_path / "in.pcap"
+    src.write_bytes(header)
+    out = tmp_path / "out.pcap"
+    merge_pcaps([src], out)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+    out.write_bytes(b"precious evidence")
+    with pytest.raises(FileExistsError):
+        merge_pcaps([src], out)
+    assert out.read_bytes() == b"precious evidence"
+
+
+# ── Removing a honeypot must not load every alert it captured ───────────────
+
+
+async def test_honeypot_stop_remove_does_not_load_the_alert_history():
+    from sqlalchemy import event, select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
+    from honeypot_mcp.tools.honeypot import honeypot_stop
+
+    async with get_session() as session:
+        hp = Honeypot(
+            name="big-history",
+            type=HoneypotType.HTTP,
+            port=1,
+            status=HoneypotStatus.RUNNING,
+            container_id=None,
+        )
+        session.add(hp)
+        await session.flush()
+        hp_id = hp.id
+        for i in range(300):
+            session.add(
+                Alert(
+                    honeypot_id=hp_id,
+                    source_ip="203.0.113.5",
+                    event_type=f"e{i}",
+                    severity="low",
+                    payload={},
+                )
+            )
+
+    loaded = {"n": 0}
+
+    def _count(_target, _context):
+        loaded["n"] += 1
+
+    event.listen(Alert, "load", _count)
+    try:
+        result = await honeypot_stop(name="big-history", remove=True)
+    finally:
+        event.remove(Alert, "load", _count)
+    assert "error" not in result, result
+    assert loaded["n"] == 0, f"{loaded['n']} Alert rows were loaded into memory"
+
+    async with get_session() as session:
+        assert await session.get(Honeypot, hp_id) is None
+        orphaned = (
+            (await session.execute(select(Alert).where(Alert.source_ip == "203.0.113.5")))
+            .scalars()
+            .all()
+        )
+    assert len(orphaned) == 300 and all(a.honeypot_id is None for a in orphaned)
+
+
+# ── Deployment plans ────────────────────────────────────────────────────────
+
+
+async def test_failed_first_sensor_under_stop_on_error_creates_no_tokens():
+    from sqlalchemy import func, select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeytoken
+    from honeypot_mcp.tools.deception import deception_deploy_plan
+
+    result = await deception_deploy_plan(
+        sensors=[{"type": "not-a-real-type", "name": "x"}],
+        tokens=[{"type": "canary_url", "label": "should-not-exist"}],
+        stop_on_error=True,
+    )
+    assert result.get("failures") or result.get("failed") or "error" in str(result).lower()
+    async with get_session() as session:
+        count = (await session.execute(select(func.count()).select_from(Honeytoken))).scalar_one()
+    assert count == 0, "tokens were created for a plan whose first sensor failed"
+    rows = await _audit("deception_deploy_plan")
+    assert rows and rows[-1].outcome == "error"
+
+
+async def test_deploy_validates_config_like_configure_does():
+    from honeypot_mcp.tools.honeypot import honeypot_deploy
+
+    smuggled = await honeypot_deploy(type="ftp", config={"fake_banner": "x\r\n230 logged in"})
+    assert "error" in smuggled
+    unknown = await honeypot_deploy(type="ftp", config={"not_a_key": 1})
+    assert "error" in unknown and "not_a_key" in unknown["error"]
+
+
+# ── Audit log integrity ─────────────────────────────────────────────────────
+
+
+async def test_audit_rows_use_one_outcome_vocabulary_and_clip_long_targets():
+    from honeypot_mcp.tools._audit import record_action
+
+    await record_action("t-vocab", "ok one", outcome="success", target="x" * 500)
+    await record_action("t-vocab", "refused one", outcome="refused")
+    await record_action("t-vocab", "fine", outcome="ok")
+    rows = await _audit("t-vocab")
+    assert sorted(r.outcome for r in rows) == ["error", "error", "ok"]
+    assert all(len(r.target or "") <= 128 for r in rows)
+    assert len(rows) == 3, "an over-long target must not drop the audit row"
+
+
+async def test_triage_is_attributed_to_the_caller_not_to_a_name_they_supply(monkeypatch):
+    from sqlalchemy import select
+
+    from honeypot_mcp import rbac
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+    from honeypot_mcp.tools.alerts import alerts_acknowledge
+
+    await _alerts_for(["203.0.113.77"], count=2)
+    monkeypatch.setattr(rbac, "current_actor", lambda: "alice (operator)")
+    result = await alerts_acknowledge(source_ip="203.0.113.77", analyst="bob (admin)" + "x" * 300)
+    assert "error" not in result, result
+    async with get_session() as session:
+        alerts = (
+            (await session.execute(select(Alert).where(Alert.source_ip == "203.0.113.77")))
+            .scalars()
+            .all()
+        )
+    assert alerts and all(a.triaged_by == "alice (operator)" for a in alerts)
+    assert all("analyst: bob" in (a.triage_note or "") for a in alerts)
+
+
+# ── Blocklists ──────────────────────────────────────────────────────────────
+
+
+async def test_exports_honour_the_never_block_allowlist(monkeypatch, tmp_path):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.analysis import export_blocklist
+
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
+    monkeypatch.setattr(get_settings(), "blocklist_allowlist", "8.8.4.4")
+    await _alerts_for(["8.8.4.4", "9.9.9.9"], count=10)
+    result = await export_blocklist(hours=24, min_hits=5)
+    text = Path(result["path"]).read_text()
+    assert "9.9.9.9" in text and "8.8.4.4" not in text
+
+
+async def test_exports_refuse_a_malformed_allowlist_instead_of_ignoring_it(monkeypatch, tmp_path):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.analysis import export_blocklist
+
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
+    monkeypatch.setattr(get_settings(), "blocklist_allowlist", "not-an-ip")
+    await _alerts_for(["9.9.9.9"], count=10)
+    assert "error" in await export_blocklist(hours=24, min_hits=5)
+
+
+async def test_waf_push_sends_only_the_address_family_the_ip_set_holds():
+    from unittest.mock import MagicMock, patch
+
+    from honeypot_mcp.tools import blocklist_push
+
+    await _alerts_for(["1.1.1.1", "2606:4700:4700::1111"], count=10)
+    client = MagicMock()
+    client.get_ip_set.return_value = {
+        "IPSet": {"Addresses": [], "IPAddressVersion": "IPV4"},
+        "LockToken": "l",
+    }
+    with patch("boto3.client", return_value=client):
+        result = await blocklist_push.blocklist_push_aws_waf(
+            ip_set_id="x", ip_set_name="x", region="us-east-1", dry_run=False
+        )
+    assert result["added"] == ["1.1.1.1/32"]
+    assert [f["ip"] for f in result["failed"]] == ["2606:4700:4700::1111/128"]
+    sent = client.update_ip_set.call_args.kwargs["Addresses"]
+    assert sent == ["1.1.1.1/32"], "a WAFv2 IPv4 set would reject the whole update"
+
+
+async def test_a_network_error_during_a_push_is_reported_and_audited_not_raised():
+    from unittest.mock import patch
+
+    import httpx
+
+    from honeypot_mcp.tools import blocklist_push
+
+    await _alerts_for(["1.1.1.1"], count=10)
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def get(self, *_a, **_k):
+            raise httpx.ConnectError("https://user:hunter2@cf.example/ refused")
+
+    with patch("httpx.AsyncClient", return_value=_Boom()):
+        result = await blocklist_push.blocklist_push_cloudflare(
+            account_id="acct", list_id="lst", api_token="tok", dry_run=False
+        )
+    assert result["failed"] and result["added"] == []
+    assert "hunter2" not in str(result)
+    rows = await _audit("blocklist_push_cloudflare")
+    assert len(rows) == 1 and "hunter2" not in f"{rows[0].summary} {rows[0].error}"
+
+
+# ── Collector mode ignores control-plane token config ───────────────────────
+
+
+async def test_collector_mode_does_not_crash_on_a_malformed_auth_token_setting(monkeypatch):
+    from honeypot_mcp import server
+    from honeypot_mcp.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "mcp_transport", "none")
+    monkeypatch.setattr(settings, "mcp_auth_tokens", "garbage-without-a-role")
+    assert server._build_auth() is None
