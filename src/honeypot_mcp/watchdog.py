@@ -237,9 +237,8 @@ class HoneypotWatchdog:
         for label, sample in low.items():
             if label in self._disk_low:
                 continue
-            self._disk_low.add(label)
             log.error("Low disk space on %s (%s): %d MB free", label, sample.path, sample.free_mb)
-            await submit_event(
+            delivered = await _emit_independent_alert(
                 PendingEvent(
                     honeypot_id=None,
                     source_ip="0.0.0.0",
@@ -253,7 +252,18 @@ class HoneypotWatchdog:
                     severity=AlertSeverity.CRITICAL,
                 )
             )
-        self._disk_low &= set(low)  # recovered volumes can alert again next time
+            # Only once the notification was queued: a failed one is retried next cycle.
+            if delivered:
+                self._disk_low.add(label)
+        # A volume re-arms only once it is clearly clear (10% above the threshold). Without
+        # the margin, free space hovering at the threshold re-alerted every cycle, and
+        # CRITICAL is exempt from notification throttling.
+        threshold = get_settings().min_free_disk_mb
+        samples = {s.label: s for s in disk.sample()}
+        for label in list(self._disk_low):
+            current = samples.get(label)
+            if label not in low and (current is None or current.free_mb >= threshold * 1.1):
+                self._disk_low.discard(label)
 
     async def _mark_recovered(self, hp_id: int, hp_name: str) -> None:
         """Flip a honeypot that is answering again back to RUNNING.
@@ -282,6 +292,42 @@ class HoneypotWatchdog:
                 severity=AlertSeverity.CRITICAL,
             )
         )
+
+
+async def _emit_independent_alert(event: PendingEvent) -> bool:
+    """Raise an alert without waiting for the database to accept its row.
+
+    The normal path (`submit_event`) notifies subscribers only AFTER the row is written,
+    which is exactly what a full disk prevents: the alert about the disk would be stuck
+    behind the failure it reports. So subscribers are notified first, and the row is
+    written best-effort afterwards (a refused write is logged, not retried into a flood).
+    The subscriber list is cached for 30 seconds; when that cache is stale and the database
+    is refusing reads, delivery still fails: the log line is the signal of last resort.
+    Returns whether the notification was queued."""
+    from honeypot_mcp.storage.models import Alert
+    from honeypot_mcp.webhooks import get_delivery
+
+    queued = True
+    try:
+        await get_delivery().enqueue_batch([event])
+    except Exception as e:
+        queued = False
+        log.error("Could not queue the %s notification: %s", event.event_type, e)
+    try:
+        async with get_session() as session:
+            session.add(
+                Alert(
+                    honeypot_id=event.honeypot_id,
+                    source_ip=event.source_ip,
+                    event_type=event.event_type,
+                    payload=event.payload,
+                    severity=event.severity,
+                    timestamp=event.timestamp,
+                )
+            )
+    except Exception as e:
+        log.error("Could not record the %s alert in the database: %s", event.event_type, e)
+    return queued
 
 
 _watchdog: HoneypotWatchdog | None = None

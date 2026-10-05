@@ -137,7 +137,12 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         real_world_port=25,
         os_family="neutral",
         roles=("mail", "public_facing"),
-        summary="Mail server with STARTTLS. Captures AUTH credentials, relay attempts, and message bodies.",
+        summary=(
+            "Postfix-style mail server with STARTTLS and a modelled queue. Captures AUTH "
+            "credentials, relay attempts and messages (attachments hashed, links listed); "
+            "mail for a local mailbox is readable over the POP3 honeypot, and mail to an "
+            "unresolvable domain bounces to a local sender. Nothing is ever sent onward."
+        ),
         signature_events=("smtp_auth_attempt", "smtp_open_relay", "smtp_message_received"),
         config_options=("fake_banner_hostname",),
         captures_credentials_as="smtp",
@@ -185,11 +190,22 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         summary=(
             "Parses the X.224 connection request and extracts the leaked "
             "`mstshash` cookie, which nearly every RDP client and brute-force tool "
-            "sends in the clear."
+            "sends in the clear. Speaks CredSSP/NTLM (captures a crackable NetNTLMv2 "
+            "response) and lets a planted honeytoken credential or one weak pair into a "
+            "short session: a static Windows-style desktop whose keystrokes and clicks "
+            "are recorded."
         ),
-        signature_events=("rdp_handshake", "rdp_connection", "rdp_nla_auth", "rdp_nla_negotiate"),
+        signature_events=(
+            "rdp_handshake",
+            "rdp_connection",
+            "rdp_nla_auth",
+            "rdp_nla_negotiate",
+            "rdp_login_attempt",
+            "rdp_session_start",
+            "rdp_session",
+        ),
         captures_credentials_as="rdp",
-        config_options=("rdp_hostname", "rdp_domain"),
+        config_options=("rdp_hostname", "rdp_domain", "accepted_logins", "sessions"),
         pairs_well_with=("smb", "ldap"),
         notes="One of the largest brute-force categories on the internet.",
     ),
@@ -486,7 +502,14 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "produced them. Deploy alongside IMAP — a host answering 143 but "
             "refusing 110 is an odd configuration a scanner will notice."
         ),
-        signature_events=("pop3_login_attempt", "pop3_mailbox_access", "pop3_auth_attempt"),
+        signature_events=(
+            "pop3_login_attempt",
+            "pop3_mailbox_access",
+            "pop3_auth_attempt",
+            "pop3_login_success",
+            "pop3_message_retrieved",
+        ),
+        config_options=("accepted_logins", "mail_domain"),
         captures_credentials_as="pop3",
         pairs_well_with=("imap", "smtp"),
     ),

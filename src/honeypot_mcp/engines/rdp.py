@@ -19,11 +19,13 @@ clientBuild, keyboard layout, screen resolution, and supported encryption
 methods. We log an `rdp_mcs_handshake` HIGH-severity event with everything
 captured, then close.
 
-We deliberately do NOT implement the rest of the protocol stack (no MCS
-Connect Response, no channel join, no CredSSP). After the MCS capture we
-close — to the attacker tool that looks like a transient server failure or
-TLS-layer rejection. CredSSP would let us capture NTLM hashes, but
-implementing it correctly is a significant attack surface in itself.
+What happens next depends on who is asking. A credential that is not one this honeypot
+lets in ends the connection as before. A planted honeytoken credential, or the one weak pair
+this honeypot derives from its name (`accepted_logins` in its config replaces it; an empty
+list lets nobody in; `sessions: false` turns sessions off), is let in to a short RDP session
+(`engines/rdp_session.py`): a static Windows-style desktop whose keystrokes and clicks are
+recorded. Over NLA the exchange is completed for real, so the client believes it
+authenticated; over plain TLS the password arrives in the clear in the Client Info PDU.
 
 Wire format references:
 * RFC 905 — X.224 Connection-Oriented Transport Protocol
@@ -41,12 +43,21 @@ import logging
 import secrets
 from typing import Any, cast
 
+from honeypot_mcp import credential_match
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_handler, shutdown_server
-from honeypot_mcp.engines.rdp_nla import hashcat_line, identity_for, run_credssp
-from honeypot_mcp.engines.tls import build_server_ssl_context_async
+from honeypot_mcp.engines.http_admin import accepted_pairs
+from honeypot_mcp.engines.rdp_nla import (
+    AuthMessage,
+    hashcat_line,
+    identity_for,
+    run_credssp,
+    verify_ntlmv2,
+)
+from honeypot_mcp.engines.rdp_session import run_session
+from honeypot_mcp.engines.tls import build_server_ssl_context_async, ensure_cert
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -421,11 +432,8 @@ async def _handle_rdp_client(
 
     # Read the MCS Connect Initial PDU. Most clients send it within ~10
     # round trips of the TLS handshake; if they don't, just bail.
-    try:
-        mcs_pdu = await asyncio.wait_for(reader.read(8192), timeout=10.0)
-    except (TimeoutError, asyncio.IncompleteReadError, OSError):
-        with contextlib.suppress(Exception):
-            writer.close()
+    mcs_pdu = await _read_first_frame(reader, writer)
+    if mcs_pdu is None:
         return
 
     fingerprint = _parse_mcs_connect_initial(mcs_pdu)
@@ -441,12 +449,133 @@ async def _handle_rdp_client(
         name="rdp-record",
     )
 
-    # Closing now looks like a transient server failure to the attacker —
-    # acceptable behaviour for a honeypot that explicitly doesn't intend to
-    # serve real RDP traffic.
-    with contextlib.suppress(Exception):
-        writer.close()
-        await writer.wait_closed()
+    if not _sessions_enabled(config):
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+        return
+
+    accepted = accepted_pairs(honeypot_name, config.get("accepted_logins"))
+
+    async def decide(info: dict[str, Any]) -> bool:
+        # Without NLA the password is in the Client Info PDU, in the clear.
+        username = str(info.get("username") or "")
+        password = str(info.get("password") or "")
+        event = PendingEvent(
+            honeypot_id=honeypot_id,
+            source_ip=peer[0],
+            source_port=peer[1],
+            event_type="rdp_login_attempt",
+            payload={
+                "username": username[:128],
+                "password": password[:128],
+                "domain": str(info.get("domain") or "")[:128],
+                "service": "rdp",
+                "method": "client_info",
+            },
+            severity=AlertSeverity.HIGH,
+        )
+        await submit_event(event)
+        planted = credential_match.is_credential_trip(event)
+        return bool(username) and (planted or (username.lower(), password) in accepted)
+
+    await _serve_session(
+        reader,
+        writer,
+        honeypot_id=honeypot_id,
+        peer=peer,
+        connect_initial=mcs_pdu,
+        selected_protocol=_PROTOCOL_SSL,
+        decide=decide,
+    )
+
+
+def _sessions_enabled(config: dict[str, Any]) -> bool:
+    return config.get("sessions", True) is not False
+
+
+async def _read_first_frame(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> bytes | None:
+    """The first PDU after TLS (the MCS Connect Initial), as exactly one TPKT frame.
+
+    Read by its declared length rather than "whatever the next recv returned": a Connect
+    Initial split across segments used to be truncated, and a client that pipelined the next
+    PDU behind it would have had it swallowed."""
+    try:
+        head = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
+        if head[0] != 3:
+            # Not a TPKT frame; keep what arrived so the fingerprint still records it.
+            return head + await asyncio.wait_for(reader.read(8192), timeout=2.0)
+        length = int.from_bytes(head[2:4], "big")
+        if length < 4:
+            return head
+        return head + await asyncio.wait_for(reader.readexactly(length - 4), timeout=10.0)
+    except (TimeoutError, asyncio.IncompleteReadError, OSError):
+        with contextlib.suppress(Exception):
+            writer.close()
+        return None
+
+
+async def _serve_session(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    honeypot_id: int | None,
+    peer: tuple[str, int],
+    connect_initial: bytes,
+    selected_protocol: int,
+    decide: Any,
+) -> None:
+    """Run the RDP session and record what the visitor did."""
+
+    async def active(info: dict[str, Any]) -> None:
+        spawn(
+            _record_event(
+                honeypot_id,
+                peer,
+                "rdp_session_start",
+                AlertSeverity.CRITICAL,
+                {
+                    **{k: v for k, v in info.items() if k in ("desktop", "color_depth")},
+                    "client_info": {
+                        k: v for k, v in info.get("client_info", {}).items() if k != "password"
+                    },
+                },
+            ),
+            name="rdp-record",
+        )
+
+    try:
+        result = await run_session(
+            reader,
+            writer,
+            connect_initial=connect_initial,
+            selected_protocol=selected_protocol,
+            decide_login=decide,
+            on_active=active,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+    # A session that reached the desktop is the finding; one that did not (refused, or the
+    # client left during the handshake) is recorded at lower severity.
+    reached = result.get("stage") == "active"
+    if "client_info" in result:
+        result["client_info"] = {
+            k: v for k, v in result["client_info"].items() if k != "password"
+        }  # the password already has its own event; keep the session record free of it
+    spawn(
+        _record_event(
+            honeypot_id,
+            peer,
+            "rdp_session",
+            AlertSeverity.CRITICAL if reached else AlertSeverity.MEDIUM,
+            result,
+        ),
+        name="rdp-record",
+    )
 
 
 async def _handle_nla(
@@ -461,35 +590,27 @@ async def _handle_nla(
 ) -> None:
     """The CredSSP exchange after the TLS upgrade, and what it captured."""
     ident = identity_for(honeypot_name, config)
-    result = await run_credssp(reader, writer, ident)
+    accepted = accepted_pairs(honeypot_name, config.get("accepted_logins"))
     base = {
         "tls_negotiated": True,
         "requested_protocols": requested,
         "selected_protocol": _PROTOCOL_HYBRID,
         "target_computer": ident.computer,
         "target_domain": ident.domain,
-        "credssp_stage": result["stage"],
     }
-    if result["stage"] == "negotiate":
-        # The client took the CHALLENGE and left: the signature of `nmap
-        # rdp-ntlm-info` and similar host-identification sweeps.
-        spawn(
-            _record_event(
-                honeypot_id,
-                peer,
-                "rdp_nla_negotiate",
-                AlertSeverity.MEDIUM,
-                {**base, **result["negotiate"], "credssp_version": result.get("client_version")},
-            ),
-            name="rdp-record",
-        )
-    elif result["stage"] == "authenticate":
-        auth = result["auth"]
-        challenge = result["server_challenge"]
+    recorded_auth = False
+
+    async def authorize(captured: dict[str, Any]) -> str | None:
+        """Record the captured NetNTLMv2 response, then decide whether to let it in.
+        Returns the plaintext password if so: the session key is derived from it."""
+        nonlocal recorded_auth
+        auth: AuthMessage = captured["auth"]
+        challenge: bytes = captured["server_challenge"]
         cracked = hashcat_line(auth, challenge)
         payload = {
             **base,
-            **result["negotiate"],
+            "credssp_stage": "authenticate",
+            **captured["negotiate"],
             "username": auth.username,
             "domain": auth.domain,
             "workstation": auth.workstation,
@@ -500,18 +621,92 @@ async def _handle_nla(
         }
         if cracked is not None:
             payload["hashcat_mode"], payload["hashcat_line"] = cracked
+        event = PendingEvent(
+            honeypot_id=honeypot_id,
+            source_ip=peer[0],
+            source_port=peer[1],
+            event_type="rdp_nla_auth",
+            payload=payload,
+            severity=AlertSeverity.HIGH,
+        )
+        await submit_event(event)
+        recorded_auth = True
+        if not _sessions_enabled(config) or len(auth.nt_response) <= 24:
+            return None
+        if credential_match.is_credential_trip(event):
+            return await credential_match.recover_ntlmv2_password(
+                "rdp", challenge, auth.nt_response, auth.username, auth.domain
+            )
+        for user, password in accepted:
+            if user == auth.username.strip().lower() and verify_ntlmv2(
+                challenge, auth.nt_response, auth.username, auth.domain, password
+            ):
+                return password
+        return None
+
+    result = await run_credssp(
+        reader, writer, ident, authorize=authorize, public_key=_server_public_key(honeypot_name)
+    )
+    if result.get("accepted"):
+        mcs_pdu = await _read_first_frame(reader, writer)
+        if mcs_pdu is not None:
+            await _serve_session(
+                reader,
+                writer,
+                honeypot_id=honeypot_id,
+                peer=peer,
+                connect_initial=mcs_pdu,
+                selected_protocol=_PROTOCOL_HYBRID,
+                decide=None,
+            )
+        return
+    if result["stage"] == "negotiate":
+        # The client took the CHALLENGE and left: the signature of `nmap
+        # rdp-ntlm-info` and similar host-identification sweeps.
         spawn(
-            _record_event(honeypot_id, peer, "rdp_nla_auth", AlertSeverity.HIGH, payload),
+            _record_event(
+                honeypot_id,
+                peer,
+                "rdp_nla_negotiate",
+                AlertSeverity.MEDIUM,
+                {
+                    **base,
+                    "credssp_stage": "negotiate",
+                    **result["negotiate"],
+                    "credssp_version": result.get("client_version"),
+                },
+            ),
             name="rdp-record",
         )
-    else:
+    elif result["stage"] != "authenticate" or not recorded_auth:
         spawn(
-            _record_event(honeypot_id, peer, "rdp_nla_probe", AlertSeverity.LOW, base),
+            _record_event(
+                honeypot_id,
+                peer,
+                "rdp_nla_probe",
+                AlertSeverity.LOW,
+                {**base, "credssp_stage": result["stage"]},
+            ),
             name="rdp-record",
         )
     with contextlib.suppress(Exception):
         writer.close()
         await writer.wait_closed()
+
+
+def _server_public_key(honeypot_name: str) -> bytes | None:
+    """The TLS certificate's RSA public key (PKCS#1 DER), which CredSSP binds the
+    exchange to. None if it cannot be read, which only disables sessions over NLA."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        cert_path, _ = ensure_cert(honeypot_name)
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        return cert.public_key().public_bytes(Encoding.DER, PublicFormat.PKCS1)
+    except Exception as e:
+        log.debug("Could not read the TLS public key for '%s': %s", honeypot_name, e)
+        return None
 
 
 class RDPEngine(HoneypotEngine):

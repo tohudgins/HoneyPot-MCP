@@ -65,6 +65,40 @@ def _escape(v: str) -> str:
     return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
+async def _database_size_bytes() -> int | None:
+    """On-disk size of the database, or None when it cannot be determined."""
+    from sqlalchemy import text
+    from sqlalchemy.engine import make_url
+
+    from honeypot_mcp.config import get_settings
+
+    url = get_settings().database_url
+    try:
+        backend = make_url(url).get_backend_name()
+        if backend == "postgresql":
+            async with get_session() as session:
+                return int(
+                    (
+                        await session.execute(text("SELECT pg_database_size(current_database())"))
+                    ).scalar_one()
+                )
+        if backend == "sqlite" and ":memory:" not in url:
+            database = make_url(url).database
+            if database:
+                import os
+
+                # The write-ahead log is part of the database: a busy one holds tens of MB
+                # that the main file does not show until a checkpoint.
+                return sum(
+                    os.stat(path).st_size
+                    for path in (database, f"{database}-wal", f"{database}-shm")
+                    if os.path.exists(path)
+                )
+    except Exception:
+        return None
+    return None
+
+
 async def _gather_metrics() -> str:
     """Run the metrics-collection queries in a single session and format
     the result as Prometheus text exposition."""
@@ -218,6 +252,14 @@ async def _gather_metrics() -> str:
         out.append("# TYPE honeypot_disk_free_bytes gauge\n")
         for v in volumes:
             out.append(_line("honeypot_disk_free_bytes", {"volume": v.label}, v.free_bytes))
+
+    # Database size: the one number that predicts a full disk on a volume this process
+    # cannot see (a remote PostgreSQL's own).
+    size = await _database_size_bytes()
+    if size is not None:
+        out.append("# HELP honeypot_database_size_bytes Size of the alert database.\n")
+        out.append("# TYPE honeypot_database_size_bytes gauge\n")
+        out.append(_line("honeypot_database_size_bytes", None, size))
 
     # Webhook events dropped by the bounded delivery queues. Read the existing
     # singleton only — a scrape must not be what instantiates the worker.

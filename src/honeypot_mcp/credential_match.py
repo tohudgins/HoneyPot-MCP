@@ -261,6 +261,35 @@ def _match_hashed(service: str, payload: dict) -> int | None:
     return None
 
 
+CREDENTIAL_TRIP_PREFIX = "honeytoken_triggered_credential_via_"
+
+
+def is_credential_trip(event: PendingEvent) -> bool:
+    """True if `submit_event` matched this event to a planted *credential* token.
+
+    `event.honeytoken_id` alone is not enough to let a visitor in: the event buffer also
+    sets it when any string in the payload is a planted canary email, JWT id or SSH
+    fingerprint, and a login that sent one of those as its password would otherwise be
+    treated as a valid login for any username."""
+    return event.event_type.startswith(CREDENTIAL_TRIP_PREFIX)
+
+
+async def recover_ntlmv2_password(
+    service: str, challenge: bytes, nt_response: bytes, username: str, domain: str
+) -> str | None:
+    """The planted password that produced this NetNTLMv2 response, if any.
+
+    Needed when a honeypot lets a planted credential in: the NTLM session key is derived
+    from the password, so recognising the token is not enough, the plaintext is."""
+    await _load_index()
+    for u, pw, _token_id in _candidates.get(service, []) + _candidates.get("any", []):
+        if u == username.strip().lower() and verify_ntlmv2(
+            challenge, nt_response, username, domain, pw
+        ):
+            return pw
+    return None
+
+
 async def match(event: PendingEvent) -> int | None:
     """Return the matching active CREDENTIAL honeytoken id, or None.
 
@@ -275,7 +304,11 @@ async def match(event: PendingEvent) -> int | None:
 
     service = _infer_service(event.event_type)
     if service in _HASHED_SERVICES:
-        return _match_hashed(service, event.payload)
+        hit = _match_hashed(service, event.payload)
+        # RDP is hashed over NLA but plaintext over plain TLS (the Client Info PDU), so a
+        # plaintext login attempt carries no digest and falls through to the ordinary lookup.
+        if hit is not None or service != "rdp" or event.payload.get("nt_response_hex"):
+            return hit
 
     for username, password in _extract_pairs(event.payload, event.event_type):
         u = username.strip().lower()

@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-1190%20unit%20%2B%2011%20e2e-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1252%20unit%20%2B%2011%20e2e-brightgreen)](tests/)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 25
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -136,6 +136,7 @@ Three design decisions worth calling out:
 
 <table>
 <tr><td><b>25 protocols</b></td><td>SSH, Telnet (Cowrie), HTTP/S, SMB, RDP, FTP, SMTP, DNS, VNC, MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch, Docker API, <b>Kubernetes API</b>, LDAP, SNMP, Memcached, IMAP, <b>POP3</b>, SIP/VoIP, rsync, NFS</td></tr>
+<tr><td><b>Past the login</b></td><td>RDP lets a planted credential (or one weak pair) into a recorded desktop session over NLA or plain TLS; POP3 serves the mailbox the SMTP honeypot filled, bounces and all; HTTP has an admin console. What an intruder does <i>after</i> getting in is captured, not just that they got in. Nothing is ever sent onward</td></tr>
 <tr><td><b>Anti-fingerprinting</b></td><td>Per-deploy SSH + HTTP personas (coherent banner/kernel/header bundles), response jitter, per-honeypot self-signed TLS, realistic <code>robots.txt</code>/<code>favicon.ico</code>/<code>security.txt</code></td></tr>
 <tr><td><b>Honeytokens</b></td><td>AWS/Azure/GCP keys, canary URLs, credential pairs, PDF/DOCX trackers, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks</td></tr>
 <tr><td><b>Credential correlation</b></td><td>Planted creds auto-match on any honeypot login and escalate to CRITICAL — including MySQL and VNC, where the plaintext never crosses the wire (the engine recomputes the scramble/DES response)</td></tr>
@@ -149,7 +150,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-1190 unit tests plus 11 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+1252 unit tests plus 11 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -501,7 +502,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 1190 unit tests
+uv run pytest tests/unit/ -v     # 1252 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

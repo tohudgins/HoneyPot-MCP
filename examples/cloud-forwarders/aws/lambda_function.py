@@ -29,6 +29,10 @@ log.setLevel(logging.INFO)
 # Security-relevant CloudTrail event names. Anything not in this set is
 # dropped unless `errorCode` is present (failed calls often reveal probing).
 _INTERESTING_EVENT_NAMES = {
+    # The first call every key-testing tool makes, and one IAM policy cannot deny: a deny-all
+    # decoy user gets a *successful* GetCallerIdentity, with no errorCode to trigger the
+    # filter below, so without this the decoy key's most likely use would go unreported.
+    "GetCallerIdentity",
     "ConsoleLogin",
     "AssumeRole",
     "GetSessionToken",

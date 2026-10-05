@@ -43,7 +43,15 @@ def _is_interesting(record: dict) -> bool:
     # Sign-in / Audit logs come through with different shapes (categories
     # `SignInLogs`, `AuditLogs`). Forward those wholesale.
     cat = (record.get("category") or "").lower()
-    if cat in {"signinlogs", "auditlogs"}:
+    # Service-principal sign-ins are their own category: they are exactly what a stolen
+    # client secret produces.
+    if cat in {
+        "signinlogs",
+        "auditlogs",
+        "serviceprincipalsigninlogs",
+        "managedidentitysigninlogs",
+        "noninteractiveusersigninlogs",
+    }:
         return True
     # Any explicit failure status — typical probe pattern.
     status = (record.get("status", {}).get("value") or "").lower()

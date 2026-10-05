@@ -25,9 +25,16 @@ This implementation:
   a domain we host) is the abuse spammers scan for — logged as
   `smtp_open_relay` HIGH instead of a plain `smtp_rcpt_to`.
 
-It is still a low-fidelity SMTP — no real mail queue — but it captures the
-things that matter (credentials, message bodies, relay attempts) and is
-significantly harder to fingerprint than a `250 OK` skeleton.
+* Models a mail queue. A completed `DATA` is analysed (headers, links, every attachment
+  hashed — `engines/mail_message.py`) and routed per recipient: mail for a local
+  mailbox is stored where the POP3 honeypot can serve it (`engines/maildrop.py`), mail for
+  a name that can never resolve (`.invalid`, `.test`, ...) bounces with a real RFC 3464
+  delivery-status notice to the sender's mailbox, and anything else is recorded as relayed.
+
+Nothing is ever sent onward. A honeypot that relayed or bounced to external addresses
+would be a spam source and a backscatter source for whoever's address was forged; a
+delivery-failure notice goes only to a mailbox on this host, and a bounce owed to an
+external sender is recorded as suppressed instead.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ import secrets
 from typing import Any
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines import mail_message
 from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
@@ -52,6 +60,7 @@ from honeypot_mcp.engines.conn_limit import (
     limited_factory,
     shutdown_server,
 )
+from honeypot_mcp.engines.maildrop import MAILDROP
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -76,6 +85,10 @@ _MAX_MESSAGE_BYTES = 10_240_000
 _MAX_BODY_PREVIEW = 4096
 # Attacker-chosen strings (commands, addresses, credentials) placed in events.
 _MAX_EVENT_STRING = 256
+# Messages analysed at once, process-wide; the rest wait their turn.
+_ANALYSIS_SLOTS = asyncio.Semaphore(2)
+# Seconds a real MTA takes to give up on an unresolvable destination and send the bounce.
+_DSN_DELAY = (2.0, 5.0)
 # Unread reply bytes tolerated before the connection is dropped.
 _MAX_WRITE_BACKLOG = 512 * 1024
 
@@ -91,14 +104,28 @@ def _b64_decode(s: str) -> str:
         return ""
 
 
+def _has_control_chars(command: str) -> bool:
+    """True if the address part of a MAIL/RCPT command contains a control character."""
+    m = re.search(r"<([^>]*)>", command)
+    addr = m.group(1) if m else command.partition(":")[2]
+    return any(ord(c) < 0x20 and c not in " \t" or ord(c) == 0x7F for c in addr.strip())
+
+
 def _extract_addr(command: str) -> str:
     """Pull the address out of `MAIL FROM:<a@b>` / `RCPT TO:<a@b>` (or the
     bare form without angle brackets)."""
     m = re.search(r"<([^>]*)>", command)
     if m:
-        return m.group(1).strip()
-    _, _, rest = command.partition(":")
-    return rest.strip().split()[0] if rest.strip() else ""
+        addr = m.group(1).strip()
+    else:
+        _, _, rest = command.partition(":")
+        addr = rest.strip().split()[0] if rest.strip() else ""
+    # An address is interpolated into the delivery-failure notice we generate, so a bare CR
+    # or LF would let a sender write its own headers and body into that message. Control
+    # characters never belong in an address; refuse them rather than try to escape.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in addr):
+        return ""
+    return addr[:320]
 
 
 def _domain_of(addr: str) -> str:
@@ -189,6 +216,11 @@ class _SMTPProtocol(asyncio.Protocol):
         self._rcpts: list[str] = []
         self._helo_seen = False
         self._data_preview_len = 0
+        # Full message text (bounded) for analysis and delivery; the preview above is
+        # what goes into the event, this is what gets parsed.
+        self._data_raw: list[bytes] = []
+        self._data_raw_len = 0
+        self._helo_name = ""
         self._starttls_pending = False
         self._wrapper: Any = None
 
@@ -224,7 +256,7 @@ class _SMTPProtocol(asyncio.Protocol):
                 break
             decoded = line.decode("utf-8", errors="replace")
             if self._in_data:
-                self._handle_data_line(decoded)
+                self._handle_data_line(decoded, line)
             else:
                 self._dispatch(decoded.strip())
         if problem and self._transport is not None and not self._transport.is_closing():
@@ -257,6 +289,7 @@ class _SMTPProtocol(asyncio.Protocol):
                 t.write(f"501 Syntax: {verb} hostname\r\n".encode())
             else:
                 self._helo_seen = True
+                self._helo_name = _clip(line.split(None, 1)[1])[:80]
                 self._reset_transaction()  # EHLO/HELO abandons any open transaction
                 if verb == "EHLO":
                     t.write(_build_ehlo_response(self._hostname))
@@ -295,6 +328,8 @@ class _SMTPProtocol(asyncio.Protocol):
                 t.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
                 self._in_data = True
                 self._data_lines = []
+                self._data_raw = []
+                self._data_raw_len = 0
                 self._data_size = 0
         elif upper.startswith("VRFY"):
             self._handle_vrfy(line)
@@ -329,6 +364,9 @@ class _SMTPProtocol(asyncio.Protocol):
         if size and int(size.group(1)) > _MAX_MESSAGE_BYTES:
             t.write(b"552 5.3.4 Error: message size exceeds fixed limit\r\n")
             return
+        if _has_control_chars(line):
+            t.write(b"501 5.1.7 Bad sender address syntax\r\n")
+            return
         self._mail_from = _extract_addr(line)
         self._txn_open = True
         self._rcpts = []
@@ -355,6 +393,9 @@ class _SMTPProtocol(asyncio.Protocol):
             return
         if len(self._rcpts) >= _MAX_RCPTS:
             t.write(b"452 4.5.3 Error: too many recipients\r\n")
+            return
+        if _has_control_chars(line):
+            t.write(b"501 5.1.3 Bad recipient address syntax\r\n")
             return
         rcpt = _extract_addr(line)
         to_dom = _domain_of(rcpt)
@@ -530,7 +571,7 @@ class _SMTPProtocol(asyncio.Protocol):
             name="smtp-record",
         )
 
-    def _handle_data_line(self, line: str) -> None:
+    def _handle_data_line(self, line: str, raw_line: bytes = b"") -> None:
         """Collect message body until a bare `.` ends DATA."""
         if line == ".":
             self._in_data = False
@@ -546,19 +587,21 @@ class _SMTPProtocol(asyncio.Protocol):
             # First 4 KB only — keeps payload size bounded even on spam blast.
             body_preview = "\n".join(self._data_lines)[:_MAX_BODY_PREVIEW]
             spawn(
-                self._record_event(
-                    "smtp_message_received",
-                    AlertSeverity.HIGH,
-                    {
-                        "queue_id": queue_id,
-                        "size_bytes": self._data_size,
-                        "body_preview": body_preview,
-                        "rejected_too_big": too_big,
-                    },
+                self._finish_message(
+                    queue_id=queue_id,
+                    raw=b"\r\n".join(self._data_raw),
+                    body_preview=body_preview,
+                    size=self._data_size,
+                    too_big=too_big,
+                    mail_from=self._mail_from,
+                    rcpts=list(self._rcpts),
+                    helo=self._helo_name,
                 ),
                 name="smtp-record",
             )
             self._data_lines = []
+            self._data_raw = []
+            self._data_raw_len = 0
             self._data_size = 0
             self._data_preview_len = 0
             self._reset_transaction()  # a completed message ends the transaction
@@ -572,6 +615,114 @@ class _SMTPProtocol(asyncio.Protocol):
         if self._data_preview_len < _MAX_BODY_PREVIEW:
             self._data_lines.append(line[:_MAX_BODY_PREVIEW])
             self._data_preview_len += len(line) + 1
+        if self._data_raw_len < mail_message.MAX_PARSE_BYTES:
+            # The bytes as sent, not the decoded text: re-encoding replaced every
+            # non-UTF-8 byte, which corrupted binary attachments and so their hashes.
+            kept = raw_line[1:] if raw_line.startswith(b"..") else raw_line
+            self._data_raw.append(kept[:_MAX_LINE_BYTES])
+            self._data_raw_len += len(kept) + 2
+
+    async def _finish_message(
+        self,
+        *,
+        queue_id: str,
+        raw: bytes,
+        body_preview: str,
+        size: int,
+        too_big: bool,
+        mail_from: str,
+        rcpts: list[str],
+        helo: str,
+    ) -> None:
+        """Analyse a completed message, route it per recipient, and record it."""
+        payload: dict[str, Any] = {
+            "queue_id": queue_id,
+            "size_bytes": size,
+            "body_preview": body_preview,
+            "rejected_too_big": too_big,
+            "recipient_count": len(rcpts),
+        }
+        severity = AlertSeverity.HIGH
+        if not too_big:
+            data = raw
+            # Parsing a hostile message is CPU work (a deeply nested one costs seconds), so
+            # it runs off the event loop, a few at a time.
+            async with _ANALYSIS_SLOTS:
+                info = await asyncio.to_thread(mail_message.analyse, data, envelope_from=mail_from)
+            payload.update({k: v for k, v in info.items() if v not in ("", [], None, False)})
+            payload["delivery"] = self._route(queue_id, data, mail_from, rcpts, helo)
+            if info.get("executable_attachment"):
+                severity = AlertSeverity.CRITICAL
+        await self._record_event("smtp_message_received", severity, payload)
+
+    def _route(
+        self, queue_id: str, raw: bytes, mail_from: str, rcpts: list[str], helo: str
+    ) -> dict[str, Any]:
+        """Decide what the queue does with each recipient. Nothing leaves this host."""
+        local_domain = self._hostname.partition(".")[2] or self._hostname
+        delivered = relayed = 0
+        failed: list[tuple[str, str]] = []
+        for rcpt in dict.fromkeys(rcpts):  # one delivery per distinct recipient
+            domain = _domain_of(rcpt)
+            if self._is_local_domain(domain):
+                header = mail_message.build_received(
+                    hostname=self._hostname,
+                    client_ip=self._peer[0],
+                    helo=helo,
+                    queue_id=queue_id,
+                    rcpt=rcpt,
+                )
+                MAILDROP.deliver(rcpt.rsplit("@", 1)[0], header.encode() + raw, domain=local_domain)
+                delivered += 1
+            elif mail_message.is_undeliverable_domain(domain):
+                failed.append(
+                    (
+                        rcpt,
+                        f"Host or domain name not found. Name service error for "
+                        f"name={domain} type=A: Host not found",
+                    )
+                )
+            else:
+                relayed += 1
+        result: dict[str, Any] = {
+            "delivered_local": delivered,
+            "relayed_external": relayed,  # recorded only; nothing is ever sent onward
+            "bounced": len(failed),
+        }
+        if failed:
+            result["dsn"] = self._schedule_dsn(queue_id, raw, mail_from, failed, local_domain)
+        return result
+
+    def _schedule_dsn(
+        self,
+        queue_id: str,
+        raw: bytes,
+        sender: str,
+        failed: list[tuple[str, str]],
+        local_domain: str,
+    ) -> str:
+        """Say where the failure notice goes, and put it there after the delay a real MTA
+        takes to give up. Returns the outcome for the event."""
+        if not sender:
+            return "none (null sender; Postfix never bounces a bounce)"
+        if not self._is_local_domain(_domain_of(sender)):
+            return "suppressed (external sender; no outbound mail is ever sent)"
+        local = sender.rsplit("@", 1)[0]
+        mailbox = local if local.lower() in _LOCAL_MAILBOXES else "postmaster"
+        notice = mail_message.build_dsn(
+            hostname=self._hostname,
+            queue_id=queue_id,
+            sender=sender,
+            failed=failed,
+            original_headers=mail_message.header_block(raw),
+        )
+
+        async def deliver() -> None:
+            await asyncio.sleep(random.uniform(*_DSN_DELAY))
+            MAILDROP.deliver(mailbox, notice, domain=local_domain)
+
+        spawn(deliver(), name="smtp-dsn")
+        return f"delivered to mailbox {mailbox}"
 
     async def _upgrade_to_tls(self) -> None:
         """Replace the plaintext transport with a TLS-wrapped one.

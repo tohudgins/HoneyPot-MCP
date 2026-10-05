@@ -29,6 +29,189 @@ from honeypot_mcp.webhooks import get_delivery
 log = logging.getLogger(__name__)
 
 
+class _OwnerServices:
+    """Everything only the sensor-owning process runs: delivery, the event flusher, the
+    canary/metrics/console servers, reconciliation of the sensors the last owner left
+    RUNNING, optional packet capture, and the watchdog.
+
+    Separate from `lifespan` so a process that started read-only can start it later,
+    when the previous owner exits (`_ownership_loop`)."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self._canary: Any = None
+        self._metrics: Any = None
+        self._console: Any = None
+
+    async def start(self) -> None:
+        """Bring the owner services up. A no-op if they already are, and all-or-nothing:
+        if anything fails, what had started is torn down before the error propagates, so a
+        failed promotion leaves nothing half-running and can be retried."""
+        if self.started:
+            return
+        try:
+            await self._start()
+        except BaseException:
+            await self._teardown()
+            raise
+
+    async def _start(self) -> None:
+        settings = get_settings()
+        buffer = get_buffer()
+        delivery = get_delivery()
+        await delivery.start()
+        buffer.set_on_flush(delivery.enqueue_batch)
+        await buffer.start()
+        self._canary = await start_canary_server()
+        if settings.metrics_port > 0:
+            self._metrics = await start_metrics_server(settings.metrics_host, settings.metrics_port)
+        # Surfaced at startup because the usual cause is `cp .env.example .env`
+        # inheriting a 0644 umask, which nobody thinks to check.
+        warn_on_world_readable_env()
+
+        if settings.console_port > 0:
+            self._console = await start_console_server(settings.console_host, settings.console_port)
+        # Re-establish honeypots the previous process left RUNNING — must happen
+        # before the watchdog starts, or it races us to mark them dead.
+        try:
+            await reconcile_running_honeypots()
+            # Then pick up honeypot containers started outside this process (the
+            # compose stack's cowrie-ssh, most importantly) — without this they
+            # capture attacks into their own logs and never raise an alert.
+            await adopt_labelled_containers()
+        except Exception:
+            log.exception("Startup reconciliation failed — continuing anyway.")
+        # After reconciliation, so the filter is built from the honeypots that are
+        # actually up. No-op unless PCAP_ENABLED — it needs elevated privileges and
+        # writes continuously, so it is never on by accident.
+        if settings.pcap_enabled:
+            from honeypot_mcp.pcap import start_capture_for_running_honeypots
+
+            result = await start_capture_for_running_honeypots()
+            if not result.get("started"):
+                log.warning("Packet capture not started: %s", result.get("reason"))
+
+        await get_watchdog().start()
+        self.started = True
+
+    async def stop(self) -> None:
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """Stop whatever is running, whether or not `start` finished. Each step is
+        independent: one failing must not leave the rest running."""
+        settings = get_settings()
+        self.started = False
+        steps: list[Any] = [get_watchdog().stop]
+        if settings.pcap_enabled:
+
+            async def stop_capture() -> None:
+                from honeypot_mcp.pcap import get_capture
+
+                await get_capture().stop()
+
+            steps.append(stop_capture)
+        for runner in (self._canary, self._metrics, self._console):
+            if runner is not None:
+                steps.append(runner.cleanup)
+        self._canary = self._metrics = self._console = None
+        steps += [get_buffer().stop, get_delivery().stop]
+        for step in steps:
+            try:
+                await step()
+            except Exception:
+                log.exception("Error while stopping owner services — continuing.")
+
+
+async def _ownership_loop(services: _OwnerServices, state: dict[str, Any]) -> None:
+    """Keep ownership honest for the life of the process.
+
+    Read-only: try to take the lock every `owner_check_seconds`; the moment the owner is
+    gone, become the owner and start the sensors it left RUNNING.
+    Owner: confirm the lock is still ours. A PostgreSQL connection that blipped has
+    silently released its advisory lock and another server may now own the sensors; that
+    is raised loudly rather than discovered as two processes fighting over ports.
+
+    A lock that cannot be *consulted* (database down) is an unknown, never an answer: an
+    owner does not give up ownership over it and a reader does not take it."""
+    settings = get_settings()
+    interval = max(1, settings.owner_check_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if not instance_lock.sensors_owned():
+                await _try_promote(services, state)
+            else:
+                lock = state.get("lock")
+                if lock is None or not await lock.alive():
+                    await _reclaim_or_report_loss(state)
+        except asyncio.CancelledError:
+            raise
+        except instance_lock.LockError as e:
+            log.warning("Ownership check skipped: %s", e)
+        except Exception:
+            log.exception("Ownership check failed — will retry.")
+
+
+async def _try_promote(services: _OwnerServices, state: dict[str, Any]) -> None:
+    settings = get_settings()
+    lock, holder = await instance_lock.acquire(
+        settings.database_url, settings.mcp_transport, fail_open=False
+    )
+    if lock is None:
+        instance_lock.set_ownership(False, holder)
+        return
+    log.warning("The previous sensor owner is gone — taking over the sensors.")
+    try:
+        await services.start()
+    except Exception:
+        # Do not sit on the lock with nothing running: nobody else could take over.
+        log.exception("Taking over the sensors failed — releasing ownership; will retry.")
+        with contextlib.suppress(Exception):
+            await lock.aclose()
+        return
+    state["lock"] = lock
+    instance_lock.set_ownership(True)
+
+
+async def _reclaim_or_report_loss(state: dict[str, Any]) -> None:
+    """The owner's lock is gone. Take it back if it is free; otherwise report that another
+    process owns the sensors now."""
+    from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
+    from honeypot_mcp.storage.models import AlertSeverity
+
+    settings = get_settings()
+    old = state.get("lock")
+    if old is not None:
+        with contextlib.suppress(Exception):
+            await old.aclose()
+        state["lock"] = None
+    # LockError propagates: the database cannot be asked, so nothing is concluded and the
+    # next check tries again (the lock object stays None, which re-enters this function).
+    lock, holder = await instance_lock.acquire(
+        settings.database_url, settings.mcp_transport, fail_open=False
+    )
+    if lock is not None:
+        log.warning("The ownership lock was lost (connection dropped) and has been re-taken.")
+        state["lock"] = lock
+        return
+    instance_lock.set_ownership(False, holder)
+    log.critical(
+        "Sensor ownership lost to %s. This process is still running its sensors and will "
+        "fight the new owner for their ports — stop it.",
+        holder.describe() if holder else "another process",
+    )
+    await submit_event(
+        PendingEvent(
+            honeypot_id=None,
+            source_ip="0.0.0.0",
+            event_type="sensor_ownership_lost",
+            payload={"new_owner": holder.describe() if holder else "unknown"},
+            severity=AlertSeverity.CRITICAL,
+        )
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastMCP):
     settings = get_settings()
@@ -41,82 +224,36 @@ async def lifespan(app: FastMCP):
 
     # Exactly one process owns the sensors for a database. A second one (a second
     # chat's stdio server, say) comes up read-only instead of fighting the first over
-    # its ports and raising false CRITICAL alerts about them. See instance_lock.py.
-    lock, holder = instance_lock.try_acquire(settings.database_url, settings.mcp_transport)
+    # its ports and raising false CRITICAL alerts about them, and takes over if the
+    # owner goes away. See instance_lock.py.
+    lock, holder = await instance_lock.acquire(settings.database_url, settings.mcp_transport)
+    services = _OwnerServices()
+    state: dict[str, Any] = {"lock": lock}
     if lock is None:
         instance_lock.set_ownership(False, holder)
         log.warning(
             "Another HoneyPot MCP process (%s) already owns this database's sensors. "
             "Starting READ-ONLY: alerts, analysis, triage and tokens work; deploying or "
             "stopping honeypots, packet capture and the canary/metrics/console servers "
-            "belong to the owner.",
+            "belong to the owner. Will take over if it exits.",
             holder.describe() if holder else "unknown",
         )
-        try:
-            yield
-        finally:
-            instance_lock.set_ownership(True)
-            await close_db()
-        return
-    instance_lock.set_ownership(True)
-
-    buffer = get_buffer()
-    delivery = get_delivery()
-    watchdog = get_watchdog()
-    await delivery.start()
-    buffer.set_on_flush(delivery.enqueue_batch)
-    await buffer.start()
-    canary_runner = await start_canary_server()
-    metrics_runner = None
-    if settings.metrics_port > 0:
-        metrics_runner = await start_metrics_server(settings.metrics_host, settings.metrics_port)
-    console_runner = None
-    # Surfaced at startup because the usual cause is `cp .env.example .env`
-    # inheriting a 0644 umask, which nobody thinks to check.
-    warn_on_world_readable_env()
-
-    if settings.console_port > 0:
-        console_runner = await start_console_server(settings.console_host, settings.console_port)
-    # Re-establish honeypots the previous process left RUNNING — must happen
-    # before the watchdog starts, or it races us to mark them dead.
-    try:
-        await reconcile_running_honeypots()
-        # Then pick up honeypot containers started outside this process (the
-        # compose stack's cowrie-ssh, most importantly) — without this they
-        # capture attacks into their own logs and never raise an alert.
-        await adopt_labelled_containers()
-    except Exception:
-        log.exception("Startup reconciliation failed — continuing anyway.")
-    # After reconciliation, so the filter is built from the honeypots that are
-    # actually up. No-op unless PCAP_ENABLED — it needs elevated privileges and
-    # writes continuously, so it is never on by accident.
-    if settings.pcap_enabled:
-        from honeypot_mcp.pcap import start_capture_for_running_honeypots
-
-        result = await start_capture_for_running_honeypots()
-        if not result.get("started"):
-            log.warning("Packet capture not started: %s", result.get("reason"))
-
-    await watchdog.start()
+    else:
+        instance_lock.set_ownership(True)
+        await services.start()
+    monitor = asyncio.create_task(_ownership_loop(services, state), name="ownership-monitor")
     try:
         yield
     finally:
         log.info("HoneyPot MCP shutting down…")
-        await watchdog.stop()
-        if settings.pcap_enabled:
-            from honeypot_mcp.pcap import get_capture
-
-            await get_capture().stop()
-        if canary_runner is not None:
-            await canary_runner.cleanup()
-        if metrics_runner is not None:
-            await metrics_runner.cleanup()
-        if console_runner is not None:
-            await console_runner.cleanup()
-        await buffer.stop()
-        await delivery.stop()
+        monitor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await monitor
+        await services.stop()
+        instance_lock.set_ownership(True)
         await close_db()
-        lock.release()
+        if state.get("lock") is not None:
+            await state["lock"].aclose()
 
 
 def _build_auth() -> Any:

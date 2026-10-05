@@ -104,6 +104,9 @@ dev = [
     # this explores the input space of isolated functions systematically
     # rather than mutating one seed.
     "hypothesis>=6.100.0",
+    # A real, independent RDP client (pure Python, speaks CredSSP/NTLM and plain TLS) so the
+    # RDP session tests exercise the protocol against something we did not write.
+    "aardwolf>=0.2.16",
 ]
 
 [project.urls]

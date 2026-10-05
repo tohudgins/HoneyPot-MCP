@@ -4,6 +4,46 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Depth: mail, RDP sessions, ownership, cloud tokens
+
+Closing the limitations that could be closed (APT research, real TLS termination and
+internet exposure remain out of scope).
+
+- **RDP has a session after authentication.** A planted honeytoken credential, or the one
+  weak pair derived from the honeypot's name, is let in. Over NLA the CredSSP exchange now
+  runs to completion (session key from the password, sealed public-key binding; FreeRDP 3
+  and aardwolf both accept it), and the server reads SPNEGO-wrapped NTLM, which is what
+  Windows' own client sends (the old code only understood bare NTLM, so it never worked
+  against mstsc-style clients). The visitor gets a static desktop, painted and checked
+  pixel-for-pixel in FreeRDP, and their keystrokes, clicks and mouse movement are recorded
+  as `rdp_session`. Verified by a mutation-replay fuzz of a recorded session.
+- **SMTP has a queue.** Messages are analysed (attachments hashed, links listed, executable
+  attachments CRITICAL), local mail goes to a maildrop, undeliverable destinations bounce
+  with a real RFC 3464 notice to a local sender. Nothing is ever sent onward.
+- **POP3 serves that maildrop** to a planted credential or its weak pair.
+- **Ownership.** A read-only server promotes itself when the owner exits; PostgreSQL
+  ownership is an advisory lock, so servers on different hosts are detected.
+- **Disk.** `disk_space_low` notifies subscribers before it tries to write itself;
+  `honeypot_database_size_bytes` makes a remote database's growth visible.
+- **Cloud tokens can adopt a real decoy identity** (Terraform / `az` / `gcloud` provided),
+  which is what makes them observable; a generated key leaves no audit-log trail.
+- `aardwolf` (an independent pure-Python RDP client) added as a dev dependency for the RDP session tests.
+- **An independent review of this work found, and this fixes:** an authentication bypass
+  (a planted *canary email* typed as the RDP/POP3 password set `honeytoken_id`, which was read
+  as "a planted credential", so any username got a session); planted credentials that never
+  worked over plain-TLS RDP; a logged-in RDP peer getting ~35,000x amplification from repeated
+  Font List / Refresh Rect PDUs (now one desktop, 3 refreshes, 16 MB per session); CR/LF
+  injection into generated bounce notices; binary attachments hashed after being re-encoded
+  as text; a 3 s event-loop stall from nested MIME (now off-loop, capped); executables hidden
+  by `a.exe.` / RTL-override names or by being the 11th attachment; unbounded POP3 output
+  buffering; lock handling that read "could not ask the database" as an answer (owner losing
+  its lock to a no-op, a reader promoting itself during an outage), failed promotions that
+  held the lock with nothing running, and a PostgreSQL lock connection that an
+  `idle_in_transaction_session_timeout` would kill; cloud-token validation holes, duplicate
+  identities that shadowed each other, a unique-constraint error that echoed the secret, the
+  raw GCP key file stored twice, and decoy keys whose most likely first call
+  (`sts:GetCallerIdentity`, which IAM cannot deny) the AWS forwarder did not forward.
+
 ## Agent surface, scale and self-monitoring
 
 A gap audit of the product as an *agent* sees it, at scale, and when something goes wrong.

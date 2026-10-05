@@ -196,10 +196,18 @@ commands out of sequence get the 503 Postfix gives (`RCPT` before `MAIL`, nested
 sender mailing an external recipient is still accepted — that is the open-relay
 behaviour the engine exists to observe. `nmap --script smtp-enum-users`
 therefore finds the real mailboxes and only those. STARTTLS completes a real TLS
-handshake and the protocol continues over it. What it does not do is deliver
-mail: there is no queue, so a completed `DATA` is acknowledged and recorded but
-never bounces or relays, and a patient human watching for a delivery failure
-notice will not get one.
+handshake and the protocol continues over it. A completed `DATA` is analysed
+(headers, links, every attachment hashed; an executable attachment makes the event
+CRITICAL) and routed per recipient: mail for a local mailbox lands in a maildrop the
+POP3 honeypot serves, mail to a name that can never resolve (`.invalid`, `.test`, ...)
+bounces with a real RFC 3464 delivery-status notice to the sender's mailbox when the
+sender is local, and anything else is recorded as relayed. **Nothing is ever sent
+onward**: relaying or bouncing to external addresses would make the honeypot a spam and
+backscatter source for whoever's address was forged, so a bounce owed to an external
+sender is recorded as suppressed. The consequence is that an attacker testing relay
+sees the same `250 queued` a working relay gives, and nothing arrives on their side.
+POP3 `AUTH PLAIN`/`LOGIN` are not decoded, so credentials sent that way are not
+cross-referenced against planted tokens (`USER`/`PASS` and `APOP` are).
 
 **FTP engine.** Backed by a small, internally consistent file tree
 (`engines/ftp_fs.py`): `LIST`, `NLST`, `SIZE`, `MDTM`, `CWD`, `REST` and `RETR`
@@ -223,8 +231,17 @@ implementation (pyspnego): the right password reproduces the response, a wrong
 one does not — which is also how a planted honeytoken password is recognised from
 the response alone, with no plaintext on the wire. Authentication then fails with
 `STATUS_LOGON_FAILURE`. A client that asks only for plain TLS still gets the MCS
-Connect Initial capture (`clientName`, build, layout). There is no RDP session
-beyond authentication: no MCS Connect Response, no channel join, no desktop.
+Connect Initial capture (`clientName`, build, layout). **A planted honeytoken
+credential, or the one weak pair derived from the honeypot's name, is let in** (config
+`accepted_logins` replaces it, `[]` lets nobody in, `sessions: false` turns sessions off).
+Over NLA the exchange is completed for real (the NTLM session key is derived from the
+password and the server's public-key binding sealed with it; FreeRDP 3 and aardwolf both
+accept it), over plain TLS the password arrives in the Client Info PDU. The visitor gets a
+short session (two minutes at most) showing a **static** Windows-style desktop; their
+keystrokes (decoded to text), clicks and mouse movement are recorded. Nothing can be run or
+opened: a human who clicks Start sees nothing happen, which is the limit of the
+illusion. Static virtual channels (clipboard, drives) are not served. Standard RDP
+security (no TLS) is still refused.
 
 ---
 
@@ -261,10 +278,17 @@ HoneyPot MCP. The operator-side glue for that now ships:
 `examples/cloud-forwarders/{aws,azure,gcp}/` contains ready-to-deploy
 Lambda / Azure Function / GCP Cloud Function forwarders (with Terraform /
 Bicep / gcloud IaC) that relay CloudTrail / Activity Log / Audit Log events
-to the HMAC-signed `/cloud-event` receiver on the canary server. You still
-have to register the decoy key in your own cloud account and deploy the
-forwarder — without that step the generated key is a believable decoy and
-nothing more. [Thinkst's Canarytokens](https://canarytokens.org) (free)
+to the HMAC-signed `/cloud-event` receiver on the canary server. The decoy
+identity is a few commands: `aws/terraform/decoy_user.tf` (a deny-all IAM user and
+its key), `azure/decoy_sp.sh` (a service principal with no role) and `gcp/decoy_sa.sh`
+(a service account with no roles); the resulting key is adopted by passing it to
+`honeytoken_generate_aws` / `honeytoken_create` (`access_key_id` + `secret_access_key`,
+`client_id` + `client_secret` + `tenant_id`, or `service_account_json`). A *generated*
+key does not exist in the cloud, so it leaves no audit-log entry and is only bait for
+scanners that grep for key patterns; the token's plant instructions say which kind it
+is. What still needs your hands is running those scripts in your account (nothing here
+has credentials to do it) and deploying the forwarder; the Terraform validates but was
+not applied to a live account. [Thinkst's Canarytokens](https://canarytokens.org) (free)
 remains the zero-setup alternative with a hosted detection backend. The
 token's `plant_instructions` text says this explicitly.
 
@@ -336,16 +360,23 @@ prevent.
 
 ## Operational notes
 
-- **One server owns the sensors.** With a local SQLite database, a second server process
-  starts read-only (queries, triage, reports work; deploy/stop/pause/clone/configure/
-  pcap_control refuse). Over PostgreSQL the lock is per-host file only, so two servers on
-  different hosts sharing one database are not detected.
-  A read-only session does not take over when the owner exits; restart it. In that mode
-  `honeypot_health`/`honeypot_status` do not probe in-process sensors (a probe from a
-  second process looks like an attacker to the owner) and say so.
+- **One server owns the sensors.** A second server process on the same database starts
+  read-only (queries, triage, reports work; deploy/stop/pause/clone/configure/pcap_control
+  refuse) and **takes over by itself when the owner exits**, re-establishing the sensors
+  the old owner left RUNNING (`OWNER_CHECK_SECONDS`, default 10). SQLite ownership is an
+  `flock` beside the database file; PostgreSQL ownership is a session advisory lock on a
+  dedicated connection, so servers on different hosts are detected too. If a PostgreSQL
+  connection blips the lock is released silently; the owner notices within one check,
+  re-takes it if free, and otherwise raises a CRITICAL `sensor_ownership_lost` alert (it
+  does not stop its own sensors, so the new owner will fail to bind their ports until it is
+  stopped). In read-only mode `honeypot_health`/`honeypot_status` do not probe in-process
+  sensors (a probe from a second process looks like an attacker to the owner) and say so.
 - **Disk watch covers the database directory, `reports_dir` and the pcap ring.** It
-  alerts below `MIN_FREE_DISK_MB` (500); it does not prevent the disk filling, and a
-  remote PostgreSQL's own volume is not visible to it.
+  alerts below `MIN_FREE_DISK_MB` (500) and does not prevent the disk filling. The
+  alert notifies subscribers directly before it tries to record itself, since the
+  normal path notifies only after the row is written, which is what a full disk
+  prevents. A remote PostgreSQL's own volume is not visible; `honeypot_database_size_bytes`
+  (from `pg_database_size`) is exported so its growth can be alerted on from there.
 
 - **Dashboards against a host daemon need one group, not a looser directory.**
   The daemon keeps `data/` private (`0700`), which Grafana (a container, uid 472)

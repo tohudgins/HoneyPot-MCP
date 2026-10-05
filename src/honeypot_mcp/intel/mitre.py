@@ -152,7 +152,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Lateral Movement",
     ),
     (
-        re.compile(r"rdp.{0,40}(handshake|mcs|connection|nla_negotiate|nla_probe)", re.I),
+        re.compile(r"rdp.{0,40}(handshake|mcs|connection|nla_negotiate|nla_probe|session)", re.I),
         "T1021.001",
         "Remote Services: Remote Desktop Protocol",
         "Lateral Movement",
@@ -311,6 +311,13 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         ),
         "T1039",
         "Data from Network Shared Drive",
+        "Collection",
+    ),
+    (
+        # Reading a mailbox once a login succeeded is collecting the mail.
+        re.compile(r"(pop3_message_retrieved|imap_message_fetched)", re.I),
+        "T1114.002",
+        "Email Collection: Remote Email Collection",
         "Collection",
     ),
     (

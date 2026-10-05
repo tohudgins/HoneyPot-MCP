@@ -211,6 +211,12 @@ async def match_file_uid(labels: list[str]) -> int | None:
     return None
 
 
+def _as_dict(value: object) -> dict:
+    """`value` if it is a dict, else an empty one. A forwarded event is whatever the sender
+    signed; a field that should be an object arriving as a string must not crash the match."""
+    return value if isinstance(value, dict) else {}
+
+
 async def match_cloud_event(event: dict) -> tuple[int | None, str | None]:
     """Match an inbound cloud-audit-log event against active cloud-credential
     tokens. Returns `(token_id, source)` where `source` is one of `"aws"`,
@@ -232,15 +238,15 @@ async def match_cloud_event(event: dict) -> tuple[int | None, str | None]:
         return None, None
 
     # AWS shapes
-    aws_key = (event.get("userIdentity") or {}).get("accessKeyId") or event.get("accessKeyId")
+    aws_key = _as_dict(event.get("userIdentity")).get("accessKeyId") or event.get("accessKeyId")
     if isinstance(aws_key, str) and aws_key in _cloud_cred_index:
         return _cloud_cred_index[aws_key], "aws"
 
     # Azure shapes
-    claims = event.get("claims") or {}
+    claims = _as_dict(event.get("claims"))
     azure_appid = (
         claims.get("appid")
-        or (event.get("identity") or {}).get("claims", {}).get("appid")
+        or _as_dict(_as_dict(event.get("identity")).get("claims")).get("appid")
         or event.get("appId")
         or event.get("client_id")
     )
@@ -248,12 +254,12 @@ async def match_cloud_event(event: dict) -> tuple[int | None, str | None]:
         return _cloud_cred_index[azure_appid], "azure"
 
     # GCP shapes
-    proto = event.get("protoPayload") or {}
-    auth = proto.get("authenticationInfo") or {}
+    proto = _as_dict(event.get("protoPayload"))
+    auth = _as_dict(proto.get("authenticationInfo"))
     gcp_email = (
         auth.get("principalEmail")
         or event.get("principalEmail")
-        or (event.get("authenticationInfo") or {}).get("principalEmail")
+        or _as_dict(event.get("authenticationInfo")).get("principalEmail")
     )
     if isinstance(gcp_email, str):
         # Case-insensitive lookup since email local-parts are case-insensitive

@@ -41,6 +41,7 @@ def _spawn(work: Path, tag: str, mcp_port: int):
         "CANARY_CALLBACK_PORT": str(_free()),
         "REPORTS_DIR": str(work / "reports"),
         "TLS_DIR": str(work / "tls"),
+        "OWNER_CHECK_SECONDS": "1",
     }
     return subprocess.Popen(
         ["uv", "run", "--project", str(ROOT), "python", "-m", "honeypot_mcp.server"],
@@ -106,13 +107,35 @@ async def test_a_second_server_is_read_only_and_raises_no_false_alarm(tmp_path):
         assert status == "running"
         socket.create_connection(("127.0.0.1", sensor_port), timeout=2).close()
 
-        # When the owner goes away the next process takes over, with no stale lock.
+        # When the owner dies the read-only process promotes itself — no restart — and
+        # brings the dead owner's sensor back up on the same port. No stale lock either.
         os.killpg(a.pid, signal.SIGKILL)  # no chance to clean up
         a.wait(timeout=20)
+        promoted = False
+        for _ in range(60):
+            await asyncio.sleep(0.5)
+            if (await _call(b_port, "ping", {})).data["role"] == "owner":
+                promoted = True
+                break
+        assert promoted, "the read-only server never took over after the owner was killed"
+        for _ in range(40):
+            try:
+                socket.create_connection(("127.0.0.1", sensor_port), timeout=1).close()
+                break
+            except OSError:
+                await asyncio.sleep(0.25)
+        else:
+            raise AssertionError("the promoted server did not restore the dead owner's sensor")
+        deployed = await _call(
+            b_port, "honeypot_deploy", {"type": "http", "port": _free(), "name": "after"}
+        )
+        assert not deployed.is_error and deployed.data["status"] == "running"
+
+        # And a process started now finds an owner again.
         c = _spawn(work, "C", c_port)
         procs.append(c)
         assert _wait(c_port)
-        assert (await _call(c_port, "ping", {})).data["role"] == "owner"
+        assert (await _call(c_port, "ping", {})).data["role"] == "read-only"
     finally:
         for p in procs:
             with contextlib.suppress(ProcessLookupError):

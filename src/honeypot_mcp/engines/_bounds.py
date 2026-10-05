@@ -11,5 +11,5 @@ def write_backlogged(transport: asyncio.Transport, limit: int) -> bool:
     queueing replies for a peer that never drains them."""
     try:
         return transport.get_write_buffer_size() > limit
-    except NotImplementedError:  # bare asyncio.Transport subclasses (test doubles)
+    except (NotImplementedError, AttributeError):  # bare Transport subclasses and test doubles
         return False

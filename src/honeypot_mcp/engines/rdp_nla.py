@@ -17,7 +17,10 @@ This module plays the server side of that exchange for as long as it is useful:
   NTLMv1) so the capture is directly crackable and, via `verify_ntlmv2`, checkable
   against planted honeytoken passwords.
 * Authentication then fails with STATUS_LOGON_FAILURE, as it would for a wrong
-  password.
+  password — unless the caller recognises the password (a planted honeytoken, or this
+  honeypot's one weak pair). Then the exchange is completed for real: the NTLM session
+  key is derived from the password, the server's public-key binding is sealed with it,
+  and the client, satisfied, sends its credentials and starts an RDP session.
 
 Everything here parses attacker bytes. Reads are length-capped, DER lengths are
 checked against the buffer before use, and nothing loops without advancing.
@@ -31,7 +34,8 @@ import hmac
 import os
 import struct
 import time
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 _MAX_TSREQUEST = 32 * 1024
@@ -130,12 +134,17 @@ def _tlv(buf: bytes, pos: int, end: int) -> tuple[int, int, int]:
 
 
 def build_ts_request(
-    version: int, nego_token: bytes | None = None, error_code: int | None = None
+    version: int,
+    nego_token: bytes | None = None,
+    error_code: int | None = None,
+    pub_key_auth: bytes | None = None,
 ) -> bytes:
     body = _der(0xA0, _der_int(version))
     if nego_token is not None:
         token = _der(0xA0, _der(0x04, nego_token))
         body += _der(0xA1, _der(0x30, _der(0x30, token)))
+    if pub_key_auth is not None:
+        body += _der(0xA3, _der(0x04, pub_key_auth))
     if error_code is not None:
         body += _der(0xA4, _der_int(error_code))
     return _der(0x30, body)
@@ -147,6 +156,7 @@ class TSRequest:
     nego_token: bytes | None = None
     has_pub_key_auth: bool = False
     has_auth_info: bool = False
+    client_nonce: bytes | None = None
 
 
 def parse_ts_request(data: bytes) -> TSRequest:
@@ -176,8 +186,38 @@ def parse_ts_request(data: bytes) -> TSRequest:
             out.has_auth_info = True
         elif ftag == 0xA3:
             out.has_pub_key_auth = True
+        elif ftag == 0xA5:  # clientNonce (CredSSP v5+)
+            ntag, nstart, nend = _tlv(data, fstart, fend)
+            if ntag == 0x04 and nend - nstart <= 64:
+                out.client_nonce = data[nstart:nend]
         pos = fend  # always advances: fend >= fstart > pos
     return out
+
+
+# ── SPNEGO ──────────────────────────────────────────────────────────────────
+#
+# Windows' own client (and anything built on its "Negotiate" package) does not send a bare
+# NTLM message inside CredSSP: it wraps it in a SPNEGO NegTokenInit, and expects the answer
+# wrapped in a NegTokenResp. Scanners such as nmap send bare NTLM. Both are served; the
+# reply is wrapped exactly when the request was.
+
+_NTLM_OID = bytes.fromhex("2b06010401823702020a")
+
+
+def unwrap_ntlm(token: bytes) -> tuple[bytes, bool]:
+    """(the NTLM message inside `token`, whether `token` wrapped it in SPNEGO)."""
+    at = token.find(_NTLMSSP)
+    if at <= 0:
+        return token, False
+    return token[at:], True
+
+
+def wrap_challenge(challenge: bytes) -> bytes:
+    """A SPNEGO NegTokenResp carrying an NTLM CHALLENGE (negState accept-incomplete)."""
+    state = _der(0xA0, _der(0x0A, b"\x01"))
+    mech = _der(0xA1, _der(0x06, _NTLM_OID))
+    response = _der(0xA2, _der(0x04, challenge))
+    return _der(0xA1, _der(0x30, state + mech + response))
 
 
 # ── NTLM ────────────────────────────────────────────────────────────────────
@@ -258,17 +298,24 @@ class AuthMessage:
     workstation: str
     lm_response: bytes
     nt_response: bytes
+    # Negotiated flags and the client's wrapped random session key (MS-NLMP 2.2.1.3).
+    # Absent from very old clients, which is why they default.
+    flags: int = 0
+    encrypted_session_key: bytes = field(default=b"", repr=False)
 
 
 def parse_authenticate(msg: bytes) -> AuthMessage | None:
     if len(msg) < 52 or msg[:8] != _NTLMSSP or struct.unpack_from("<I", msg, 8)[0] != 3:
         return None
+    flags = struct.unpack_from("<I", msg, 60)[0] if len(msg) >= 64 else 0
     return AuthMessage(
         username=_decode(_field(msg, 36)),
         domain=_decode(_field(msg, 28)),
         workstation=_decode(_field(msg, 44)),
         lm_response=_field(msg, 12),
         nt_response=_field(msg, 20),
+        flags=flags,
+        encrypted_session_key=_field(msg, 52) if len(msg) >= 64 else b"",
     )
 
 
@@ -354,6 +401,82 @@ def verify_ntlmv2(
     return hmac.compare_digest(expected, nt_response[:16])
 
 
+# ── Sealing the server's reply (MS-NLMP 3.4, MS-CSSP 3.1.5) ──────────────────
+
+_NEGOTIATE_EXTENDED_SESSIONSECURITY = 0x00080000
+_NEGOTIATE_128 = 0x20000000
+_NEGOTIATE_KEY_EXCH = 0x40000000
+_NEGOTIATE_56 = 0x80000000
+
+
+def _rc4(key: bytes):
+    from cryptography.hazmat.decrepit.ciphers.algorithms import ARC4
+    from cryptography.hazmat.primitives.ciphers import Cipher
+
+    return Cipher(ARC4(key), mode=None).encryptor()
+
+
+def server_to_client_keys(auth: AuthMessage, password: str) -> tuple[bytes, bytes]:
+    """(signing key, sealing key) for the server-to-client direction, given the password
+    that produced `auth`. The client never sends the session key, it sends it wrapped
+    under a key only someone who knows the password can derive; so being able to seal a
+    message the client accepts is itself proof that the password is right."""
+    if not auth.flags & _NEGOTIATE_EXTENDED_SESSIONSECURITY:
+        raise ValueError("client did not negotiate extended session security")
+    nt_hash = _md4(_u16(password))
+    ntlmv2_key = hmac.new(nt_hash, _u16(auth.username.upper() + auth.domain), hashlib.md5).digest()
+    session_base_key = hmac.new(ntlmv2_key, auth.nt_response[:16], hashlib.md5).digest()
+    if auth.flags & _NEGOTIATE_KEY_EXCH and len(auth.encrypted_session_key) == 16:
+        exported = _rc4(session_base_key).update(auth.encrypted_session_key)
+    else:
+        exported = session_base_key
+    if auth.flags & _NEGOTIATE_128:
+        seal_material = exported
+    elif auth.flags & _NEGOTIATE_56:
+        seal_material = exported[:7]
+    else:
+        seal_material = exported[:5] + b"\xe5\x38\xb0"
+    seal_key = hashlib.md5(
+        seal_material + b"session key to server-to-client sealing key magic constant\x00"
+    ).digest()
+    sign_key = hashlib.md5(
+        exported + b"session key to server-to-client signing key magic constant\x00"
+    ).digest()
+    return sign_key, seal_key
+
+
+def seal(message: bytes, sign_key: bytes, seal_key: bytes, flags: int, seq: int = 0) -> bytes:
+    """NTLMSSP EncryptMessage with extended session security: 16-byte signature, then the
+    ciphertext. The checksum is encrypted with the same RC4 stream, after the message."""
+    handle = _rc4(seal_key)
+    ciphertext = handle.update(message)
+    checksum = hmac.new(sign_key, struct.pack("<I", seq) + message, hashlib.md5).digest()[:8]
+    if flags & _NEGOTIATE_KEY_EXCH:
+        checksum = handle.update(checksum)
+    return struct.pack("<I", 1) + checksum + struct.pack("<I", seq) + ciphertext
+
+
+def server_public_key_reply(
+    version: int, public_key: bytes, client_nonce: bytes | None, sign_key: bytes,
+    seal_key: bytes, flags: int,
+) -> bytes | None:  # fmt: skip
+    """The server's proof that it holds the key the client authenticated against
+    (CredSSP's defence against a man in the middle). v2-4 echo the key with its first byte
+    incremented; v5 and later hash it with the client's nonce. None when a v5+ client
+    sent no nonce."""
+    if version >= 5:
+        if not client_nonce:
+            return None
+        material = hashlib.sha256(
+            b"CredSSP Server-To-Client Binding Hash\x00" + client_nonce + public_key
+        ).digest()
+    else:
+        bumped = bytearray(public_key)
+        bumped[0] = (bumped[0] + 1) & 0xFF
+        material = bytes(bumped)
+    return seal(material, sign_key, seal_key, flags)
+
+
 # ── The exchange ────────────────────────────────────────────────────────────
 
 
@@ -378,21 +501,34 @@ async def _read_der_message(reader: asyncio.StreamReader) -> bytes:
     return head + extra + body
 
 
+# Decides whether a captured AUTHENTICATE is for a credential this honeypot lets in, and
+# returns the plaintext password if so (needed to derive the session key), else None.
+Authorizer = Callable[[dict[str, Any]], Awaitable[str | None]]
+
+
 async def run_credssp(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ident: HostIdentity
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    ident: HostIdentity,
+    *,
+    authorize: Authorizer | None = None,
+    public_key: bytes | None = None,
 ) -> dict[str, Any]:
     """Play the server side of CredSSP/NTLM. Returns what was captured:
 
     * ``stage``: "none" | "negotiate" | "authenticate"
     * ``negotiate``: parsed NEGOTIATE fields (once reached)
     * ``auth``: an AuthMessage plus ``server_challenge`` (once reached)
+    * ``accepted``: True when `authorize` recognised the password and the exchange ran
+      to completion; the stream is then ready for the RDP session
     """
     result: dict[str, Any] = {"stage": "none"}
     try:
         first = parse_ts_request(await _read_der_message(reader))
     except (ValueError, asyncio.IncompleteReadError, TimeoutError, OSError):
         return result
-    negotiate = parse_negotiate(first.nego_token or b"")
+    ntlm_negotiate, spnego = unwrap_ntlm(first.nego_token or b"")
+    negotiate = parse_negotiate(ntlm_negotiate)
     if negotiate is None:
         return result
     result["stage"] = "negotiate"
@@ -401,18 +537,41 @@ async def run_credssp(
 
     version = max(2, min(first.version, 6))
     server_challenge = os.urandom(8)
-    writer.write(build_ts_request(version, build_challenge(ident, server_challenge)))
+    challenge_message = build_challenge(ident, server_challenge)
+    writer.write(
+        build_ts_request(
+            version, wrap_challenge(challenge_message) if spnego else challenge_message
+        )
+    )
     try:
         await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
         second = parse_ts_request(await _read_der_message(reader))
     except (ValueError, asyncio.IncompleteReadError, TimeoutError, OSError):
         return result  # a scanner that only wanted the CHALLENGE (rdp-ntlm-info)
-    auth = parse_authenticate(second.nego_token or b"")
+    auth = parse_authenticate(unwrap_ntlm(second.nego_token or b"")[0])
     if auth is None:
         return result
     result["stage"] = "authenticate"
     result["auth"] = auth
     result["server_challenge"] = server_challenge
+
+    password = await authorize(result) if authorize is not None else None
+    if password is not None and public_key is not None:
+        try:
+            sign_key, seal_key = server_to_client_keys(auth, password)
+            reply = server_public_key_reply(
+                version, public_key, second.client_nonce, sign_key, seal_key, auth.flags
+            )
+            if reply is not None:
+                writer.write(build_ts_request(version, pub_key_auth=reply))
+                await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
+                # The client now sends its (sealed) credentials. We already know the
+                # password, so the message is only consumed.
+                await _read_der_message(reader)
+                result["accepted"] = True
+                return result
+        except (ValueError, asyncio.IncompleteReadError, TimeoutError, OSError):
+            return result
 
     # A wrong password: CredSSP v3+ clients are told so with an errorCode;
     # older ones just see the connection end.

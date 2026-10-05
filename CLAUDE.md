@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1190 unit tests covering security-critical paths)
+# Tests (1252 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -288,13 +288,18 @@ protocol state per RFC 3207 and requires the client to re-issue EHLO.
 
 ### RDP engine
 
-`engines/rdp.py` is banner-only: parses the X.224 Connection Request,
-extracts the leaked `Cookie: mstshash=user[@DOMAIN]` field (almost every
-RDP client and brute-force tool sends this in the clear), and returns a
-TPKT + X.224 Connection Confirm with a believable NLA-required
-negotiation-failure response. No real RDP protocol stack — that's NOT the
-goal here; the goal is to catch RDP brute-force traffic, which is one of
-the largest internet attack categories.
+`engines/rdp.py` parses the X.224 Connection Request, extracts the leaked
+`Cookie: mstshash=user[@DOMAIN]` field (almost every RDP client and brute-force tool sends
+this in the clear), and negotiates TLS or CredSSP. `rdp_nla.py` plays the server side of
+CredSSP/NTLM (bare or SPNEGO-wrapped NTLM, as Windows' own client sends) and captures a
+crackable NetNTLMv2 response. A planted honeytoken credential or the one weak pair derived
+from the honeypot's name (`accepted_logins` / `sessions` in its config) is let in:
+`rdp_nla.py` derives the NTLM session key from the password and seals the server's
+public-key binding (which is how a client that checks it, FreeRDP, aardwolf, proceeds), then
+`rdp_session.py` runs a short MCS/capability exchange, paints a static desktop and records
+keystrokes and clicks. The tests drive it with aardwolf (`tests/unit/test_rdp_session.py`,
+including a mutation-replay fuzz of a recorded session) and FreeRDP 3
+(`tests/integration/test_rdp_freerdp.py`, Docker-gated, checks pixels).
 
 Logs `rdp_handshake` at HIGH severity when the X.224 parses, `rdp_invalid_probe`
 at LOW for port-scan garbage.
@@ -380,6 +385,19 @@ default port in `config.py`, the `Literal` and `default_ports` dict in
 `tools/honeypot.py`, `engines/__init__.py:get_engine()`, and an Alembic
 migration (`Enum(...)` is a native PostgreSQL type — `ALTER TYPE … ADD VALUE`,
 one statement per value; see `0012_add_five_types`).
+
+### Mail: SMTP queue, maildrop, POP3
+
+`engines/smtp.py` analyses a completed `DATA` (`engines/mail_message.py`: headers, links,
+every attachment SHA-256'd, executable attachments CRITICAL) and routes it per recipient
+(`SMTPProtocol._route`): local mailbox -> `engines/maildrop.py` (process-wide, bounded,
+seeded with ordinary internal mail so an inbox is never conspicuously empty), reserved TLD ->
+RFC 3464 bounce to a *local* sender's mailbox after `_DSN_DELAY`, anything else -> recorded
+as relayed. **Nothing is ever sent onward** (spam source / backscatter), pinned by a test
+that fails on any non-loopback connect. `engines/pop3.py` serves the maildrop to a planted
+credential or one derived weak pair (same acceptance rule as the HTTP admin area and RDP);
+`DELE` is acknowledged per session and never removes mail. IMAP is unchanged (rejects every
+login). `tests/unit/test_mail_system.py` drives real `smtplib` and `poplib`.
 
 ### IMAP / SIP / rsync / NFS engines
 

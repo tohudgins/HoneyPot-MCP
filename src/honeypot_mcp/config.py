@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     # less than this many MB free. A full disk silently ends collection: the listeners
     # keep answering while events stop persisting. 0 disables the check.
     min_free_disk_mb: int = 500
+
+    # How often a read-only server checks whether the sensor owner is gone (and takes
+    # over), and how often the owner confirms it still holds the ownership lock.
+    owner_check_seconds: int = 10
     # How often the retention sweep runs, in hours. Independent of the
     # watchdog's health-check cadence — pruning daily is plenty.
     retention_sweep_interval_hours: float = 24.0

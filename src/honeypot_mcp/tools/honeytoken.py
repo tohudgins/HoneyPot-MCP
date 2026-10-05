@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
+from sqlalchemy.exc import IntegrityError
+
 from honeypot_mcp.rbac import require_role, role_at_least
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
@@ -58,7 +60,9 @@ async def honeytoken_create(
 
     Args:
         type: Token type. Options:
-              - api_key: fake AWS credentials (decoy-only, see KNOWN_LIMITATIONS.md)
+              - api_key: AWS credentials. Generated ones are lookalikes that leave no CloudTrail
+                trail; pass a real decoy IAM user's access_key_id + secret_access_key in
+                `metadata` to adopt it (see examples/cloud-forwarders/aws)
               - canary_url: unique URL that fires on HTTP GET
               - credential: fake username/password pair (auto-matched on any honeypot)
               - file: PDF/DOCX with embedded tracker
@@ -67,8 +71,10 @@ async def honeytoken_create(
               - db_row: canary database row with unique email (match on SMTP RCPT TO)
               - kubeconfig: cluster credentials for a decoy API server
               - slack_webhook: incoming-webhook URL that fires when posted to
-              - azure_credential: service-principal client id/secret pair
-              - gcp_service_account: service-account JSON key
+              - azure_credential: service-principal client id/secret pair (adopt a real decoy
+                with metadata client_id, client_secret, tenant_id)
+              - gcp_service_account: service-account JSON key (adopt a real decoy key with
+                metadata service_account_json)
         label: Human-readable label to identify this token (e.g. 'prod-server .env backup').
         metadata: Optional type-specific settings (e.g. {'service': 'aws', 'region': 'us-east-1'}).
         planted_at: Where this token is being placed — "the finance file share",
@@ -78,7 +84,13 @@ async def honeytoken_create(
                     the attacker actually reached; without it a CRITICAL arrives
                     with no location and triage starts from nothing.
     """
-    created = await _create_token(type, label, metadata, planted_at)
+    try:
+        created = await _create_token(type, label, metadata, planted_at)
+    except ValueError as e:
+        return {"error": str(e)}
+    except IntegrityError:
+        # Deliberately not the driver's message: it quotes the bound parameters, i.e. the secret.
+        return {"error": "A honeytoken with this value already exists."}
     await _audit_creation("honeytoken_create", created, metadata, planted_at)
     return created
 
@@ -105,6 +117,51 @@ async def _audit_creation(
     )
 
 
+# Inputs consumed by a provider that must not be kept as given.
+_NEVER_STORE = {"service_account_json"}
+
+
+def _cloud_identifiers(meta: dict[str, Any]) -> set[str]:
+    """The names a cloud audit-log event can carry for a token. Matching is by these across
+    all three clouds in one index, so two tokens sharing one (or a GCP key id equal to an AWS
+    key id) would shadow each other."""
+    found = {
+        str(meta[k]).lower()
+        for k in ("access_key_id", "client_id", "client_email", "private_key_id")
+        if isinstance(meta.get(k), str | int) and meta.get(k)
+    }
+    return found
+
+
+async def _refuse_duplicate_identity(extra_meta: dict[str, Any]) -> None:
+    """Raise ValueError if another live cloud token already answers to the same identifier."""
+    wanted = _cloud_identifiers(extra_meta)
+    if not wanted:
+        return
+    from sqlalchemy import select
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Honeytoken).where(
+                    Honeytoken.type.in_(
+                        [
+                            HoneytokenType.API_KEY,
+                            HoneytokenType.AZURE_CREDENTIAL,
+                            HoneytokenType.GCP_SERVICE_ACCOUNT,
+                        ]
+                    ),
+                    Honeytoken.status != HoneytokenStatus.REVOKED,
+                )
+            )
+        ).scalars()
+        for existing in rows:
+            if wanted & _cloud_identifiers(existing.token_meta or {}):
+                raise ValueError(
+                    f"That cloud identity is already registered as honeytoken {existing.id}."
+                )
+
+
 async def _create_token(
     type: str,
     label: str,
@@ -114,6 +171,11 @@ async def _create_token(
     """Create and persist a token. Unaudited — every caller records its own action."""
     provider = get_provider(HoneytokenType(type))
     token_value, extra_meta = await provider.create(metadata or {})
+    await _refuse_duplicate_identity(extra_meta)
+
+    # What the operator passed in is not stored verbatim: a service-account key file would
+    # be kept a second time, private key and all, next to the parsed fields extracted from it.
+    supplied = {k: v for k, v in (metadata or {}).items() if k not in _NEVER_STORE}
 
     async with get_session() as session:
         token = Honeytoken(
@@ -122,7 +184,7 @@ async def _create_token(
             token_value=token_value,
             status=HoneytokenStatus.ACTIVE,
             token_meta={
-                **(metadata or {}),
+                **supplied,
                 **extra_meta,
                 **({"planted_at": planted_at} if planted_at else {}),
             },
@@ -140,13 +202,11 @@ async def _create_token(
         "token_value": token_value,
         "status": "active",
         "metadata": {
-            **(metadata or {}),
+            **supplied,
             **extra_meta,
             **({"planted_at": planted_at} if planted_at else {}),
         },
-        "plant_instructions": provider.plant_instructions(
-            token_value, {**(metadata or {}), **extra_meta}
-        ),
+        "plant_instructions": provider.plant_instructions(token_value, {**supplied, **extra_meta}),
     }
 
 
@@ -276,6 +336,15 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
         old_type = old.type
         old_label = old.label
         old_meta = dict(old.token_meta or {})
+    if old_meta.get("adopted"):
+        return {
+            "error": (
+                f"Honeytoken {token_id} is a real identity from your cloud account, so it "
+                "cannot be rotated here: a generated replacement would not exist in the cloud "
+                "and would silently stop detecting. Issue a new key in the cloud, create a new "
+                "token from it, then revoke this one."
+            )
+        }
 
     # Anything the provider generated is regenerated; only the operator's
     # own settings carry across, or the "new" token would be the old one.
@@ -289,6 +358,13 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
         "password",
         "access_key_id",
         "secret_access_key",
+        "client_id",
+        "client_secret",
+        "tenant_id",
+        "subscription_id",
+        "client_email",
+        "private_key_id",
+        "adopted",
         "private_key",
         "public_key",
         "fingerprint",
@@ -379,18 +455,34 @@ async def honeytoken_generate_aws(
     label: str,
     region: str = "us-east-1",
     service_prefix: str = "AKIA",
+    access_key_id: str | None = None,
+    secret_access_key: str | None = None,
 ) -> dict[str, Any]:
-    """Generate a believable fake AWS access key pair and store it as a honeytoken. Plant it where
-    an attacker would look (an `.env` file, a repo, a config). It alerts only if your AWS account has
-    the CloudTrail forwarder from `examples/cloud-forwarders/` deployed, since the key is not real.
+    """Create an AWS access-key honeytoken. With no key given it is a lookalike that does NOT
+    exist in AWS, so using it leaves no CloudTrail event: it is only bait for scanners that grep
+    for AKIA strings. For real detection create a decoy IAM user (Terraform in
+    `examples/cloud-forwarders/aws/terraform/decoy_user.tf`), deploy the forwarder, and pass that
+    user's `access_key_id` and `secret_access_key` here: its use is then logged by CloudTrail,
+    forwarded, and raises a CRITICAL alert with the attacker's source IP.
 
     Args:
         label: Human-readable label (e.g. 'leaked-in-github-repo').
-        region: Fake AWS region to embed in the credentials file.
-        service_prefix: AWS key prefix — AKIA (long-term) or ASIA (temporary).
+        region: AWS region to embed in the credentials file.
+        service_prefix: AKIA (long-term) or ASIA (temporary); ignored when adopting a key.
+        access_key_id: A real decoy user's access key ID (adopt it instead of generating one).
+        secret_access_key: The matching secret. Required with access_key_id.
     """
     metadata: dict[str, Any] = {"service": "aws", "region": region, "prefix": service_prefix}
-    created = await _create_token("api_key", label, metadata, None)
+    if access_key_id is not None or secret_access_key is not None:
+        metadata["access_key_id"] = access_key_id
+        metadata["secret_access_key"] = secret_access_key
+    try:
+        created = await _create_token("api_key", label, metadata, None)
+    except ValueError as e:
+        return {"error": str(e)}
+    except IntegrityError:
+        # Deliberately not the driver's message: it quotes the bound parameters, i.e. the secret.
+        return {"error": "A honeytoken with this value already exists."}
     await _audit_creation("honeytoken_generate_aws", created, metadata, None)
     return created
 

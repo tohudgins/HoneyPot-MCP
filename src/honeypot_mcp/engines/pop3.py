@@ -18,8 +18,13 @@ digests.
 stop the attacker sending the password, which is the one thing this engine
 exists to collect.
 
-Not implemented: an actual maildrop. `STAT` and `LIST` answer from a fixed
-fiction so a client that authenticates sees a plausible empty-ish mailbox.
+A login succeeds only for a credential an operator planted as a honeytoken (the event
+buffer's matcher marks the event) or the one weak pair this honeypot derives from its name
+(`accepted_logins` in its config replaces it; an empty list turns access off, as for the
+HTTP admin area). A spray that gets in reaches a real, read-only maildrop
+(`engines/maildrop.py`): what the SMTP honeypot accepted, including delivery-failure
+notices, plus a few ordinary internal messages so the inbox is not conspicuously empty.
+`DELE` is acknowledged and nothing is ever removed.
 
 Wire format: RFC 1939 (POP3), RFC 2449 (CAPA).
 """
@@ -33,7 +38,9 @@ import secrets
 import time
 from typing import Any
 
+from honeypot_mcp import credential_match
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import (
@@ -44,6 +51,8 @@ from honeypot_mcp.engines.conn_limit import (
     limited_factory,
     shutdown_server,
 )
+from honeypot_mcp.engines.http_admin import accepted_pairs
+from honeypot_mcp.engines.maildrop import MAILDROP, StoredMessage
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -58,6 +67,24 @@ _MAX_LINES_PER_READ = 16
 # Real servers pause before rejecting. Instant refusal makes guessing free and
 # is itself a tell.
 _AUTH_FAIL_DELAY = 1.2
+# Retrieval events recorded per session; a client downloading a whole mailbox is one finding.
+_MAX_RETRIEVAL_EVENTS = 20
+_MAX_WRITE_BACKLOG = 512 * 1024
+
+
+def _safe(text: str) -> str:
+    """Attacker text echoed in a reply: printable, short, no line breaks."""
+    return "".join(c for c in text[:32] if c.isprintable())
+
+
+def _subject_of(raw: bytes) -> str:
+    for line in raw[:4096].decode("utf-8", errors="replace").splitlines():
+        if line.lower().startswith("subject:"):
+            return line[8:].strip()[:200]
+        if not line.strip():
+            break
+    return ""
+
 
 _CAPABILITIES = (
     "CAPA",
@@ -72,9 +99,22 @@ _CAPABILITIES = (
 
 
 class _POP3Protocol(asyncio.Protocol):
-    def __init__(self, honeypot_name: str, hp_id: int | None) -> None:
+    def __init__(
+        self,
+        honeypot_name: str,
+        hp_id: int | None,
+        accepted: frozenset[tuple[str, str]] = frozenset(),
+        mail_domain: str = "corp.local",
+    ) -> None:
         self._name = honeypot_name
         self._hp_id = hp_id
+        self._accepted = accepted
+        self._mail_domain = mail_domain
+        # Set once a login succeeds: the POP3 "transaction" state (RFC 1939 §5).
+        self._mailbox: str | None = None
+        self._messages: list[StoredMessage] = []
+        self._deleted: set[int] = set()
+        self._retrievals = 0
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
@@ -94,6 +134,11 @@ class _POP3Protocol(asyncio.Protocol):
 
     def _send(self, text: str) -> None:
         if self._transport is not None and not self._transport.is_closing():
+            if write_backlogged(self._transport, _MAX_WRITE_BACKLOG):
+                # A peer pipelining RETRs and never reading the replies: ~4 KB of commands
+                # bought 61 MB of buffered output on one connection.
+                self._transport.abort()
+                return
             # Half-closed by `close_after_error`; see the IMAP engine.
             with contextlib.suppress(RuntimeError):
                 self._transport.write((text + "\r\n").encode("utf-8", errors="replace"))
@@ -130,6 +175,9 @@ class _POP3Protocol(asyncio.Protocol):
         command = parts[0].upper()
         rest = parts[1].strip() if len(parts) > 1 else ""
 
+        if self._mailbox is not None and await self._transaction(command, rest):
+            return
+
         if command == "CAPA":
             body = "\r\n".join(_CAPABILITIES)
             self._send(f"+OK Capability list follows\r\n{body}\r\n.")
@@ -143,7 +191,7 @@ class _POP3Protocol(asyncio.Protocol):
 
         if command == "PASS":
             # The whole point of port 110: no encoding, no encryption.
-            await self._record(
+            attempt = await self._record(
                 "pop3_login_attempt",
                 AlertSeverity.HIGH,
                 {
@@ -154,6 +202,10 @@ class _POP3Protocol(asyncio.Protocol):
                 },
             )
             await self._auth_delay()
+            planted = credential_match.is_credential_trip(attempt)
+            if self._username and (planted or (self._username.lower(), rest) in self._accepted):
+                await self._open_mailbox(self._username, planted)
+                return
             self._send("-ERR [AUTH] Authentication failed.")
             return
 
@@ -211,18 +263,134 @@ class _POP3Protocol(asyncio.Protocol):
         self._send("-ERR Unknown command.")
         await self._record("pop3_command", AlertSeverity.LOW, {"command": line[:200]})
 
-    async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
+    async def _record(
+        self, event_type: str, severity: AlertSeverity, payload: dict
+    ) -> PendingEvent:
+        """Submit an event and return it: the buffer marks a planted credential on the
+        event itself, which is how a login learns it was a honeytoken."""
         src_ip, src_port = self._peer
-        await submit_event(
-            PendingEvent(
-                honeypot_id=self._hp_id,
-                source_ip=src_ip,
-                source_port=src_port,
-                event_type=event_type,
-                payload=payload,
-                severity=severity,
-            )
+        event = PendingEvent(
+            honeypot_id=self._hp_id,
+            source_ip=src_ip,
+            source_port=src_port,
+            event_type=event_type,
+            payload=payload,
+            severity=severity,
         )
+        await submit_event(event)
+        return event
+
+    async def _open_mailbox(self, username: str, planted: bool) -> None:
+        mailbox = username.split("@", 1)[0].lower()[:64]
+        self._mailbox = mailbox
+        self._messages = MAILDROP.messages(mailbox, self._mail_domain)
+        self._deleted = set()
+        self._send("+OK Logged in.")
+        await self._record(
+            "pop3_login_success",
+            AlertSeverity.HIGH,
+            {
+                "username": username[:256],
+                "planted_credential": planted,
+                "messages": len(self._messages),
+                "service": "pop3",
+            },
+        )
+
+    def _live(self) -> list[tuple[int, StoredMessage]]:
+        """(1-based number, message) for messages not marked deleted."""
+        return [(i + 1, m) for i, m in enumerate(self._messages) if (i + 1) not in self._deleted]
+
+    def _pick(self, rest: str) -> tuple[int, StoredMessage] | None:
+        word = rest.split()[0] if rest.split() else ""
+        if not (word.isascii() and word.isdigit()):  # int() accepts "1_0", "+1", "٣"
+            return None
+        number = int(word)
+        if number < 1 or number > len(self._messages) or number in self._deleted:
+            return None
+        return number, self._messages[number - 1]
+
+    @staticmethod
+    def _stuffed(raw: bytes, *, header_only: bool = False, body_lines: int = 0) -> str:
+        """A message as POP3 sends it: CRLF lines, leading dots doubled, ending ".".
+        TOP sends the headers plus `body_lines` lines of body."""
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        lines = text.split("\n")
+        if header_only:
+            try:
+                split = lines.index("")
+            except ValueError:
+                split = len(lines)
+            lines = lines[: split + 1 + body_lines]
+        out = [("." + ln if ln.startswith(".") else ln) for ln in lines]
+        return "\r\n".join(out) + "\r\n."
+
+    async def _transaction(self, command: str, rest: str) -> bool:
+        """Commands valid once logged in. Returns False for anything it does not own so
+        the caller can fall through to the shared handling (CAPA, QUIT, unknown)."""
+        live = self._live()
+        if command == "STAT":
+            self._send(f"+OK {len(live)} {sum(m.size for _, m in live)}")
+            return True
+        if command in ("LIST", "UIDL"):
+            if rest:
+                picked = self._pick(rest)
+                if picked is None:
+                    self._send("-ERR There's no message " + _safe(rest) + ".")
+                else:
+                    number, message = picked
+                    self._send(f"+OK {number} {message.size if command == 'LIST' else message.uid}")
+                return True
+            rows = [f"{n} {m.size if command == 'LIST' else m.uid}" for n, m in live]
+            self._send("\r\n".join([f"+OK {len(live)} messages:", *rows, "."]))
+            return True
+        if command in ("RETR", "TOP"):
+            picked = self._pick(rest)
+            if picked is None:
+                self._send("-ERR There's no message " + _safe(rest.split(" ")[0]) + ".")
+                return True
+            number, message = picked
+            if command == "TOP":
+                try:
+                    count = max(0, int(rest.split()[1]))
+                except (ValueError, IndexError):
+                    self._send("-ERR Invalid line count.")
+                    return True
+                self._send(
+                    "+OK\r\n" + self._stuffed(message.raw, header_only=True, body_lines=count)
+                )
+                return True
+            self._send(f"+OK {message.size} octets\r\n" + self._stuffed(message.raw))
+            if self._retrievals < _MAX_RETRIEVAL_EVENTS:
+                self._retrievals += 1
+                subject = _subject_of(message.raw)
+                await self._record(
+                    "pop3_message_retrieved",
+                    AlertSeverity.MEDIUM,
+                    {"mailbox": self._mailbox, "message": number, "subject": subject},
+                )
+            return True
+        if command == "DELE":
+            picked = self._pick(rest)
+            if picked is None:
+                self._send("-ERR There's no message " + _safe(rest) + ".")
+            else:
+                # Acknowledged and remembered for this session only: the maildrop is
+                # shared decoy state and an intruder must not be able to empty it.
+                self._deleted.add(picked[0])
+                self._send("+OK Marked to be deleted.")
+            return True
+        if command == "RSET":
+            self._deleted.clear()
+            self._send("+OK")
+            return True
+        if command == "NOOP":
+            self._send("+OK")
+            return True
+        if command in ("USER", "PASS", "APOP"):
+            self._send("-ERR Command not permitted when logged in.")
+            return True
+        return False
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._buf = b""
@@ -240,9 +408,13 @@ class POP3Engine(HoneypotEngine):
             if hp:
                 hp_id = hp.id
 
+        accepted = accepted_pairs(name, config.get("accepted_logins"))
+        mail_domain = str(config.get("mail_domain") or "corp.local")[:64]
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            limited_factory(lambda: _POP3Protocol(name, hp_id), self._limiter),
+            limited_factory(
+                lambda: _POP3Protocol(name, hp_id, accepted, mail_domain), self._limiter
+            ),
             host="0.0.0.0",
             port=port,
         )
