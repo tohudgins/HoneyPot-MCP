@@ -13,6 +13,7 @@ from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertDisposition, AlertSeverity
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import (
     digest_payload,
@@ -21,7 +22,7 @@ from honeypot_mcp.tools._format import (
 )
 
 
-@mcp.tool
+@mcp.tool(**hints("alerts_recent"))
 async def alerts_recent(
     limit: int = 25,
     since_hours: float | None = None,
@@ -114,7 +115,7 @@ async def alerts_recent(
     return result
 
 
-@mcp.tool
+@mcp.tool(**hints("alerts_get"))
 async def alerts_get(alert_id: int) -> dict[str, Any]:
     """Get the complete captured payload for one alert.
 
@@ -154,7 +155,7 @@ async def alerts_get(alert_id: int) -> dict[str, Any]:
         }
 
 
-@mcp.tool
+@mcp.tool(**hints("alerts_search"))
 async def alerts_search(
     query: str,
     limit: int = 50,
@@ -205,7 +206,7 @@ async def alerts_search(
     return result
 
 
-@mcp.tool
+@mcp.tool(**hints("alerts_stats"))
 async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
     """Aggregate alert statistics: totals by severity, top attacker IPs, top event types.
 
@@ -229,7 +230,7 @@ async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
     return stats
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("alerts_acknowledge"))
 async def alerts_acknowledge(
     alert_ids: list[int] | None = None,
     disposition: Literal["true_positive", "false_positive", "benign", "duplicate"] | None = None,
@@ -338,7 +339,7 @@ async def alerts_acknowledge(
     return result
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("alerts_prune"))
 async def alerts_prune(
     older_than_days: int = 90,
     archive: bool = True,
@@ -425,7 +426,7 @@ async def alerts_prune(
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("alerts_export"))
 async def alerts_export(
     format: Literal["json", "csv"] = "json",
     limit: int = 1000,
@@ -500,7 +501,7 @@ async def alerts_export(
     }
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("audit_log_search"))
 async def audit_log_search(
     tool: str | None = None,
     target: str | None = None,

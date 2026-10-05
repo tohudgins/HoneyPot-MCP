@@ -11,12 +11,15 @@ from typing import Any, Literal
 
 from sqlalchemy import delete, update
 
+from honeypot_mcp import instance_lock
+from honeypot_mcp.deception.capabilities import BY_TYPE
 from honeypot_mcp.engines import get_engine
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_honeypot_name
 
@@ -28,7 +31,7 @@ log = logging.getLogger(__name__)
 _ENGINE_STOP_TIMEOUT_SECONDS = 15.0
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_deploy"))
 async def honeypot_deploy(
     type: Literal[
         "ssh",
@@ -61,7 +64,13 @@ async def honeypot_deploy(
     name: str | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Deploy a new honeypot container.
+    """Deploy a honeypot (a decoy network service) and start capturing attacks against it.
+    Choose `type` from `honeypot_templates` (25 kinds: ssh, http, smtp, ftp, rdp, redis, mysql, ...);
+    it listens on that type's default port unless you pass `port`. Returns the honeypot's name,
+    port and status. For several sensors that must look like one coherent environment, use
+    `deception_plan` then `deception_deploy_plan` instead: they pick consistent identities and free
+    ports. SSH and Telnet run Cowrie in Docker; every other type runs inside this server. Fails with
+    a hint if the port is in use or (SSH/Telnet) Docker is unavailable.
 
     Args:
         type: Protocol type — ssh, telnet, http, smtp, ftp, dns, rdp, vnc,
@@ -71,6 +80,8 @@ async def honeypot_deploy(
         name: Unique name for this honeypot (auto-generated if omitted).
         config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     from honeypot_mcp.config import get_settings
 
     settings = get_settings()
@@ -199,11 +210,13 @@ async def honeypot_deploy(
     }
 
 
-@mcp.tool
+@mcp.tool(**hints("honeypot_list"))
 async def honeypot_list(
     status: Literal["running", "stopped", "paused", "error"] | None = None,
 ) -> list[dict[str, Any]]:
-    """List all honeypots with their current status and hit counts.
+    """List every honeypot with its type, port, status (running, paused, stopped, error) and
+    alert count. Start here to see what is deployed. Use `honeypot_health` to confirm the sensors
+    actually answer on their ports, and `honeypot_status` for one sensor's recent events.
 
     Args:
         status: Filter by status (running, stopped, paused, error). Omit for all.
@@ -229,9 +242,33 @@ async def honeypot_list(
     return result
 
 
-@mcp.tool
+def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
+    """For a read-only process: why it cannot inspect this sensor's live engine state.
+
+    In-process engines (everything except Cowrie) live in the owner's memory, so a
+    second process asking one for its status gets "not running" while the database
+    says RUNNING — and a TCP probe from here is indistinguishable from an attacker to
+    the owner, which would record it as traffic. Docker-backed sensors are reachable
+    through the daemon from anywhere, so they are inspected normally.
+    """
+    if instance_lock.sensors_owned():
+        return None
+    capability = BY_TYPE.get(hp.type.value)
+    if capability is not None and capability.requires_docker:
+        return None
+    return {
+        "note": "This session is read-only; the process that owns the sensors holds this "
+        "engine's live state, so it is not inspected from here. The database row below "
+        "is the owner's last record.",
+        "alive": None,
+        "method": "not-probed",
+    }
+
+
+@mcp.tool(**hints("honeypot_status"))
 async def honeypot_status(name: str) -> dict[str, Any]:
-    """Get detailed status and recent events for a specific honeypot.
+    """Details for one honeypot, by name: its configuration, status and most recent events.
+    Use `honeypot_list` first if you do not know the name.
 
     Args:
         name: The honeypot name.
@@ -246,7 +283,9 @@ async def honeypot_status(name: str) -> dict[str, Any]:
 
         engine = get_engine(hp.type)
         engine_status = {}
-        if hp.container_id:
+        if foreign := _owned_elsewhere(hp):
+            engine_status = foreign
+        elif hp.container_id:
             engine_status = await engine.status(hp.container_id)
 
         return {
@@ -273,7 +312,7 @@ async def honeypot_status(name: str) -> dict[str, Any]:
         }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_stop"))
 async def honeypot_stop(
     name: str | None = None,
     names: list[str] | None = None,
@@ -303,6 +342,8 @@ async def honeypot_stop(
         status: Filter by current status.
         remove: Also delete the container and the DB record.
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     if not name and not names and not type and not status:
         return {
             "error": (
@@ -409,13 +450,17 @@ async def honeypot_stop(
     return result
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_pause"))
 async def honeypot_pause(name: str) -> dict[str, Any]:
-    """Pause a running honeypot without removing it.
+    """Suspend collection on a running honeypot without deleting it; `honeypot_resume` brings it
+    back with its configuration and history intact. Prefer this to `honeypot_stop` when the sensor
+    should come back. Only a running honeypot can be paused.
 
     Args:
         name: The honeypot name.
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     async with get_session() as session:
         hp = await queries.get_honeypot_by_name(session, name)
         if not hp:
@@ -437,13 +482,16 @@ async def honeypot_pause(name: str) -> dict[str, Any]:
     return {"name": name, "status": "paused"}
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_resume"))
 async def honeypot_resume(name: str) -> dict[str, Any]:
-    """Resume a paused honeypot.
+    """Resume a paused honeypot so it captures again, with its configuration and history intact.
+
 
     Args:
         name: The honeypot name.
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     async with get_session() as session:
         hp = await queries.get_honeypot_by_name(session, name)
         if not hp:
@@ -465,7 +513,7 @@ async def honeypot_resume(name: str) -> dict[str, Any]:
     return {"name": name, "status": "running"}
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_configure"))
 async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any]:
     """Update the configuration for an existing honeypot.
     Changes take effect after the next stop/start cycle.
@@ -474,6 +522,8 @@ async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any
         name: The honeypot name.
         config: Key-value pairs to merge into the current config.
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     if not isinstance(config, dict):
         return {"error": "config must be an object of key/value pairs."}
 
@@ -586,9 +636,10 @@ def _validate_config(hp_type: str, config: dict[str, Any]) -> str | None:
     return None
 
 
-@mcp.tool
+@mcp.tool(**hints("honeypot_logs"))
 async def honeypot_logs(name: str, lines: int = 50) -> dict[str, Any]:
-    """Fetch recent raw logs from a honeypot container.
+    """Raw log lines from a honeypot's container or process. For debugging a sensor, not for
+    triage: use `alerts_recent` or `alerts_search` to look at attack events.
 
     Args:
         name: The honeypot name.
@@ -604,13 +655,15 @@ async def honeypot_logs(name: str, lines: int = 50) -> dict[str, Any]:
         if not hp.container_id:
             return {"error": f"Honeypot '{name}' has no running container."}
 
+        if foreign := _owned_elsewhere(hp):
+            return {"name": name, "lines": lines, "logs": [], **foreign}
         engine = get_engine(hp.type)
         log_data = await engine.get_logs(hp.container_id, lines=lines)
 
     return {"name": name, "lines": lines, "logs": log_data}
 
 
-@mcp.tool
+@mcp.tool(**hints("honeypot_templates"))
 async def honeypot_templates() -> list[dict[str, Any]]:
     """List every deployable sensor type with its default port and what it captures.
 
@@ -641,7 +694,7 @@ async def honeypot_templates() -> list[dict[str, Any]]:
     ]
 
 
-@mcp.tool
+@mcp.tool(**hints("honeypot_health"))
 async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
     """Check whether honeypots are actually responding (port probe + container status).
 
@@ -673,6 +726,8 @@ async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict
             entry.update(
                 {"alive": False, "detail": "No container_id — never started?", "method": "none"}
             )
+        elif foreign := _owned_elsewhere(hp):
+            entry.update(foreign)
         else:
             try:
                 engine = get_engine(hp.type)
@@ -689,7 +744,7 @@ async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict
     return results
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_self_test"))
 async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, Any]:
     """End-to-end smoke test: send a synthetic probe to the honeypot's port and
     confirm an alert with our unique marker shows up in the DB. Catches subtle
@@ -707,6 +762,8 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
         timeout_seconds: How long to wait for the probe alert to appear
                          (default 15 — SSH needs ~5-10s due to Cowrie log polling).
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     from sqlalchemy import String, cast, select
 
     from honeypot_mcp.storage.models import Alert
@@ -1336,17 +1393,20 @@ _PROBES: dict[str, Any] = {
 }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeypot_clone"))
 async def honeypot_clone(
     source_name: str, new_port: int, new_name: str | None = None
 ) -> dict[str, Any]:
-    """Clone an existing honeypot with a new port (and optionally a new name).
+    """Create a new honeypot with an existing one's type and configuration on a different port,
+    optionally under a new name. Useful for running the same decoy on several ports.
 
     Args:
         source_name: Name of the honeypot to clone.
         new_port: Port for the cloned honeypot.
         new_name: Name for the clone (auto-generated if omitted).
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     async with get_session() as session:
         source = await queries.get_honeypot_by_name(session, source_name)
         if not source:

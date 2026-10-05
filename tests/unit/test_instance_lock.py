@@ -1,0 +1,222 @@
+"""One process owns a deployment's sensors; the rest are read-only."""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import pytest
+
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
+
+@pytest.fixture(autouse=True)
+def restore_ownership():
+    from honeypot_mcp import instance_lock
+
+    yield
+    instance_lock.set_ownership(True)
+
+
+def _url(tmp_path) -> str:
+    return f"sqlite+aiosqlite:///{tmp_path / 'hp.db'}"
+
+
+def test_the_first_process_owns_the_sensors_and_the_second_is_told_who(tmp_path):
+    from honeypot_mcp import instance_lock
+
+    first, holder = instance_lock.try_acquire(_url(tmp_path), "stdio")
+    assert first is not None and holder is None
+
+    second, holder = instance_lock.try_acquire(_url(tmp_path), "streamable-http")
+    assert second is None
+    assert holder is not None and holder.pid == os.getpid() and holder.transport == "stdio"
+    assert str(os.getpid()) in holder.describe()
+
+    first.release()
+    third, holder = instance_lock.try_acquire(_url(tmp_path), "stdio")
+    assert third is not None and holder is None, "releasing the lock must hand over ownership"
+    third.release()
+
+
+def test_an_in_memory_database_is_never_contended():
+    from honeypot_mcp import instance_lock
+
+    for _ in range(2):
+        lock, holder = instance_lock.try_acquire("sqlite+aiosqlite:///:memory:", "stdio")
+        assert lock is not None and holder is None
+
+
+def test_a_killed_owner_does_not_leave_a_stale_lock(tmp_path):
+    """The OS drops the lock when the owner dies, however it dies — there is no pid
+    file to go stale and no manual cleanup after a crash."""
+    from honeypot_mcp import instance_lock
+
+    code = (
+        "import sys, time\n"
+        "from honeypot_mcp import instance_lock\n"
+        f"lock, _ = instance_lock.try_acquire({_url(tmp_path)!r}, 'stdio')\n"
+        "print('held' if lock else 'denied', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "held"
+        blocked, holder = instance_lock.try_acquire(_url(tmp_path), "stdio")
+        assert blocked is None and holder.pid == child.pid
+        child.send_signal(signal.SIGKILL)  # no chance to clean up
+        child.wait(timeout=10)
+        deadline = time.time() + 5
+        lock = None
+        while lock is None and time.time() < deadline:
+            lock, _ = instance_lock.try_acquire(_url(tmp_path), "stdio")
+            time.sleep(0.05)
+        assert lock is not None, "the lock outlived its owner"
+        lock.release()
+    finally:
+        if child.poll() is None:
+            child.kill()
+
+
+def test_the_owner_records_itself_for_the_message_other_processes_show(tmp_path):
+    from honeypot_mcp import instance_lock
+
+    lock, _ = instance_lock.try_acquire(_url(tmp_path), "streamable-http")
+    data = json.loads(lock.path.read_text())
+    assert data["pid"] == os.getpid() and data["transport"] == "streamable-http"
+    lock.release()
+
+
+def test_a_lock_that_cannot_be_created_does_not_stop_the_server(tmp_path, monkeypatch):
+    from honeypot_mcp import instance_lock
+
+    monkeypatch.setattr(
+        instance_lock.Path, "mkdir", lambda *a, **k: (_ for _ in ()).throw(OSError("ro"))
+    )
+    lock, holder = instance_lock.try_acquire(_url(tmp_path / "nope"), "stdio")
+    assert lock is not None and holder is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("tools.honeypot:honeypot_deploy", {"type": "http"}),
+        ("tools.honeypot:honeypot_stop", {"name": "x"}),
+        ("tools.honeypot:honeypot_pause", {"name": "x"}),
+        ("tools.honeypot:honeypot_resume", {"name": "x"}),
+        ("tools.honeypot:honeypot_clone", {"source_name": "x", "new_port": 9999}),
+        ("tools.honeypot:honeypot_configure", {"name": "x", "config": {}}),
+        ("tools.honeypot:honeypot_self_test", {"name": "x"}),
+        ("tools.deception:deception_deploy_plan", {"sensors": [], "tokens": []}),
+        ("tools.pcap:pcap_control", {"action": "start"}),
+    ],
+)
+async def test_every_tool_that_changes_sensors_refuses_in_a_read_only_process(tool, args):
+    import importlib
+    import inspect
+
+    from honeypot_mcp import instance_lock
+
+    module_name, func_name = tool.split(":")
+    fn = getattr(importlib.import_module(f"honeypot_mcp.{module_name}"), func_name)
+    params = set(inspect.signature(fn.fn if hasattr(fn, "fn") else fn).parameters)
+    call_args = {k: v for k, v in args.items() if k in params}
+
+    instance_lock.set_ownership(False, instance_lock.Holder(pid=4242, transport="stdio"))
+    out = await fn(**call_args)
+    assert "read-only" in out["error"] and "4242" in out["error"], out
+    assert out["sensor_owner"] == {"pid": 4242, "transport": "stdio"}
+
+
+@pytest.mark.asyncio
+async def test_read_only_processes_still_serve_reads_and_say_what_they_are():
+    from honeypot_mcp import instance_lock
+    from honeypot_mcp.server import ping
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
+    from honeypot_mcp.tools.honeypot import honeypot_list
+
+    event_buffer.reset_for_tests()
+    await init_db()
+    try:
+        assert (await ping())["role"] == "owner"
+        instance_lock.set_ownership(False, instance_lock.Holder(pid=1))
+        assert (await ping())["role"] == "read-only"
+        assert await honeypot_list() == []
+    finally:
+        await close_db()
+        event_buffer.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_process_never_probes_or_inspects_in_process_sensors():
+    """A TCP probe from the read-only process is indistinguishable from an attacker to the
+    owner (self_probe is per-process), so it was recorded as a redis_connection alert; and
+    asking an in-process engine for status from here said 'not running' for a sensor the
+    database lists RUNNING."""
+    from sqlalchemy import func, select
+
+    from honeypot_mcp import instance_lock
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, get_session, init_db
+    from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
+    from honeypot_mcp.tools.honeypot import honeypot_health, honeypot_status
+
+    event_buffer.reset_for_tests()
+    await init_db()
+    try:
+        async with get_session() as session:
+            session.add(
+                Honeypot(
+                    name="r1",
+                    type=HoneypotType.REDIS,
+                    port=16379,
+                    status=HoneypotStatus.RUNNING,
+                    container_id="in-process",
+                )
+            )
+        instance_lock.set_ownership(False, instance_lock.Holder(pid=4242))
+        health = await honeypot_health("r1")
+        assert health["method"] == "not-probed" and health["alive"] is None
+        status = await honeypot_status("r1")
+        assert status["engine_status"]["method"] == "not-probed"
+        async with get_session() as session:
+            assert (
+                await session.execute(select(func.count()).select_from(Alert))
+            ).scalar_one() == 0
+    finally:
+        instance_lock.set_ownership(True)
+        await close_db()
+
+
+def test_in_memory_url_variants_share_no_lock_and_postgres_locks_are_private(tmp_path, monkeypatch):
+    from honeypot_mcp import instance_lock
+
+    for url in (
+        "sqlite+aiosqlite:///:memory:",
+        "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
+    ):
+        assert instance_lock.lock_path_for(url) is None, url
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = instance_lock.lock_path_for("postgresql+asyncpg://u:p@db/hp")
+    assert path is not None and path.parent == tmp_path / ".honeypot-mcp"
+
+
+def test_the_lock_file_is_never_written_through_a_planted_symlink(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    db = tmp_path / "hp.db"
+    (tmp_path / "hp.db.owner").symlink_to(victim)
+    from honeypot_mcp import instance_lock
+
+    lock, holder = instance_lock.try_acquire(f"sqlite+aiosqlite:///{db}", "stdio")
+    try:
+        assert victim.read_text() == "precious"
+        assert lock is not None  # refusing to follow the link must not stop the server
+    finally:
+        if lock:
+            lock.release()

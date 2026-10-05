@@ -42,6 +42,7 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -160,7 +161,7 @@ async def _finish(
 # ── Cloudflare ──────────────────────────────────────────────────────────────
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("blocklist_push_cloudflare"))
 async def blocklist_push_cloudflare(
     account_id: str,
     list_id: str,
@@ -286,7 +287,7 @@ async def _cloudflare_push(
 # ── pfSense ─────────────────────────────────────────────────────────────────
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("blocklist_push_pfsense"))
 async def blocklist_push_pfsense(
     base_url: str,
     api_key: str,
@@ -443,7 +444,7 @@ async def _pfsense_push(
 # ── AWS WAFv2 ───────────────────────────────────────────────────────────────
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("blocklist_push_aws_waf"))
 async def blocklist_push_aws_waf(
     ip_set_id: str,
     ip_set_name: str,

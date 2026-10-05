@@ -160,7 +160,7 @@ async def test_fetching_the_embedded_url_triggers_the_token(file_type, tmp_path,
         assert resp.content_type == "image/png"
 
         # The trigger is written by the buffer's flusher; poll, bounded.
-        for _ in range(100):
+        for _ in range(300):  # 15 s: returns as soon as it fires; this is for loaded runners
             async with get_session() as session:
                 token = await session.get(Honeytoken, created["id"])
             assert token is not None

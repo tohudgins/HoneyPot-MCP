@@ -167,7 +167,9 @@ async def test_probe_to_a_non_loopback_local_address_is_also_claimed():
     port = server.sockets[0].getsockname()[1]
     try:
         assert (await tcp_probe(port, host=host))["alive"] is True
-        for _ in range(20):
+        # Returns the instant the server has seen the connection; the generous budget
+        # only matters on a loaded runner (0.4 s was not enough there).
+        for _ in range(250):
             await asyncio.sleep(0.02)
             if seen:
                 break

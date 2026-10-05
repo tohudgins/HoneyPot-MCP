@@ -39,7 +39,7 @@ import asyncio
 import contextlib
 import logging
 import secrets
-from typing import Any
+from typing import Any, cast
 
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
@@ -363,19 +363,16 @@ async def _handle_rdp_client(
             await writer.wait_closed()
         return
 
-    # Client wants TLS. Send Connection Confirm + NegRSP(success, SSL), then
-    # upgrade the stream.
-    try:
-        # NLA clients (mstsc, FreeRDP, scanners) ask for CredSSP; answer in kind
-        # and run it after the TLS upgrade. Asking for SSL alone still gets SSL.
-        selected = _PROTOCOL_HYBRID if requested & _PROTOCOL_HYBRID else _PROTOCOL_SSL
-        writer.write(_build_neg_success_response(selected))
-        await writer.drain()
-    except Exception:
-        with contextlib.suppress(Exception):
-            writer.close()
-        return
-
+    # Client wants TLS. Get the certificate ready FIRST, then send Connection Confirm
+    # + NegRSP and upgrade the stream.
+    #
+    # Order matters. A real client starts its TLS handshake the instant it reads the
+    # Connection Confirm, and the first use of a honeypot generates its certificate
+    # (an RSA key — long enough for the ClientHello to arrive meanwhile). Bytes that
+    # arrive before `start_tls` takes over the transport are read into the
+    # StreamReader's buffer and never reach the TLS layer, so the handshake times out.
+    # Building the context before replying removes the gap, and pausing the transport
+    # across the reply closes what is left of it.
     try:
         ssl_ctx = await build_server_ssl_context_async(honeypot_name)
     except Exception as e:
@@ -384,6 +381,20 @@ async def _handle_rdp_client(
         # the handshake.
         log.warning("RDP TLS context unavailable for '%s': %s", honeypot_name, e)
         writer.close()
+        return
+
+    try:
+        # NLA clients (mstsc, FreeRDP, scanners) ask for CredSSP; answer in kind
+        # and run it after the TLS upgrade. Asking for SSL alone still gets SSL.
+        selected = _PROTOCOL_HYBRID if requested & _PROTOCOL_HYBRID else _PROTOCOL_SSL
+        # A server-side stream's transport is a full duplex Transport; the stub types
+        # `StreamWriter.transport` as write-only.
+        cast(asyncio.Transport, writer.transport).pause_reading()
+        writer.write(_build_neg_success_response(selected))
+        await writer.drain()
+    except Exception:
+        with contextlib.suppress(Exception):
+            writer.close()
         return
 
     try:

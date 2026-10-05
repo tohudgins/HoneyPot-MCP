@@ -24,12 +24,13 @@ from honeypot_mcp.rbac import current_actor, hash_token, invalidate_api_key_cach
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import ApiKey
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 
 _LABEL_RE = re.compile(r"[A-Za-z0-9_.@ -]{1,64}")
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("api_key_create"))
 async def api_key_create(
     label: str,
     role: Literal["viewer", "operator", "admin"],
@@ -124,7 +125,7 @@ async def api_key_create(
     }
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("api_key_revoke"))
 async def api_key_revoke(key_id: int) -> dict[str, Any]:
     """Revoke a live-provisioned API key. Takes effect within 30 seconds on
     every server process, no restart needed.
@@ -160,7 +161,7 @@ async def api_key_revoke(key_id: int) -> dict[str, Any]:
     return {"id": key_id, "label": label, "status": "revoked"}
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("api_key_list"))
 async def api_key_list(include_revoked: bool = False) -> list[dict[str, Any]]:
     """List live-provisioned API keys — metadata only, never the tokens
     themselves (only their hash is ever stored, and this doesn't return

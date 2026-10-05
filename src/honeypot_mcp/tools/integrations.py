@@ -24,6 +24,7 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import AlertSeverity, Subscription, SuppressionRule
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 
 _ACTIONS = ("drop", "rate_limit")
@@ -87,7 +88,7 @@ def _validate_rule(
 # ── Subscriptions ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("alert_subscribe"))
 async def alert_subscribe(
     url: str,
     label: str,
@@ -256,7 +257,7 @@ async def alert_subscribe(
     }
 
 
-@mcp.tool(auth=require_role("admin"))
+@mcp.tool(auth=require_role("admin"), **hints("alert_unsubscribe"))
 async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
     """Deactivate a webhook subscription. Existing rows are kept for audit; only
     `active=False` is set so deliveries stop.
@@ -285,7 +286,7 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
     return {"id": subscription_id, "active": False}
 
 
-@mcp.tool
+@mcp.tool(**hints("alert_subscriptions_list"))
 async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, Any]]:
     """List webhook subscriptions with their delivery health stats.
 
@@ -326,7 +327,7 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
 # ── Suppression rules ─────────────────────────────────────────────────────────
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("suppression_add"))
 async def suppression_add(
     label: str,
     ip_pattern: str | None = None,
@@ -424,9 +425,10 @@ async def suppression_add(
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("suppression_remove"))
 async def suppression_remove(rule_id: int) -> dict[str, Any]:
-    """Deactivate a suppression rule.
+    """Deactivate a suppression rule so the events it was dropping are recorded again. Find rule
+    ids with `suppression_list`.
 
     Args:
         rule_id: The rule ID returned by suppression_add.
@@ -450,9 +452,10 @@ async def suppression_remove(rule_id: int) -> dict[str, Any]:
     return {"id": rule_id, "active": False}
 
 
-@mcp.tool
+@mcp.tool(**hints("suppression_list"))
 async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
-    """List suppression rules with their hit counts.
+    """List suppression rules (the filters that drop or rate-limit noisy events such as known
+    scanners) with their ids and how many events each has matched.
 
     Args:
         active_only: If True (default), only return active rules.
@@ -482,7 +485,7 @@ async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
     ]
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("suppression_load_preset"))
 async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     """Apply a bundled suppression preset (e.g. 'shodan', 'censys',
     'internal-rfc1918').
@@ -632,7 +635,7 @@ def _list_available_presets() -> list[str]:
     return sorted(set(presets))
 
 
-@mcp.tool
+@mcp.tool(**hints("suppression_list_presets"))
 async def suppression_list_presets() -> list[str]:
     """List bundled suppression presets available to `suppression_load_preset`.
 

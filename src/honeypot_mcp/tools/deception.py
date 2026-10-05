@@ -23,6 +23,7 @@ from typing import Any, Literal
 
 from sqlalchemy import func, select
 
+from honeypot_mcp import instance_lock
 from honeypot_mcp.deception.capabilities import BY_TYPE, all_capabilities, all_profiles
 from honeypot_mcp.deception.coverage import build_coverage
 from honeypot_mcp.deception.planner import build_plan
@@ -37,11 +38,12 @@ from honeypot_mcp.storage.models import (
     Honeytoken,
     HoneytokenStatus,
 )
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import digest_payload
 
 
-@mcp.tool
+@mcp.tool(**hints("deception_profiles"))
 async def deception_profiles() -> dict[str, Any]:
     """List environment profiles and every deployable sensor type.
 
@@ -83,7 +85,7 @@ async def deception_profiles() -> dict[str, Any]:
     }
 
 
-@mcp.tool
+@mcp.tool(**hints("deception_plan"))
 async def deception_plan(
     profile: Literal[
         "corporate_windows",
@@ -163,7 +165,7 @@ async def deception_plan(
     return plan
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("deception_deploy_plan"))
 async def deception_deploy_plan(
     sensors: list[dict[str, Any]],
     tokens: list[dict[str, Any]] | None = None,
@@ -185,6 +187,8 @@ async def deception_deploy_plan(
         tokens: Token entries from the plan (type, label, metadata).
         stop_on_error: Roll back everything on the first failure.
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     from honeypot_mcp.tools.honeypot import honeypot_deploy, honeypot_stop
     from honeypot_mcp.tools.honeytoken import honeytoken_create
 
@@ -280,7 +284,7 @@ async def deception_deploy_plan(
     }
 
 
-@mcp.tool
+@mcp.tool(**hints("deception_coverage"))
 async def deception_coverage(include_recommendations: bool = True) -> dict[str, Any]:
     """What the live deployment can detect, per ATT&CK tactic, and where it is blind.
 
@@ -325,7 +329,7 @@ async def deception_coverage(include_recommendations: bool = True) -> dict[str, 
     return await build_coverage(deployed, tokens, include_recommendations=include_recommendations)
 
 
-@mcp.tool
+@mcp.tool(**hints("soc_brief"))
 async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[str, Any]:
     """Shift handover: what happened, what needs a human, what was noise.
 

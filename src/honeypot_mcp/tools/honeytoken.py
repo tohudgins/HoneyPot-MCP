@@ -11,6 +11,7 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
 from honeypot_mcp.tokens import get_provider
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 
 
@@ -28,7 +29,7 @@ def _invalidate_matcher_caches(token_type: HoneytokenType | None = None) -> None
     invalidate_token_match()
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_create"))
 async def honeytoken_create(
     type: Literal[
         "api_key",
@@ -47,7 +48,13 @@ async def honeytoken_create(
     metadata: dict[str, Any] | None = None,
     planted_at: str | None = None,
 ) -> dict[str, Any]:
-    """Create a new honeytoken.
+    """Create a honeytoken: a fake credential, key, link or document that raises a CRITICAL alert
+    the moment anyone uses it. `type` selects the kind (canary_url, file, credential, ssh_key,
+    api_key, jwt, db_row, kubeconfig, slack_webhook, azure_credential, gcp_service_account).
+    Afterwards call `honeytoken_export` for planting instructions. A token only fires when the
+    attacker uses it where this deployment can see it: a canary URL being fetched, a planted
+    credential being tried against one of your honeypots, or (cloud keys) a forwarder you set up.
+    Prefer `honeytoken_generate_credentials` / `honeytoken_generate_aws` for those common cases.
 
     Args:
         type: Token type. Options:
@@ -143,11 +150,12 @@ async def _create_token(
     }
 
 
-@mcp.tool
+@mcp.tool(**hints("honeytoken_list"))
 async def honeytoken_list(
     status: Literal["active", "triggered", "revoked"] | None = None,
 ) -> list[dict[str, Any]]:
-    """List all honeytokens, optionally filtered by status.
+    """List honeytokens with their type, label and status (active, triggered, revoked), optionally
+    filtered by status. Use `honeytoken_status` for who triggered one and when.
 
     Args:
         status: Filter by status (active, triggered, revoked). Omit for all.
@@ -169,9 +177,10 @@ async def honeytoken_list(
     ]
 
 
-@mcp.tool
+@mcp.tool(**hints("honeytoken_status"))
 async def honeytoken_status(token_id: int) -> dict[str, Any]:
-    """Get detailed status and trigger history for a specific honeytoken.
+    """Details for one honeytoken: its type, label, status and trigger history (which attacker IP
+    used it, when, and through what).
 
     Args:
         token_id: The numeric honeytoken ID.
@@ -227,7 +236,7 @@ async def honeytoken_status(token_id: int) -> dict[str, Any]:
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_rotate"))
 async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dict[str, Any]:
     """Replace a honeytoken with a fresh one, keeping its identity and history.
 
@@ -333,9 +342,10 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_revoke"))
 async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
-    """Deactivate a honeytoken so it no longer triggers alerts.
+    """Deactivate a honeytoken so it no longer alerts. There is no un-revoke: create a new token
+    (or use `honeytoken_rotate`, which keeps the history and issues a fresh secret) if you still want one.
 
     Args:
         token_id: The numeric honeytoken ID.
@@ -364,13 +374,15 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
     return {"token_id": token_id, "status": "revoked"}
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_generate_aws"))
 async def honeytoken_generate_aws(
     label: str,
     region: str = "us-east-1",
     service_prefix: str = "AKIA",
 ) -> dict[str, Any]:
-    """Generate a believable fake AWS access key pair and store it as a honeytoken.
+    """Generate a believable fake AWS access key pair and store it as a honeytoken. Plant it where
+    an attacker would look (an `.env` file, a repo, a config). It alerts only if your AWS account has
+    the CloudTrail forwarder from `examples/cloud-forwarders/` deployed, since the key is not real.
 
     Args:
         label: Human-readable label (e.g. 'leaked-in-github-repo').
@@ -383,13 +395,15 @@ async def honeytoken_generate_aws(
     return created
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_generate_credentials"))
 async def honeytoken_generate_credentials(
     label: str,
     count: int = 5,
     service: str = "ssh",
 ) -> dict[str, Any]:
-    """Generate believable fake username/password pairs as honeytokens.
+    """Generate believable fake username/password pairs for a service (ssh, ftp, http, smtp, rdp, ...)
+    and store them as honeytokens. They fire when an attacker tries them against one of your own
+    honeypots for that service, with a CRITICAL alert naming the token. Returned once: plant them.
 
     Args:
         label: Label for this credential set.
@@ -402,7 +416,7 @@ async def honeytoken_generate_credentials(
     return created
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_embed_file"))
 async def honeytoken_embed_file(
     label: str,
     file_type: Literal["pdf", "docx"] = "pdf",
@@ -422,11 +436,12 @@ async def honeytoken_embed_file(
     return created
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("honeytoken_export"))
 async def honeytoken_export(
     token_id: int, context: Literal["env_file", "aws_credentials", "bash", "json"] = "json"
 ) -> str:
-    """Export a honeytoken formatted for planting in a specific context.
+    """Format an existing honeytoken for planting in a given context (env file, config snippet,
+    authorized_keys, ...). The output contains the secret value, so treat it as sensitive.
 
     Args:
         token_id: The honeytoken ID to export.

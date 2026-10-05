@@ -119,11 +119,12 @@ async def test_journey_records_phase_transitions():
 
 @pytest.mark.asyncio
 async def test_journey_caps_chronological_output():
-    from honeypot_mcp.tools.analysis import analyze_attacker_journey
+    from honeypot_mcp.tools.analysis import _JOURNEY_CHRONOLOGICAL, analyze_attacker_journey
 
     ssh_id = await _add_honeypot("ssh-honey", "ssh", 2222)
     ip = "7.7.7.7"
-    # 250 events — chronological list should cap at 200
+    # More events than the chronological list may hold: the total stays exact, the
+    # list is capped.
     for i in range(250):
         await _add_alert(
             ip, "ssh_login_failed", {"attempt": i}, hp_id=ssh_id, minutes_ago=60 - (i * 0.1)
@@ -131,4 +132,4 @@ async def test_journey_caps_chronological_output():
 
     out = await analyze_attacker_journey(ip, hours=24)
     assert out["total_alerts"] == 250
-    assert len(out["chronological"]) == 200
+    assert len(out["chronological"]) == _JOURNEY_CHRONOLOGICAL < 250

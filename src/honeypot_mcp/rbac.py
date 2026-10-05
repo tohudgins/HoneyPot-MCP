@@ -352,6 +352,7 @@ def build_combined_verifier(static_tokens: dict[str, dict[str, Any]]) -> Any:
 VIEWER_TOOLS: frozenset[str] = frozenset(
     {
         "alerts_recent",
+        "fingerprint_clusters",
         "alerts_get",
         "alerts_search",
         "alerts_stats",

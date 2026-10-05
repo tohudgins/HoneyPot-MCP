@@ -13,16 +13,18 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from honeypot_mcp import instance_lock
 from honeypot_mcp import pcap as pcap_module
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools import _audit
 from honeypot_mcp.tools._format import validate_ip
 
 log = logging.getLogger(__name__)
 
 
-@mcp.tool
+@mcp.tool(**hints("pcap_status"))
 async def pcap_status() -> dict[str, Any]:
     """Is packet capture running, and how much disk is it using?
 
@@ -38,7 +40,7 @@ async def pcap_status() -> dict[str, Any]:
     return status
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("pcap_extract"))
 async def pcap_extract(
     source_ip: str,
     output_path: str | None = None,
@@ -57,6 +59,7 @@ async def pcap_extract(
     error = validate_ip(source_ip)
     if error:
         return {"error": error}
+    source_ip = source_ip.strip()
 
     if output_path is None:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -84,7 +87,7 @@ async def pcap_extract(
     return result
 
 
-@mcp.tool
+@mcp.tool(**hints("pcap_files"))
 async def pcap_files() -> dict[str, Any]:
     """List the capture ring's files, oldest first, with sizes and ages.
 
@@ -119,7 +122,7 @@ async def pcap_files() -> dict[str, Any]:
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("pcap_control"))
 async def pcap_control(action: Literal["start", "stop", "restart"]) -> dict[str, Any]:
     """Start, stop or restart packet capture.
 
@@ -131,6 +134,8 @@ async def pcap_control(action: Literal["start", "stop", "restart"]) -> dict[str,
     Args:
         action: "start", "stop", or "restart".
     """
+    if (read_only := instance_lock.read_only_error()) is not None:
+        return read_only
     normalized = (action or "").strip().lower()
     if normalized not in ("start", "stop", "restart"):
         return {"error": f"action must be start, stop or restart (got {action!r})"}

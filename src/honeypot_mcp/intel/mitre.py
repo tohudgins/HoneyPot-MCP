@@ -347,6 +347,14 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Command and Control",
     ),
     (
+        # An SSH/Telnet session asking the honeypot to open a connection onward: the
+        # honeypot is being used as a proxy hop.
+        re.compile(r"(ssh|telnet).{0,12}port.forward", re.I),
+        "T1090",
+        "Proxy",
+        "Command and Control",
+    ),
+    (
         re.compile(r"(c2|command.and.control|reverse.shell)", re.I),
         "T1105",
         "Ingress Tool Transfer",

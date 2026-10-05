@@ -121,6 +121,23 @@ async def _gather_metrics() -> str:
         out.append("# TYPE honeypot_active_honeypots gauge\n")
         out.append(_line("honeypot_active_honeypots", None, active_hp))
 
+        # One series per sensor that is supposed to be up (RUNNING, or ERROR after a failed
+        # probe), so `honeypot_sensor_up == 0` is an alert rule. Sensors an operator
+        # stopped or paused are left out: a deliberate stop must not page anyone.
+        sensors = (
+            await session.execute(
+                select(Honeypot.name, Honeypot.type, Honeypot.status)
+                .where(Honeypot.status.in_([HoneypotStatus.RUNNING, HoneypotStatus.ERROR]))
+                .order_by(Honeypot.id)
+            )
+        ).all()
+        out.append("# HELP honeypot_sensor_up 1 when the honeypot is RUNNING, else 0.\n")
+        out.append("# TYPE honeypot_sensor_up gauge\n")
+        for name, hp_type, status in sensors:
+            type_value = hp_type.value if hasattr(hp_type, "value") else str(hp_type)
+            up = 1 if status == HoneypotStatus.RUNNING else 0
+            out.append(_line("honeypot_sensor_up", {"name": name, "type": type_value}, up))
+
         # Active tokens by type (gauge)
         tok_rows = (
             await session.execute(
@@ -191,6 +208,16 @@ async def _gather_metrics() -> str:
         out.append("# TYPE honeypot_event_queue_dropped_total counter\n")
         for sev, n in sorted(by_sev().items()):
             out.append(_line("honeypot_event_queue_dropped_total", {"severity": sev}, n))
+
+    # Free space where the server writes. A full disk ends collection silently.
+    from honeypot_mcp.storage import disk
+
+    volumes = disk.sample()
+    if volumes:
+        out.append("# HELP honeypot_disk_free_bytes Free bytes on a volume the server writes to.\n")
+        out.append("# TYPE honeypot_disk_free_bytes gauge\n")
+        for v in volumes:
+            out.append(_line("honeypot_disk_free_bytes", {"volume": v.label}, v.free_bytes))
 
     # Webhook events dropped by the bounded delivery queues. Read the existing
     # singleton only — a scrape must not be what instantiates the worker.
@@ -267,6 +294,18 @@ async def _handle_readyz(_request: web.Request) -> web.Response:
     if depth > 50_000:
         checks["event_queue"] = "backlog — ingest is outrunning the database"
         ready = False
+
+    from honeypot_mcp.storage import disk
+
+    # Only the database volume decides readiness: it is the one whose exhaustion stops
+    # events persisting. A full reports or pcap volume is alerted on (watchdog,
+    # honeypot_disk_free_bytes) but must not mark a collecting server unhealthy.
+    low = [v for v in disk.low_volumes() if v.label == "database"]
+    if low:
+        checks["disk"] = "; ".join(f"low on {v.label}: {v.free_mb} MB free" for v in low)
+        ready = False
+    else:
+        checks["disk"] = "ok"
 
     return web.json_response(
         {"status": "ready" if ready else "not ready", "checks": checks},

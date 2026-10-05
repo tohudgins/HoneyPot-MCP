@@ -282,15 +282,15 @@ async def test_delivery_queue_sheds_low_severity_first_and_counts_drops(monkeypa
     d = WebhookDelivery()
     await d.enqueue_batch([_event("low") for _ in range(5)])
     assert d.pending == 3
-    assert d.dropped == 2
+    assert d.dropped_count == 2
 
     d2 = WebhookDelivery()
     await d2.enqueue_batch([_event("high", event_type=f"h{i}") for i in range(3)])
     await d2.enqueue_batch([_event("low")])  # full of HIGH: the newcomer is shed
-    assert d2.pending == 3 and d2.dropped == 1
+    assert d2.pending == 3 and d2.dropped_count == 1
     await d2.enqueue_batch([_event("critical", event_type="crit")])
     kept = [j.event.event_type for j in d2._high]
-    assert "crit" in kept and d2.pending == 3 and d2.dropped == 2
+    assert "crit" in kept and d2.pending == 3 and d2.dropped_count == 2
 
 
 @pytest.mark.asyncio
@@ -383,3 +383,21 @@ def test_every_renderer_tolerates_an_event_with_no_honeypot():
     ):
         assert getattr(webhooks, name)(ev, sub), name
     assert webhooks.render_syslog(ev, sub)
+
+
+async def test_webhook_drops_reach_the_metrics_endpoint():
+    """Two halves of the same feature were written apart: the delivery queue counted
+    drops as `dropped` while the metrics code read `dropped_count`, so the
+    `honeypot_webhook_dropped_total` series was silently never exported — a shed
+    notification was invisible to the operator who needed to know."""
+    from honeypot_mcp import webhooks
+    from honeypot_mcp.metrics import _gather_metrics
+
+    delivery = webhooks.get_delivery()
+    before = delivery.dropped_count
+    delivery.dropped_count = before + 7
+    try:
+        body = await _gather_metrics()
+    finally:
+        delivery.dropped_count = before
+    assert f"honeypot_webhook_dropped_total {before + 7}" in body

@@ -1477,7 +1477,7 @@ class WebhookDelivery:
         self._sub_backlog: dict[int, int] = {}
         self._dest_cache: dict[tuple[str, str, bool], tuple[float, str | None, list[str]]] = {}
         self._inflight: set[asyncio.Task[None]] = set()
-        self.dropped = 0
+        self.dropped_count = 0
         self._dropped_since_log = 0
         self._last_drop_log = 0.0
 
@@ -1487,7 +1487,7 @@ class WebhookDelivery:
         return len(self._high) + len(self._low)
 
     def _note_drop(self) -> None:
-        self.dropped += 1
+        self.dropped_count += 1
         self._dropped_since_log += 1
         now = time.monotonic()
         if now - self._last_drop_log >= 10.0:
@@ -1496,7 +1496,7 @@ class WebhookDelivery:
                 "a destination is slower than the event rate. Raise `webhook_queue_max` "
                 "or fix the slow subscription.",
                 self._dropped_since_log,
-                self.dropped,
+                self.dropped_count,
             )
             self._last_drop_log = now
             self._dropped_since_log = 0
@@ -1758,7 +1758,7 @@ def webhook_dropped_count() -> int:
     """Events the delivery layer has shed (queue overflow or a backlogged
     subscription). Counterpart to the event buffer's dropped counter, for the
     metrics endpoint."""
-    return get_delivery().dropped
+    return get_delivery().dropped_count
 
 
 def get_delivery() -> WebhookDelivery:

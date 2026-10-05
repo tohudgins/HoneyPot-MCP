@@ -376,3 +376,33 @@ async def test_a_client_asking_only_for_ssl_still_gets_plain_tls():
     ssl_only = rdp._build_neg_success_response(1)
     nla_reply = rdp._build_neg_success_response(2)
     assert ssl_only[-4:] == b"\x01\x00\x00\x00" and nla_reply[-4:] == b"\x02\x00\x00\x00"
+
+
+async def test_tls_upgrade_survives_a_client_that_sends_its_hello_immediately_on_a_cold_certificate(
+    monkeypatch,
+):
+    """A real client starts its TLS handshake the instant it reads the Connection
+    Confirm. The first use of a honeypot generates its certificate, which takes long
+    enough for that ClientHello to arrive meanwhile; bytes that arrive before
+    `start_tls` takes over the transport land in the stream buffer and never reach the
+    TLS layer, so the handshake timed out. Slowing certificate generation down makes
+    the window wide enough to hit deterministically."""
+    import time
+
+    from honeypot_mcp.engines import tls as tls_mod
+
+    real = tls_mod.build_server_ssl_context
+
+    def slow(*args, **kwargs):
+        time.sleep(0.6)  # what generating an RSA key on a busy host looks like
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tls_mod, "build_server_ssl_context", slow)
+    port, engine, cid = await _rdp("rdp-cold-cert")
+    try:
+        out = await asyncio.to_thread(_client, port, "alice", "ACME", "Summer2026!")
+    finally:
+        await engine.stop(cid)
+    assert out["final"].endswith(b"\xa4\x06\x02\x04\xc0\x00\x00\x6d"), (
+        "the TLS handshake did not complete when the ClientHello arrived early"
+    )

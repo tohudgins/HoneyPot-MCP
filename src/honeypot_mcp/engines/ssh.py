@@ -112,7 +112,51 @@ _EVENT_MAP = {
     # Client banner exchange — useful for fingerprinting attacker tools
     # (e.g. libssh / Paramiko / OpenSSH variants) and for the self-test probe.
     "cowrie.client.version": ("ssh_client_version", AlertSeverity.LOW),
+    # The client's key-exchange offer. Its HASSH (an MD5 of the algorithm lists, in
+    # the offer's order) identifies the SSH *implementation* behind a connection, not
+    # the address: the same botnet binary produces the same HASSH from every IP it
+    # runs on, which is what lets an analyst cluster scattered sources into one
+    # campaign. Cowrie computes it; it was being discarded as an unmapped eventid.
+    "cowrie.client.kex": ("ssh_client_kex", AlertSeverity.LOW),
+    # A public key offered for authentication: the fingerprint ties together logins
+    # by the same attacker key (and is what a planted key's trip-wire matches on).
+    "cowrie.client.fingerprint": ("ssh_pubkey_attempt", AlertSeverity.MEDIUM),
+    # What an attacker pushes through the SSH proxy once a direct-tcpip channel is
+    # open: the request line / payload (spam relays, scan traffic, C2 hops) and its
+    # JA4H fingerprint. The channel *request* was recorded; its content was not.
+    "cowrie.direct-tcpip.data": ("ssh_port_forward_data", AlertSeverity.HIGH),
+    "cowrie.direct-tcpip.ja4h": ("ssh_port_forward_ja4h", AlertSeverity.LOW),
 }
+
+# Fields kept from a key-exchange event: the fingerprint and the algorithm offers
+# it was computed from, each list capped (a real offer is ~10-30 names).
+_KEX_KEEP = ("hassh", "hasshAlgorithms", "kexAlgs", "keyAlgs", "encCS", "macCS", "compCS")
+_KEX_LIST_CAP = 40
+_FORWARDED_DATA_CAP = 2048
+
+
+def _shape_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Trim fields that are bulky and add nothing once the fingerprint is recorded."""
+    if event_type.endswith("_client_kex"):
+        shaped = {k: v for k, v in payload.items() if k not in _KEX_KEEP and k != "langCS"}
+        for key in _KEX_KEEP:
+            value = payload.get(key)
+            if isinstance(value, list):
+                value = [str(v)[:64] for v in value[:_KEX_LIST_CAP]]
+            elif isinstance(value, str):
+                value = value[:1024]
+            if value is not None:
+                shaped[key] = value
+        return shaped
+    if event_type.endswith("_port_forward_data") and isinstance(payload.get("data"), str):
+        data = payload["data"]
+        return {
+            **payload,
+            "data": data[:_FORWARDED_DATA_CAP],
+            "data_bytes": len(data),
+            "data_truncated": len(data) > _FORWARDED_DATA_CAP,
+        }
+    return payload
 
 
 def _retag_for_protocol(event_type: str, protocol: str | None) -> str:
@@ -731,7 +775,10 @@ class SSHEngine(HoneypotEngine):
                 probe_sessions.add(session_id)
             return
 
-        payload = {k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")}
+        payload = _shape_payload(
+            event_type,
+            {k: v for k, v in entry.items() if k not in ("eventid", "src_ip", "src_port")},
+        )
 
         await submit_event(
             PendingEvent(

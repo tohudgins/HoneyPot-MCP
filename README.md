@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-1137%20unit%20%2B%2011%20e2e-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1190%20unit%20%2B%2011%20e2e-brightgreen)](tests/)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 25
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -149,7 +149,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-1137 unit tests plus 11 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+1190 unit tests plus 11 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -365,7 +365,8 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 | Tool | Description |
 |---|---|
 | `enrich_ip` | VirusTotal + AbuseIPDB + GeoIP, parallel and cached |
-| `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile + risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline |
+| `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile + risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline (exact totals, bounded sample — safe on an attacker with 100k+ events) |
+| `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH) — the same tooling behind many IPs is one operator |
 | `analyze_campaign` / `map_ttps` / `threat_timeline` | Campaign correlation, MITRE mapping, chronological timeline |
 | `generate_report` | Write an XSS-safe HTML or Markdown report to disk |
 | `export_blocklist` / `export_stix` | Write iptables/fail2ban/CIDR list or a STIX 2.1 bundle to disk |
@@ -398,6 +399,12 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 </details>
 
 **MCP resources:** `honeypot://active` · `alerts://stream` · `honeytoken://triggered` · `stats://dashboard`
+
+**MCP prompts:** `shift_handover` · `investigate_ip` · `honeytoken_tripped` · `hunt_campaigns` · `deploy_deception` · `weekly_report` — ready-made workflows for the common jobs. Each tells the model that captured text was written by an attacker and that destructive actions need confirmation.
+
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool that is not in it cannot register.
+
+**Two processes, one database.** The first server to start owns the sensors (an OS file lock beside the SQLite file). A second one — another chat session — starts read-only: it can query, triage and report, and refuses to deploy or stop, instead of fighting the owner and raising false "sensor dead" alerts. `ping` reports the role.
 
 ---
 
@@ -494,7 +501,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 1137 unit tests
+uv run pytest tests/unit/ -v     # 1190 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

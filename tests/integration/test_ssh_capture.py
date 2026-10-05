@@ -366,3 +366,91 @@ async def test_deployed_cowrie_tells_one_consistent_story_about_itself(persona_i
     assert "phil" not in seen["home"] and "phil" not in seen["passwd"]
     assert seen["home"].strip(), "no home directory at all"
     assert seen["banner"] == persona.ssh_version_string
+
+
+@skip_docker
+async def test_real_ssh_clients_with_different_offers_cluster_by_hassh():
+    """Live Cowrie, real OpenSSH clients, the real ingest path: sessions from the same
+    client configuration share a HASSH, a different key-exchange offer gets a different
+    one, and `fingerprint_clusters` reports them as separate clusters."""
+    import shutil
+    import subprocess
+
+    from honeypot_mcp import config
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
+    from honeypot_mcp.tools.analysis import fingerprint_clusters
+    from honeypot_mcp.tools.honeypot import honeypot_deploy, honeypot_stop
+
+    if shutil.which("sshpass") is None:
+        pytest.skip("needs sshpass to drive a login")
+
+    previous_url = os.environ.get("DATABASE_URL")
+    db_dir = tempfile.mkdtemp(prefix="honeypot-ssh-hassh-")
+    await close_db()
+    os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{Path(db_dir) / 'it.db'}"
+    config._settings = None
+    event_buffer.reset_for_tests()
+    await init_db()
+    buffer = event_buffer.get_buffer()
+    await buffer.start()
+
+    name = f"it-hassh-{uuid.uuid4().hex[:8]}"
+    port = _free_port()
+    deployed = False
+    try:
+        result = await honeypot_deploy(type="ssh", name=name, port=port)
+        assert "error" not in result, result
+        deployed = True
+        for _ in range(40):
+            await asyncio.sleep(1)
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                break
+            except OSError:
+                continue
+        else:
+            pytest.fail("Cowrie never accepted a connection")
+
+        def connect(*extra: str) -> None:
+            subprocess.run(
+                [
+                    "sshpass", "-p", "x", "ssh", "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8",
+                    "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
+                    *extra, "-p", str(port), "root@127.0.0.1", "true",
+                ],
+                capture_output=True, timeout=40,
+            )  # fmt: skip
+
+        def drive() -> None:
+            for _ in range(2):
+                connect()  # default OpenSSH offer
+            for _ in range(2):
+                connect("-o", "Ciphers=aes128-ctr", "-o", "MACs=hmac-sha2-256")  # another offer
+
+        await asyncio.to_thread(drive)
+        out: dict = {}
+        for _ in range(40):  # let the log ingester catch up
+            await asyncio.sleep(1)
+            out = await fingerprint_clusters(min_sources=1)
+            if out["fingerprints_seen"] >= 2:
+                break
+    finally:
+        if deployed:
+            with contextlib.suppress(Exception):
+                await honeypot_stop(name=name, remove=True)
+        await buffer.stop()
+        event_buffer.reset_for_tests()
+        await close_db()
+        if previous_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous_url
+        config._settings = None
+
+    assert out["fingerprints_seen"] == 2, out
+    assert sorted(c["sessions"] for c in out["clusters"]) == [2, 2]
+    assert all(len(c["hassh"]) == 32 for c in out["clusters"])
+    assert all(c["client_banners"] and c["client_banners"][0]["banner"].startswith("SSH-2.0-OpenSSH")
+               for c in out["clusters"])  # fmt: skip

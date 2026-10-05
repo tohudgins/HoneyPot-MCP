@@ -336,6 +336,17 @@ prevent.
 
 ## Operational notes
 
+- **One server owns the sensors.** With a local SQLite database, a second server process
+  starts read-only (queries, triage, reports work; deploy/stop/pause/clone/configure/
+  pcap_control refuse). Over PostgreSQL the lock is per-host file only, so two servers on
+  different hosts sharing one database are not detected.
+  A read-only session does not take over when the owner exits; restart it. In that mode
+  `honeypot_health`/`honeypot_status` do not probe in-process sensors (a probe from a
+  second process looks like an attacker to the owner) and say so.
+- **Disk watch covers the database directory, `reports_dir` and the pcap ring.** It
+  alerts below `MIN_FREE_DISK_MB` (500); it does not prevent the disk filling, and a
+  remote PostgreSQL's own volume is not visible to it.
+
 - **Dashboards against a host daemon need one group, not a looser directory.**
   The daemon keeps `data/` private (`0700`), which Grafana (a container, uid 472)
   cannot read. `docs/DEPLOY.md` step 9 gives read access to a dedicated

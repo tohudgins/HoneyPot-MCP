@@ -49,6 +49,8 @@ class HoneypotWatchdog:
         # Monotonic timestamp of the last retention sweep. 0.0 means "never" so
         # the first cycle after startup runs it immediately when enabled.
         self._last_prune_at: float = 0.0
+        # Volumes already reported low, so a full disk raises one alert, not one per cycle.
+        self._disk_low: set[str] = set()
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -74,6 +76,10 @@ class HoneypotWatchdog:
                 await self._maybe_prune()
             except Exception as e:
                 log.warning("Retention sweep failed: %s", e)
+            try:
+                await self._check_disk()
+            except Exception as e:
+                log.warning("Disk check failed: %s", e)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
             except TimeoutError:
@@ -222,6 +228,32 @@ class HoneypotWatchdog:
                 continue
             self._reported_dead.add(hp.id)
             await self._mark_dead(hp.id, hp.name, health)
+
+    async def _check_disk(self) -> None:
+        """Raise one CRITICAL alert when a volume runs low, and clear it on recovery."""
+        from honeypot_mcp.storage import disk
+
+        low = {sample.label: sample for sample in disk.low_volumes()}
+        for label, sample in low.items():
+            if label in self._disk_low:
+                continue
+            self._disk_low.add(label)
+            log.error("Low disk space on %s (%s): %d MB free", label, sample.path, sample.free_mb)
+            await submit_event(
+                PendingEvent(
+                    honeypot_id=None,
+                    source_ip="0.0.0.0",
+                    event_type="disk_space_low",
+                    payload={
+                        "volume": label,
+                        "path": sample.path,
+                        "free_mb": sample.free_mb,
+                        "threshold_mb": get_settings().min_free_disk_mb,
+                    },
+                    severity=AlertSeverity.CRITICAL,
+                )
+            )
+        self._disk_low &= set(low)  # recovered volumes can alert again next time
 
     async def _mark_recovered(self, hp_id: int, hp_name: str) -> None:
         """Flip a honeypot that is answering again back to RUNNING.

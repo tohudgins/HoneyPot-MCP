@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     # manual `alerts_prune` tool). 0 = disabled (never auto-delete) — the safe
     # default, so nobody loses data they didn't opt into discarding.
     retention_days: int = 0
+
+    # Alert (watchdog CRITICAL event, /readyz 503) when a volume the server writes to has
+    # less than this many MB free. A full disk silently ends collection: the listeners
+    # keep answering while events stop persisting. 0 disables the check.
+    min_free_disk_mb: int = 500
     # How often the retention sweep runs, in hours. Independent of the
     # watchdog's health-check cadence — pruning daily is plenty.
     retention_sweep_interval_hours: float = 24.0

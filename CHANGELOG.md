@@ -4,6 +4,35 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Agent surface, scale and self-monitoring
+
+A gap audit of the product as an *agent* sees it, at scale, and when something goes wrong.
+
+- **Tool annotations and titles** on all 65 tools (`tool_hints.py`), fail-closed: an
+  unclassified tool cannot register. The viewer tier is pinned read-only (except
+  `generate_report`, which writes a file). Eighteen terse descriptions were rewritten;
+  a test requires every parameter to be documented.
+- **MCP prompts** (`prompts.py`) and rewritten server instructions.
+- **`analyze_attacker_journey` was 12.2 MB in 5 s** for the busiest source in a
+  250k-alert database. Now exact totals plus a bounded sample: 26 KB in 0.3 s.
+- **SSH client fingerprints.** Cowrie's `client.kex` (HASSH) and `direct-tcpip.data`
+  events were being discarded as unmapped. Now recorded, `ssh_port_forward_data` maps to
+  T1090, and `fingerprint_clusters` groups sources by HASSH.
+- **Two servers on one database** raised false CRITICAL `honeypot_restart_failed`
+  alerts. An `flock` ownership lock makes the second one read-only; a killed owner
+  releases it automatically. Checked with two real processes.
+- **Disk space is watched.** A full disk stops persistence while the listeners keep
+  answering. `/readyz` goes 503, `honeypot_disk_free_bytes` is exported, and the watchdog
+  raises one CRITICAL `disk_space_low` (re-armed after recovery). `MIN_FREE_DISK_MB`,
+  default 500, 0 disables. New `honeypot_sensor_up{name,type}` gauge.
+- **`honeypot_webhook_dropped_total` was never exported** (the metrics code read an
+  attribute the class did not have). Fixed and pinned.
+- **RDP TLS-upgrade race** (latent): a client sending its TLS hello immediately after the
+  Connection Confirm could be reset on a cold certificate. Found only by running the suite
+  on Python 3.12.
+- `fastmcp>=3.4,<4` — the old `>=2.0.0` floor was never true. Suite verified on Python
+  3.11, 3.12, 3.13 and 3.14.
+
 ## Fidelity: what a human probing by hand would notice
 
 The limitations list named the places a skilled person could tell the engines from

@@ -10,6 +10,7 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
+from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_ip, write_artifact
 
@@ -17,7 +18,7 @@ _MAX_ABUSE_COMMENT_CHARS = 500
 _MAX_REPORT_ALERTS = 1000
 
 
-@mcp.tool
+@mcp.tool(**hints("enrich_ip"))
 async def enrich_ip(ip: str) -> dict[str, Any]:
     """Enrich an IP address with threat intelligence from multiple sources.
     Queries VirusTotal, AbuseIPDB, and MaxMind GeoIP in parallel.
@@ -29,6 +30,7 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
 
     if err := validate_ip(ip):
         return {"error": err}
+    ip = ip.strip()
 
     from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
     from honeypot_mcp.intel.geoip import lookup_geoip
@@ -52,7 +54,7 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("report_ip_abuse"))
 async def report_ip_abuse(
     ip: str,
     categories: list[int] | None = None,
@@ -106,7 +108,7 @@ async def report_ip_abuse(
     return result
 
 
-@mcp.tool
+@mcp.tool(**hints("analyze_attacker"))
 async def analyze_attacker(ip: str) -> dict[str, Any]:
     """Build a full attacker profile for an IP: all honeypot events, token triggers,
     threat intel enrichment, and MITRE ATT&CK technique mapping.
@@ -118,6 +120,7 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
 
     if err := validate_ip(ip):
         return {"error": err}
+    ip = ip.strip()
 
     from honeypot_mcp.analysis.profiler import build_profile
     from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
@@ -147,7 +150,7 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
     return profile
 
 
-@mcp.tool
+@mcp.tool(**hints("analyze_campaign"))
 async def analyze_campaign(
     window_minutes: int = 60,
     min_sources: int = 3,
@@ -172,7 +175,7 @@ async def analyze_campaign(
     return campaigns
 
 
-@mcp.tool
+@mcp.tool(**hints("map_ttps"))
 async def map_ttps(
     ip: str | None = None,
     event_types: list[str] | None = None,
@@ -206,7 +209,7 @@ async def map_ttps(
     return await map_to_attack(terms)
 
 
-@mcp.tool
+@mcp.tool(**hints("generate_report"))
 async def generate_report(
     title: str = "Attack Analysis Report",
     ip: str | None = None,
@@ -249,6 +252,7 @@ async def generate_report(
         }
     if ip and (err := validate_ip(ip)):
         return {"error": err}
+    ip = ip.strip() if ip else ip
     since = None
     if since_hours is not None:
         if since_hours <= 0:
@@ -374,14 +378,49 @@ def _summarize_payload(payload: dict[str, Any]) -> str:
     return f"{len(payload)} fields"
 
 
-@mcp.tool
-async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
-    """Reconstruct an attacker's full activity across all honeypots and tokens.
+# How much of one attacker's history the journey tool returns in detail. A scanner
+# that has been hitting a honeypot for a week produces tens of thousands of alerts;
+# returning them all (the original behaviour: 12 MB and five seconds for one IP)
+# is useless to an agent and overflows its context. Counts are always exact; the
+# detail is a bounded, representative sample, and the response says so.
+_JOURNEY_DETAIL_LIMIT = 600  # alerts analysed one by one
+_JOURNEY_EDGE_ROWS = 150  # earliest and latest alerts always included in a sample
+_JOURNEY_EVENTS_PER_PHASE = 10
+_JOURNEY_TRANSITIONS = 30
+_JOURNEY_CHRONOLOGICAL = 40
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
-    Pulls every alert + token trigger for the IP, maps each to a MITRE ATT&CK
-    tactic, groups by phase in kill-chain order, and shows the transitions
-    between phases. This is the 'what's the story of this attacker' view —
-    the multi-honeypot complement to `analyze_session` (which is per-Cowrie-session).
+
+def _representative(events: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    """At most `cap` events from a chronological list: the first and last few, then
+    the most severe of the rest, returned in time order."""
+    if len(events) <= cap:
+        return events
+    edge = max(cap // 6, 1)
+    chosen = {id(e) for e in events[:edge]} | {id(e) for e in events[-edge:]}
+    middle = sorted(
+        (e for e in events[edge:-edge]),
+        key=lambda e: _SEVERITY_RANK.get(e["severity"], 0),
+        reverse=True,
+    )
+    chosen |= {id(e) for e in middle[: cap - len(chosen)]}
+    return [e for e in events if id(e) in chosen]
+
+
+@mcp.tool(**hints("analyze_attacker_journey"))
+async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
+    """Reconstruct an attacker's activity across all honeypots and tokens as a story.
+
+    Maps what the IP did to MITRE ATT&CK tactics, groups it by phase in kill-chain
+    order, and shows the transitions between phases. This is the 'what is the story
+    of this attacker' view; the multi-honeypot complement to `analyze_session`
+    (which is one Cowrie session).
+
+    Output is bounded whatever the volume: totals and per-phase counts are exact,
+    but for an attacker with many alerts the individual events listed are a
+    representative sample (earliest, latest, and the most severe) and the response
+    carries `sampled: true`. For the raw events behind it use `alerts_recent` or
+    `alerts_search` with `source_ip`.
 
     Args:
         ip: The attacker's IP address.
@@ -389,37 +428,93 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
     """
     if err := validate_ip(ip):
         return {"error": err}
+    ip = ip.strip()
+    hours = max(1, min(hours, 24 * 365 * 5))
 
     from datetime import datetime, timedelta
 
-    from sqlalchemy import select
+    from sqlalchemy import case, func, select
 
     from honeypot_mcp.intel.mitre import map_to_attack
     from honeypot_mcp.storage.models import (
         Alert,
+        AlertSeverity,
         AttackerEvent,
         Honeypot,
         Honeytoken,
     )
 
     since = datetime.now(UTC) - timedelta(hours=hours)
+    in_window = (Alert.source_ip == ip, Alert.timestamp >= since)
+    severity_rank = case(
+        (Alert.severity == AlertSeverity.CRITICAL, 3),
+        (Alert.severity == AlertSeverity.HIGH, 2),
+        (Alert.severity == AlertSeverity.MEDIUM, 1),
+        else_=0,
+    )
 
     async with get_session() as session:
-        alerts_result = await session.execute(
-            select(Alert)
-            .where(Alert.source_ip == ip, Alert.timestamp >= since)
-            .order_by(Alert.timestamp)
-        )
-        alerts = list(alerts_result.scalars().all())
+        total, first_ts, last_ts = (
+            await session.execute(
+                select(func.count(), func.min(Alert.timestamp), func.max(Alert.timestamp)).where(
+                    *in_window
+                )
+            )
+        ).one()
+        total_events = (
+            await session.execute(
+                select(func.count())
+                .select_from(AttackerEvent)
+                .where(AttackerEvent.ip == ip, AttackerEvent.timestamp >= since)
+            )
+        ).scalar_one()
 
-        events_result = await session.execute(
-            select(AttackerEvent)
-            .where(AttackerEvent.ip == ip, AttackerEvent.timestamp >= since)
-            .order_by(AttackerEvent.timestamp)
-        )
-        events = list(events_result.scalars().all())
+        if not total and not total_events:
+            return {
+                "ip": ip,
+                "total_alerts": 0,
+                "total_events": 0,
+                "summary": f"No activity for {ip} in the last {hours}h.",
+            }
 
-        hp_ids = {a.honeypot_id for a in alerts if a.honeypot_id is not None}
+        sampled = total > _JOURNEY_DETAIL_LIMIT
+        if not sampled:
+            rows = await session.execute(
+                select(Alert).where(*in_window).order_by(Alert.timestamp, Alert.id)
+            )
+            alerts = list(rows.scalars().all())
+            type_counts: dict[str, int] = {}
+        else:
+            # Exact counts per event type for the whole window, then a bounded
+            # sample: the earliest and latest alerts plus the most severe ones.
+            type_rows = await session.execute(
+                select(Alert.event_type, func.count()).where(*in_window).group_by(Alert.event_type)
+            )
+            type_counts = {row[0]: row[1] for row in type_rows.all()}
+            picked: dict[int, Alert] = {}
+            for query in (
+                select(Alert).where(*in_window).order_by(Alert.timestamp, Alert.id),
+                select(Alert).where(*in_window).order_by(Alert.timestamp.desc(), Alert.id.desc()),
+            ):
+                result = await session.execute(query.limit(_JOURNEY_EDGE_ROWS))
+                picked.update({a.id: a for a in result.scalars().all()})
+            result = await session.execute(
+                select(Alert)
+                .where(*in_window)
+                .order_by(severity_rank.desc(), Alert.timestamp.desc())
+                .limit(_JOURNEY_DETAIL_LIMIT - len(picked))
+            )
+            picked.update({a.id: a for a in result.scalars().all()})
+            alerts = sorted(picked.values(), key=lambda a: (a.timestamp, a.id))
+
+        # Which honeypots, and which tokens, over the WHOLE window (not just the sample).
+        hp_ids = {
+            row[0]
+            for row in (
+                await session.execute(select(Alert.honeypot_id).where(*in_window).distinct())
+            ).all()
+            if row[0] is not None
+        }
         honeypot_names: dict[int, str] = {}
         if hp_ids:
             hp_result = await session.execute(
@@ -427,7 +522,20 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
             )
             honeypot_names = {row[0]: row[1] for row in hp_result.all()}
 
-        token_ids = {e.honeytoken_id for e in events if e.honeytoken_id is not None}
+        token_ids = {
+            row[0]
+            for row in (
+                await session.execute(
+                    select(AttackerEvent.honeytoken_id)
+                    .where(
+                        AttackerEvent.ip == ip,
+                        AttackerEvent.timestamp >= since,
+                        AttackerEvent.honeytoken_id.is_not(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+        }
         tokens_triggered: list[dict[str, Any]] = []
         if token_ids:
             tok_result = await session.execute(
@@ -443,12 +551,14 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
                     }
                 )
 
-    if not alerts and not events:
+    if not alerts:
         return {
             "ip": ip,
             "total_alerts": 0,
-            "total_events": 0,
-            "summary": f"No activity for {ip} in the last {hours}h.",
+            "total_events": total_events,
+            "tokens_triggered": tokens_triggered,
+            "summary": f"{total_events} token event(s) but no honeypot alerts for {ip} "
+            f"in the last {hours}h.",
         }
 
     chronological: list[dict[str, Any]] = []
@@ -472,7 +582,6 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
                 "primary_tactic": _primary_tactic(ttps),
             }
         )
-    chronological.sort(key=lambda x: x["_ts"])
 
     # Group by primary tactic. Each phase aggregates the events and the
     # unique technique IDs observed within it.
@@ -495,23 +604,38 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
             if tid not in phases[pt]["_tech_ids"]:
                 phases[pt]["_tech_ids"].add(tid)
                 phases[pt]["techniques"].append(
-                    {
-                        "technique_id": tid,
-                        "technique_name": t["technique_name"],
-                    }
+                    {"technique_id": tid, "technique_name": t["technique_name"]}
                 )
 
-    # Order phases by kill-chain progression.
+    # With a sample, per-phase totals come from the exact per-event-type counts (each
+    # type mapped to its tactic once), so they cover the whole window. That classifies
+    # by event type only; the sample also reads payload text (a command that edits
+    # authorized_keys is Persistence even though its event type is just "a command"),
+    # so a phase found only that way is reported from the sample and flagged inexact.
+    exact_phase_counts: dict[str, int] = {}
+    if sampled:
+        for event_type, count in type_counts.items():
+            tactic = _primary_tactic(await map_to_attack([event_type]))
+            exact_phase_counts[tactic] = exact_phase_counts.get(tactic, 0) + count
+            phases.setdefault(
+                tactic, {"phase": tactic, "events": [], "_tech_ids": set(), "techniques": []}
+            )
+
     phases_list = []
-    for _phase_name, data in phases.items():
+    for name, data in phases.items():
         data.pop("_tech_ids", None)
-        data["event_count"] = len(data["events"])
+        listed = data["events"]
+        data["event_count"] = exact_phase_counts.get(name, len(listed))
+        if sampled:
+            data["event_count_exact"] = name in exact_phase_counts
+        data["events"] = _representative(listed, _JOURNEY_EVENTS_PER_PHASE)
+        data["events_shown"] = len(data["events"])
         phases_list.append(data)
     phases_list.sort(
         key=lambda p: _KILL_CHAIN_ORDER.index(p["phase"]) if p["phase"] in _KILL_CHAIN_ORDER else 99
     )
 
-    # Detect phase transitions in chronological order.
+    # Phase transitions in chronological order (of what was analysed), bounded.
     transitions: list[dict[str, Any]] = []
     last_phase: str | None = None
     for e in chronological:
@@ -525,14 +649,18 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
                 }
             )
         last_phase = e["primary_tactic"]
+    transitions_total = len(transitions)
+    if transitions_total > _JOURNEY_TRANSITIONS:
+        half = _JOURNEY_TRANSITIONS // 2
+        transitions = transitions[:half] + transitions[-half:]
 
-    first_seen = chronological[0]["_ts"]
-    last_seen = chronological[-1]["_ts"]
+    first_seen = first_ts or chronological[0]["_ts"]
+    last_seen = last_ts or chronological[-1]["_ts"]
 
     summary_bits = [
         f"Attacker {ip} active from {first_seen.isoformat()} to {last_seen.isoformat()}",
         f"touched {len(honeypot_names)} honeypot(s)",
-        f"{len(alerts)} alert(s) across {len(phases_list)} ATT&CK phase(s)",
+        f"{total} alert(s) across {len(phases_list)} ATT&CK phase(s)",
     ]
     if tokens_triggered:
         summary_bits.append(f"triggered {len(tokens_triggered)} honeytoken(s)")
@@ -540,26 +668,169 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         summary_bits.append("phase progression: " + " → ".join(p["phase"] for p in phases_list))
     summary = ". ".join(summary_bits) + "."
 
-    return {
+    chrono_out = [
+        {k: v for k, v in e.items() if k not in ("_ts", "techniques", "primary_tactic")}
+        for e in chronological
+    ]
+    out: dict[str, Any] = {
         "ip": ip,
         "first_seen": first_seen.isoformat(),
         "last_seen": last_seen.isoformat(),
         "duration_seconds": (last_seen - first_seen).total_seconds(),
         "honeypots_touched": sorted(honeypot_names.values()),
         "tokens_triggered": tokens_triggered,
-        "total_alerts": len(alerts),
-        "total_events": len(events),
+        "total_alerts": total,
+        "total_events": total_events,
         "phases": phases_list,
         "transitions": transitions,
+        "transitions_total": transitions_total,
+        "transitions_basis": "sample" if sampled else "all events",
         "summary": summary,
-        "chronological": [
-            {k: v for k, v in e.items() if k not in ("_ts", "techniques", "primary_tactic")}
-            for e in chronological[:200]
-        ],
+        "chronological": _representative(chrono_out, _JOURNEY_CHRONOLOGICAL),
+        "sampled": sampled,
+    }
+    if sampled:
+        out["by_event_type"] = dict(sorted(type_counts.items(), key=lambda kv: -kv[1])[:30])
+        out["note"] = (
+            f"{total} alerts in the window. total_alerts and by_event_type are exact; "
+            "per-phase counts classify by event type (event_count_exact=false marks a "
+            f"phase seen only in the sample's payload text). Events are a sample of "
+            f"{len(alerts)} (earliest, latest, most severe), and transitions come from "
+            "that sample. Use alerts_recent / alerts_search with source_ip for raw events."
+        )
+    return out
+
+
+# Most rows the fingerprint tool will read from the window; it reports when it hit this.
+_CLUSTER_SCAN_CAP = 50_000
+
+
+@mcp.tool(**hints("fingerprint_clusters"))
+async def fingerprint_clusters(
+    hours: int = 168, min_sources: int = 2, limit: int = 15
+) -> dict[str, Any]:
+    """Group attacker IPs by the SSH client software they run, to expose botnets.
+
+    An address is cheap to change; the SSH implementation behind it is not. Every
+    connection's key-exchange offer hashes to a HASSH, and the same tool or botnet
+    binary produces the same HASSH from every IP it runs on. This groups sources by
+    that fingerprint, so fifty scattered addresses that share one HASSH show up as
+    one campaign. Each cluster lists how many distinct IPs and sessions used it, when,
+    a few example IPs, and the client banners (`SSH-2.0-...`) seen with it.
+
+    Follow up with `analyze_attacker_journey` on an example IP, or
+    `export_blocklist` once you are satisfied the cluster is hostile.
+
+    Args:
+        hours: Look-back window in hours (default 168 = 7 days).
+        min_sources: Only clusters with at least this many distinct IPs (default 2;
+            use 1 to include every fingerprint).
+        limit: Maximum clusters to return, largest first (default 15).
+    """
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.models import Alert
+
+    hours = max(1, min(hours, 24 * 90))
+    limit = max(1, min(limit, 100))
+    since = datetime.now(UTC) - timedelta(hours=hours)
+
+    async with get_session() as session:
+        kex = (
+            await session.execute(
+                select(Alert.source_ip, Alert.timestamp, Alert.payload)
+                .where(Alert.event_type == "ssh_client_kex", Alert.timestamp >= since)
+                .order_by(Alert.timestamp.desc())
+                .limit(_CLUSTER_SCAN_CAP + 1)
+            )
+        ).all()
+        truncated = len(kex) > _CLUSTER_SCAN_CAP
+        kex = kex[:_CLUSTER_SCAN_CAP]
+        banners = (
+            await session.execute(
+                select(Alert.payload)
+                .where(Alert.event_type == "ssh_client_version", Alert.timestamp >= since)
+                .order_by(Alert.timestamp.desc())
+                .limit(_CLUSTER_SCAN_CAP)
+            )
+        ).all()
+
+    version_by_session: dict[str, str] = {}
+    for (payload,) in banners:
+        session_id, version = payload.get("session"), payload.get("version")
+        if isinstance(session_id, str) and isinstance(version, str):
+            version_by_session[session_id] = version[:80]
+
+    clusters: dict[str, dict[str, Any]] = {}
+    for ip, ts, payload in kex:
+        fingerprint = payload.get("hassh")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            continue
+        c = clusters.setdefault(
+            fingerprint,
+            {
+                "hassh": fingerprint,
+                "ips": set(),
+                "sessions": set(),
+                "first_seen": ts,
+                "last_seen": ts,
+                "versions": {},
+                "kex_offer": payload.get("kexAlgs"),
+            },
+        )
+        c["ips"].add(ip)
+        session_id = payload.get("session")
+        if isinstance(session_id, str):
+            c["sessions"].add(session_id)
+            version = version_by_session.get(session_id)
+            if version:
+                c["versions"][version] = c["versions"].get(version, 0) + 1
+        c["first_seen"] = min(c["first_seen"], ts)
+        c["last_seen"] = max(c["last_seen"], ts)
+
+    ranked = sorted(
+        (c for c in clusters.values() if len(c["ips"]) >= min_sources),
+        key=lambda c: (len(c["ips"]), len(c["sessions"])),
+        reverse=True,
+    )
+    out_clusters = []
+    for c in ranked[:limit]:
+        top_versions = sorted(c["versions"].items(), key=lambda kv: kv[1], reverse=True)[:3]
+        offer = c["kex_offer"] if isinstance(c["kex_offer"], list) else []
+        out_clusters.append(
+            {
+                "hassh": c["hassh"],
+                "distinct_ips": len(c["ips"]),
+                "sessions": len(c["sessions"]),
+                "first_seen": c["first_seen"].isoformat(),
+                "last_seen": c["last_seen"].isoformat(),
+                "client_banners": [{"banner": v, "sessions": n} for v, n in top_versions],
+                "example_ips": sorted(c["ips"])[:10],
+                "kex_offer_start": offer[:3],
+            }
+        )
+    return {
+        "window_hours": hours,
+        "fingerprints_seen": len(clusters),
+        "clusters_matching": len(ranked),
+        "clusters": out_clusters,
+        "truncated": truncated,
+        "note": (
+            "Scan hit its row cap, so older activity in the window is missing."
+            if truncated
+            else (
+                None
+                if clusters
+                else "No SSH key-exchange fingerprints recorded in this window "
+                "(needs an SSH honeypot that has seen connections)."
+            )
+        ),
     }
 
 
-@mcp.tool
+@mcp.tool(**hints("analyze_session"))
 async def analyze_session(session_id: str) -> dict[str, Any]:
     """Reconstruct a single SSH attack session into a coherent timeline.
 
@@ -671,7 +942,7 @@ def _stix_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("export_blocklist"))
 async def export_blocklist(
     format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
     hours: int = 24,
@@ -738,7 +1009,7 @@ async def export_blocklist(
     }
 
 
-@mcp.tool(auth=require_role("operator"))
+@mcp.tool(auth=require_role("operator"), **hints("export_stix"))
 async def export_stix(
     hours: int = 24,
     min_hits: int = 1,
@@ -807,13 +1078,15 @@ async def export_stix(
     }
 
 
-@mcp.tool
+@mcp.tool(**hints("threat_timeline"))
 async def threat_timeline(
     ip: str | None = None,
     hours: int = 24,
     limit: int = 200,
 ) -> dict[str, Any]:
-    """Get a chronological event timeline for a time range or specific IP.
+    """A chronological feed of events, newest last, for a time range or one IP: the narrative view.
+    For counts and rankings use `alerts_stats`; for one attacker's story by ATT&CK phase use
+    `analyze_attacker_journey`.
 
     Args:
         ip: Filter to a specific attacker IP (omit for all sources).
