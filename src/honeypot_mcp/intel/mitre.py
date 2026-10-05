@@ -105,6 +105,13 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Execution",
     ),
     (
+        # Text pasted into a remote desktop is, in practice, a command about to be run.
+        re.compile(r"rdp.clipboard", re.I),
+        "T1059",
+        "Command and Scripting Interpreter",
+        "Execution",
+    ),
+    (
         re.compile(r"(command.input|ssh.command|shell.exec|/bin/(ba)?sh|cmd.exe)", re.I),
         "T1059.004",
         "Command and Scripting Interpreter: Unix Shell",

@@ -206,8 +206,16 @@ onward**: relaying or bouncing to external addresses would make the honeypot a s
 backscatter source for whoever's address was forged, so a bounce owed to an external
 sender is recorded as suppressed. The consequence is that an attacker testing relay
 sees the same `250 queued` a working relay gives, and nothing arrives on their side.
-POP3 `AUTH PLAIN`/`LOGIN` are not decoded, so credentials sent that way are not
-cross-referenced against planted tokens (`USER`/`PASS` and `APOP` are).
+POP3 and IMAP serve that maildrop to the same two kinds of login (a planted credential,
+or the one weak pair derived from the honeypot's name; `accepted_logins` replaces it, `[]`
+lets nobody in). `USER`/`PASS`, `APOP`, `AUTH PLAIN`, `AUTH LOGIN`, IMAP `LOGIN` and
+`AUTHENTICATE PLAIN`/`LOGIN` all end in the same capture and the same check. Flags,
+expunges and deletes are remembered for the session only; one visitor cannot change what the
+next sees. IMAP implements SELECT/EXAMINE, LIST/LSUB/STATUS/NAMESPACE, FETCH (ENVELOPE,
+BODYSTRUCTURE, BODY sections and partials, the macros), SEARCH (including NOT/OR/groups and
+dates), STORE, EXPUNGE, IDLE, UID variants and literals; it does **not** implement
+APPEND/CREATE/DELETE/RENAME/COPY (refused), SORT/THREAD/CONDSTORE/MOVE (not advertised), and
+the folders other than INBOX are empty. STARTTLS is still declined, deliberately.
 
 **FTP engine.** Backed by a small, internally consistent file tree
 (`engines/ftp_fs.py`): `LIST`, `NLST`, `SIZE`, `MDTM`, `CWD`, `REST` and `RETR`
@@ -240,7 +248,9 @@ accept it), over plain TLS the password arrives in the Client Info PDU. The visi
 short session (two minutes at most) showing a **static** Windows-style desktop; their
 keystrokes (decoded to text), clicks and mouse movement are recorded. Nothing can be run or
 opened: a human who clicks Start sees nothing happen, which is the limit of the
-illusion. Static virtual channels (clipboard, drives) are not served. Standard RDP
+illusion. The **clipboard channel** is served (text a visitor pastes is recorded as
+`rdp_clipboard` and in the session summary, up to 20 items of 4,000 characters; nothing is
+ever offered back). Other static channels (drives, printers, audio) are not. Standard RDP
 security (no TLS) is still refused.
 
 ---

@@ -358,7 +358,63 @@ host daemon, set `METRICS_HOST` to the Docker bridge gateway (e.g.
 `172.17.0.1`) rather than `0.0.0.0`. Dashboards: Overview, Threat Map, MITRE
 Coverage.
 
-### 10. Wait
+### 10. Pre-flight, then go live
+
+Run the checks before you open the firewall to the world. They take seconds and find the
+mistakes that are cheap now and expensive once traffic arrives:
+
+```bash
+scripts/preflight.sh \
+  --ports 22,80,3389,25,110,143 \
+  --metrics-url http://127.0.0.1:9090 \
+  --mcp-url http://127.0.0.1:8000/mcp --token "$OPERATOR_TOKEN" \
+  --backup-dir /var/backups/honeypot
+```
+
+It checks the control plane (a token, and a strong one), that the console and metrics are
+bound to loopback, `.env` permissions, a persistent database, free disk against
+`MIN_FREE_DISK_MB` (plus the packet-capture ring), Docker, that every port you plan to use
+is free, and that the port you are SSH'd in on is not one a honeypot is about to take (the
+lock-out). Against the running server it asks `/readyz`, confirms this process owns the
+sensors, that each sensor answers, that a synthetic probe to **each** sensor becomes an alert
+(`honeypot_self_test`), and that someone is subscribed to alerts. It exits non-zero on any
+failure, so it can gate a script; `--strict` also fails on warnings. The self-test leaves a
+clearly marked probe alert behind, so run it before go-live (or pass `--no-self-test`).
+
+**A sensible first estate** is small, so a surprise is easy to attribute: SSH (Cowrie), HTTP,
+RDP, SMTP and POP3. `deception_plan` describes the rest.
+
+**Before you walk away**
+
+- [ ] Pre-flight is green (`0 failed`).
+- [ ] An alert channel is subscribed at `high`, and you have seen a test message arrive.
+- [ ] You know how you will notice a dead sensor without looking: alert on `/readyz` going
+      non-200, on `honeypot_sensor_up == 0`, and on the `disk_space_low` / `sensor_ownership_lost`
+      CRITICAL alerts.
+- [ ] A backup exists (`scripts/backup.sh`) and the database is not on the volume that
+      holds the packet-capture ring.
+- [ ] Your own SSH access is on a port the honeypots do not use, and you have a second way in
+      (the provider's console).
+
+**During the run: do not tune.** If something looks wrong, write it down and keep collecting.
+A changed configuration halfway through makes the data uninterpretable, and a honeypot that is
+reconfigured after the first contact teaches the scanners something.
+
+**After 24 hours**
+
+```
+> soc_brief                      # what needs a human, separated from background radiation
+> deception_coverage             # what the estate could and could not have caught
+> fingerprint_clusters           # many addresses, one toolkit?
+> alerts_recent severity=critical
+> generate_report format=markdown
+```
+
+Then look for what real traffic did that the synthetic traffic did not: protocol quirks a
+scanner tripped on, event volumes, false CRITICALs. That is where the next round of fixes
+comes from.
+
+### 11. Wait
 
 You'll see your first Mirai-family scanner usually within 5–10 minutes.
 Within an hour you'll have dozens of failed SSH logins. Within 24 hours

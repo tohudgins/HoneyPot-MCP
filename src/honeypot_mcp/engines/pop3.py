@@ -41,6 +41,12 @@ from typing import Any
 from honeypot_mcp import credential_match
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._sasl import (
+    LOGIN_PASSWORD_PROMPT,
+    LOGIN_USERNAME_PROMPT,
+    decode_plain,
+    decode_text,
+)
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import (
@@ -113,12 +119,14 @@ class _POP3Protocol(asyncio.Protocol):
         # Set once a login succeeds: the POP3 "transaction" state (RFC 1939 §5).
         self._mailbox: str | None = None
         self._messages: list[StoredMessage] = []
+        # (stage, username so far) while an AUTH exchange waits for its next line.
+        self._sasl: tuple[str, str] | None = None
         self._deleted: set[int] = set()
         self._retrievals = 0
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = b""
-        self._worker = LineWorker(self._handle_raw, name="pop3-lines")
+        self._worker = LineWorker(self._handle_raw, name="pop3-lines", max_total=2048)
         self._username = ""
         # The APOP challenge from our greeting. Recorded with any digest so the
         # captured hash can be attacked offline.
@@ -169,6 +177,9 @@ class _POP3Protocol(asyncio.Protocol):
         await self._handle(raw.decode("utf-8", errors="replace").strip())
 
     async def _handle(self, line: str) -> None:
+        if self._sasl is not None:
+            await self._continue_auth(line)
+            return
         if not line:
             return
         parts = line.split(" ", 1)
@@ -191,22 +202,7 @@ class _POP3Protocol(asyncio.Protocol):
 
         if command == "PASS":
             # The whole point of port 110: no encoding, no encryption.
-            attempt = await self._record(
-                "pop3_login_attempt",
-                AlertSeverity.HIGH,
-                {
-                    "username": self._username[:256],
-                    "password": rest[:256],
-                    "service": "pop3",
-                    "method": "USER/PASS",
-                },
-            )
-            await self._auth_delay()
-            planted = credential_match.is_credential_trip(attempt)
-            if self._username and (planted or (self._username.lower(), rest) in self._accepted):
-                await self._open_mailbox(self._username, planted)
-                return
-            self._send("-ERR [AUTH] Authentication failed.")
+            await self._attempt_login(self._username, rest, "USER/PASS")
             return
 
         if command == "APOP":
@@ -230,15 +226,7 @@ class _POP3Protocol(asyncio.Protocol):
             return
 
         if command == "AUTH":
-            if not rest:
-                self._send("+OK\r\nPLAIN\r\nLOGIN\r\n.")
-                return
-            self._send("-ERR [AUTH] Authentication failed.")
-            await self._record(
-                "pop3_auth_attempt",
-                AlertSeverity.MEDIUM,
-                {"mechanism": rest[:64], "service": "pop3"},
-            )
+            await self._begin_auth(rest)
             return
 
         if command == "STLS":
@@ -262,6 +250,72 @@ class _POP3Protocol(asyncio.Protocol):
 
         self._send("-ERR Unknown command.")
         await self._record("pop3_command", AlertSeverity.LOW, {"command": line[:200]})
+
+    async def _attempt_login(self, username: str, password: str, method: str) -> None:
+        """The one place a plaintext login is judged, whichever way it arrived."""
+        attempt = await self._record(
+            "pop3_login_attempt",
+            AlertSeverity.HIGH,
+            {
+                "username": username[:256],
+                "password": password[:256],
+                "service": "pop3",
+                "method": method,
+            },
+        )
+        await self._auth_delay()
+        planted = credential_match.is_credential_trip(attempt)
+        if username and (planted or (username.lower(), password) in self._accepted):
+            await self._open_mailbox(username, planted)
+            return
+        self._send("-ERR [AUTH] Authentication failed.")
+
+    async def _begin_auth(self, rest: str) -> None:
+        """`AUTH`, `AUTH PLAIN [initial-response]`, `AUTH LOGIN` (RFC 5034)."""
+        words = rest.split(None, 1)
+        mechanism = words[0].upper() if words else ""
+        if not mechanism:
+            self._send("+OK\r\nPLAIN\r\nLOGIN\r\n.")
+            return
+        if mechanism == "PLAIN":
+            if len(words) > 1:
+                username, password = decode_plain(words[1])
+                await self._attempt_login(username, password, "AUTH PLAIN")
+            else:
+                self._sasl = ("plain", "")
+                self._send("+ ")
+            return
+        if mechanism == "LOGIN":
+            if len(words) > 1:  # an initial response carries the username
+                self._sasl = ("login_pass", decode_text(words[1]))
+                self._send(f"+ {LOGIN_PASSWORD_PROMPT}")
+            else:
+                self._sasl = ("login_user", "")
+                self._send(f"+ {LOGIN_USERNAME_PROMPT}")
+            return
+        self._send("-ERR Unsupported authentication mechanism.")
+        await self._record(
+            "pop3_auth_attempt",
+            AlertSeverity.MEDIUM,
+            {"mechanism": mechanism[:64], "service": "pop3"},
+        )
+
+    async def _continue_auth(self, line: str) -> None:
+        """The next line of a multi-step AUTH exchange."""
+        assert self._sasl is not None
+        stage, username = self._sasl
+        self._sasl = None
+        if line.strip() == "*":  # the client cancels
+            self._send("-ERR Authentication cancelled.")
+            return
+        if stage == "plain":
+            user, password = decode_plain(line)
+            await self._attempt_login(user, password, "AUTH PLAIN")
+        elif stage == "login_user":
+            self._sasl = ("login_pass", decode_text(line))
+            self._send(f"+ {LOGIN_PASSWORD_PROMPT}")
+        else:
+            await self._attempt_login(username, decode_text(line), "AUTH LOGIN")
 
     async def _record(
         self, event_type: str, severity: AlertSeverity, payload: dict
@@ -303,7 +357,8 @@ class _POP3Protocol(asyncio.Protocol):
 
     def _pick(self, rest: str) -> tuple[int, StoredMessage] | None:
         word = rest.split()[0] if rest.split() else ""
-        if not (word.isascii() and word.isdigit()):  # int() accepts "1_0", "+1", "٣"
+        # int() accepts "1_0", "+1" and Arabic-Indic digits, and refuses over 4300 digits.
+        if not (word.isascii() and word.isdigit()) or len(word) > 9:
             return None
         number = int(word)
         if number < 1 or number > len(self._messages) or number in self._deleted:
@@ -387,7 +442,9 @@ class _POP3Protocol(asyncio.Protocol):
         if command == "NOOP":
             self._send("+OK")
             return True
-        if command in ("USER", "PASS", "APOP"):
+        if command in ("USER", "PASS", "APOP", "AUTH"):
+            # AUTH was reachable here: it swallowed the next command as a credential and, on
+            # success, swapped the session to another mailbox: one more guess per command.
             self._send("-ERR Command not permitted when logged in.")
             return True
         return False

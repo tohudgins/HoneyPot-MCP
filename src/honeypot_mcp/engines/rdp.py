@@ -546,6 +546,19 @@ async def _serve_session(
             name="rdp-record",
         )
 
+    async def pasted(texts: list[str]) -> None:
+        for text in texts:
+            spawn(
+                _record_event(
+                    honeypot_id,
+                    peer,
+                    "rdp_clipboard",
+                    AlertSeverity.HIGH,
+                    {"text": text, "service": "rdp"},
+                ),
+                name="rdp-record",
+            )
+
     try:
         result = await run_session(
             reader,
@@ -554,6 +567,7 @@ async def _serve_session(
             selected_protocol=selected_protocol,
             decide_login=decide,
             on_active=active,
+            on_clipboard=pasted,
         )
     finally:
         with contextlib.suppress(Exception):

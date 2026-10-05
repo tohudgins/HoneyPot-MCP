@@ -19,8 +19,17 @@ umask 077
 
 DEST="${1:-./backups}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="$DEST/honeypot-$STAMP"
+FINAL="$DEST/honeypot-$STAMP"
+# Built beside its final name and renamed only when complete: a run that fails halfway must not
+# leave a directory that looks like a backup (the pre-flight check, and a human, would trust it).
+OUT="$FINAL.partial"
 mkdir -p "$OUT"
+cleanup() {
+  rm -f "${PGPASSFILE:-}"
+  [ -d "$OUT" ] && rm -rf "$OUT"
+  return 0
+}
+trap cleanup EXIT
 
 
 # Where is the database? Same answer the server gives, not a guess: an explicit
@@ -48,7 +57,6 @@ elif [ "$IS_POSTGRES" = 1 ]; then
   # user) into a mode-0600 PGPASSFILE that is removed on exit.
   PGPASSFILE="$(mktemp)"
   export PGPASSFILE
-  trap 'rm -f "$PGPASSFILE"' EXIT
   PG_CLEAN_URL="$(python3 "$(dirname "${BASH_SOURCE[0]}")/_pgurl.py" "$DATABASE_URL" "$PGPASSFILE")"
   pg_dump "$PG_CLEAN_URL" > "$OUT/honeypot_mcp.sql"
   echo "  database  -> $OUT/honeypot_mcp.sql ($(du -h "$OUT/honeypot_mcp.sql" | cut -f1))"
@@ -70,7 +78,8 @@ if [ -f .env ]; then
   echo "  .env      -> $OUT/.env (mode 600)"
 fi
 chmod -R go-rwx "$OUT"
+mv "$OUT" "$FINAL"
 
 echo
-echo "Backup complete: $OUT"
+echo "Backup complete: $FINAL"
 echo "It contains secrets. Store it where you would store the .env itself."

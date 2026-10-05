@@ -48,6 +48,7 @@ import re
 import secrets
 from typing import Any
 
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines import mail_message
 from honeypot_mcp.engines._bounds import write_backlogged
@@ -86,7 +87,7 @@ _MAX_BODY_PREVIEW = 4096
 # Attacker-chosen strings (commands, addresses, credentials) placed in events.
 _MAX_EVENT_STRING = 256
 # Messages analysed at once, process-wide; the rest wait their turn.
-_ANALYSIS_SLOTS = asyncio.Semaphore(2)
+_ANALYSIS_SLOTS: LoopBound[asyncio.Semaphore] = LoopBound(lambda: asyncio.Semaphore(2))
 # Seconds a real MTA takes to give up on an unresolvable destination and send the bounce.
 _DSN_DELAY = (2.0, 5.0)
 # Unread reply bytes tolerated before the connection is dropped.
@@ -647,7 +648,7 @@ class _SMTPProtocol(asyncio.Protocol):
             data = raw
             # Parsing a hostile message is CPU work (a deeply nested one costs seconds), so
             # it runs off the event loop, a few at a time.
-            async with _ANALYSIS_SLOTS:
+            async with _ANALYSIS_SLOTS.get():
                 info = await asyncio.to_thread(mail_message.analyse, data, envelope_from=mail_from)
             payload.update({k: v for k, v in info.items() if v not in ("", [], None, False)})
             payload["delivery"] = self._route(queue_id, data, mail_from, rcpts, helo)

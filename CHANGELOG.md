@@ -4,6 +4,47 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Mail clients, the clipboard, and a pre-flight
+
+- **IMAP serves the maildrop** the SMTP honeypot fills, to the same logins as POP3 (a planted
+  credential or the one weak pair). SELECT/EXAMINE, LIST/LSUB/STATUS/NAMESPACE, FETCH
+  (ENVELOPE, BODYSTRUCTURE, sections and partials), SEARCH (NOT/OR/groups/dates), STORE,
+  EXPUNGE, IDLE, UID variants and literals. Checked with stdlib `imaplib` and with `curl`.
+  Flags and expunges last for the connection only. CAPABILITY now advertises only what is
+  implemented (`AUTH=LOGIN` and `LITERAL+` were advertised before they worked).
+  Found along the way: serialising a message with the default line ending (bare LF) made
+  every IMAP octet count short by one per line, which desyncs real clients.
+- **POP3 `AUTH PLAIN` / `AUTH LOGIN`** are decoded, so a credential sent that way is matched
+  against planted tokens and can log in like `USER`/`PASS`.
+- **RDP clipboard (MS-RDPECLIP).** Text a visitor pastes into the session is recorded
+  (`rdp_clipboard`, and in the session summary): the command they were about to run.
+- **`python -m honeypot_mcp.preflight` / `scripts/preflight.sh`**: configuration, bind
+  addresses, token strength, disk, ports (including the lock-out of the SSH port you are
+  connected on), Docker, backups, `/readyz`, ownership, per-sensor health, an end-to-end
+  probe of *every* sensor, and whether anyone is subscribed to alerts. Run against a real
+  daemon it found that **the SMTP `honeypot_self_test` had been failing**: the probe expected
+  its marker in the raw command after AUTH began to be decoded into username/password, and no
+  test covered SMTP, FTP or DNS. Fixed, and all three are now in the self-test suite.
+- `docs/DEPLOY.md` gains the go-live checklist.
+- **An independent review of this round found, and this fixes** (no auth bypass; the rest
+  would break real clients or allow resource exhaustion): a non-ASCII attachment name
+  (RFC 2231) made BODYSTRUCTURE raise and the command never got a reply; one hostile message
+  in a mailbox (nested multiparts, nested `message/rfc822`, address-group syntax) overflowed
+  the stack and broke FETCH for everyone reading that mailbox; an ordinary multi-line APPEND
+  was answered `BYE Too fast` because literal bytes were counted as command lines; a 512 KB
+  write-backlog limit aborted FETCH of a larger mailbox for a merely slow client (now
+  backpressure with a 15 s no-progress cutoff); thousands of FETCH items or `1:4294967296`
+  sets were built before anything was sent (capped at 16 items, parsed off the event loop,
+  4 at a time); `LIST` patterns went through `fnmatch`'s process-wide cache; tags and numbers
+  could carry CR/LF or 5,000 digits into a reply or an uncaught exception; POP3 `AUTH` was
+  reachable after login and swallowed the next command as a credential; the clipboard could
+  be blinded by one oversized message; the client's MCS user id could collide with a static
+  channel id. Pre-flight: guessable long tokens passed, a disabled console was reported as
+  exposed, the packet ring was charged to the wrong volume, a failed backup left a directory
+  that counted as one (`backup.sh` now publishes only a complete snapshot), a port in
+  TIME_WAIT read as taken, UDP ports were never probed, and an error object where a list was
+  expected read as "no sensor is dead".
+
 ## Depth: mail, RDP sessions, ownership, cloud tokens
 
 Closing the limitations that could be closed (APT research, real TLS termination and

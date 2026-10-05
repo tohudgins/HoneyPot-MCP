@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import secrets
@@ -884,14 +885,16 @@ async def _http_probe(port: int, marker: str) -> tuple[bool, str, str]:
 
 
 async def _smtp_probe(port: int, marker: str) -> tuple[bool, str, str]:
-    """AUTH PLAIN with marker as the credentials blob — lands in payload['command']."""
+    """AUTH PLAIN whose username is the marker. The engine decodes AUTH into username and
+    password (so planted credentials can be matched), so that is where the marker lands."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     try:
         await asyncio.wait_for(reader.readline(), timeout=3.0)
         writer.write(b"EHLO selftest.local\r\n")
         await writer.drain()
         await asyncio.wait_for(reader.read(256), timeout=3.0)
-        writer.write(f"AUTH PLAIN {marker}\r\n".encode())
+        blob = base64.b64encode(f"\0{marker}\0selftest".encode()).decode()
+        writer.write(f"AUTH PLAIN {blob}\r\n".encode())
         await writer.drain()
         await asyncio.sleep(0.3)
     finally:

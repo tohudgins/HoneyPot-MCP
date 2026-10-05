@@ -34,9 +34,11 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from honeypot_mcp.engines.rdp_cliprdr import ClipboardChannel, wrap_channel_pdu
+
 SERVER_USER = 1002
 IO_CHANNEL = 1003
-CLIENT_USER = 1007  # what Windows hands the first client
+CLIENT_USER = 1007  # what Windows hands the first client of a session with few channels
 
 SESSION_SECONDS = 120.0
 IDLE_SECONDS = 45.0
@@ -158,12 +160,14 @@ def parse_client_blocks(connect_initial: bytes) -> dict[str, Any]:
         body = connect_initial[pos + 4 : pos + block_len]
         if block_type == 0xC001 and len(body) >= 8:  # CS_CORE
             out["width"], out["height"] = struct.unpack_from("<HH", body, 4)
-        elif block_type == 0xC003 and len(body) >= 4:  # CS_NET
+        elif block_type == 0xC003 and len(body) >= 4 and not out["channels"]:  # CS_NET, first only
             count = min(struct.unpack_from("<I", body, 0)[0], MAX_STATIC_CHANNELS)
             for i in range(count):
                 entry = body[4 + i * 12 : 4 + i * 12 + 8]
                 if len(entry) == 8:
-                    out["channels"].append(entry.rstrip(b"\x00").decode("ascii", "replace")[:7])
+                    # The whole 8-byte field: truncating to 7 characters made `cliprdrX` look
+                    # like `cliprdr`.
+                    out["channels"].append(entry.rstrip(b"\x00").decode("ascii", "replace"))
         pos += block_len
     return out
 
@@ -485,6 +489,7 @@ async def run_session(
     selected_protocol: int,
     decide_login: LoginDecision | None,
     on_active: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_clipboard: Callable[[list[str]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Serve one session from the client's Connect Initial to its end.
 
@@ -496,12 +501,30 @@ async def run_session(
     width = max(320, min(blocks["width"], 1024)) // 4 * 4
     height = max(240, min(blocks["height"], 768))
     channels: list[str] = blocks["channels"]
+    # The client's own MCS user channel. Static channels take the ids after the I/O channel
+    # (1004, 1005, ...); a user id equal to one of them would send that channel's traffic to the
+    # client instead. Windows allocates the user id after the channels for the same reason.
+    client_user = max(CLIENT_USER, IO_CHANNEL + 1 + len(channels))
     result: dict[str, Any] = {
         "stage": "connect",
         "desktop": f"{width}x{height}",
         "static_channels": channels,
     }
     recorder = InputRecorder()
+    # The clipboard channel, if the client asked for it: static channels are numbered in the
+    # order they were requested, starting after the I/O channel (see build_connect_response).
+    clip_id = next(
+        (IO_CHANNEL + 1 + i for i, name in enumerate(channels) if name.lower() == "cliprdr"), None
+    )
+    clipboard = ClipboardChannel() if clip_id is not None else None
+    clipboard_reported = 0
+
+    def send_clipboard(messages: list[bytes]) -> None:
+        assert clip_id is not None
+        for message in messages:
+            for chunk in wrap_channel_pdu(message):
+                send(send_data_indication(clip_id, chunk))
+
     bpp = 16
     stage = "mcs"
     input_bytes = 0
@@ -554,13 +577,13 @@ async def run_session(
                 result["ended_by"] = "client disconnect"
                 break
             if pdu == 10:  # Attach User Request
-                send(frame(b"\x2e\x00" + struct.pack(">H", CLIENT_USER - 1001)))
+                send(frame(b"\x2e\x00" + struct.pack(">H", client_user - 1001)))
             elif pdu == 14 and len(mcs) >= 5:  # Channel Join Request
                 requested = struct.unpack_from(">H", mcs, 3)[0]
                 send(
                     frame(
                         b"\x3e\x00"
-                        + struct.pack(">H", CLIENT_USER - 1001)
+                        + struct.pack(">H", client_user - 1001)
                         + struct.pack(">H", requested)
                         + struct.pack(">H", requested)
                     )
@@ -571,7 +594,16 @@ async def run_session(
                     continue
                 channel, data = parsed
                 if channel != IO_CHANNEL:
-                    continue  # a static virtual channel: not served
+                    if clipboard is not None and channel == clip_id and stage == "active":
+                        events += 1
+                        last_input = time.monotonic()
+                        send_clipboard(clipboard.feed(data))
+                        fresh = clipboard.take_new_text(clipboard_reported)
+                        if fresh:
+                            clipboard_reported += len(fresh)
+                            if on_clipboard is not None:
+                                await on_clipboard(fresh)
+                    continue  # any other static virtual channel: not served
                 events += 1
                 last_input = time.monotonic()
                 if stage == "mcs":
@@ -606,7 +638,7 @@ async def run_session(
                     send(
                         send_data_indication(
                             IO_CHANNEL,
-                            share_data(_DATA_SYNCHRONIZE, struct.pack("<HH", 1, CLIENT_USER)),
+                            share_data(_DATA_SYNCHRONIZE, struct.pack("<HH", 1, client_user)),
                         )
                     )
                     send(
@@ -620,7 +652,7 @@ async def run_session(
                     payload = data[18:]
                     if data_type == _DATA_CONTROL and len(payload) >= 2:
                         if struct.unpack_from("<H", payload, 0)[0] == 1:  # request control
-                            reply = struct.pack("<HHI", 2, CLIENT_USER, 0x03EA)  # granted
+                            reply = struct.pack("<HHI", 2, client_user, 0x03EA)  # granted
                             send(send_data_indication(IO_CHANNEL, share_data(_DATA_CONTROL, reply)))
                     elif data_type == _DATA_FONT_LIST and stage == "finalize":
                         send(
@@ -636,6 +668,8 @@ async def run_session(
                         result["stage"] = "active"
                         if on_active is not None:
                             await on_active(dict(result))
+                        if clipboard is not None:
+                            send_clipboard(clipboard.opening())
                     elif data_type == _DATA_INPUT and stage == "active":
                         events += parse_slow_path_input(payload, recorder)
                     elif data_type == _DATA_SHUTDOWN_REQUEST:
@@ -662,4 +696,7 @@ async def run_session(
     result.setdefault("ended_by", "ended")
     result["duration_seconds"] = round(time.monotonic() - started, 1)
     result.update(recorder.summary())
+    if clipboard is not None and (clipboard.texts or clipboard.formats_seen):
+        result["clipboard"] = clipboard.texts
+        result["clipboard_formats"] = sorted(clipboard.formats_seen)[:32]
     return result

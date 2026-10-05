@@ -158,6 +158,12 @@ def _free_port() -> int:
         ("honeypot_mcp.engines.nfs", "NFSEngine", "NFS"),
         ("honeypot_mcp.engines.pop3", "POP3Engine", "POP3"),
         ("honeypot_mcp.engines.kubernetes", "KubernetesEngine", "KUBERNETES"),
+        # These three were missing from this list, and the SMTP probe had silently stopped
+        # working: it expected the marker in the raw command, but AUTH has since been decoded
+        # into username/password. A live pre-flight run found it; this keeps it found.
+        ("honeypot_mcp.engines.smtp", "SMTPEngine", "SMTP"),
+        ("honeypot_mcp.engines.ftp", "FTPEngine", "FTP"),
+        ("honeypot_mcp.engines.dns", "DNSEngine", "DNS"),
     ],
 )
 @pytest.mark.asyncio

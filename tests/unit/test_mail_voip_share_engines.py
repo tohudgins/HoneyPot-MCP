@@ -129,7 +129,7 @@ async def test_imap_login_argument_parsing_handles_quoting(rest, expected):
 
 
 async def test_imap_sasl_plain_is_decoded():
-    from honeypot_mcp.engines.imap import _decode_sasl_plain
+    from honeypot_mcp.engines._sasl import decode_plain as _decode_sasl_plain
 
     blob = base64.b64encode(b"\x00svc_mail\x00Hunter2!").decode()
     assert _decode_sasl_plain(blob) == ("svc_mail", "Hunter2!")

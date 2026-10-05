@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1252 unit tests covering security-critical paths)
+# Tests (1371 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -297,7 +297,8 @@ from the honeypot's name (`accepted_logins` / `sessions` in its config) is let i
 `rdp_nla.py` derives the NTLM session key from the password and seals the server's
 public-key binding (which is how a client that checks it, FreeRDP, aardwolf, proceeds), then
 `rdp_session.py` runs a short MCS/capability exchange, paints a static desktop and records
-keystrokes and clicks. The tests drive it with aardwolf (`tests/unit/test_rdp_session.py`,
+keystrokes, clicks and pasted clipboard text (`rdp_cliprdr.py`, MS-RDPECLIP over the `cliprdr`
+static channel: Format List -> Format Data Request -> recorded text, nothing offered back). The tests drive it with aardwolf (`tests/unit/test_rdp_session.py`,
 including a mutation-replay fuzz of a recorded session) and FreeRDP 3
 (`tests/integration/test_rdp_freerdp.py`, Docker-gated, checks pixels).
 
@@ -396,8 +397,14 @@ RFC 3464 bounce to a *local* sender's mailbox after `_DSN_DELAY`, anything else 
 as relayed. **Nothing is ever sent onward** (spam source / backscatter), pinned by a test
 that fails on any non-loopback connect. `engines/pop3.py` serves the maildrop to a planted
 credential or one derived weak pair (same acceptance rule as the HTTP admin area and RDP);
-`DELE` is acknowledged per session and never removes mail. IMAP is unchanged (rejects every
-login). `tests/unit/test_mail_system.py` drives real `smtplib` and `poplib`.
+`DELE` is acknowledged per session and never removes mail; `AUTH PLAIN`/`LOGIN` decode through
+the same `_attempt_login` as `USER`/`PASS` (`engines/_sasl.py`). `engines/imap.py` serves the
+same maildrop on the same acceptance rule, with the protocol logic (sequence sets, FETCH item
+tokenizer, ENVELOPE, recursive BODYSTRUCTURE, sections, SEARCH incl. NOT/OR) in the pure
+`engines/imap_mailbox.py`; BODY sections return bytes **as stored, not transfer-decoded**, and
+serialisation uses CRLF (the default LF made every octet count short). Flags/expunges live on
+the connection, never in the shared maildrop. Validated with `imaplib` and `curl`.
+`tests/unit/test_mail_system.py`, `test_imap_session.py` and `test_imap_mailbox.py`.
 
 ### IMAP / SIP / rsync / NFS engines
 
@@ -408,8 +415,9 @@ Four more surfaces, each chosen because its traffic means something specific.
   deliberately omits `LOGINDISABLED` — a hardened server advertises it to force
   STARTTLS, but then the attacker never sends the password, and impersonating
   the misconfigured server is the entire point. Handles `LOGIN` (with IMAP
-  quoted-string parsing, so a password containing a space survives) and SASL
-  `AUTHENTICATE PLAIN`, both SASL-IR and two-step.
+  quoted-string parsing, so a password containing a space survives, and literals),
+  and SASL `AUTHENTICATE PLAIN`/`LOGIN`, both SASL-IR and two-step. Only what is
+  implemented is advertised in CAPABILITY.
 - `engines/sip.py` — tcp+udp/5060, both because a service on only one is a
   tell. Separates the three phases that mean different things: `OPTIONS`
   sweeps (`friendly-scanner` and friends are named in the alert), extension

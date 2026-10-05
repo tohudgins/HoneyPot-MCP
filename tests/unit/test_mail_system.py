@@ -113,9 +113,14 @@ def _msg(
 async def _events(event_type: str) -> list:
     from sqlalchemy import select
 
+    from honeypot_mcp.storage import event_buffer
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert
 
+    for _ in range(200):  # wait for the flusher to go idle before querying the shared database
+        if event_buffer.get_buffer().qsize() == 0:
+            break
+        await asyncio.sleep(0.05)
     await asyncio.sleep(0.4)
     async with get_session() as session:
         rows = (await session.execute(select(Alert))).scalars().all()
@@ -457,3 +462,123 @@ async def test_pop3_message_numbers_are_plain_ascii_digits(mail):
         await asyncio.to_thread(client._shortcmd, "RETR 1")  # the plain form still works
     finally:
         client.close()
+
+
+# ── POP3 AUTH (SASL) ─────────────────────────────────────────────────────────
+
+
+class _Raw:
+    """A bare POP3 conversation, line by line."""
+
+    def __init__(self, reader, writer) -> None:
+        self.reader, self.writer = reader, writer
+
+    @classmethod
+    async def open(cls, port: int) -> "_Raw":
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        raw = cls(reader, writer)
+        await raw.line()  # greeting
+        return raw
+
+    async def line(self) -> str:
+        return (await asyncio.wait_for(self.reader.readline(), 10)).decode().rstrip("\r\n")
+
+    async def say(self, text: str) -> str:
+        self.writer.write(text.encode() + b"\r\n")
+        await self.writer.drain()
+        return await self.line()
+
+    def close(self) -> None:
+        self.writer.close()
+
+
+def _b64(text: str) -> str:
+    import base64
+
+    return base64.b64encode(text.encode()).decode()
+
+
+async def test_pop3_auth_plain_with_an_initial_response_logs_in(mail):
+    _, pop_port = mail
+    user, password = _weak_login()
+    raw = await _Raw.open(pop_port)
+    try:
+        reply = await raw.say(f"AUTH PLAIN {_b64(chr(0) + user + chr(0) + password)}")
+        assert reply.startswith("+OK")
+        assert (await raw.say("STAT")).startswith("+OK")
+    finally:
+        raw.close()
+
+
+async def test_pop3_auth_plain_and_login_work_step_by_step(mail):
+    _, pop_port = mail
+    user, password = _weak_login()
+    raw = await _Raw.open(pop_port)
+    try:
+        assert await raw.say("AUTH PLAIN") == "+ "
+        assert (await raw.say(_b64(f"\0{user}\0{password}"))).startswith("+OK")
+    finally:
+        raw.close()
+    raw = await _Raw.open(pop_port)
+    try:
+        assert await raw.say("AUTH LOGIN") == f"+ {_b64('Username:')}"
+        assert await raw.say(_b64(user)) == f"+ {_b64('Password:')}"
+        assert (await raw.say(_b64(password))).startswith("+OK")
+    finally:
+        raw.close()
+
+
+async def test_pop3_auth_refuses_wrong_passwords_and_records_the_attempt(mail):
+    _, pop_port = mail
+    user, password = _weak_login()
+    raw = await _Raw.open(pop_port)
+    try:
+        reply = await raw.say(f"AUTH PLAIN {_b64(f'{chr(0)}{user}{chr(0)}{password}x')}")
+        assert reply.startswith("-ERR")
+        assert (await raw.say("AUTH LOGIN")).startswith("+ ")
+        await raw.say(_b64(user))
+        assert (await raw.say(_b64("wrong"))).startswith("-ERR")
+        assert (await raw.say("AUTH CRAM-MD5")).startswith("-ERR Unsupported")
+        assert (await raw.say("AUTH LOGIN")).startswith("+ ")
+        assert (await raw.say("*")).startswith("-ERR Authentication cancelled")
+    finally:
+        raw.close()
+    attempts = await _events("pop3_login_attempt")
+    assert {a.payload["method"] for a in attempts} >= {"AUTH PLAIN", "AUTH LOGIN"}
+    assert all(a.payload["password"] != password for a in attempts)  # decoded, not the blob
+
+
+async def test_a_planted_credential_sent_over_auth_login_trips_its_token(mail):
+    """AUTH LOGIN was never decoded, so a planted credential sent that way was neither
+    matched nor let in."""
+    _, pop_port = mail
+    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+
+    created = await honeytoken_generate_credentials("sasl", count=1, service="pop3")
+    pair = created["metadata"]["credentials"][0]
+    raw = await _Raw.open(pop_port)
+    try:
+        await raw.say("AUTH LOGIN")
+        await raw.say(_b64(pair["username"]))
+        assert (await raw.say(_b64(pair["password"]))).startswith("+OK")
+    finally:
+        raw.close()
+    tripped = await _events("honeytoken_triggered_credential_via_pop3_login_attempt")
+    assert tripped and tripped[0].severity.value == "critical"
+
+
+async def test_auth_is_refused_once_logged_in_and_the_next_command_still_works(mail):
+    """AUTH was reachable in the transaction state: it swallowed the next command as a
+    credential and could swap the session to another mailbox (a free guess per command)."""
+    _, pop_port = mail
+    user, password = _weak_login()
+    raw = await _Raw.open(pop_port)
+    try:
+        assert (await raw.say(f"USER {user}")).startswith("+OK")
+        assert (await raw.say(f"PASS {password}")).startswith("+OK")
+        assert (await raw.say("AUTH PLAIN")).startswith("-ERR Command not permitted")
+        assert (await raw.say("AUTH LOGIN")).startswith("-ERR Command not permitted")
+        assert (await raw.say("STAT")).startswith("+OK")  # not eaten as a credential
+        assert (await raw.say("RETR " + "9" * 5000)).startswith("-ERR")  # and no 4300-digit crash
+    finally:
+        raw.close()

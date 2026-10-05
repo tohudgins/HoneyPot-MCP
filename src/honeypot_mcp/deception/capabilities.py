@@ -203,6 +203,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "rdp_login_attempt",
             "rdp_session_start",
             "rdp_session",
+            "rdp_clipboard",
         ),
         captures_credentials_as="rdp",
         config_options=("rdp_hostname", "rdp_domain", "accepted_logins", "sessions"),
@@ -420,10 +421,18 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         summary=(
             "Cleartext mailbox login on the unencrypted port. Advertises a real "
             "Dovecot capability set *without* LOGINDISABLED, so credential-stuffing "
-            "bots actually send the password instead of being forced to STARTTLS."
+            "bots actually send the password instead of being forced to STARTTLS. A "
+            "planted honeytoken credential or one weak pair opens the same read-only "
+            "mailbox the SMTP honeypot fills (SELECT, SEARCH, FETCH, session-only flags)."
         ),
-        signature_events=("imap_login_attempt", "imap_mailbox_access", "imap_auth_attempt"),
-        config_options=("fake_banner",),
+        signature_events=(
+            "imap_login_attempt",
+            "imap_mailbox_access",
+            "imap_auth_attempt",
+            "imap_login_success",
+            "imap_message_fetched",
+        ),
+        config_options=("fake_banner", "accepted_logins", "mail_domain"),
         captures_credentials_as="imap",
         pairs_well_with=("smtp",),
         notes="Mail access is how credential stuffing cashes out — it owns password resets everywhere else.",
