@@ -6,9 +6,12 @@ record what is typed; this records what is pasted.
 
 The conversation is the standard one. The server announces itself (capabilities, then Monitor
 Ready); whenever the client's clipboard changes it sends a Format List; the server accepts it
-and asks for the text; the client answers with the text. Nothing is ever offered in the other
-direction: a request for the server's clipboard is answered with a failure, because there is
-nothing on this desktop to copy.
+and asks for the text; the client answers with the text.
+
+By default nothing is offered in the other direction and a request for the server's clipboard is
+answered with a failure. An operator may configure `clipboard_text`: a short string the server
+then announces as its own clipboard, and serves when the client pastes it. A clipboard that is
+never empty is what a used machine has, and what a visitor takes from it is recorded.
 
 Pure: `ClipboardChannel` takes channel payloads in and returns payloads to send, so it is tested
 without a socket. Framing (`CHANNEL_PDU_HEADER`, chunking at 1600 bytes) lives here too.
@@ -40,6 +43,7 @@ CHUNK_SIZE = 1600
 MAX_MESSAGE = 256 * 1024  # largest single clipboard message accepted
 MAX_TEXTS = 20  # clipboard contents recorded per session
 MAX_TEXT_CHARS = 4000
+MAX_OFFER_CHARS = 500
 _SHORT_FORMAT_ENTRY = 36  # formatId(4) + a 32-byte name
 
 _TEXT_FORMATS = (CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT)
@@ -66,7 +70,12 @@ def wrap_channel_pdu(message: bytes) -> list[bytes]:
 class ClipboardChannel:
     """One session's clipboard conversation."""
 
-    def __init__(self) -> None:
+    def __init__(self, offer: str | None = None) -> None:
+        self.offer = _printable(offer)[:MAX_OFFER_CHARS] if offer else None
+        self.offer_reads = 0
+        # Announced once the client has finished its own initial exchange. Real clients (and
+        # aardwolf) ignore anything but a Format List Response until then, as the protocol says.
+        self._offer_pending = bool(self.offer)
         self.texts: list[str] = []
         self.formats_seen: set[int] = set()
         self.offered_lists = 0
@@ -81,6 +90,10 @@ class ClipboardChannel:
         short fixed-size form this side parses."""
         caps = struct.pack("<HHHHII", 1, 0, 1, 12, 2, 0)  # one set: general, version 2, flags 0
         return [_pdu(CB_CLIP_CAPS, 0, caps), _pdu(CB_MONITOR_READY)]
+
+    def _offer_list(self) -> bytes:
+        """The server's own clipboard, as a Format List: Unicode text, no format name."""
+        return _pdu(CB_FORMAT_LIST, 0, struct.pack("<I", CF_UNICODETEXT) + bytes(32))
 
     # ── what the client sends ────────────────────────────────────────────────
 
@@ -124,9 +137,19 @@ class ClipboardChannel:
             return self._format_list(data)
         if msg_type == CB_FORMAT_DATA_RESPONSE:
             self._data_response(msg_flags, data)
-            return []
+            # The server's own Format List claims clipboard ownership, which would cancel a
+            # request still in flight; so it follows the answer to ours, not the request.
+            return [self._take_offer()] if self._offer_pending else []
+
         if msg_type == CB_FORMAT_DATA_REQUEST:
-            # The client wants our clipboard. There is nothing on this desktop to copy.
+            wanted = struct.unpack_from("<I", data, 0)[0] if len(data) >= 4 else 0
+            if self.offer and wanted in (CF_UNICODETEXT, CF_TEXT):
+                self.offer_reads += 1
+                text = self.offer.encode(
+                    "utf-16-le" if wanted == CF_UNICODETEXT else "cp1252", errors="replace"
+                )
+                text += b"\x00\x00" if wanted == CF_UNICODETEXT else b"\x00"
+                return [_pdu(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, text)]
             return [_pdu(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL)]
         return []  # capabilities, temporary directory, file contents, locks: not served
 
@@ -145,7 +168,13 @@ class ClipboardChannel:
         if wanted is not None and len(self.texts) < MAX_TEXTS:
             self._pending_format = wanted
             replies.append(_pdu(CB_FORMAT_DATA_REQUEST, 0, struct.pack("<I", wanted)))
+        if self._offer_pending and self._pending_format is None:
+            replies.append(self._take_offer())  # nothing outstanding to cancel
         return replies
+
+    def _take_offer(self) -> bytes:
+        self._offer_pending = False
+        return self._offer_list()
 
     def _data_response(self, flags: int, data: bytes) -> None:
         format_id, self._pending_format = self._pending_format, None

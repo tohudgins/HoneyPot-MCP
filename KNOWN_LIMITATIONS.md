@@ -214,8 +214,15 @@ expunges and deletes are remembered for the session only; one visitor cannot cha
 next sees. IMAP implements SELECT/EXAMINE, LIST/LSUB/STATUS/NAMESPACE, FETCH (ENVELOPE,
 BODYSTRUCTURE, BODY sections and partials, the macros), SEARCH (including NOT/OR/groups and
 dates), STORE, EXPUNGE, IDLE, UID variants and literals; it does **not** implement
-APPEND/CREATE/DELETE/RENAME/COPY (refused), SORT/THREAD/CONDSTORE/MOVE (not advertised), and
-the folders other than INBOX are empty. STARTTLS is still declined, deliberately.
+SORT/THREAD/CONDSTORE/MOVE/UIDPLUS (not advertised). Sent, Drafts, Trash and Junk hold a few
+ordinary messages. CREATE/DELETE/RENAME of the visitor's own folders, APPEND and COPY work
+**for the connection only** (8 folders, 50 messages, 512 KB; an APPEND is recorded as
+`imap_append`, since a visitor drafting a message into a mailbox is worth knowing about); the
+shared mailbox is never changed, and system folders cannot be deleted or renamed. APPEND
+reports no `APPENDUID` (UIDPLUS is not advertised).
+STARTTLS is still declined, deliberately. `imap_append` is deliberately not mapped to an
+ATT&CK technique (none describes appending to a mailbox; a wrong mapping is worse than none); it
+is recorded and visible in alerts.
 
 **FTP engine.** Backed by a small, internally consistent file tree
 (`engines/ftp_fs.py`): `LIST`, `NLST`, `SIZE`, `MDTM`, `CWD`, `REST` and `RETR`
@@ -245,13 +252,27 @@ credential, or the one weak pair derived from the honeypot's name, is let in** (
 Over NLA the exchange is completed for real (the NTLM session key is derived from the
 password and the server's public-key binding sealed with it; FreeRDP 3 and aardwolf both
 accept it), over plain TLS the password arrives in the Client Info PDU. The visitor gets a
-short session (two minutes at most) showing a **static** Windows-style desktop; their
-keystrokes (decoded to text), clicks and mouse movement are recorded. Nothing can be run or
-opened: a human who clicks Start sees nothing happen, which is the limit of the
-illusion. The **clipboard channel** is served (text a visitor pastes is recorded as
-`rdp_clipboard` and in the session summary, up to 20 items of 4,000 characters; nothing is
-ever offered back). Other static channels (drives, printers, audio) are not. Standard RDP
-security (no TLS) is still refused.
+session (two minutes, ten once they start typing commands) on a Windows-style desktop that
+**works as far as a console does**: double-click the `cmd` icon, use the Start menu, or press
+Win+R and run `cmd` / `powershell`, and a console window opens in which a fake shell
+answers (`whoami`, `dir`, `cd`, `type`, `echo > file`, `ipconfig`, `systeminfo`, `net user`
+(including `/add`, which the visitor can read back), `tasklist`, `netstat`, `quser`, `ping`,
+PowerShell's `Get-Process`, `Get-ChildItem`, `$PSVersionTable`...). Every command is recorded
+(`rdp_command`, CRITICAL when it tries to download something, with the URLs extracted). The
+shell **executes nothing and the machine has no route out**: `ping` times out, names do not
+resolve, `curl`/`certutil`/`bitsadmin`/`Invoke-WebRequest` fail the way a firewalled server
+fails, and protected processes refuse to die. Limits: it is a table of answers over a small
+virtual filesystem, not Windows, so a command we do not model prints nothing (real commands
+that exist) or "not recognized" (names that do not); command output appears instantly where
+`ping` would take four seconds, and a command that would run for a long time (a download, a
+`dir /s` of the whole disk) answers at once; `shutdown /r` and `logoff` end the session;
+the machine answers `ping` for itself only; there is no Explorer, no Task Manager, no Notepad, and
+programs launched from Run that exist on Windows simply open no window; windows cannot be
+dragged. The **clipboard channel** is served both ways: text a visitor pastes is recorded
+as `rdp_clipboard` (20 items of 4,000 characters), and an optional `clipboard_text` is
+announced as the server's own clipboard and served to a visitor who pastes it (counted in the
+session summary). Other static channels (drives, printers, audio) are not served. Standard
+RDP security (no TLS) is still refused.
 
 ---
 

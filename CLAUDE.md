@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1371 unit tests covering security-critical paths)
+# Tests (1448 unit tests covering security-critical paths)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -298,7 +298,15 @@ from the honeypot's name (`accepted_logins` / `sessions` in its config) is let i
 public-key binding (which is how a client that checks it, FreeRDP, aardwolf, proceeds), then
 `rdp_session.py` runs a short MCS/capability exchange, paints a static desktop and records
 keystrokes, clicks and pasted clipboard text (`rdp_cliprdr.py`, MS-RDPECLIP over the `cliprdr`
-static channel: Format List -> Format Data Request -> recorded text, nothing offered back). The tests drive it with aardwolf (`tests/unit/test_rdp_session.py`,
+static channel: Format List -> Format Data Request -> recorded text; an optional `clipboard_text`
+is announced only after the client's own initial Format List, because clients ignore anything
+else until then). The desktop is `rdp_desktop.py` (a framebuffer `Screen` with Spleen 8x16 glyphs
+from `rdp_font.py`, and a `Desktop` state machine: icons, Start menu, Win+R, a console window;
+`commit()` repaints and returns only the changed rectangle, found by XOR-ing rows as big
+integers), and the console's answers come from `rdp_shell.py` (a pure fake `cmd`/PowerShell:
+no network, no execution, session-local files and `net user /add`). Input becomes `actions`
+via `InputRecorder`; repainting runs in `asyncio.to_thread`. `rdp_command` events carry the
+command and extracted URLs (CRITICAL on a download attempt). The tests drive it with aardwolf (`tests/unit/test_rdp_session.py`,
 including a mutation-replay fuzz of a recorded session) and FreeRDP 3
 (`tests/integration/test_rdp_freerdp.py`, Docker-gated, checks pixels).
 
@@ -397,7 +405,7 @@ RFC 3464 bounce to a *local* sender's mailbox after `_DSN_DELAY`, anything else 
 as relayed. **Nothing is ever sent onward** (spam source / backscatter), pinned by a test
 that fails on any non-loopback connect. `engines/pop3.py` serves the maildrop to a planted
 credential or one derived weak pair (same acceptance rule as the HTTP admin area and RDP);
-`DELE` is acknowledged per session and never removes mail; `AUTH PLAIN`/`LOGIN` decode through
+`DELE` is acknowledged per session and never removes mail (IMAP's CREATE/APPEND/COPY likewise live on the connection only, bounded, with the visitor's own mail numbered from 1,000,000 in the inbox so it cannot collide with mail the SMTP honeypot delivers later); `AUTH PLAIN`/`LOGIN` decode through
 the same `_attempt_login` as `USER`/`PASS` (`engines/_sasl.py`). `engines/imap.py` serves the
 same maildrop on the same acceptance rule, with the protocol logic (sequence sets, FETCH item
 tokenizer, ENVELOPE, recursive BODYSTRUCTURE, sections, SEARCH incl. NOT/OR) in the pure

@@ -4,6 +4,46 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## A console behind the RDP login, and the last mail gaps
+
+- **The RDP desktop works.** Double-click the `cmd` icon, use Start, or Win+R `cmd`/`powershell`,
+  and a console opens. A fake shell (`rdp_shell.py`) answers `whoami`, `dir`, `cd`, `type`,
+  `echo > file` (readable back), `ipconfig`, `systeminfo`, `net user` (incl. `/add`),
+  `tasklist`, `netstat`, `quser`, PowerShell cmdlets and Windows' exact error wording. It
+  executes nothing and has **no route out**: every download tool fails the way a firewalled
+  server fails, `ping` times out, and the URL is extracted into a CRITICAL `rdp_command`
+  event. Rendering is a framebuffer with Spleen 8x16 glyphs and dirty-rectangle updates (a
+  keystroke costs ~1 KB). Checked with FreeRDP 3 driven by xdotool (double-click, typed
+  commands, screenshot) and recorded events.
+- **The clipboard goes both ways**: an optional `clipboard_text` is announced as the
+  server's own and served to a visitor who pastes it. aardwolf showed that clients ignore a
+  server Format List until their own initial exchange completes, so the offer follows it.
+- **IMAP**: Sent/Drafts/Trash/Junk hold ordinary seeded mail; CREATE/DELETE/RENAME of the
+  visitor's own folders, APPEND (recorded as `imap_append`) and COPY work for the connection
+  only and are bounded.
+- **An independent review of this round** found no security-class defect (120,000 hostile
+  commands with socket/file/subprocess patched to raise; every update rectangle reconstructed
+  the screen exactly on a simulated client) and these, now fixed: an unbounded glyph cache (85,000
+  distinct Unicode characters = 121 MB); INBOX mail the visitor appended was numbered from
+  1,000,000 so UIDs went 1 2 3 1000001 4 and UIDNEXT never rose when new mail arrived (appended
+  mail now takes a number from the shared counter); UIDVALIDITY did not change when a folder was
+  deleted and recreated; APPEND with no literal stored an earlier literal as the message; text
+  in an appended message body was read as its flags; COPY stopped half-way over quota; the
+  128 KB literal allowance applied to any line containing the word APPEND; no cap on what one
+  connection may be sent; the console did not know `cmd` (so `cmd /c ...`, the commonest launcher,
+  failed from a window titled cmd.exe), `cd..`, `ipconfig/all`, `dir/w`, `echo.`, quoted paths
+  with spaces, `rmdir`/`ren`/`move`, `shutdown`/`logoff` (which now end the session, as they
+  would), `powershell -w hidden -c ...` (flag values were run as the command), and answered
+  `ping localhost` with a timeout; `echo curl` was treated as a download and raised CRITICAL;
+  the console claimed Server 2019 whatever build the honeypot reported over NLA; files differed
+  by case, `> nul` made a file; a PowerShell window turned into cmd on `exit`; Run opened under
+  a message box that then swallowed its input; dialogs overflowed small screens; Ctrl+V typed a
+  `v` (it now pastes the visitor's clipboard) and a lost Win key-up swallowed all later typing;
+  the server's clipboard offer could cancel the visitor's first paste, so it now follows it.
+- A FreeRDP integration test was writing its honeypots into the developer's own
+  `honeypot_mcp.db` (the settings were cached before the test set `DATABASE_URL`); it now uses a
+  throwaway database like the SSH tests.
+
 ## Mail clients, the clipboard, and a pre-flight
 
 - **IMAP serves the maildrop** the SMTP honeypot fills, to the same logins as POP3 (a planted

@@ -89,6 +89,54 @@ def _seed_messages(mailbox: str, domain: str) -> list[StoredMessage]:
     return out
 
 
+# Ordinary mail for the folders besides the inbox: (subject, body). A mailbox with an empty Sent
+# folder is one nobody has ever used, which a visitor who checks notices.
+_FOLDER_SEEDS: dict[str, tuple[tuple[str, str], ...]] = {
+    "Sent": (
+        (
+            "Re: Weekly backup report",
+            "Thanks, looks fine. Please keep the Sunday window as is.\r\n",
+        ),
+        (
+            "Q3 vendor invoices",
+            "Attached is the list for approval. Let me know if anything looks off.\r\n",
+        ),
+        ("Patching window", "Confirming Saturday 22:00-02:00 for the Linux estate.\r\n"),
+    ),
+    "Drafts": (
+        ("Notes for Monday", "- review the open tickets\r\n- follow up with procurement\r\n"),
+    ),
+    "Trash": (
+        ("Your mailbox quota", "Your mailbox is at 94% of its quota.\r\n"),
+        ("Lunch on Friday?", "Are we still on for noon?\r\n"),
+    ),
+    "Junk": (("You have been selected", "Click here to claim your reward.\r\n"),),
+}
+
+
+def _seed_folder(mailbox: str, folder: str, domain: str) -> list[StoredMessage]:
+    """Starting mail for a non-inbox folder, derived from the mailbox so it never changes."""
+    seeds = _FOLDER_SEEDS.get(folder, ())
+    seed = int.from_bytes(hashlib.sha256(f"folder:{mailbox}:{folder}".encode()).digest()[:8], "big")
+    rng = random.Random(seed)
+    now = datetime.now(UTC)
+    out = []
+    for n, (subject, body) in enumerate(seeds, start=1):
+        when = now - timedelta(days=rng.randint(1, 25) + n, hours=rng.randint(0, 23))
+        sender, recipient = (
+            (f"{mailbox}@{domain}", rng.choice(("it-ops", "finance", "facilities")) + f"@{domain}")
+            if folder in ("Sent", "Drafts")
+            else (rng.choice(("noreply", "alerts", "promo")) + f"@{domain}", f"{mailbox}@{domain}")
+        )
+        raw = (
+            f"From: {sender}\r\nTo: {recipient}\r\nSubject: {subject}\r\nDate: {format_datetime(when)}\r\n"
+            f"Message-ID: <{folder.lower()}{seed % 10**6}{n}@{domain}>\r\nMIME-Version: 1.0\r\n"
+            f"Content-Type: text/plain; charset=us-ascii\r\n\r\n{body}"
+        ).encode()
+        out.append(StoredMessage(uid=f"seed{folder.lower()}{n}", raw=raw, number=n))
+    return out
+
+
 class Maildrop:
     def __init__(self) -> None:
         self._boxes: OrderedDict[str, list[StoredMessage]] = OrderedDict()
@@ -96,6 +144,7 @@ class Maildrop:
         self._next_number: dict[str, int] = {}
         self._validity: dict[str, int] = {}
         self._generation = 0
+        self._folders: dict[tuple[str, str], list[StoredMessage]] = {}
 
     @staticmethod
     def _key(mailbox: str) -> str:
@@ -116,6 +165,8 @@ class Maildrop:
                 evicted, _ = self._boxes.popitem(last=False)
                 self._next_number.pop(evicted, None)
                 self._validity.pop(evicted, None)
+                for folder_key in [k for k in self._folders if k[0] == evicted]:
+                    del self._folders[folder_key]
         else:
             self._boxes.move_to_end(key)
         return box
@@ -134,6 +185,23 @@ class Maildrop:
         while len(box) > _MAX_MESSAGES or (total > _MAX_MAILBOX_BYTES and len(box) > 1):
             total -= box.pop(0).size
         return message
+
+    def folder(self, mailbox: str, folder: str, domain: str = "localhost") -> list[StoredMessage]:
+        """The shared, read-only messages of a folder other than the inbox."""
+        self._box(mailbox, domain)
+        key = (self._key(mailbox), folder)
+        if key not in self._folders:
+            self._folders[key] = _seed_folder(key[0], folder, domain)
+        return list(self._folders[key])
+
+    def reserve_number(self, mailbox: str, domain: str = "localhost") -> int:
+        """Take the next UID for a message that is not stored here (one a visitor appended), so
+        the shared numbering never hands out the same number to mail delivered later."""
+        self._box(mailbox, domain)
+        key = self._key(mailbox)
+        number = self._next_number[key]
+        self._next_number[key] = number + 1
+        return number
 
     def validity(self, mailbox: str, domain: str = "localhost") -> int:
         self._box(mailbox, domain)

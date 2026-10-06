@@ -49,6 +49,7 @@ from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_handler, shutdown_server
 from honeypot_mcp.engines.http_admin import accepted_pairs
+from honeypot_mcp.engines.rdp_desktop import Command
 from honeypot_mcp.engines.rdp_nla import (
     AuthMessage,
     hashcat_line,
@@ -57,6 +58,7 @@ from honeypot_mcp.engines.rdp_nla import (
     verify_ntlmv2,
 )
 from honeypot_mcp.engines.rdp_session import run_session
+from honeypot_mcp.engines.rdp_shell import Identity, extract_urls, looks_like_download
 from honeypot_mcp.engines.tls import build_server_ssl_context_async, ensure_cert
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -487,7 +489,25 @@ async def _handle_rdp_client(
         connect_initial=mcs_pdu,
         selected_protocol=_PROTOCOL_SSL,
         decide=decide,
+        shell_identity=_shell_identity(honeypot_name, config, peer),
+        clipboard_text=_clipboard_text(config),
     )
+
+
+# rdp_command events per session; the session summary still lists up to 100 commands.
+_MAX_COMMAND_EVENTS = 50
+
+
+def _shell_identity(honeypot_name: str, config: dict[str, Any], peer: tuple[str, int]) -> Identity:
+    """The machine the visitor believes they are on: the same computer name, domain and Windows
+    build the NLA exchange and the nmap scripts already reported for this honeypot."""
+    host = identity_for(honeypot_name, config)
+    return Identity(host.computer, host.domain, "Administrator", host.version, peer[0])
+
+
+def _clipboard_text(config: dict[str, Any]) -> str | None:
+    value = config.get("clipboard_text")
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _sessions_enabled(config: dict[str, Any]) -> bool:
@@ -526,8 +546,37 @@ async def _serve_session(
     connect_initial: bytes,
     selected_protocol: int,
     decide: Any,
+    shell_identity: Identity,
+    login_user: str | None = None,
+    clipboard_text: str | None = None,
 ) -> None:
     """Run the RDP session and record what the visitor did."""
+    commands_recorded = 0
+
+    async def ran(commands: list[Command]) -> None:
+        nonlocal commands_recorded
+        for command in commands:
+            if commands_recorded >= _MAX_COMMAND_EVENTS:
+                return
+            commands_recorded += 1
+            urls = extract_urls(command.text)
+            spawn(
+                _record_event(
+                    honeypot_id,
+                    peer,
+                    "rdp_command",
+                    AlertSeverity.CRITICAL
+                    if looks_like_download(command.text)
+                    else AlertSeverity.HIGH,
+                    {
+                        "shell": command.shell,
+                        "command": command.text,
+                        "urls": urls,
+                        "service": "rdp",
+                    },
+                ),
+                name="rdp-record",
+            )
 
     async def active(info: dict[str, Any]) -> None:
         spawn(
@@ -568,6 +617,10 @@ async def _serve_session(
             decide_login=decide,
             on_active=active,
             on_clipboard=pasted,
+            on_command=ran,
+            identity=shell_identity,
+            login_user=login_user,
+            clipboard_text=clipboard_text,
         )
     finally:
         with contextlib.suppress(Exception):
@@ -613,12 +666,15 @@ async def _handle_nla(
         "target_domain": ident.domain,
     }
     recorded_auth = False
+    logged_in_as: str | None = None
 
     async def authorize(captured: dict[str, Any]) -> str | None:
         """Record the captured NetNTLMv2 response, then decide whether to let it in.
         Returns the plaintext password if so: the session key is derived from it."""
         nonlocal recorded_auth
+        nonlocal logged_in_as
         auth: AuthMessage = captured["auth"]
+        logged_in_as = auth.username
         challenge: bytes = captured["server_challenge"]
         cracked = hashcat_line(auth, challenge)
         payload = {
@@ -672,6 +728,9 @@ async def _handle_nla(
                 connect_initial=mcs_pdu,
                 selected_protocol=_PROTOCOL_HYBRID,
                 decide=None,
+                shell_identity=_shell_identity(honeypot_name, config, peer),
+                login_user=logged_in_as,
+                clipboard_text=_clipboard_text(config),
             )
         return
     if result["stage"] == "negotiate":

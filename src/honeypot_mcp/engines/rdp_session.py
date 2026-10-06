@@ -29,24 +29,35 @@ read has a timeout, and a session is bounded by time, events and bytes.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import struct
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 
 from honeypot_mcp.engines.rdp_cliprdr import ClipboardChannel, wrap_channel_pdu
+from honeypot_mcp.engines.rdp_desktop import Command, Desktop
+from honeypot_mcp.engines.rdp_shell import Identity
+
+log = logging.getLogger(__name__)
 
 SERVER_USER = 1002
 IO_CHANNEL = 1003
 CLIENT_USER = 1007  # what Windows hands the first client of a session with few channels
 
 SESSION_SECONDS = 120.0
+# A visitor who has used the terminal is working, not probing: give them longer. They are still
+# bounded by IDLE_SECONDS, MAX_EVENTS, MAX_OUTPUT_BYTES and MAX_REPAINTS.
+INTERACTIVE_SECONDS = 600.0
+MAX_REPAINTS = 1500
 IDLE_SECONDS = 45.0
 MAX_EVENTS = 4000
 MAX_INPUT_BYTES = 1024 * 1024
 # The desktop is ~2 MB and a client can ask for it again, so output is capped per session:
 # without it a few KB of Refresh Rect PDUs bought gigabytes of replies.
-MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_OUTPUT_BYTES = 48 * 1024 * 1024
 MAX_REFRESHES = 3
 MAX_TYPED = 2000
 MAX_CLICKS = 50
@@ -76,6 +87,14 @@ _DATA_SET_ERROR_INFO = 0x2F
 
 
 # ── Wire helpers ────────────────────────────────────────────────────────────
+
+
+def _safe_user(name: str) -> str:
+    """The account name a visitor logged in as, for the prompt and home directory. Anything
+    that is not a plain account name falls back to Administrator: it is rendered into paths."""
+    name = name.strip().split("\\")[-1].split("@")[0]
+    plain = re.fullmatch(r"[A-Za-z0-9._-]{1,20}", name) is not None and name.strip(".") != ""
+    return name if plain else "Administrator"
 
 
 def per_length(n: int) -> bytes:
@@ -296,75 +315,6 @@ def parse_client_info(data: bytes) -> dict[str, Any] | None:
     return out
 
 
-# ── The desktop ─────────────────────────────────────────────────────────────
-
-_PIXEL_FORMATS = {15, 16, 24, 32}
-
-
-def _pixel(rgb: tuple[int, int, int], bpp: int) -> bytes:
-    r, g, b = rgb
-    if bpp == 16:
-        return struct.pack("<H", ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3))
-    if bpp == 15:
-        return struct.pack("<H", ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3))
-    if bpp == 24:
-        return bytes((b, g, r))
-    return bytes((b, g, r, 0))
-
-
-def render_desktop(width: int, height: int, bpp: int) -> list[bytes]:
-    """Top-down pixel rows of the decoy desktop, built from horizontal runs so a 1024x768
-    frame costs a few thousand byte joins rather than 786,432 pixel packs."""
-    taskbar = 40
-    taskbar_colour, start_colour, tray_colour = (28, 28, 32), (0, 120, 215), (40, 40, 46)
-    icon_columns = 24
-    icon_tops = (24, 112)
-    rows: list[bytes] = []
-    for y in range(height):
-        if y >= height - taskbar:
-            if y > height - taskbar + 3:
-                runs = [
-                    (0, 52, start_colour),
-                    (52, width - 120, taskbar_colour),
-                    (width - 120, width, tray_colour),
-                ]
-            else:
-                runs = [(0, width, taskbar_colour)]
-        else:
-            shade = max(0, 150 - (y * 90) // max(1, height))
-            background = (8, shade // 2 + 20, shade + 40)
-            runs = [(0, width, background)]
-            for top in icon_tops:
-                if top <= y < top + 48:
-                    glyph = (235, 235, 240) if y < top + 36 else (90, 110, 150)
-                    runs = [
-                        (0, icon_columns, background),
-                        (icon_columns, icon_columns + 48, glyph),
-                        (icon_columns + 48, width, background),
-                    ]
-                    break
-        rows.append(
-            b"".join(_pixel(colour, bpp) * max(0, end - start) for start, end, colour in runs)
-        )
-    return rows
-
-
-def bitmap_updates(rows: list[bytes], width: int, bpp: int) -> list[bytes]:
-    """Slow-path bitmap Update PDUs covering the whole desktop in full-width bands."""
-    bytes_per_pixel = (bpp + 7) // 8
-    per_band = max(1, 7600 // max(1, width * bytes_per_pixel))
-    out: list[bytes] = []
-    for top in range(0, len(rows), per_band):
-        band = rows[top : top + per_band]
-        bottom = top + len(band) - 1
-        data = b"".join(reversed(band))  # bitmaps are stored bottom-up
-        rect = struct.pack(
-            "<HHHHHHHHH", 0, top, width - 1, bottom, width, len(band), bpp, 0, len(data)
-        )
-        out.append(share_data(_DATA_UPDATE, struct.pack("<HH", 1, 1) + rect + data))
-    return out
-
-
 # ── Input ───────────────────────────────────────────────────────────────────
 
 # Set-1 scancodes on a US keyboard: unshifted, shifted.
@@ -389,7 +339,8 @@ _EXTENDED_KEYS = {
 
 
 class InputRecorder:
-    """Turns keyboard and mouse events into a bounded transcript of what was done."""
+    """Turns keyboard and mouse events into a bounded transcript of what was done, and into
+    the `actions` the desktop reacts to (characters, Esc, Win, Win+R, clicks)."""
 
     def __init__(self) -> None:
         self.typed: list[str] = []
@@ -397,8 +348,23 @@ class InputRecorder:
         self.clicks: list[tuple[int, int]] = []
         self.moves = 0
         self.special: set[str] = set()
+        self.actions: list[tuple] = []
         self._shift = False
         self._caps = False
+        self._win_down = False
+        self._win_combo = False
+        self._ctrl = False
+        self._alt = False
+
+    def on_sync(self) -> None:
+        """INPUT_EVENT_SYNC: sent when the client gains focus. Any modifier whose key-up was lost
+        (the window lost focus while it was held) is released here, or every later key would be
+        read as part of a combination."""
+        self._shift = self._win_down = self._win_combo = self._ctrl = self._alt = False
+
+    def take_actions(self) -> list[tuple]:
+        out, self.actions = self.actions, []
+        return out
 
     def on_scancode(self, flags: int, code: int) -> None:
         released = bool(flags & 0x8000)
@@ -408,40 +374,79 @@ class InputRecorder:
         if code in (_LSHIFT, _RSHIFT):
             self._shift = not released
             return
+        if code == 0x1D:  # either Ctrl
+            self._ctrl = not released
+            return
+        if code == 0x38:  # either Alt
+            self._alt = not released
+            return
+        if code in (_LWIN, 0x5C):  # either Windows key
+            if released:
+                if self._win_down and not self._win_combo:
+                    self.actions.append(("special", "win"))  # Windows opens Start on release
+                self._win_down = False
+            else:
+                self._win_down, self._win_combo = True, False
+                self.keys += 1
+                self.special.add("windows_key")
+            return
         if released:
             return
         self.keys += 1
-        if code == _LWIN:
-            self.special.add("windows_key")
-            return
         if code == _CAPS:
             self._caps = not self._caps
+            return
+        if code == 0x01:
+            self.actions.append(("special", "esc"))
             return
         if code == _BACKSPACE:
             if self.typed:
                 self.typed.pop()
+            self.actions.append(("char", "\b"))
             return
         if extended and code in _EXTENDED_KEYS:
             self.special.add(_EXTENDED_KEYS[code])
             return
         entry = _KEYS.get(code)
-        if entry is None or len(self.typed) >= MAX_TYPED:
+        if entry is None:
+            return
+        if self._ctrl:  # Ctrl+C cancels the line; Ctrl+V pastes the visitor's clipboard
+            if code == 0x2E:
+                self.actions.append(("special", "ctrl+c"))
+            elif code == 0x2F:
+                self.actions.append(("special", "ctrl+v"))
+            return
+        if self._alt:  # Alt+Tab and friends are not text
+            return
+        if self._win_down:
+            self._win_combo = True
+            if code == 0x13:  # R
+                self.actions.append(("special", "win+r"))
             return
         upper = self._shift ^ self._caps if entry[0].isalpha() else self._shift
-        self.typed.append(entry[1] if upper else entry[0])
+        char = entry[1] if upper else entry[0]
+        self.actions.append(("char", char))
+        if len(self.typed) < MAX_TYPED:
+            self.typed.append(char)
 
     def on_unicode(self, flags: int, code: int) -> None:
         if flags & 0x8000:
             return
         self.keys += 1
-        if len(self.typed) < MAX_TYPED and 0 < code < 0x110000:
-            self.typed.append(chr(code) if chr(code).isprintable() or code in (9, 10, 13) else "?")
+        if 0 < code < 0x110000:
+            char = chr(code)
+            self.actions.append(("char", "\n" if code == 13 else char))
+            if len(self.typed) < MAX_TYPED:
+                self.typed.append(char if char.isprintable() or code in (9, 10, 13) else "?")
 
     def on_mouse(self, flags: int, x: int, y: int) -> None:
         if flags & 0x0800:
             self.moves += 1
-        if flags & 0x8000 and flags & 0x7000 and len(self.clicks) < MAX_CLICKS:
-            self.clicks.append((x, y))
+        if flags & 0x8000 and flags & 0x7000:
+            if len(self.clicks) < MAX_CLICKS:
+                self.clicks.append((x, y))
+            button = 1 if flags & 0x1000 else 2 if flags & 0x2000 else 3
+            self.actions.append(("click", x, y, button))
 
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -455,6 +460,27 @@ class InputRecorder:
         return out
 
 
+def _output_cap(desktop: Desktop | None) -> int:
+    """Bytes the session may be sent. Every command that scrolls the console repaints it
+    (about 1 MB at 32 bpp), so a visitor who is working earns more room, up to a ceiling."""
+    if desktop is None:
+        return MAX_OUTPUT_BYTES
+    return min(MAX_OUTPUT_BYTES * 3, MAX_OUTPUT_BYTES + desktop.commands_run * 1024 * 1024)
+
+
+def _expand_paste(actions: list[tuple], text: str) -> list[tuple]:
+    """Replace each Ctrl+V with the characters of the visitor's own clipboard, as the console
+    would receive them: line breaks become Enter, so a pasted block runs line by line."""
+    pasted = text.replace("\r\n", "\n").replace("\r", "\n")[:500]
+    out: list[tuple] = []
+    for action in actions:
+        if action == ("special", "ctrl+v"):
+            out.extend(("char", c) for c in pasted if c == "\n" or c.isprintable())
+        else:
+            out.append(action)
+    return out
+
+
 def parse_slow_path_input(payload: bytes, recorder: InputRecorder) -> int:
     """Feed an Input Data PDU's events to `recorder`. Returns the number of events."""
     if len(payload) < 4:
@@ -465,7 +491,9 @@ def parse_slow_path_input(payload: bytes, recorder: InputRecorder) -> int:
         if pos + 12 > len(payload):
             break
         _time, kind, a, b, c = struct.unpack_from("<IHHHH", payload, pos)
-        if kind == 0x0004:
+        if kind == 0x0000:
+            recorder.on_sync()
+        elif kind == 0x0004:
             recorder.on_scancode(a, b)
         elif kind == 0x0005:
             recorder.on_unicode(a, b)
@@ -490,6 +518,10 @@ async def run_session(
     decide_login: LoginDecision | None,
     on_active: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     on_clipboard: Callable[[list[str]], Awaitable[None]] | None = None,
+    on_command: Callable[[list[Command]], Awaitable[None]] | None = None,
+    identity: Identity | None = None,
+    login_user: str | None = None,
+    clipboard_text: str | None = None,
 ) -> dict[str, Any]:
     """Serve one session from the client's Connect Initial to its end.
 
@@ -516,7 +548,7 @@ async def run_session(
     clip_id = next(
         (IO_CHANNEL + 1 + i for i, name in enumerate(channels) if name.lower() == "cliprdr"), None
     )
-    clipboard = ClipboardChannel() if clip_id is not None else None
+    clipboard = ClipboardChannel(clipboard_text) if clip_id is not None else None
     clipboard_reported = 0
 
     def send_clipboard(messages: list[bytes]) -> None:
@@ -533,7 +565,8 @@ async def run_session(
 
     sent = 0
     refreshes = 0
-    desktop: list[bytes] | None = None
+    desktop: Desktop | None = None
+    shell_identity = identity or Identity("WIN-HONEYPOT", "WORKGROUP", "Administrator")
 
     def send(data: bytes) -> None:
         nonlocal sent
@@ -541,25 +574,30 @@ async def run_session(
         if not writer.is_closing():
             writer.write(data)
 
-    def desktop_updates() -> list[bytes]:
-        """The desktop as ready-to-send frames, rendered once per session."""
-        nonlocal desktop
-        if desktop is None:
-            rows = render_desktop(width, height, bpp)
-            desktop = [
-                send_data_indication(IO_CHANNEL, u) for u in bitmap_updates(rows, width, bpp)
-            ]
-        return desktop
+    def send_rect(rect: tuple[int, int, int, int]) -> None:
+        """Send the part of the current frame inside `rect` as bitmap updates."""
+        assert desktop is not None
+        for x0, y0, x1, y1, data in desktop.chunks(rect):
+            header = struct.pack("<HH", 1, 1) + struct.pack(
+                "<HHHHHHHHH", x0, y0, x1 - 1, y1 - 1, x1 - x0, y1 - y0, bpp, 0, len(data)
+            )
+            send(send_data_indication(IO_CHANNEL, share_data(_DATA_UPDATE, header + data)))
 
     send(build_connect_response(len(channels), selected_protocol))
     try:
         await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
         while True:
             now = time.monotonic()
-            if now - started > SESSION_SECONDS or now - last_input > IDLE_SECONDS:
+            limit = INTERACTIVE_SECONDS if desktop and desktop.commands_run else SESSION_SECONDS
+            if now - started > limit or now - last_input > IDLE_SECONDS:
                 result["ended_by"] = "time limit"
                 break
-            if events > MAX_EVENTS or input_bytes > MAX_INPUT_BYTES or sent > MAX_OUTPUT_BYTES:
+            if (
+                events > MAX_EVENTS
+                or input_bytes > MAX_INPUT_BYTES
+                or sent > _output_cap(desktop)
+                or (desktop is not None and desktop.repaints > MAX_REPAINTS)
+            ):
                 result["ended_by"] = "volume limit"
                 break
             kind, body = await read_frame(reader, _READ_TIMEOUT)
@@ -661,9 +699,14 @@ async def run_session(
                                 share_data(_DATA_FONT_MAP, struct.pack("<HHHH", 0, 0, 3, 4)),
                             )
                         )
-                        for frame_bytes in desktop_updates():
-                            send(frame_bytes)
-                            await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
+                        who = login_user or str(result.get("client_info", {}).get("username") or "")
+                        desktop = Desktop(
+                            width, height, bpp, replace(shell_identity, user=_safe_user(who))
+                        )
+                        full = desktop.commit()
+                        assert full is not None
+                        send_rect(full)
+                        await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
                         stage = "active"
                         result["stage"] = "active"
                         if on_active is not None:
@@ -672,6 +715,20 @@ async def run_session(
                             send_clipboard(clipboard.opening())
                     elif data_type == _DATA_INPUT and stage == "active":
                         events += parse_slow_path_input(payload, recorder)
+                        actions = recorder.take_actions()
+                        if clipboard is not None and clipboard.texts:
+                            actions = _expand_paste(actions, clipboard.texts[-1])
+                        if actions and desktop is not None:
+                            # Repainting is CPU work driven by the visitor: off the event loop.
+                            rect = await asyncio.to_thread(desktop.apply, actions)
+                            if rect is not None:
+                                send_rect(rect)
+                            if desktop.disconnect:
+                                result["ended_by"] = "visitor logged off"
+                                break
+                            typed_commands = desktop.drain_commands()
+                            if typed_commands and on_command is not None:
+                                await on_command(typed_commands)
                     elif data_type == _DATA_SHUTDOWN_REQUEST:
                         send(
                             send_data_indication(IO_CHANNEL, share_data(_DATA_SHUTDOWN_DENIED, b""))
@@ -679,13 +736,12 @@ async def run_session(
                     elif (
                         data_type == _DATA_REFRESH_RECT
                         and stage == "active"
+                        and desktop is not None
                         and refreshes < MAX_REFRESHES
                     ):
                         refreshes += 1
-                        for frame_bytes in desktop_updates():
-                            send(frame_bytes)
-                            await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
-            await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
+                        send_rect((0, 0, width, height))
+                        await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
             await asyncio.wait_for(writer.drain(), _READ_TIMEOUT)
     except (asyncio.IncompleteReadError, ConnectionError, OSError):
         result.setdefault("ended_by", "connection closed")
@@ -693,10 +749,19 @@ async def run_session(
         result.setdefault("ended_by", "timeout")
     except ValueError:
         result.setdefault("ended_by", "malformed pdu")
+    except Exception:
+        # A bug in the desktop or shell must not cost the record of what the visitor did up to
+        # that point: the summary below is the finding.
+        log.exception("RDP session failed internally")
+        result.setdefault("ended_by", "internal error")
     result.setdefault("ended_by", "ended")
     result["duration_seconds"] = round(time.monotonic() - started, 1)
     result.update(recorder.summary())
+    if desktop is not None and desktop.commands:
+        result["commands"] = [{"shell": c.shell, "input": c.text} for c in desktop.commands]
     if clipboard is not None and (clipboard.texts or clipboard.formats_seen):
         result["clipboard"] = clipboard.texts
         result["clipboard_formats"] = sorted(clipboard.formats_seen)[:32]
+    if clipboard is not None and clipboard.offer_reads:
+        result["clipboard_offer_read"] = clipboard.offer_reads
     return result

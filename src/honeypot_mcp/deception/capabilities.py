@@ -192,8 +192,9 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "`mstshash` cookie, which nearly every RDP client and brute-force tool "
             "sends in the clear. Speaks CredSSP/NTLM (captures a crackable NetNTLMv2 "
             "response) and lets a planted honeytoken credential or one weak pair into a "
-            "short session: a static Windows-style desktop whose keystrokes and clicks "
-            "are recorded."
+            "short session: a Windows-style desktop with a console (cmd and PowerShell "
+            "answered by a fake shell that never executes anything, with no route out) whose "
+            "keystrokes, clicks, pasted text and commands are recorded."
         ),
         signature_events=(
             "rdp_handshake",
@@ -204,9 +205,16 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "rdp_session_start",
             "rdp_session",
             "rdp_clipboard",
+            "rdp_command",
         ),
         captures_credentials_as="rdp",
-        config_options=("rdp_hostname", "rdp_domain", "accepted_logins", "sessions"),
+        config_options=(
+            "rdp_hostname",
+            "rdp_domain",
+            "accepted_logins",
+            "sessions",
+            "clipboard_text",
+        ),
         pairs_well_with=("smb", "ldap"),
         notes="One of the largest brute-force categories on the internet.",
     ),

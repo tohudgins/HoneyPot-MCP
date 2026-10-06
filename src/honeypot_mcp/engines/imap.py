@@ -40,6 +40,7 @@ import contextlib
 import logging
 import re
 import secrets
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -122,6 +123,24 @@ _MAX_FETCH_EVENTS = 20
 _SYSTEM_FLAGS = ("\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft")
 _FLAG_BY_LOWER = {f.lower(): f for f in _SYSTEM_FLAGS}
 _FOLDERS = ("INBOX", "Sent", "Drafts", "Trash", "Junk")
+# What one connection may add to the (otherwise read-only) mailbox: folders it creates, and mail it
+# APPENDs or COPYs. All of it lives and dies with the connection.
+_MAX_USER_FOLDERS = 8
+_MAX_SESSION_MESSAGES = 50
+_MAX_SESSION_BYTES = 512 * 1024
+_MAX_APPEND = 128 * 1024
+_MAX_APPEND_EVENTS = 20
+_FOLDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}")
+# A flag is a system flag (`\\Seen`) or a plain keyword atom; nothing that needs quoting.
+_FLAG = re.compile(
+    r"\\(?:Answered|Flagged|Deleted|Seen|Draft)|[A-Za-z0-9$_.-]{1,64}", re.IGNORECASE
+)
+# `tag APPEND ...`: the only command whose literal may be a whole message.
+_APPEND_LINE = re.compile(r"\S+\s+APPEND\s", re.IGNORECASE)
+# Everything one connection may be sent, however it is asked for: a few pipelined FETCHes of
+# the largest messages are megabytes, and a connection that never stops asking is a client
+# reading the mailbox in a loop.
+_MAX_CONNECTION_OUTPUT = 64 * 1024 * 1024
 _ATTRIBUTES = {"Sent": "\\Sent", "Drafts": "\\Drafts", "Trash": "\\Trash", "Junk": "\\Junk"}
 
 
@@ -182,6 +201,25 @@ class _IMAPProtocol(asyncio.Protocol):
         # mailbox the visitor left, and never reaches the shared maildrop.
         self._flag_store: dict[str, dict[int, set[str]]] = {}
         self._expunge_store: dict[str, set[int]] = {}
+        # Folders this connection created, and mail it added to any folder.
+        self._user_folders: list[str] = []
+        self._appended: dict[str, list[StoredMessage]] = {}
+        self._session_bytes = 0
+        self._append_events = 0
+        self._last_literal = b""
+        # The command text that preceded the last literal (`a APPEND Sent (\\Seen) `): APPEND's
+        # folder and flags are read from it alone, never from the message that follows.
+        self._last_literal_head = ""
+        self._overlay_counter = 0
+        # How often each user-folder name has been deleted or renamed away: a recreated folder
+        # restarts its UIDs, which RFC 3501 requires to be announced as a new UIDVALIDITY.
+        self._folder_generation: dict[str, int] = {}
+        self._sent_total = 0
+        # Framing (data_received) and command handling (_handle) each track whether the command
+        # being assembled is an APPEND, since only its literal may be message-sized.
+        self._frame_continuation = False
+        self._frame_append = False
+        self._handle_append = False
 
     # ── connection plumbing ──────────────────────────────────────────────────
 
@@ -197,6 +235,10 @@ class _IMAPProtocol(asyncio.Protocol):
 
     def _send_bytes(self, data: bytes) -> None:
         if self._transport is None or self._transport.is_closing():
+            return
+        self._sent_total += len(data)
+        if self._sent_total > _MAX_CONNECTION_OUTPUT:
+            self._transport.abort()
             return
         if write_backlogged(self._transport, _MAX_WRITE_BACKLOG):
             # A peer pipelining FETCHes and never reading the answers.
@@ -245,10 +287,15 @@ class _IMAPProtocol(asyncio.Protocol):
                 break
             lines.append(line)
             pos = end + 1
+            if not self._frame_continuation:  # the first line of a command decides its literal cap
+                self._frame_append = self._mailbox is not None and bool(
+                    _APPEND_LINE.match(line.decode("utf-8", errors="replace"))
+                )
             marker = _LITERAL_MARKER.search(line)
+            self._frame_continuation = marker is not None
             if marker:
                 size = int(marker.group(1))
-                if size > _MAX_LITERAL:
+                if size > (_MAX_APPEND if self._frame_append else _MAX_LITERAL):
                     break  # the worker answers NO [TOOBIG] and hangs up when it reaches this line
                 self._literal_remaining = size
                 if size == 0:
@@ -324,12 +371,17 @@ class _IMAPProtocol(asyncio.Protocol):
         if self._command_prefix is not None:
             # The rest of a command whose earlier argument was a literal.
             line, self._command_prefix = self._command_prefix + line, None
+        elif not self._literal_count:
+            # A new command: whatever literal an earlier command left behind is not its message.
+            self._last_literal, self._last_literal_head = b"", ""
+            self._handle_append = self._mailbox is not None and bool(_APPEND_LINE.match(line))
 
         # A line ending in a literal marker: `a LOGIN user {8}` (or `{8+}`). The bytes follow.
         marker = re.search(r"\s\{(\d{1,10})(\+?)\}\s*$", line)
         if marker:
             size = int(marker.group(1))
-            if size > _MAX_LITERAL or self._literal_count >= _MAX_LITERALS_PER_COMMAND:
+            cap = _MAX_APPEND if self._handle_append else _MAX_LITERAL
+            if size > cap or self._literal_count >= _MAX_LITERALS_PER_COMMAND:
                 self._send(
                     f"{_tag_of(line)} NO [TOOBIG] Literal too large.\r\n* BYE Literal too large.\r\n"
                 )
@@ -351,6 +403,8 @@ class _IMAPProtocol(asyncio.Protocol):
             return
         head, _size = self._literal
         self._literal = None
+        self._last_literal = payload
+        self._last_literal_head = head
         text = payload.decode("utf-8", errors="replace")
         quoted = '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
         self._command_prefix = head + quoted
@@ -525,13 +579,14 @@ class _IMAPProtocol(asyncio.Protocol):
             self._send("+ idling\r\n")
         elif command in ("SUBSCRIBE", "UNSUBSCRIBE"):
             self._send(f"{tag} OK {command.title()} completed.\r\n")
-        elif command in ("CREATE", "DELETE", "RENAME"):
-            self._send(f"{tag} NO [NOPERM] Permission denied.\r\n")
-            await self._record("imap_command", AlertSeverity.LOW, {"command": line[:200]})
+        elif command == "CREATE":
+            await self._create(tag, rest, line)
+        elif command == "DELETE":
+            await self._delete(tag, rest, line)
+        elif command == "RENAME":
+            await self._rename(tag, rest, line)
         elif command == "APPEND":
-            # The literal (if any) was consumed by the framing layer; nothing is stored.
-            self._send(f"{tag} NO [NOPERM] Permission denied.\r\n")
-            await self._record("imap_command", AlertSeverity.MEDIUM, {"command": line[:200]})
+            await self._append(tag, rest, line)
         elif command in ("FETCH", "STORE", "SEARCH", "EXPUNGE", "CLOSE", "UNSELECT", "COPY"):
             await self._selected_command(tag, command, rest, uid_mode=False, line=line)
         else:
@@ -539,15 +594,201 @@ class _IMAPProtocol(asyncio.Protocol):
             await self._record("imap_command", AlertSeverity.LOW, {"command": line[:200]})
 
     def _folder_messages(self, name: str) -> list[StoredMessage]:
+        """A folder's messages as this connection sees them: the shared ones, then what it added,
+        in UID order (mail it appended to the inbox takes a number from the shared counter, so
+        it sorts among the real mail by when it arrived)."""
         assert self._mailbox is not None
-        if name.upper() == "INBOX":
-            return list(MAILDROP.messages(self._mailbox, self._mail_domain))
-        return []
+        if name == "INBOX":
+            base = list(MAILDROP.messages(self._mailbox, self._mail_domain))
+        elif name in _FOLDERS:
+            base = MAILDROP.folder(self._mailbox, name, self._mail_domain)
+        else:
+            base = []
+        return sorted(base + self._appended.get(name, []), key=lambda m: m.number)
 
     def _canonical(self, name: str) -> str | None:
         if name.upper() == "INBOX":
             return "INBOX"
-        return next((f for f in _FOLDERS if f == name), None)
+        if name in _FOLDERS or name in self._user_folders:
+            return name
+        return None
+
+    def _all_folders(self) -> list[str]:
+        return [*_FOLDERS, *sorted(self._user_folders)]
+
+    def _uidnext(self, folder: str) -> int:
+        assert self._mailbox is not None
+        highest = max((m.number for m in self._folder_messages(folder)), default=0)
+        if folder == "INBOX":
+            highest = max(highest, MAILDROP.next_number(self._mailbox, self._mail_domain) - 1)
+        return highest + 1
+
+    def _uidvalidity(self, folder: str) -> int:
+        assert self._mailbox is not None
+        base = MAILDROP.validity(self._mailbox, self._mail_domain)
+        if folder == "INBOX":
+            return base
+        return (
+            base
+            + 1
+            + zlib.crc32(folder.encode()) % 1000
+            + 1009 * self._folder_generation.get(folder, 0)
+        )
+
+    def _add_message(self, folder: str, raw: bytes, flags: set[str]) -> bool:
+        """Put a message into `folder` for this connection only. False if over budget."""
+        if (
+            sum(len(v) for v in self._appended.values()) >= _MAX_SESSION_MESSAGES
+            or self._session_bytes + len(raw) > _MAX_SESSION_BYTES
+        ):
+            return False
+        self._overlay_counter += 1
+        if folder == "INBOX":
+            # From the shared counter, so it can never collide with mail delivered later and the
+            # UIDs stay ascending in the order things arrived.
+            assert self._mailbox is not None
+            number = MAILDROP.reserve_number(self._mailbox, self._mail_domain)
+        else:
+            number = max((m.number for m in self._folder_messages(folder)), default=0) + 1
+        message = StoredMessage(
+            uid=f"s{self._overlay_counter}", raw=raw[:_MAX_APPEND], number=number
+        )
+        self._appended.setdefault(folder, []).append(message)
+        self._session_bytes += len(message.raw)
+        self._flag_store.setdefault(folder, {})[number] = set(flags)
+        sel = self._selected
+        if sel is not None and sel.name == folder:
+            sel.messages.append(message)
+            self._send(f"* {len(sel.view())} EXISTS\r\n* 1 RECENT\r\n")
+        return True
+
+    async def _create(self, tag: str, rest: str, line: str) -> None:
+        args = _split_args(rest)
+        name = args[0] if args else ""
+        if name.upper() == "INBOX" or name in self._all_folders():
+            self._send(f"{tag} NO [ALREADYEXISTS] Mailbox already exists.\r\n")
+        elif not _FOLDER_NAME.fullmatch(name) or len(self._user_folders) >= _MAX_USER_FOLDERS:
+            self._send(f"{tag} NO [CANNOT] Invalid mailbox name.\r\n")
+        else:
+            self._user_folders.append(name)
+            self._send(f"{tag} OK Create completed.\r\n")
+        await self._record("imap_command", AlertSeverity.LOW, {"command": line[:200]})
+
+    async def _delete(self, tag: str, rest: str, line: str) -> None:
+        args = _split_args(rest)
+        name = args[0] if args else ""
+        if name not in self._user_folders:
+            what = (
+                "[NOPERM] Permission denied"
+                if self._canonical(name)
+                else "[NONEXISTENT] Mailbox doesn't exist"
+            )
+            self._send(f"{tag} NO {what}.\r\n")
+        else:
+            self._forget_folder(name)
+            self._send(f"{tag} OK Delete completed.\r\n")
+        await self._record("imap_command", AlertSeverity.LOW, {"command": line[:200]})
+
+    def _forget_folder(self, name: str) -> None:
+        self._folder_generation[name] = self._folder_generation.get(name, 0) + 1
+        self._user_folders.remove(name)
+        self._session_bytes -= sum(len(m.raw) for m in self._appended.pop(name, []))
+        self._flag_store.pop(name, None)
+        self._expunge_store.pop(name, None)
+        if self._selected is not None and self._selected.name == name:
+            self._selected = None
+
+    async def _rename(self, tag: str, rest: str, line: str) -> None:
+        args = _split_args(rest)
+        old, new = (args + ["", ""])[:2]
+        if old not in self._user_folders:
+            self._send(f"{tag} NO [NOPERM] Permission denied.\r\n")
+        elif new.upper() == "INBOX" or new in self._all_folders():
+            self._send(f"{tag} NO [ALREADYEXISTS] Mailbox already exists.\r\n")
+        elif not _FOLDER_NAME.fullmatch(new):
+            self._send(f"{tag} NO [CANNOT] Invalid mailbox name.\r\n")
+        else:
+            self._folder_generation[old] = self._folder_generation.get(old, 0) + 1
+            self._user_folders[self._user_folders.index(old)] = new
+            if old in self._appended:
+                self._appended[new] = self._appended.pop(old)
+            if old in self._flag_store:
+                self._flag_store[new] = self._flag_store.pop(old)
+            if old in self._expunge_store:
+                self._expunge_store[new] = self._expunge_store.pop(old)
+            if self._selected is not None and self._selected.name == old:
+                self._selected = None
+            self._send(f"{tag} OK Rename completed.\r\n")
+        await self._record("imap_command", AlertSeverity.LOW, {"command": line[:200]})
+
+    async def _append(self, tag: str, rest: str, line: str) -> None:
+        """APPEND folder [(flags)] [date] {literal}: the message is kept for this connection."""
+        raw, self._last_literal = self._last_literal, b""
+        head, self._last_literal_head = self._last_literal_head, ""
+        # `tag APPEND folder [(flags)] [date-time]`: drop the tag and the command word.
+        rest = head.strip().split(None, 2)[2] if len(head.split(None, 2)) > 2 else rest
+        args = _split_args(rest.split("(", 1)[0])
+        folder = self._canonical(args[0]) if args else None
+        if not raw:
+            self._send(f"{tag} BAD Error in IMAP command APPEND: Missing message literal.\r\n")
+            return
+        if folder is None:
+            self._send(
+                f"{tag} NO [TRYCREATE] Mailbox doesn't exist: {_safe(args[0] if args else '')}\r\n"
+            )
+            return
+        flag_text = re.search(r"\(([^)]*)\)", rest)
+        flags = {
+            _FLAG_BY_LOWER.get(f.lower(), f) for f in (flag_text[1].split() if flag_text else [])
+        }
+        if len(flags) > _MAX_KEYWORDS or not all(_FLAG.fullmatch(f) for f in flags):
+            self._send(f"{tag} BAD Error in IMAP command APPEND: Invalid flags.\r\n")
+            return
+        if not self._add_message(folder, raw, flags):
+            self._send(f"{tag} NO [OVERQUOTA] Mailbox is over quota.\r\n")
+            return
+        self._send(f"{tag} OK Append completed.\r\n")
+        if self._append_events < _MAX_APPEND_EVENTS:
+            self._append_events += 1
+            await self._record(
+                "imap_append",
+                AlertSeverity.MEDIUM,
+                {
+                    "folder": folder,
+                    "size_bytes": len(raw),
+                    "subject": _subject_of(raw),
+                    "service": "imap",
+                },
+            )
+
+    def _copy(self, tag: str, rest: str, sel: _Selected, uid_mode: bool) -> None:
+        spec, _, target_text = rest.partition(" ")
+        seqnums = self._seqnums(spec, sel, uid_mode)
+        args = _split_args(target_text)
+        if seqnums is None or not args:
+            self._send(f"{tag} BAD Error in IMAP command COPY: Invalid arguments.\r\n")
+            return
+        target = self._canonical(args[0])
+        if target is None:
+            self._send(f"{tag} NO [TRYCREATE] Mailbox doesn't exist: {_safe(args[0])}\r\n")
+            return
+        view = sel.view()
+        chosen = [view[seq - 1] for seq in seqnums]
+        # All or nothing: a COPY that stopped part-way would leave a partial copy behind.
+        if not self._fits(len(chosen), sum(len(m.raw) for m in chosen)):
+            self._send(f"{tag} NO [OVERQUOTA] Mailbox is over quota.\r\n")
+            return
+        for message in chosen:
+            flags = set(sel.flags.get(message.number, set())) - {"\\Recent"}
+            self._add_message(target, message.raw, flags)
+        self._send(f"{tag} OK Copy completed.\r\n")
+
+    def _fits(self, count: int, size: int) -> bool:
+        """Whether `count` more messages of `size` bytes fit in this connection's allowance."""
+        return (
+            sum(len(v) for v in self._appended.values()) + count <= _MAX_SESSION_MESSAGES
+            and self._session_bytes + size <= _MAX_SESSION_BYTES
+        )
 
     def _list(self, tag: str, command: str, rest: str) -> None:
         args = _split_args(rest)
@@ -561,7 +802,7 @@ class _IMAPProtocol(asyncio.Protocol):
             )
             return
         full = (reference + pattern).replace("%", "*")  # a flat hierarchy: % and * agree
-        for name in _FOLDERS:
+        for name in self._all_folders():
             if _wild_match(full, name):
                 attrs = ["\\HasNoChildren"] + ([_ATTRIBUTES[name]] if name in _ATTRIBUTES else [])
                 self._send(f'* {command} ({" ".join(attrs)}) "/" {mbx.imap_string(name)}\r\n')
@@ -584,10 +825,8 @@ class _IMAPProtocol(asyncio.Protocol):
         values = {
             "MESSAGES": len(messages),
             "RECENT": 0,
-            "UIDNEXT": MAILDROP.next_number(self._mailbox, self._mail_domain)
-            if folder == "INBOX"
-            else 1,
-            "UIDVALIDITY": MAILDROP.validity(self._mailbox, self._mail_domain),
+            "UIDNEXT": self._uidnext(folder),
+            "UIDVALIDITY": self._uidvalidity(folder),
             "UNSEEN": unseen,
         }
         wanted = [i.upper() for i in items if i.upper() in values]
@@ -621,10 +860,8 @@ class _IMAPProtocol(asyncio.Protocol):
             (i + 1 for i, m in enumerate(view) if "\\Seen" not in self._selected.flags[m.number]),
             None,
         )
-        validity = MAILDROP.validity(self._mailbox, self._mail_domain)
-        next_uid = (
-            MAILDROP.next_number(self._mailbox, self._mail_domain) if folder == "INBOX" else 1
-        )
+        validity = self._uidvalidity(folder)
+        next_uid = self._uidnext(folder)
         permanent = "()" if read_only else "(\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)"
         lines = [
             f"* FLAGS ({' '.join(_SYSTEM_FLAGS)})",
@@ -686,7 +923,7 @@ class _IMAPProtocol(asyncio.Protocol):
             self._selected = None
             self._send(f"{tag} OK Unselect completed.\r\n")
         elif command == "COPY":
-            self._send(f"{tag} NO [NOPERM] Permission denied.\r\n")
+            self._copy(tag, rest, sel, uid_mode)
         else:
             self._send(f"{tag} BAD Unknown command.\r\n")
 
@@ -779,6 +1016,11 @@ class _IMAPProtocol(asyncio.Protocol):
             len(f) > _MAX_KEYWORD_LENGTH or not f.isprintable() for f in wanted
         ):
             self._send(f"{tag} NO [LIMIT] Too many or too long flags.\r\n")
+            return
+        if not all(
+            _FLAG.fullmatch(f) for f in wanted
+        ):  # atoms that would need quoting, \\Recent...
+            self._send(f"{tag} BAD Error in IMAP command STORE: Invalid flag.\r\n")
             return
         view = sel.view()
         for seq in seqnums:
