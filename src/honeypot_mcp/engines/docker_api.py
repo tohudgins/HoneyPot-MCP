@@ -47,6 +47,7 @@ from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.http_identity import (
     MAX_REQUEST_BYTES,
     ExactHeaderResponse,
+    compact_dumps,
     identity_runner,
     read_body,
 )
@@ -285,6 +286,7 @@ class DockerAPIEngine(HoneypotEngine):
                     "BuildTime": "2023-10-26T09:08:01.000000000+00:00",
                 },
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def info(request: web.Request) -> web.Response:
@@ -316,6 +318,7 @@ class DockerAPIEngine(HoneypotEngine):
                     "SystemTime": _now_iso(),
                 },
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def ping(request: web.Request) -> web.Response:
@@ -350,6 +353,7 @@ class DockerAPIEngine(HoneypotEngine):
                     },
                 ],
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def list_images(request: web.Request) -> web.Response:
@@ -370,6 +374,7 @@ class DockerAPIEngine(HoneypotEngine):
                     },
                 ],
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def create_image(request: web.Request) -> web.Response:
@@ -421,7 +426,10 @@ class DockerAPIEngine(HoneypotEngine):
                 },
             )
             return web.json_response(
-                {"Id": container_id, "Warnings": []}, status=201, headers=headers()
+                {"Id": container_id, "Warnings": []},
+                status=201,
+                headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def start_container(request: web.Request) -> web.Response:
@@ -454,7 +462,9 @@ class DockerAPIEngine(HoneypotEngine):
                     "payload_command": malicious,
                 },
             )
-            return web.json_response({"Id": secrets.token_hex(32)}, status=201, headers=headers())
+            return web.json_response(
+                {"Id": secrets.token_hex(32)}, status=201, headers=headers(), dumps=compact_dumps
+            )
 
         async def start_exec(request: web.Request) -> web.Response:
             await self._record(hp_id, request, "docker_api_exec_start", AlertSeverity.CRITICAL, {})

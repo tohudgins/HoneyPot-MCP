@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from typing import Any
 
 from honeypot_mcp.config import get_settings
@@ -512,6 +513,18 @@ class _RedisProtocol(asyncio.Protocol):
             )
             return
 
+        if verb == "ECHO" and len(args) == 2:
+            t.write(_bulk_string(args[1]))
+            return
+
+        if verb == "TIME":
+            now = time.time()
+            t.write(_array([str(int(now)), str(int((now % 1) * 1_000_000))]))
+            return
+
+        if verb == "CLIENT":
+            self._handle_client(args, t)
+            return
         if verb in ("MODULE",):
             # MODULE LOAD with a malicious .so — another known RCE path.
             t.write(_error("ERR module loading is disabled"))
@@ -588,8 +601,14 @@ class _RedisProtocol(asyncio.Protocol):
             t.write(_integer(len(self._store)))
             return
 
-        # Unknown / un-modelled command — log and respond like Redis 7.
-        t.write(_error(f"ERR unknown command `{_clip(args[0], 128)}`"))
+        # Unknown / un-modelled command — log and respond like Redis 7, which names the command
+        # in single quotes and lists the arguments it was sent ("with args beginning with: ...").
+        shown = "".join(f"'{_clip(a, 128)}' " for a in args[1:])
+        t.write(
+            _error(
+                f"ERR unknown command '{_clip(args[0], 128)}', with args beginning with: {shown}"
+            )
+        )
         spawn(
             self._record(
                 "redis_command",
@@ -662,6 +681,38 @@ class _RedisProtocol(asyncio.Protocol):
                     },
                 ),
                 name="redis-event",
+            )
+
+    def _handle_client(self, args: list[str], t: asyncio.Transport) -> None:
+        """`CLIENT ID|SETNAME|GETNAME|SETINFO|INFO|LIST`: what client libraries send on connect
+        and what an operator runs first. redis-py >= 5 issues `CLIENT SETINFO` for every new
+        connection, so an unknown-command reply to it is visible in the client's own logs."""
+        sub = args[1].upper() if len(args) > 1 else ""
+        if sub == "ID":
+            t.write(_integer(self._client_id))
+        elif sub == "SETNAME" and len(args) == 3:
+            self._client_name = _clip(args[2], 128)
+            t.write(_simple("OK"))
+        elif sub == "GETNAME":
+            t.write(_bulk_string(self._client_name) if self._client_name else _null_bulk())
+        elif sub == "SETINFO" and len(args) == 4:
+            t.write(_simple("OK"))
+        elif sub in ("INFO", "LIST"):
+            addr = f"{self._peer[0]}:{self._peer[1]}"
+            line = (
+                f"id={self._client_id} addr={addr} laddr=127.0.0.1:6379 fd=8 "
+                f"name={self._client_name or ''} age=0 idle=0 flags=N db=0 sub=0 psub=0 ssub=0 "
+                f"multi=-1 qbuf=26 qbuf-free=20448 argv-mem=10 multi-mem=0 obl=0 oll=0 omem=0 "
+                f"tot-mem=22298 events=r cmd=client|{sub.lower()} user=default redir=-1 resp="
+                f"{self._proto}\n"
+            )
+            t.write(_bulk_string(line))
+        else:
+            t.write(
+                _error(
+                    f"ERR unknown subcommand '{_clip(args[1], 128) if len(args) > 1 else ''}'. "
+                    "Try CLIENT HELP."
+                )
             )
 
     def _handle_hello(self, args: list[str], t: asyncio.Transport) -> None:

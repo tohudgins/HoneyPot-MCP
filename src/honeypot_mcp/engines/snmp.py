@@ -30,7 +30,12 @@ are trivially spoofed and a helpful reply would make this honeypot a
 participant in someone else's DDoS. Same reasoning as the memcached engine.
 
 Wire format: RFC 1157 (v1) / RFC 3416 (v2c), ASN.1 BER. Only the subset needed
-to parse a request and build a response is implemented — there is no MIB tree.
+to parse a request and build a response is implemented. The MIB is a small fixed table (the
+system group, ifNumber and a four-port ifTable) held in lexicographic order so GetNext, GetBulk
+and therefore `snmpwalk` behave as against a real agent: each step returns the next OID, the
+walk ends in endOfMibView (v2c) / noSuchName (v1), and an OID the agent does not have is
+noSuchObject, never a stand-in value. A walker that sees the same OID twice ("OID not
+increasing") has identified a decoy.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from typing import Any, cast
 
 from honeypot_mcp.engines._tasks import spawn
@@ -66,6 +72,15 @@ _GET_BULK_REQUEST = 0xA5
 
 # error-status values (RFC 3416 §3).
 _ERR_TOO_BIG = 1
+_ERR_NO_SUCH_NAME = 2
+_ERR_NOT_WRITABLE = 17
+
+# v2c varbind exceptions (RFC 3416 §3): context-specific, zero length.
+_NO_SUCH_OBJECT = 0x80
+_END_OF_MIB_VIEW = 0x82
+
+# Most varbinds a GetBulk reply carries, before the per-request byte bound trims it.
+_MAX_BULK_VARBINDS = 16
 
 # Attacker-chosen strings placed in events are clipped to this many chars.
 _MAX_EVENT_STRING = 256
@@ -101,9 +116,29 @@ _SYS_OBJECT_ID = "1.3.6.1.4.1.9.1.2494"
 _SYS_NAME = "sw-core-01"
 _SYS_LOCATION = "DC1 / Rack 14"
 _SYS_CONTACT = "netops@example.com"
-_SYS_UPTIME_TICKS = 284_913_400  # ~33 days, in hundredths of a second
+_SYS_UPTIME_TICKS = 284_913_400  # ~33 days, in hundredths of a second, when the agent started
+_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
+_STARTED = time.monotonic()
 
-_SCALARS: dict[str, tuple[int, Any]] = {
+
+def _uptime_ticks() -> int:
+    """sysUpTime advances in real time: two reads that return the same value are a static decoy."""
+    elapsed = int((time.monotonic() - _STARTED) * 100)
+    return (_SYS_UPTIME_TICKS + elapsed) & 0xFFFFFFFF
+
+
+def _oid_key(oid: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in oid.split(".") if part)
+
+
+_PORTS = (
+    "GigabitEthernet1/0/1",
+    "GigabitEthernet1/0/2",
+    "GigabitEthernet1/0/3",
+    "GigabitEthernet1/0/4",
+)
+
+_MIB_ROWS: dict[str, tuple[int, Any]] = {
     "1.3.6.1.2.1.1.1.0": (_OCTET_STRING, _SYS_DESCR),
     "1.3.6.1.2.1.1.2.0": (_OID, _SYS_OBJECT_ID),
     "1.3.6.1.2.1.1.3.0": (0x43, _SYS_UPTIME_TICKS),  # TimeTicks
@@ -111,7 +146,32 @@ _SCALARS: dict[str, tuple[int, Any]] = {
     "1.3.6.1.2.1.1.5.0": (_OCTET_STRING, _SYS_NAME),
     "1.3.6.1.2.1.1.6.0": (_OCTET_STRING, _SYS_LOCATION),
     "1.3.6.1.2.1.1.7.0": (_INTEGER, 78),
+    "1.3.6.1.2.1.2.1.0": (_INTEGER, len(_PORTS)),  # ifNumber
 }
+for _i, _descr in enumerate(_PORTS, start=1):
+    _MIB_ROWS[f"1.3.6.1.2.1.2.2.1.1.{_i}"] = (_INTEGER, _i)  # ifIndex
+    _MIB_ROWS[f"1.3.6.1.2.1.2.2.1.2.{_i}"] = (_OCTET_STRING, _descr)  # ifDescr
+    _MIB_ROWS[f"1.3.6.1.2.1.2.2.1.3.{_i}"] = (_INTEGER, 6)  # ifType: ethernetCsmacd
+    _MIB_ROWS[f"1.3.6.1.2.1.2.2.1.8.{_i}"] = (_INTEGER, 1)  # ifOperStatus: up
+
+# Lexicographic order, which is what GetNext walks.
+_MIB: list[tuple[tuple[int, ...], str, int, Any]] = sorted(
+    (_oid_key(oid), oid, tag, value) for oid, (tag, value) in _MIB_ROWS.items()
+)
+_MIB_BY_OID = {oid: (tag, value) for _key, oid, tag, value in _MIB}
+
+
+def _next_row(oid: str) -> tuple[str, int, Any] | None:
+    """The first MIB entry strictly after `oid`, or None past the end of the MIB."""
+    try:
+        key = _oid_key(oid)
+    except ValueError:
+        return None
+    for row_key, row_oid, tag, value in _MIB:
+        if row_key > key:
+            return row_oid, tag, value
+    return None
+
 
 _MAX_DATAGRAM = 8192
 
@@ -212,8 +272,8 @@ def parse_snmp(datagram: bytes) -> dict[str, Any] | None:
         inner = 0
         _t, raw_request_id, inner = _decode_tlv(pdu_body, inner)
         request_id = int.from_bytes(raw_request_id, "big", signed=True) if raw_request_id else 0
-        _t, _err_status, inner = _decode_tlv(pdu_body, inner)
-        _t, _err_index, inner = _decode_tlv(pdu_body, inner)
+        _t, raw_err_status, inner = _decode_tlv(pdu_body, inner)
+        _t, raw_err_index, inner = _decode_tlv(pdu_body, inner)
         _t, varbind_list, _ = _decode_tlv(pdu_body, inner)
 
         oids: list[str] = []
@@ -230,6 +290,9 @@ def parse_snmp(datagram: bytes) -> dict[str, Any] | None:
             "pdu_type": pdu_tag,
             "pdu_name": _PDU_NAMES.get(pdu_tag, f"0x{pdu_tag:02x}"),
             "request_id": request_id,
+            # In a GetBulk PDU these two fields are non-repeaters and max-repetitions.
+            "error_status": int.from_bytes(raw_err_status, "big") if raw_err_status else 0,
+            "error_index": int.from_bytes(raw_err_index, "big") if raw_err_index else 0,
             "oids": oids,
         }
     except (ValueError, IndexError):
@@ -243,29 +306,80 @@ def _encode_value(tag: int, value: Any) -> bytes:
         return _encode_oid(str(value))
     if tag in (_INTEGER, 0x43, 0x41):
         return _encode_int(int(value), tag)
+    if tag in (_NO_SUCH_OBJECT, 0x81, _END_OF_MIB_VIEW):
+        return _tlv(tag, b"")
     return _tlv(_NULL, b"")
 
 
-def build_response(request: dict[str, Any], max_varbinds: int = 8) -> bytes:
+def _answer(
+    request: dict[str, Any], max_varbinds: int
+) -> tuple[list[tuple[str, int, Any]], int, int]:
+    """(varbinds, error-status, error-index) for a request, per RFC 3416 §4.2.
+
+    v1 has no exceptions: a missing OID is `noSuchName` naming the offending varbind.
+    """
+    pdu = request["pdu_type"]
+    v1 = request["version"] == 0
+    oids = request["oids"] or ["1.3.6.1.2.1.1.1.0"]
+
+    if pdu == _SET_REQUEST:
+        # Nothing here is writable. The values the client sent are not parsed (and not echoed).
+        status = _ERR_NO_SUCH_NAME if v1 else _ERR_NOT_WRITABLE
+        return [(oid, _NULL, None) for oid in oids[:max_varbinds]], status, 1
+
+    out: list[tuple[str, int, Any]] = []
+
+    def step(oid: str) -> tuple[str, int, Any]:
+        nxt = _next_row(oid)
+        return nxt if nxt else (oid, _END_OF_MIB_VIEW, None)
+
+    if pdu == _GET_BULK_REQUEST and not v1:
+        non_repeaters = max(0, min(request.get("error_status", 0), len(oids)))
+        max_repetitions = max(0, request.get("error_index", 0))
+        for oid in oids[:non_repeaters]:
+            out.append(step(oid))
+        cursors = list(oids[non_repeaters:])
+        for _ in range(max_repetitions):
+            if not cursors or len(out) + len(cursors) > max_varbinds:
+                break
+            nxt_row = [step(oid) for oid in cursors]
+            out.extend(nxt_row)
+            cursors = [row[0] for row in nxt_row]
+            if all(row[1] == _END_OF_MIB_VIEW for row in nxt_row):
+                break
+        return out[:max_varbinds], 0, 0
+
+    for index, oid in enumerate(oids[:max_varbinds], start=1):
+        if pdu == _GET_NEXT_REQUEST:
+            row = step(oid)
+        elif oid in _MIB_BY_OID:
+            row = (oid, *_MIB_BY_OID[oid])
+        else:
+            row = (oid, _NO_SUCH_OBJECT, None)
+        if v1 and row[1] in (_NO_SUCH_OBJECT, _END_OF_MIB_VIEW):
+            return [(o, _NULL, None) for o in oids[:max_varbinds]], _ERR_NO_SUCH_NAME, index
+        out.append(row)
+    return out, 0, 0
+
+
+def build_response(request: dict[str, Any], max_varbinds: int = _MAX_BULK_VARBINDS) -> bytes:
     """Build a GetResponse for a parsed request.
 
-    GetBulk is answered with the same single-varbind shape as a Get rather than
-    the repeated varbinds a real agent returns — see the module docstring: a
-    faithful GetBulk reply is the amplification.
+    The byte bound in `build_bounded_response` (never longer than a small multiple of the
+    request) is what keeps GetBulk from being the amplification it is on a real agent.
     """
-    varbinds = b""
-    for oid in request["oids"][:max_varbinds] or ["1.3.6.1.2.1.1.1.0"]:
-        lookup = oid
-        if request["pdu_type"] == _GET_NEXT_REQUEST:
-            # Walkers start at 1.3.6.1.2.1.1 and expect the first scalar back.
-            lookup = "1.3.6.1.2.1.1.1.0" if not oid.endswith(".0") else oid
-        tag, value = _SCALARS.get(lookup, (_OCTET_STRING, _SYS_DESCR))
-        varbinds += _tlv(_SEQUENCE, _encode_oid(lookup) + _encode_value(tag, value))
-
+    rows, status, index = _answer(request, max_varbinds)
+    varbinds = b"".join(
+        _tlv(
+            _SEQUENCE,
+            _encode_oid(oid) + _encode_value(tag, _uptime_ticks() if oid == _UPTIME_OID else value),
+        )
+        for oid, tag, value in rows
+    )
     pdu = (
         _encode_int(request["request_id"])
-        + _encode_int(0)  # error-status: noError
-        + _encode_int(0)  # error-index
+        + _encode_int(status)
+        + _encode_int(index)
         + _tlv(_SEQUENCE, varbinds)
     )
     message = (
@@ -299,29 +413,41 @@ def build_bounded_response(request: dict[str, Any], limit: int) -> bytes | None:
     """The most faithful response no longer than `limit` bytes, or None.
 
     UDP sources are spoofable, so an answer larger than the question is a
-    reflection primitive. Tries the full response, then a single varbind, then
-    `tooBig`; a request too small even for that gets silence.
+    reflection primitive. Tries the full response, then progressively fewer
+    varbinds (a GetBulk may legally return fewer than it was asked for, and the
+    walker simply continues from the last one), then `tooBig`; a request too
+    small even for that gets silence.
     """
-    for candidate in (
-        build_response(request),
-        build_response(request, max_varbinds=1),
-        build_too_big_response(request),
-    ):
+    count = _MAX_BULK_VARBINDS
+    while count >= 1:
+        candidate = build_response(request, max_varbinds=count)
         if len(candidate) <= limit:
             return candidate
-    return None
+        count //= 2
+    candidate = build_too_big_response(request)
+    return candidate if len(candidate) <= limit else None
 
 
-def build_get_request(oid: str, community: str = "public", request_id: int = 1) -> bytes:
-    """A well-formed v2c GetRequest. Used by the health probe and by tests."""
+def build_get_request(
+    oid: str,
+    community: str = "public",
+    request_id: int = 1,
+    *,
+    pdu_type: int = _GET_REQUEST,
+    version: int = 1,
+    non_repeaters: int = 0,
+    max_repetitions: int = 0,
+) -> bytes:
+    """A well-formed request (v2c GetRequest unless told otherwise). Used by the health probe
+    and by tests; for a GetBulk the two counts ride in the error-status/error-index slots."""
     varbind = _tlv(_SEQUENCE, _encode_oid(oid) + _tlv(_NULL, b""))
     pdu = (
         _encode_int(request_id)
-        + _encode_int(0)  # error-status
-        + _encode_int(0)  # error-index
+        + _encode_int(non_repeaters)  # error-status (non-repeaters in a GetBulk)
+        + _encode_int(max_repetitions)  # error-index (max-repetitions in a GetBulk)
         + _tlv(_SEQUENCE, varbind)  # varbind list
     )
-    message = _encode_int(1) + _tlv(_OCTET_STRING, community.encode()) + _tlv(_GET_REQUEST, pdu)
+    message = _encode_int(version) + _tlv(_OCTET_STRING, community.encode()) + _tlv(pdu_type, pdu)
     return _tlv(_SEQUENCE, message)
 
 

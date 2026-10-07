@@ -18,6 +18,7 @@ So identity is set explicitly here rather than left to a library default.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -294,6 +295,19 @@ async def read_body(request: web.Request, limit: int = MAX_REQUEST_BYTES) -> Bod
     except Exception:  # client reset or malformed framing: keep what arrived
         pass
     return BodyRead(bytes(buf), truncated, timed_out)
+
+
+def compact_dumps(data: Any) -> str:
+    """JSON the way Go's `encoding/json` and Jackson write it: no space after `:` or `,`.
+    Python's default (`", "` and `": "`) makes a Kubernetes, Docker or Elasticsearch body
+    differ byte-for-byte from the real server's, which fingerprinting rules compare."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
+def pretty_dumps(data: Any) -> str:
+    """JSON as Elasticsearch's root endpoint prints it: two-space indent, `"key" : value`,
+    and a trailing newline (nmap's Elasticsearch rules anchor on exactly this layout)."""
+    return json.dumps(data, indent=2, separators=(",", " : "), ensure_ascii=False) + "\n"
 
 
 def clip(value: object, limit: int) -> str:

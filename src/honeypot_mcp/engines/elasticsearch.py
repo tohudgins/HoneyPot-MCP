@@ -37,7 +37,9 @@ from honeypot_mcp.http_identity import (
     MAX_REQUEST_BYTES,
     NGINX_BANNER,
     clip,
+    compact_dumps,
     identity_runner,
+    pretty_dumps,
     read_body,
     safe_headers,
     safe_query,
@@ -191,7 +193,7 @@ class ElasticsearchEngine(HoneypotEngine):
                 "version": _VERSION_BLOCK,
                 "tagline": "You Know, for Search",
             }
-            return web.json_response(body)
+            return web.json_response(body, dumps=pretty_dumps)
 
         async def _handle_health(request: web.Request) -> web.Response:
             await _record(request, "elasticsearch_health_probe", AlertSeverity.LOW)
@@ -212,7 +214,7 @@ class ElasticsearchEngine(HoneypotEngine):
                 "task_max_waiting_in_queue_millis": 0,
                 "active_shards_percent_as_number": 100.0,
             }
-            return web.json_response(body)
+            return web.json_response(body, dumps=compact_dumps)
 
         async def _handle_cat_indices(request: web.Request) -> web.Response:
             await _record(
@@ -253,7 +255,7 @@ class ElasticsearchEngine(HoneypotEngine):
                     }
                 },
             }
-            return web.json_response(body)
+            return web.json_response(body, dumps=compact_dumps)
 
         async def _handle_catchall(request: web.Request) -> web.Response:
             path = request.path
@@ -335,7 +337,7 @@ class ElasticsearchEngine(HoneypotEngine):
                 },
                 "status": 404,
             }
-            return web.json_response(body, status=404)
+            return web.json_response(body, status=404, dumps=compact_dumps)
 
         app.router.add_get("/", _handle_root)
         app.router.add_get("/_cluster/health", _handle_health)

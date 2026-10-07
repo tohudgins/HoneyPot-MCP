@@ -42,7 +42,7 @@ CRED_REFRESH_SECONDS = 30
 # be matched by exact (service, user, pass) lookup — the engine captures a
 # salted digest instead, verified against candidate passwords in
 # `credential_verify`. See `_match_hashed`.
-_HASHED_SERVICES = {"mysql", "vnc", "rdp"}
+_HASHED_SERVICES = {"mysql", "vnc", "rdp", "smb"}
 
 # (service, username_lower, password) → token_id
 # Usernames are lowercased on insert AND lookup; passwords stay case-sensitive.
@@ -149,6 +149,7 @@ _SERVICE_PREFIXES = {
     "mysql_": "mysql",
     "vnc_": "vnc",
     "rdp_": "rdp",
+    "smb_": "smb",
 }
 
 
@@ -244,7 +245,7 @@ def _match_hashed(service: str, payload: dict) -> int | None:
                 return token_id
         return None
 
-    if service == "rdp":
+    if service in ("rdp", "smb"):
         challenge = _decode_hex(payload.get("server_challenge_hex"))
         nt_response = _decode_hex(payload.get("nt_response_hex"))
         if challenge is None or nt_response is None:

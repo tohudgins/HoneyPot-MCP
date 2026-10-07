@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import struct
 from typing import Any
@@ -70,8 +71,15 @@ _CAPABILITY_FLAGS = 0x807FE7FF
 # Status flags. SERVER_STATUS_AUTOCOMMIT (0x0002).
 _STATUS_FLAGS = 0x0002
 
+# Client capability flags that say which optional HandshakeResponse41 fields follow.
+_CLIENT_CONNECT_WITH_DB = 0x00000008
+_CLIENT_PLUGIN_AUTH = 0x00080000
+
 # Character set: utf8mb4_general_ci (0xff is wrong; 0x2D is utf8mb4_general_ci).
 _CHARSET = 0x2D
+
+# What `SHOW DATABASES` lists on a fresh MySQL 8 install.
+_DATABASES = ("information_schema", "mysql", "performance_schema", "sys")
 
 # Per-connection bounds. The wire format allows 16 MiB packets; nothing a
 # honeypot needs to capture is that large, and buffering them is the exposure.
@@ -196,11 +204,20 @@ def _parse_handshake_response(payload: bytes) -> dict[str, Any]:
     out["auth_response_hex"] = auth_response.hex()
     pos += auth_len
 
-    # Optional database name (null-term)
-    if pos < len(payload):
+    # Optional database name (CLIENT_CONNECT_WITH_DB) and plugin name (CLIENT_PLUGIN_AUTH),
+    # both null-terminated and each present only if its capability flag was sent. Reading them
+    # without the flags files the plugin name as the database.
+    if client_flag & _CLIENT_CONNECT_WITH_DB and pos < len(payload):
         next_null = payload.find(b"\x00", pos)
         if next_null != -1:
             out["database"] = payload[pos : min(next_null, pos + 2048)].decode(
+                "utf-8", errors="replace"
+            )
+            pos = next_null + 1
+    if client_flag & _CLIENT_PLUGIN_AUTH and pos < len(payload):
+        next_null = payload.find(b"\x00", pos)
+        if next_null != -1:
+            out["auth_plugin"] = payload[pos : min(next_null, pos + 128)].decode(
                 "utf-8", errors="replace"
             )
 
@@ -254,15 +271,23 @@ def _column_def(seq: int, name: str) -> bytes:
     return _packet(seq, payload)
 
 
-def _single_value_resultset(column_name: str, value: str) -> bytes:
-    """A one-column, one-row text result set — enough for `SELECT @@version`
-    and friends so a scanner that reads results stays engaged."""
+def _resultset(column_name: str, values: list[str]) -> bytes:
+    """A one-column text result set, one row per value."""
     out = _packet(1, _lenenc_int(1))  # column count = 1
     out += _column_def(2, column_name)
     out += _eof_packet(3)
-    out += _packet(4, _lenenc_str(value))  # one row, one value
-    out += _eof_packet(5)
+    seq = 4
+    for value in values:
+        out += _packet(seq, _lenenc_str(value))
+        seq += 1
+    out += _eof_packet(seq)
     return out
+
+
+def _single_value_resultset(column_name: str, value: str) -> bytes:
+    """A one-column, one-row text result set — enough for `SELECT @@version`
+    and friends so a scanner that reads results stays engaged."""
+    return _resultset(column_name, [value])
 
 
 def _classify_query(sql: str) -> tuple[str, AlertSeverity]:
@@ -304,6 +329,8 @@ class _MySQLProtocol(asyncio.Protocol):
         self._packets = 0
         self._sent_handshake = False
         self._authed = False
+        # A handshake response awaiting the client's reply to our AuthSwitchRequest.
+        self._pending_login: dict[str, Any] | None = None
         # Full 20-byte scramble we advertised — needed to verify the client's
         # mysql_native_password response against a planted honeytoken password.
         self._salt = b""
@@ -365,7 +392,28 @@ class _MySQLProtocol(asyncio.Protocol):
         del buf[:pos]
 
     def _handle_login(self, seq: int, payload: bytes) -> None:
+        if self._pending_login is not None:
+            # The reply to our AuthSwitchRequest: the bare 20-byte scramble response, no
+            # length prefix. It is what the first packet lacked.
+            parsed, self._pending_login = self._pending_login, None
+            parsed["auth_response_hex"] = payload[:512].hex()
+            self._finish_login(seq, parsed)
+            return
         parsed = _parse_handshake_response(payload)
+        plugin = parsed.get("auth_plugin")
+        if plugin and plugin != "mysql_native_password" and self._transport is not None:
+            # A client that does not already speak the server's plugin (libmariadb names its
+            # placeholder `dummy_fallback_auth`) sends no password with its first packet and
+            # waits for the server to say which plugin to use, as MySQL 8 does. Without this
+            # the client treated the immediate OK as a protocol error and the password was
+            # never captured.
+            self._pending_login = parsed
+            switch = b"\xfemysql_native_password\x00" + self._salt + b"\x00"
+            self._transport.write(_packet(seq + 1, switch))
+            return
+        self._finish_login(seq, parsed)
+
+    def _finish_login(self, seq: int, parsed: dict[str, Any]) -> None:
         spawn(
             self._record(
                 "mysql_login_attempt",
@@ -413,11 +461,16 @@ class _MySQLProtocol(asyncio.Protocol):
             return
         s = sql.lower().strip()
         if "@@version" in s or "version()" in s:
-            t.write(_single_value_resultset("@@version", _SERVER_VERSION.decode()))
+            column = "@@version" if "@@version" in s else "version()"
+            t.write(_single_value_resultset(column, _SERVER_VERSION.decode()))
         elif "user()" in s or "current_user" in s:
             t.write(_single_value_resultset("user()", "root@localhost"))
         elif "@@datadir" in s:
             t.write(_single_value_resultset("@@datadir", "/var/lib/mysql/"))
+        elif re.fullmatch(r"show\s+(databases|schemas)\s*;?", s):
+            t.write(_resultset("Database", list(_DATABASES)))
+        elif m := re.fullmatch(r"select\s+(\d{1,9})\s*;?", s):
+            t.write(_single_value_resultset(m.group(1), m.group(1)))
         elif s.startswith("select"):
             # Empty single-column result — believable "no rows" for arbitrary
             # SELECTs without implementing a real query engine.

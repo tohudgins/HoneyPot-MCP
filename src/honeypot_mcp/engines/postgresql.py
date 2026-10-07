@@ -79,13 +79,24 @@ def _auth_cleartext_request() -> bytes:
     return b"R" + struct.pack("!II", 8, 3)
 
 
-def _error_response(severity: str, code: str, message: str) -> bytes:
+# Source location a 14.x postmaster reports in its startup errors. Every real ErrorResponse ends
+# with these three fields (file, line, routine) and nmap reads the line number to name the
+# version: 2142 is ProcessStartupPacket's "unsupported frontend protocol" in 14.10 (what the
+# banner below claims). The invalid-length error sits a few dozen lines earlier in the same
+# function.
+_SRC_UNSUPPORTED_PROTOCOL = ("postmaster.c", 2142, "ProcessStartupPacket")
+_SRC_INVALID_LENGTH = ("postmaster.c", 2092, "ProcessStartupPacket")
+
+
+def _error_response(
+    severity: str, code: str, message: str, source: tuple[str, int, str] | None = None
+) -> bytes:
     """Build an ErrorResponse in modern PostgreSQL's field order.
 
     'E' + Int32 len + [field-type byte + string\\0]... + \\0. Real servers since
     9.6 send both S (localised severity) and V (non-localised) before the
-    SQLSTATE and message; the pair is what identifies a genuine PostgreSQL
-    error frame to a scanner.
+    SQLSTATE and message, and close with F/L/R (file, line, routine); the pair
+    and the trailer are what identify a genuine PostgreSQL error frame to a scanner.
     """
     fields = (
         b"S"
@@ -100,8 +111,12 @@ def _error_response(severity: str, code: str, message: str) -> bytes:
         + b"M"
         + message.encode()
         + b"\x00"
-        + b"\x00"
     )
+    if source is not None:
+        file, line, routine = source
+        fields += b"F" + file.encode() + b"\x00" + b"L" + str(line).encode() + b"\x00"
+        fields += b"R" + routine.encode() + b"\x00"
+    fields += b"\x00"
     return b"E" + struct.pack("!I", len(fields) + 4) + fields
 
 
@@ -184,6 +199,28 @@ def _classify_pg_query(sql: str) -> tuple[str, AlertSeverity]:
     return "postgresql_query", AlertSeverity.MEDIUM
 
 
+# What `SELECT version()` returns on the Debian 14.10 build the startup parameters describe; the
+# short form that was here disagreed with `server_version` in the same connection.
+_VERSION_STRING = (
+    "PostgreSQL 14.10 (Debian 14.10-1.pgdg120+1) on x86_64-pc-linux-gnu, "
+    "compiled by gcc (Debian 12.2.0-14) 12.2.0, 64-bit"
+)
+
+
+def _command_tag(sql: str) -> str:
+    """The CommandComplete tag PostgreSQL gives a statement (`SET`, `INSERT 0 1`, `COPY 0`...).
+    A literal `OK` is not a tag any real server emits."""
+    words = sql.strip().rstrip(";").split()
+    verb = words[0].upper() if words else ""
+    if verb in ("CREATE", "DROP", "ALTER") and len(words) > 1:
+        return f"{verb} {words[1].upper()}"
+    if verb == "INSERT":
+        return "INSERT 0 1"
+    if verb in ("UPDATE", "DELETE", "COPY"):
+        return f"{verb} 0"
+    return verb or "EMPTY"
+
+
 class _PGProtocol(asyncio.Protocol):
     def __init__(self, honeypot_id: int | None) -> None:
         self._hp_id = honeypot_id
@@ -229,7 +266,12 @@ class _PGProtocol(asyncio.Protocol):
                         # length and lands here. Closing mutely left the port
                         # unidentifiable, which is itself conspicuous.
                         t.write(
-                            _error_response("FATAL", "08P01", "invalid length of startup packet")
+                            _error_response(
+                                "FATAL",
+                                "08P01",
+                                "invalid length of startup packet",
+                                _SRC_INVALID_LENGTH,
+                            )
                         )
                         self._close()
                         return
@@ -299,6 +341,7 @@ class _PGProtocol(asyncio.Protocol):
                 "FATAL",
                 "0A000",
                 f"unsupported frontend protocol {major}.{minor}: server supports 3.0 to 3.0",
+                _SRC_UNSUPPORTED_PROTOCOL,
             )
         )
         self._close()
@@ -343,14 +386,14 @@ class _PGProtocol(asyncio.Protocol):
             return
         s = sql.lower()
         if "version()" in s:
-            t.write(_single_value_result("version", "PostgreSQL 14.10 on x86_64-pc-linux-gnu"))
+            t.write(_single_value_result("version", _VERSION_STRING))
         elif "current_user" in s or s.strip().rstrip(";") == "user":
             t.write(_single_value_result("current_user", "postgres"))
         elif s.strip().startswith("select"):
             t.write(_single_value_result("?column?", ""))
         else:
             # DDL/DML/COPY/SET — CommandComplete + ready.
-            t.write(_msg(b"C", b"OK\x00") + _ready_for_query())
+            t.write(_msg(b"C", _command_tag(sql).encode() + b"\x00") + _ready_for_query())
 
     def _close(self) -> None:
         self._buf.clear()

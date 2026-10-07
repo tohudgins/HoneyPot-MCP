@@ -157,22 +157,38 @@ def _parse_login7(body: bytes) -> dict[str, str]:
     return out
 
 
-def _build_login_error() -> bytes:
-    """ERROR token (18456 Login failed) + DONE token, wrapped as a TDS response."""
-    msg = "Login failed for user.".encode("utf-16-le")
+def _login7_tds_version(body: bytes) -> int:
+    """The TDS version in the LOGIN7 record's fixed header (offset 4)."""
+    return struct.unpack_from("<I", body, 4)[0] if len(body) >= 8 else 0x74000004
+
+
+def _build_login_error(tds_version: int = 0x74000004, username: str = "") -> bytes:
+    """ERROR token (18456 Login failed) + DONE token, wrapped as a TDS response.
+
+    A server answers in the TDS version the client asked for. From 7.2 on the DONE row count
+    is 8 bytes and the ERROR line number 4; before that they are 4 and 2, and a client that
+    negotiated 7.1 (impacket does) reads the longer encoding as a stray token. Real SQL Server
+    names the account in the message.
+    """
+    modern = tds_version >= 0x72000000
+    text = f"Login failed for user '{username[:128]}'." if username else "Login failed for user."
+    msg = text.encode("utf-16-le")
+    server = "SQL01".encode("utf-16-le")
     err_body = (
         struct.pack("<I", 18456)  # error number
         + bytes([1])  # state
         + bytes([14])  # class (severity)
         + struct.pack("<H", len(msg) // 2)  # message length in chars
         + msg
-        + bytes([0])  # server name length (chars)
+        + bytes([len(server) // 2])  # server name length (chars)
+        + server
         + bytes([0])  # proc name length (chars)
-        + struct.pack("<I", 1)  # line number
+        + (struct.pack("<I", 1) if modern else struct.pack("<H", 1))  # line number
     )
     error_token = bytes([0xAA]) + struct.pack("<H", len(err_body)) + err_body
-    # DONE token: status(2, error=0x0002) + curcmd(2) + rowcount(8).
-    done_token = bytes([0xFD]) + struct.pack("<HHQ", 0x0002, 0, 0)
+    # DONE token: status(2, error=0x0002) + curcmd(2) + rowcount(8, or 4 before TDS 7.2).
+    done_token = bytes([0xFD]) + struct.pack("<HH", 0x0002, 0)
+    done_token += struct.pack("<Q", 0) if modern else struct.pack("<I", 0)
     return _tds_packet(_TDS_RESPONSE, error_token + done_token)
 
 
@@ -239,7 +255,7 @@ class _MSSQLProtocol(asyncio.Protocol):
             fields = _parse_login7(body)
             spawn(self._record_login(fields), name="mssql-event")
             with contextlib.suppress(Exception):
-                t.write(_build_login_error())
+                t.write(_build_login_error(_login7_tds_version(body), fields.get("username", "")))
             self._close()
             return
         # Anything else pre-auth — reject.

@@ -1,10 +1,15 @@
-"""SMB honeypot engine — negotiate capture + EternalBlue/DoublePulsar detection.
+"""SMB honeypot engine — negotiate capture, NTLM credential capture, EternalBlue/DoublePulsar.
 
 SMB on tcp/445 is one of the most heavily scanned surfaces on the public
 internet: it's the initial-access vector behind WannaCry, NotPetya, and a large
-share of ransomware intrusions. The high-value signal here isn't serving a real
-file share — it's catching the scanners and exploit tools, which announce
-themselves loudly in the first one or two packets:
+share of ransomware intrusions. Two populations hit it and both are caught:
+
+**Credential sprayers** speak SMB2. `engines/smb2.py` negotiates dialect 2.1 and plays the
+server side of NTLM session setup, so a login attempt from `smbclient`, impacket, NetExec or
+Metasploit yields the account, domain, workstation and a NetNTLMv2 response with its hashcat
+line (`smb_ntlm_auth`). The login is refused: there is no file server behind it.
+
+**Scanners and exploit tools** announce themselves loudly in the first one or two SMB1 packets:
 
 * Any SMB1 (`\\xffSMB`) negotiation on 445 in 2020s traffic is already
   suspicious — modern clients speak SMB2/3. EternalBlue *requires* SMB1.
@@ -14,11 +19,11 @@ themselves loudly in the first one or two packets:
 * EternalBlue itself sends oversized/malformed Trans2 requests right after the
   negotiate, before any real session exists.
 
-So this engine parses the framing, logs the negotiated dialects, sends a
-believable SMB1 negotiate response to keep the exploit tool talking, and then
-classifies the follow-up packets — emitting a CRITICAL `smb_exploit_attempt`
-on a DoublePulsar/EternalBlue signature and capturing NTLM session-setup data
-(username/hostname/domain) when present.
+An SMB1 negotiate that offers only SMB1 dialects (nmap, exploit tools) is answered in SMB1 to
+keep the tool talking, and the follow-up packets are classified — emitting a CRITICAL
+`smb_exploit_attempt` on a DoublePulsar/EternalBlue signature and capturing NTLM session-setup
+data (username/hostname/domain) when present. A multi-protocol negotiate that also offers
+SMB 2.x (impacket, older smbclient) is answered in SMB2, as Windows does.
 
 We deliberately do NOT implement a real SMB file server (no tree connect, no
 file I/O) — that's a large attack surface and not the goal. This is the same
@@ -26,7 +31,7 @@ file I/O) — that's a large attack surface and not the goal. This is the same
 
 Wire references:
 * MS-SMB   §2.2  — SMB1 message syntax
-* MS-SMB2  §2.2  — SMB2 negotiate
+* MS-SMB2  §2.2  — SMB2 negotiate and session setup
 * [MS-CIFS] §2.2.4.52 — TRANS2_SESSION_SETUP (the DoublePulsar subcommand)
 """
 
@@ -44,6 +49,14 @@ from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_handler, shutdown_server
+from honeypot_mcp.engines.rdp_nla import AuthMessage, HostIdentity, hashcat_line, identity_for
+from honeypot_mcp.engines.smb2 import (
+    DIALECT_2_0_2,
+    DIALECT_WILDCARD,
+    negotiate_response,
+    serve_smb2,
+    stable_guid,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -141,9 +154,12 @@ class SMBEngine(HoneypotEngine):
             if hp:
                 hp_id = hp.id
 
+        ident = identity_for(name, config)
+        guid = stable_guid(name)
+
         async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
-                await _handle_smb_client(reader, writer, honeypot_id=hp_id)
+                await _handle_smb_client(reader, writer, honeypot_id=hp_id, ident=ident, guid=guid)
             except Exception as e:
                 log.warning("SMB handler error: %s", e)
 
@@ -206,7 +222,9 @@ def _select_dialect_index(dialects: list[str]) -> int:
     return max(len(dialects) - 1, 1)
 
 
-def _build_smb1_negotiate_response(request: bytes, dialects: list[str]) -> bytes:
+def _build_smb1_negotiate_response(
+    request: bytes, dialects: list[str], ident: HostIdentity | None = None
+) -> bytes:
     """A believable SMB1 Negotiate Response selecting NT LM 0.12 and demanding
     challenge/response auth. Enough to make an exploit tool proceed to its
     session-setup / exploit packet.
@@ -219,8 +237,12 @@ def _build_smb1_negotiate_response(request: bytes, dialects: list[str]) -> bytes
     # (32-byte SMB1 header); fall back to values a real client would send.
     if len(request) >= 32:
         tid, pid_low, uid, mid = struct.unpack_from("<HHHH", request, 24)
+        # Windows answers with the Flags2 bits the client sent (unicode, NT status, ...). A
+        # constant here is what `nmap -sV` compares against the request it just made.
+        (flags2,) = struct.unpack_from("<H", request, 10)
     else:
         tid, pid_low, uid, mid = 0, 0x0640, 0, 1
+        flags2 = 0xC001
 
     # SMB header (32 bytes).
     header = (
@@ -228,7 +250,7 @@ def _build_smb1_negotiate_response(request: bytes, dialects: list[str]) -> bytes
         + bytes([_SMB_COM_NEGOTIATE])
         + struct.pack("<I", 0)  # NT status = success
         + bytes([0x88])  # flags: reply + case-insensitive
-        + struct.pack("<H", 0xC001)  # flags2: NT status + unicode
+        + struct.pack("<H", flags2)
         + struct.pack("<H", 0)  # PIDHigh
         + b"\x00" * 8  # security signature
         + struct.pack("<H", 0)  # reserved
@@ -238,23 +260,30 @@ def _build_smb1_negotiate_response(request: bytes, dialects: list[str]) -> bytes
         + struct.pack("<H", mid)
     )
     challenge = secrets.token_bytes(8)
-    # Negotiate response parameters (WordCount = 17).
+    # Negotiate response parameters (WordCount = 17). The sizes and capability word are what a
+    # Windows 7 / Server 2008 R2 host reports, which is the persona EternalBlue-era tooling
+    # expects to find on 445.
     params = struct.pack(
         "<HBHHIIIIQhB",
         _select_dialect_index(dialects),
         0x03,  # SecurityMode: user-level + challenge/response
-        50,  # MaxMpxCount
+        10,  # MaxMpxCount
         1,  # MaxNumberVcs
-        16644,  # MaxBufferSize
-        65535,  # MaxRawSize
+        4356,  # MaxBufferSize
+        65536,  # MaxRawSize
         0,  # SessionKey
-        0x8000_00FD & 0xFFFFFFFF,  # Capabilities (NT SMBs etc.)
+        0x0001_E3FC,  # Capabilities: unicode, large files, NT SMBs, status32, DFS, large r/w
         _filetime_now(),  # SystemTime — 0 renders as 1601-01-01 in any client
         0,  # ServerTimeZone
         len(challenge),  # ChallengeLength
     )
-    domain = "WORKGROUP\x00".encode("utf-16-le")
-    data = challenge + domain
+    # DomainName then ServerName, both UTF-16LE and NUL-terminated; a response that stops after
+    # the domain is structurally short of anything a Windows host sends.
+    # The domain and server name are the ones the NTLM CHALLENGE discloses over SMB2 and RDP:
+    # a host that is WORKGROUP/FS01 here and CORP/WIN-xxxx a packet later is two hosts.
+    domain = f"{ident.domain if ident else 'WORKGROUP'}\x00".encode("utf-16-le")
+    server = f"{ident.computer if ident else 'FS01'}\x00".encode("utf-16-le")
+    data = challenge + domain + server
     body = bytes([17]) + params + struct.pack("<H", len(data)) + data
     smb = header + body
     netbios = b"\x00" + len(smb).to_bytes(3, "big")
@@ -285,6 +314,8 @@ async def _handle_smb_client(
     writer: asyncio.StreamWriter,
     *,
     honeypot_id: int | None,
+    ident: HostIdentity,
+    guid: bytes,
 ) -> None:
     peer = writer.get_extra_info("peername") or ("0.0.0.0", 0)
     spawn(_record(honeypot_id, peer, "smb_connection", AlertSeverity.LOW, {}), name="smb-event")
@@ -299,17 +330,59 @@ async def _handle_smb_client(
     # SMB1 negotiate on 445 is itself notable; SMB2 is normal.
     severity = AlertSeverity.MEDIUM if info.get("smb_version") == "SMB1" else AlertSeverity.LOW
     event_info = dict(info)
+    dialects: list[str] = info.get("dialects") or []
     if "dialects" in event_info:
         # The full list drives dialect selection; the event only needs a sample.
         event_info["dialects"] = [d[:64] for d in event_info["dialects"][:32]]
     spawn(_record(honeypot_id, peer, "smb_negotiate", severity, event_info), name="smb-event")
 
-    # Respond to an SMB1 negotiate so the exploit tool proceeds. (For SMB2 we
-    # just capture and close — real SMB2 exploitation is rarer and a full SMB2
-    # negotiate response is a much larger surface.)
-    if info.get("smb_version") == "SMB1":
+    async def send(data: bytes) -> None:
+        writer.write(b"\x00" + len(data).to_bytes(3, "big") + data)
+        await asyncio.wait_for(writer.drain(), timeout=5.0)
+
+    async def read_frame(timeout: float) -> bytes | None:
+        return await _read_frame(reader, timeout=timeout)
+
+    async def on_auth(auth: AuthMessage, challenge: bytes, negotiate: dict[str, Any]) -> None:
+        payload: dict[str, Any] = {
+            **negotiate,
+            "username": auth.username,
+            "domain": auth.domain,
+            "workstation": auth.workstation,
+            "ntlm_version": "v2" if len(auth.nt_response) > 24 else "v1",
+            "service": "smb",
+            "server_challenge_hex": challenge.hex(),
+            "nt_response_hex": auth.nt_response.hex(),
+        }
+        cracked = hashcat_line(auth, challenge)
+        if cracked is not None:
+            payload["hashcat_mode"], payload["hashcat_line"] = cracked
+        await _record(honeypot_id, peer, "smb_ntlm_auth", AlertSeverity.HIGH, payload)
+
+    # A client that offers SMB 2.x gets SMB2, as it does from Windows: either its own SMB2
+    # NEGOTIATE, or (impacket, older smbclient) an SMB1 multi-protocol negotiate that lists
+    # "SMB 2.002" / "SMB 2.???", which a server answers with an SMB2 response.
+    smb2_first: bytes | None = None
+    use_smb2 = False
+    if info.get("smb_version") == "SMB2":
+        use_smb2, smb2_first = True, first
+    elif info.get("command") == _SMB_COM_NEGOTIATE and any(
+        d in ("SMB 2.002", "SMB 2.???") for d in dialects
+    ):
+        wildcard = "SMB 2.???" in dialects
+        with contextlib.suppress(OSError, TimeoutError):
+            await send(
+                negotiate_response(None, DIALECT_WILDCARD if wildcard else DIALECT_2_0_2, guid)
+            )
+            use_smb2 = True
+
+    if use_smb2:
+        with contextlib.suppress(OSError, TimeoutError):
+            await serve_smb2(smb2_first, read_frame, send, ident, guid, on_auth)
+    elif info.get("smb_version") == "SMB1":
+        # Respond to an SMB1-only negotiate so the exploit tool proceeds.
         with contextlib.suppress(Exception):
-            writer.write(_build_smb1_negotiate_response(first, info.get("dialects") or []))
+            writer.write(_build_smb1_negotiate_response(first, dialects, ident))
             await asyncio.wait_for(writer.drain(), timeout=5.0)
 
         # Read up to a few follow-up packets looking for the exploit/backdoor

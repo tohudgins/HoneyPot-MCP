@@ -28,14 +28,22 @@ and runs privileged" is an incident.
 
 Responses carry the headers a real API server always sends — `Audit-Id` and the
 `X-Kubernetes-Pf-*` flow-control UIDs — because their absence is a one-request
-tell. Nothing is scheduled and no cluster exists; object names and UIDs are
-generated and every later reference is answered from the same fiction.
+tell. Nothing is scheduled and no cluster exists, but the fiction is stable: object
+UIDs, pod names, secret values, the build commit and the flow-control UIDs derive
+from the honeypot's name and never change between requests, because a scanner
+that asks twice and gets two identities has found the decoy. Discovery
+(`/api/v1`, `/apis/{group}/{version}`, `/healthz`) answers as kubectl expects, so
+`kubectl get pods|nodes|secrets` works against it; resources the decoy has no
+data for (deployments, services, ...) return valid empty lists.
 
 API reference: Kubernetes API v1.28.
 """
 
 from __future__ import annotations
 
+import base64
+import calendar
+import hashlib
 import json
 import logging
 import re
@@ -49,6 +57,7 @@ from aiohttp import web
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.http_identity import (
     MAX_REQUEST_BYTES,
+    compact_dumps,
     identity_runner,
     read_body,
     server_identity_middleware,
@@ -63,6 +72,12 @@ log = logging.getLogger(__name__)
 _K8S_MAJOR, _K8S_MINOR = "1", "28"
 _K8S_VERSION = f"v{_K8S_MAJOR}.{_K8S_MINOR}.4"
 _GO_VERSION = "go1.20.8"
+# The real v1.28.4 build identity: a version with a random commit is a decoy.
+_K8S_GIT_COMMIT = "bae2c62678db2b5053817bc97181fcc2e8388103"
+_K8S_BUILD_DATE = "2023-11-15T16:58:20Z"
+# When the fictional cluster was created; every object's age is measured from here.
+_CREATED = "2026-06-03T09:12:44Z"
+_NODE = "ip-10-0-1-42.ec2.internal"
 # kube-apiserver sets no Server header of its own; nginx-ingress in front of it
 # is by far the most common thing on 6443 that does.
 _SERVER_BANNER = "nginx/1.25.3"
@@ -214,6 +229,311 @@ def _status(message: str, reason: str, code: int) -> dict[str, Any]:
     }
 
 
+def _uid(seed: str, *parts: str) -> str:
+    """A UID that is the same on every request: UIDs identify an object for its lifetime."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "/".join((seed, *parts))))
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _secret_data(seed: str, secret: str, key: str) -> str:
+    """Base64 secret value (as the API returns it), fixed per honeypot and secret."""
+    digest = hashlib.sha256(f"{seed}/{secret}/{key}".encode()).digest()
+    if key == "token":
+        head = _b64url(json.dumps({"alg": "RS256", "kid": digest[:12].hex()}).encode())
+        body = _b64url(
+            json.dumps(
+                {
+                    "iss": "kubernetes/serviceaccount",
+                    "sub": "system:serviceaccount:default:default",
+                }
+            ).encode()
+        )
+        value = f"{head}.{body}.{_b64url(digest * 8)}".encode()
+    elif key == ".dockerconfigjson":
+        auth = base64.b64encode(b"svc-pull:" + digest[:12].hex().encode()).decode()
+        value = json.dumps({"auths": {"registry.internal": {"auth": auth}}}).encode()
+    else:
+        value = digest[:9].hex().encode()
+    return base64.b64encode(value).decode()
+
+
+# group/version -> (resource, kind, namespaced). The discovery document and the generic list
+# handler both read this, so what `kubectl api-resources` advertises is what answers.
+_RESOURCES: dict[str, tuple[tuple[str, str, bool], ...]] = {
+    "v1": (
+        ("namespaces", "Namespace", False),
+        ("nodes", "Node", False),
+        ("pods", "Pod", True),
+        ("secrets", "Secret", True),
+        ("serviceaccounts", "ServiceAccount", True),
+        ("services", "Service", True),
+        ("configmaps", "ConfigMap", True),
+    ),
+    "apps/v1": (
+        ("deployments", "Deployment", True),
+        ("daemonsets", "DaemonSet", True),
+        ("statefulsets", "StatefulSet", True),
+        ("replicasets", "ReplicaSet", True),
+    ),
+    "batch/v1": (("jobs", "Job", True), ("cronjobs", "CronJob", True)),
+    "networking.k8s.io/v1": (
+        ("ingresses", "Ingress", True),
+        ("networkpolicies", "NetworkPolicy", True),
+    ),
+    "rbac.authorization.k8s.io/v1": (
+        ("clusterroles", "ClusterRole", False),
+        ("clusterrolebindings", "ClusterRoleBinding", False),
+        ("roles", "Role", True),
+        ("rolebindings", "RoleBinding", True),
+    ),
+    "authorization.k8s.io/v1": (
+        ("selfsubjectaccessreviews", "SelfSubjectAccessReview", False),
+        ("selfsubjectrulesreviews", "SelfSubjectRulesReview", False),
+    ),
+}
+_CREATE_ONLY = frozenset({"selfsubjectaccessreviews", "selfsubjectrulesreviews"})
+_SHORT_NAMES = {
+    "namespaces": ["ns"],
+    "nodes": ["no"],
+    "pods": ["po"],
+    "serviceaccounts": ["sa"],
+    "services": ["svc"],
+    "configmaps": ["cm"],
+    "deployments": ["deploy"],
+    "daemonsets": ["ds"],
+    "statefulsets": ["sts"],
+    "replicasets": ["rs"],
+    "cronjobs": ["cj"],
+    "ingresses": ["ing"],
+    "networkpolicies": ["netpol"],
+}
+_VERBS = ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+
+
+def _resource_list(group_version: str) -> dict[str, Any]:
+    resources: list[dict[str, Any]] = []
+    for resource, kind, namespaced in _RESOURCES[group_version]:
+        entry: dict[str, Any] = {
+            "name": resource,
+            "singularName": "",
+            "namespaced": namespaced,
+            "kind": kind,
+            "verbs": ["create"] if resource in _CREATE_ONLY else _VERBS,
+        }
+        if resource in _SHORT_NAMES:
+            entry["shortNames"] = _SHORT_NAMES[resource]
+        resources.append(entry)
+    if group_version == "v1":
+        resources.append(
+            {
+                "name": "pods/exec",
+                "singularName": "",
+                "namespaced": True,
+                "kind": "PodExecOptions",
+                "verbs": ["create", "get"],
+            }
+        )
+    return {
+        "kind": "APIResourceList",
+        "groupVersion": group_version,
+        "resources": resources,
+    }
+
+
+def _age(timestamp: str) -> str:
+    """An age in `kubectl`'s own format (the server computes the Age column, not the client)."""
+    created = calendar.timegm(time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ"))
+    seconds = max(0, int(time.time()) - created)
+    minutes, hours = seconds // 60, seconds // 3600
+    days = hours // 24
+    if seconds < 120:
+        return f"{seconds}s"
+    if minutes < 10:
+        return f"{minutes}m{seconds % 60}s"
+    if minutes < 180:
+        return f"{minutes}m"
+    if hours < 8:
+        return f"{hours}h{minutes % 60}m"
+    if hours < 48:
+        return f"{hours}h"
+    if days < 8:
+        return f"{days}d{hours % 24}h"
+    if days < 730:
+        return f"{days}d"
+    return f"{days // 365}y{days % 365}d"
+
+
+def _pod_cells(o: dict[str, Any]) -> list[Any]:
+    statuses = o["status"]["containerStatuses"]
+    return [
+        o["metadata"]["name"],
+        f"{sum(1 for s in statuses if s['ready'])}/{len(statuses)}",
+        o["status"]["phase"],
+        sum(s["restartCount"] for s in statuses),
+        _age(o["metadata"]["creationTimestamp"]),
+        o["status"]["podIP"],
+        o["spec"]["nodeName"],
+        "<none>",
+        "<none>",
+    ]
+
+
+def _node_cells(o: dict[str, Any]) -> list[Any]:
+    labels = o["metadata"]["labels"]
+    roles = [k.split("/", 1)[1] for k in labels if k.startswith("node-role.kubernetes.io/")]
+    info = o["status"]["nodeInfo"]
+    return [
+        o["metadata"]["name"],
+        "Ready",
+        ",".join(roles) or "<none>",
+        _age(o["metadata"]["creationTimestamp"]),
+        info["kubeletVersion"],
+        o["status"]["addresses"][0]["address"],
+        "<none>",
+        info["osImage"],
+        info["kernelVersion"],
+        info["containerRuntimeVersion"],
+    ]
+
+
+_Column = tuple[str, str, int]  # name, type, priority (1 = shown by `-o wide`)
+_NAME_AGE: tuple[list[_Column], Any] = (
+    [("Name", "string", 0), ("Age", "string", 0)],
+    lambda o: [o["metadata"]["name"], _age(o["metadata"]["creationTimestamp"])],
+)
+# resource -> (columns, cells). What the API server returns when `kubectl` asks for
+# `as=Table`; without it kubectl falls back to a bare `NAME AGE` listing no real cluster prints.
+_TABLES: dict[str, tuple[list[_Column], Any]] = {
+    "pods": (
+        [
+            ("Name", "string", 0),
+            ("Ready", "string", 0),
+            ("Status", "string", 0),
+            ("Restarts", "integer", 0),
+            ("Age", "string", 0),
+            ("IP", "string", 1),
+            ("Node", "string", 1),
+            ("Nominated Node", "string", 1),
+            ("Readiness Gates", "string", 1),
+        ],
+        _pod_cells,
+    ),
+    "nodes": (
+        [
+            ("Name", "string", 0),
+            ("Status", "string", 0),
+            ("Roles", "string", 0),
+            ("Age", "string", 0),
+            ("Version", "string", 0),
+            ("Internal-IP", "string", 1),
+            ("External-IP", "string", 1),
+            ("OS-Image", "string", 1),
+            ("Kernel-Version", "string", 1),
+            ("Container-Runtime", "string", 1),
+        ],
+        _node_cells,
+    ),
+    "namespaces": (
+        [("Name", "string", 0), ("Status", "string", 0), ("Age", "string", 0)],
+        lambda o: [
+            o["metadata"]["name"],
+            o["status"]["phase"],
+            _age(o["metadata"]["creationTimestamp"]),
+        ],
+    ),
+    "secrets": (
+        [
+            ("Name", "string", 0),
+            ("Type", "string", 0),
+            ("Data", "integer", 0),
+            ("Age", "string", 0),
+        ],
+        lambda o: [
+            o["metadata"]["name"],
+            o["type"],
+            len(o["data"]),
+            _age(o["metadata"]["creationTimestamp"]),
+        ],
+    ),
+    "serviceaccounts": (
+        [("Name", "string", 0), ("Secrets", "integer", 0), ("Age", "string", 0)],
+        lambda o: [o["metadata"]["name"], 0, _age(o["metadata"]["creationTimestamp"])],
+    ),
+    "clusterroles": (
+        [("Name", "string", 0), ("Created At", "date", 0)],
+        lambda o: [o["metadata"]["name"], o["metadata"]["creationTimestamp"]],
+    ),
+    "clusterrolebindings": (
+        [
+            ("Name", "string", 0),
+            ("Role", "string", 0),
+            ("Age", "string", 0),
+            ("Users", "string", 1),
+            ("Groups", "string", 1),
+            ("ServiceAccounts", "string", 1),
+        ],
+        lambda o: [
+            o["metadata"]["name"],
+            f"{o['roleRef']['kind']}/{o['roleRef']['name']}",
+            _age(o["metadata"]["creationTimestamp"]),
+            "",
+            ",".join(s["name"] for s in o["subjects"] if s["kind"] == "Group"),
+            "",
+        ],
+    ),
+}
+
+
+def _list_response(
+    request: web.Request,
+    resource: str,
+    kind: str,
+    api_version: str,
+    items: list[dict[str, Any]],
+    headers: dict[str, str],
+) -> web.Response:
+    """The list as kubectl asked for it: a Table when `Accept` says `as=Table`, else the List."""
+    if "as=Table" in request.headers.get("Accept", ""):
+        columns, cells = _TABLES.get(resource, _NAME_AGE)
+        body: dict[str, Any] = {
+            "kind": "Table",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": {"resourceVersion": "48211"},
+            "columnDefinitions": [
+                {
+                    "name": col,
+                    "type": kind_,
+                    "format": "name" if col == "Name" else "",
+                    "description": col,
+                    "priority": priority,
+                }
+                for col, kind_, priority in columns
+            ],
+            "rows": [
+                {
+                    "cells": cells(item),
+                    "object": {
+                        "kind": "PartialObjectMetadata",
+                        "apiVersion": "meta.k8s.io/v1",
+                        "metadata": item["metadata"],
+                    },
+                }
+                for item in items
+            ],
+        }
+    else:
+        body = {
+            "kind": f"{kind}List",
+            "apiVersion": api_version,
+            "metadata": {"resourceVersion": "48211"},
+            "items": items,
+        }
+    return web.json_response(body, headers=headers, dumps=compact_dumps)
+
+
 class KubernetesEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._runners: dict[str, web.AppRunner] = {}
@@ -269,12 +589,13 @@ class KubernetesEngine(HoneypotEngine):
     def _build_app(self, name: str, hp_id: int | None) -> web.Application:
         def headers() -> dict[str, str]:
             # Real API servers always send these. Their absence identifies a
-            # decoy in a single request.
+            # decoy in a single request. Audit-Id is per request; the flow-control UIDs name
+            # the server's FlowSchema/PriorityLevel objects, so they are constant.
             return {
                 "Audit-Id": str(uuid.uuid4()),
                 "Cache-Control": "no-cache, private",
-                "X-Kubernetes-Pf-Flowschema-Uid": str(uuid.uuid4()),
-                "X-Kubernetes-Pf-Prioritylevel-Uid": str(uuid.uuid4()),
+                "X-Kubernetes-Pf-Flowschema-Uid": _uid(name, "flowschema"),
+                "X-Kubernetes-Pf-Prioritylevel-Uid": _uid(name, "prioritylevel"),
             }
 
         async def version(request: web.Request) -> web.Response:
@@ -284,14 +605,32 @@ class KubernetesEngine(HoneypotEngine):
                     "major": _K8S_MAJOR,
                     "minor": _K8S_MINOR,
                     "gitVersion": _K8S_VERSION,
-                    "gitCommit": secrets.token_hex(20),
+                    "gitCommit": _K8S_GIT_COMMIT,
                     "gitTreeState": "clean",
-                    "buildDate": "2023-11-15T16:48:54Z",
+                    "buildDate": _K8S_BUILD_DATE,
                     "goVersion": _GO_VERSION,
                     "compiler": "gc",
                     "platform": "linux/amd64",
                 },
                 headers=headers(),
+                dumps=compact_dumps,
+            )
+
+        async def health(request: web.Request) -> web.Response:
+            await self._record(hp_id, request, "kubernetes_recon", AlertSeverity.MEDIUM, {})
+            return web.Response(text="ok", content_type="text/plain", headers=headers())
+
+        async def resource_list(request: web.Request) -> web.Response:
+            group_version = request.match_info.get("gv", "")
+            if "group" in request.match_info:
+                group_version = f"{request.match_info['group']}/{request.match_info['version']}"
+            elif not group_version:
+                group_version = "v1"
+            if group_version not in _RESOURCES:
+                return await catch_all(request)
+            await self._record(hp_id, request, "kubernetes_recon", AlertSeverity.MEDIUM, {})
+            return web.json_response(
+                _resource_list(group_version), headers=headers(), dumps=compact_dumps
             )
 
         async def api_root(request: web.Request) -> web.Response:
@@ -299,6 +638,7 @@ class KubernetesEngine(HoneypotEngine):
             return web.json_response(
                 {"kind": "APIVersions", "versions": ["v1"], "serverAddressByClientCIDRs": []},
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def api_groups(request: web.Request) -> web.Response:
@@ -309,10 +649,18 @@ class KubernetesEngine(HoneypotEngine):
                     "versions": [{"groupVersion": f"{group}/v1", "version": "v1"}],
                     "preferredVersion": {"groupVersion": f"{group}/v1", "version": "v1"},
                 }
-                for group in ("apps", "batch", "rbac.authorization.k8s.io", "networking.k8s.io")
+                for group in (
+                    "apps",
+                    "batch",
+                    "rbac.authorization.k8s.io",
+                    "networking.k8s.io",
+                    "authorization.k8s.io",
+                )
             ]
             return web.json_response(
-                {"kind": "APIGroupList", "apiVersion": "v1", "groups": groups}, headers=headers()
+                {"kind": "APIGroupList", "apiVersion": "v1", "groups": groups},
+                headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def list_namespaces(request: web.Request) -> web.Response:
@@ -321,15 +669,144 @@ class KubernetesEngine(HoneypotEngine):
                 {
                     "metadata": {
                         "name": ns,
-                        "uid": str(uuid.uuid4()),
-                        "creationTimestamp": _now_iso(),
+                        "uid": _uid(name, "namespace", ns),
+                        "resourceVersion": str(40 + n),
+                        "creationTimestamp": _CREATED,
+                        "labels": {"kubernetes.io/metadata.name": ns},
                     },
+                    "spec": {"finalizers": ["kubernetes"]},
                     "status": {"phase": "Active"},
                 }
-                for ns in ("default", "kube-system", "production", "payments", "monitoring")
+                for n, ns in enumerate(
+                    ("default", "kube-system", "production", "payments", "monitoring")
+                )
             ]
+            return _list_response(request, "namespaces", "Namespace", "v1", items, headers())
+
+        async def list_nodes(request: web.Request) -> web.Response:
+            await self._record(
+                hp_id,
+                request,
+                "kubernetes_enumerate",
+                AlertSeverity.HIGH,
+                {"resource": "nodes"},
+            )
+            node = {
+                "metadata": {
+                    "name": _NODE,
+                    "uid": _uid(name, "node", _NODE),
+                    "resourceVersion": "48190",
+                    "creationTimestamp": _CREATED,
+                    "labels": {
+                        "kubernetes.io/hostname": _NODE,
+                        "kubernetes.io/os": "linux",
+                        "kubernetes.io/arch": "amd64",
+                        "node-role.kubernetes.io/control-plane": "",
+                    },
+                },
+                "spec": {"providerID": f"aws:///us-east-1a/i-{_uid(name, 'instance')[:17]}"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True", "reason": "KubeletReady"}],
+                    "addresses": [
+                        {"type": "InternalIP", "address": "10.0.1.42"},
+                        {"type": "Hostname", "address": _NODE},
+                    ],
+                    "nodeInfo": {
+                        "kubeletVersion": _K8S_VERSION,
+                        "osImage": "Ubuntu 22.04.3 LTS",
+                        "kernelVersion": "5.15.0-1051-aws",
+                        "containerRuntimeVersion": "containerd://1.7.8",
+                        "operatingSystem": "linux",
+                        "architecture": "amd64",
+                    },
+                },
+            }
+            return _list_response(request, "nodes", "Node", "v1", [node], headers())
+
+        async def list_serviceaccounts(request: web.Request) -> web.Response:
+            namespace = request.match_info.get("ns", "default")
+            await self._record(
+                hp_id,
+                request,
+                "kubernetes_enumerate",
+                AlertSeverity.HIGH,
+                {"namespace": namespace[:64], "resource": "serviceaccounts"},
+            )
+            items = [
+                {
+                    "metadata": {
+                        "name": "default",
+                        "namespace": namespace,
+                        "uid": _uid(name, "serviceaccount", namespace, "default"),
+                        "creationTimestamp": _CREATED,
+                    }
+                }
+            ]
+            return _list_response(
+                request, "serviceaccounts", "ServiceAccount", "v1", items, headers()
+            )
+
+        async def list_empty(request: web.Request) -> web.Response:
+            # A resource the decoy advertises but has no objects for: a valid empty list, which
+            # is what a cluster with none of them returns.
+            info = request.match_info
+            group_version = f"{info['group']}/{info['version']}" if "group" in info else "v1"
+            resource = info["resource"]
+            kind = next((k for r, k, _ in _RESOURCES.get(group_version, ()) if r == resource), None)
+            if kind is None:
+                return await catch_all(request)
+            if resource in _CREATE_ONLY:
+                return web.json_response(
+                    _status(
+                        "the server does not allow this method on the requested resource",
+                        "MethodNotAllowed",
+                        405,
+                    ),
+                    status=405,
+                    headers=headers(),
+                    dumps=compact_dumps,
+                )
+            await self._record(
+                hp_id,
+                request,
+                "kubernetes_enumerate",
+                AlertSeverity.HIGH,
+                {"resource": resource[:64]},
+            )
+            return _list_response(request, resource, kind, group_version, [], headers())
+
+        async def access_review(request: web.Request) -> web.Response:
+            # `kubectl auth can-i`: what a holder of a stolen token runs first. The decoy's
+            # persona is a permissive cluster, so every check is allowed.
+            body = await self._read_json(request)
+            await self._record(
+                hp_id,
+                request,
+                "kubernetes_recon",
+                AlertSeverity.MEDIUM,
+                {"note": "checking own permissions"},
+            )
+            rules = request.path.endswith("selfsubjectrulesreviews")
+            status: dict[str, Any] = (
+                {
+                    "resourceRules": [{"verbs": ["*"], "apiGroups": ["*"], "resources": ["*"]}],
+                    "nonResourceRules": [{"verbs": ["*"], "nonResourceURLs": ["*"]}],
+                    "incomplete": False,
+                }
+                if rules
+                else {"allowed": True}
+            )
             return web.json_response(
-                {"kind": "NamespaceList", "apiVersion": "v1", "items": items}, headers=headers()
+                {
+                    "kind": "SelfSubjectRulesReview" if rules else "SelfSubjectAccessReview",
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "metadata": {"creationTimestamp": None},
+                    "spec": _as_dict(body.get("spec")),
+                    "status": status,
+                },
+                status=201,
+                headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def list_pods(request: web.Request) -> web.Response:
@@ -341,20 +818,45 @@ class KubernetesEngine(HoneypotEngine):
                 AlertSeverity.HIGH,
                 {"namespace": namespace[:64], "resource": "pods"},
             )
-            items = [
-                {
+
+            def pod(n: int, app: str, image: str) -> dict[str, Any]:
+                suffix = hashlib.sha256(f"{name}/{namespace}/{app}".encode()).hexdigest()
+                pod_name = f"{app}-{suffix[:10]}-{suffix[10:15]}"
+                return {
                     "metadata": {
-                        "name": f"{app}-{secrets.token_hex(4)}",
+                        "name": pod_name,
                         "namespace": namespace,
-                        "uid": str(uuid.uuid4()),
+                        "uid": _uid(name, "pod", namespace, app),
+                        "resourceVersion": str(30000 + n),
+                        "creationTimestamp": _CREATED,
+                        "labels": {"app": app},
                     },
                     "spec": {
                         "containers": [{"name": app, "image": image}],
-                        "nodeName": "ip-10-0-1-42.ec2.internal",
+                        "nodeName": _NODE,
                         "serviceAccountName": "default",
                     },
-                    "status": {"phase": "Running", "podIP": f"10.244.1.{n + 10}"},
+                    "status": {
+                        "phase": "Running",
+                        "hostIP": "10.0.1.42",
+                        "podIP": f"10.244.1.{n + 10}",
+                        "startTime": _CREATED,
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "containerStatuses": [
+                            {
+                                "name": app,
+                                "image": image,
+                                "ready": True,
+                                "restartCount": 0,
+                                "started": True,
+                                "state": {"running": {"startedAt": _CREATED}},
+                            }
+                        ],
+                    },
                 }
+
+            items = [
+                pod(n, app, image)
                 for n, (app, image) in enumerate(
                     (
                         ("payments-api", "registry.internal/payments-api:2.4.1"),
@@ -363,9 +865,7 @@ class KubernetesEngine(HoneypotEngine):
                     )
                 )
             ]
-            return web.json_response(
-                {"kind": "PodList", "apiVersion": "v1", "items": items}, headers=headers()
-            )
+            return _list_response(request, "pods", "Pod", "v1", items, headers())
 
         async def list_secrets(request: web.Request) -> web.Response:
             # The prize. Secrets hold service-account tokens, registry pull
@@ -387,9 +887,14 @@ class KubernetesEngine(HoneypotEngine):
             )
             items = [
                 {
-                    "metadata": {"name": nm, "namespace": namespace, "uid": str(uuid.uuid4())},
+                    "metadata": {
+                        "name": nm,
+                        "namespace": namespace,
+                        "uid": _uid(name, "secret", namespace, nm),
+                        "creationTimestamp": _CREATED,
+                    },
                     "type": kind,
-                    "data": {key: secrets.token_urlsafe(32)},
+                    "data": {key: _secret_data(name, nm, key)},
                 }
                 for nm, kind, key in (
                     ("default-token-x7k2p", "kubernetes.io/service-account-token", "token"),
@@ -397,9 +902,7 @@ class KubernetesEngine(HoneypotEngine):
                     ("postgres-credentials", "Opaque", "password"),
                 )
             ]
-            return web.json_response(
-                {"kind": "SecretList", "apiVersion": "v1", "items": items}, headers=headers()
-            )
+            return _list_response(request, "secrets", "Secret", "v1", items, headers())
 
         async def list_rbac(request: web.Request) -> web.Response:
             await self._record(
@@ -409,19 +912,47 @@ class KubernetesEngine(HoneypotEngine):
                 AlertSeverity.HIGH,
                 {"note": "mapping permissions — looking for a path to cluster-admin"},
             )
-            return web.json_response(
-                {
-                    "kind": "ClusterRoleBindingList",
-                    "apiVersion": "rbac.authorization.k8s.io/v1",
-                    "items": [
-                        {
-                            "metadata": {"name": "cluster-admin"},
-                            "roleRef": {"kind": "ClusterRole", "name": "cluster-admin"},
-                            "subjects": [{"kind": "Group", "name": "system:masters"}],
-                        }
-                    ],
-                },
-                headers=headers(),
+            clusterroles = request.path.endswith("clusterroles")
+            if clusterroles:
+                items: list[dict[str, Any]] = [
+                    {
+                        "metadata": {
+                            "name": "cluster-admin",
+                            "uid": _uid(name, "clusterrole", "cluster-admin"),
+                            "creationTimestamp": _CREATED,
+                        },
+                        "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}],
+                    }
+                ]
+            else:
+                items = [
+                    {
+                        "metadata": {
+                            "name": "cluster-admin",
+                            "uid": _uid(name, "clusterrolebinding", "cluster-admin"),
+                            "creationTimestamp": _CREATED,
+                        },
+                        "roleRef": {
+                            "apiGroup": "rbac.authorization.k8s.io",
+                            "kind": "ClusterRole",
+                            "name": "cluster-admin",
+                        },
+                        "subjects": [
+                            {
+                                "apiGroup": "rbac.authorization.k8s.io",
+                                "kind": "Group",
+                                "name": "system:masters",
+                            }
+                        ],
+                    }
+                ]
+            return _list_response(
+                request,
+                "clusterroles" if clusterroles else "clusterrolebindings",
+                "ClusterRole" if clusterroles else "ClusterRoleBinding",
+                "rbac.authorization.k8s.io/v1",
+                items,
+                headers(),
             )
 
         async def create_pod(request: web.Request) -> web.Response:
@@ -462,6 +993,7 @@ class KubernetesEngine(HoneypotEngine):
                 },
                 status=201,
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def pod_exec(request: web.Request) -> web.Response:
@@ -483,6 +1015,7 @@ class KubernetesEngine(HoneypotEngine):
                 _status("Upgrade request required", "BadRequest", 400),
                 status=400,
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         async def catch_all(request: web.Request) -> web.Response:
@@ -495,6 +1028,7 @@ class KubernetesEngine(HoneypotEngine):
                 ),
                 status=404,
                 headers=headers(),
+                dumps=compact_dumps,
             )
 
         app = web.Application(
@@ -503,19 +1037,31 @@ class KubernetesEngine(HoneypotEngine):
         )
         router = app.router
         router.add_get("/version", version)
+        router.add_get("/healthz", health)
+        router.add_get("/livez", health)
+        router.add_get("/readyz", health)
         router.add_get("/api", api_root)
         router.add_get("/apis", api_groups)
+        router.add_get("/api/v1", resource_list)
+        router.add_get("/apis/{group}/{version}", resource_list)
         router.add_get("/api/v1/namespaces", list_namespaces)
+        router.add_get("/api/v1/nodes", list_nodes)
         router.add_get("/api/v1/pods", list_pods)
         router.add_get("/api/v1/secrets", list_secrets)
         router.add_get("/api/v1/namespaces/{ns}/pods", list_pods)
         router.add_get("/api/v1/namespaces/{ns}/secrets", list_secrets)
-        router.add_get("/api/v1/namespaces/{ns}/serviceaccounts", list_secrets)
+        router.add_get("/api/v1/namespaces/{ns}/serviceaccounts", list_serviceaccounts)
         router.add_get("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", list_rbac)
         router.add_get("/apis/rbac.authorization.k8s.io/v1/clusterroles", list_rbac)
+        router.add_post("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", access_review)
+        router.add_post("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", access_review)
         router.add_post("/api/v1/namespaces/{ns}/pods", create_pod)
         router.add_post("/api/v1/namespaces/{ns}/pods/{pod}/exec", pod_exec)
         router.add_get("/api/v1/namespaces/{ns}/pods/{pod}/exec", pod_exec)
+        router.add_get("/api/v1/{resource}", list_empty)
+        router.add_get("/api/v1/namespaces/{ns}/{resource}", list_empty)
+        router.add_get("/apis/{group}/{version}/{resource}", list_empty)
+        router.add_get("/apis/{group}/{version}/namespaces/{ns}/{resource}", list_empty)
         router.add_route("*", "/{tail:.*}", catch_all)
         return app
 
@@ -528,7 +1074,13 @@ class KubernetesEngine(HoneypotEngine):
 
         runner = identity_runner(self._build_app(name, hp_id), _SERVER_BANNER)
         await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", port).start()
+        # kube-apiserver has no plaintext listener: kubectl, client-go and every scanner open
+        # TLS first, so an API that answers plain HTTP on 6443 is identified (and unusable by
+        # kubectl) before the first request. The self-signed cert persists across restarts.
+        from honeypot_mcp.engines.tls import build_server_ssl_context_async
+
+        ssl_context = await build_server_ssl_context_async(name, common_name="kube-apiserver")
+        await web.TCPSite(runner, "0.0.0.0", port, ssl_context=ssl_context).start()
         cid = f"k8s-{secrets.token_hex(8)}"
         self._runners[cid] = runner
         log.info("Kubernetes API honeypot '%s' listening on port %d", name, port)

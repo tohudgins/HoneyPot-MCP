@@ -20,7 +20,12 @@ requesting the `javaClassName` / `javaCodeBase` attributes.
 
 Implemented: BER parse of LDAPMessage for bindRequest, searchRequest,
 unbindRequest and abandonRequest, plus well-formed bindResponse and
-searchResDone replies. Not implemented: a real directory tree, SASL, or LDAPS.
+searchResDone replies, and a rootDSE entry. The persona is Active Directory
+(the bind error text is AD's): the rootDSE is readable anonymously, as on a real
+domain controller, and every other search before a successful bind is refused
+with operationsError, as AD does with anonymous access disabled. An empty
+searchResDone on `dc=corp,dc=local` was how `ldapsearch` told a decoy from a DC.
+Not implemented: a real directory tree, SASL, or LDAPS.
 The goal is to keep the client talking long enough to hand over what it wants,
 not to be a directory server.
 
@@ -61,6 +66,7 @@ _SEARCH_RES_ENTRY = 0x64
 _SEARCH_RES_DONE = 0x65
 _ABANDON_REQUEST = 0x50
 _EXTENDED_REQUEST = 0x77
+_SET = 0x31
 
 _OP_NAMES = {
     _BIND_REQUEST: "bindRequest",
@@ -72,6 +78,7 @@ _OP_NAMES = {
 
 # Result codes (RFC 4511 §4.1.9).
 _SUCCESS = 0
+_OPERATIONS_ERROR = 1
 _INVALID_CREDENTIALS = 49
 
 _MAX_MESSAGE_BYTES = 65536
@@ -166,6 +173,8 @@ def parse_ldap_message(data: bytes) -> dict[str, Any] | None:
             inner = 0
             _t, raw_base, inner = _decode_tlv(op_body, inner)
             result["base_dn"] = raw_base.decode("utf-8", errors="replace")
+            _t, raw_scope, inner = _decode_tlv(op_body, inner)
+            result["scope"] = int.from_bytes(raw_scope, "big") if raw_scope else 0
             attributes: list[str] = []
             # Walk the remaining fields; the attribute list is the final
             # SEQUENCE. Scanners send wildly varied filters, so rather than
@@ -202,11 +211,73 @@ def build_bind_response(message_id: int, result_code: int, message: str = "") ->
     return _tlv(_SEQUENCE, _encode_int(message_id) + _tlv(_BIND_RESPONSE, body))
 
 
-def build_search_done(message_id: int, result_code: int = _SUCCESS) -> bytes:
+def build_search_done(message_id: int, result_code: int = _SUCCESS, diagnostic: str = "") -> bytes:
     body = (
-        _encode_int(result_code, _ENUMERATED) + _tlv(_OCTET_STRING, b"") + _tlv(_OCTET_STRING, b"")
+        _encode_int(result_code, _ENUMERATED)
+        + _tlv(_OCTET_STRING, b"")
+        + _tlv(_OCTET_STRING, diagnostic.encode())
     )
     return _tlv(_SEQUENCE, _encode_int(message_id) + _tlv(_SEARCH_RES_DONE, body))
+
+
+_DOMAIN_DN = "DC=corp,DC=local"
+_DC_HOST = "DC01.corp.local"
+_ROOT_DSE: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("currentTime", ("20261006201500.0Z",)),
+    ("subschemaSubentry", (f"CN=Aggregate,CN=Schema,CN=Configuration,{_DOMAIN_DN}",)),
+    (
+        "dsServiceName",
+        (
+            "CN=NTDS Settings,CN=DC01,CN=Servers,CN=Default-First-Site-Name,"
+            f"CN=Sites,CN=Configuration,{_DOMAIN_DN}",
+        ),
+    ),
+    (
+        "namingContexts",
+        (
+            _DOMAIN_DN,
+            f"CN=Configuration,{_DOMAIN_DN}",
+            f"CN=Schema,CN=Configuration,{_DOMAIN_DN}",
+            f"DC=DomainDnsZones,{_DOMAIN_DN}",
+            f"DC=ForestDnsZones,{_DOMAIN_DN}",
+        ),
+    ),
+    ("defaultNamingContext", (_DOMAIN_DN,)),
+    ("schemaNamingContext", (f"CN=Schema,CN=Configuration,{_DOMAIN_DN}",)),
+    ("configurationNamingContext", (f"CN=Configuration,{_DOMAIN_DN}",)),
+    ("rootDomainNamingContext", (_DOMAIN_DN,)),
+    ("supportedLDAPVersion", ("3", "2")),
+    ("supportedSASLMechanisms", ("GSSAPI", "GSS-SPNEGO", "EXTERNAL", "DIGEST-MD5")),
+    ("highestCommittedUSN", ("12741",)),
+    ("dnsHostName", (_DC_HOST,)),
+    ("ldapServiceName", ("corp.local:dc01$@CORP.LOCAL",)),
+    (
+        "serverName",
+        (f"CN=DC01,CN=Servers,CN=Default-First-Site-Name,CN=Sites,CN=Configuration,{_DOMAIN_DN}",),
+    ),
+    ("isSynchronized", ("TRUE",)),
+    ("isGlobalCatalogReady", ("TRUE",)),
+    ("domainFunctionality", ("7",)),
+    ("forestFunctionality", ("7",)),
+    ("domainControllerFunctionality", ("7",)),
+)
+
+
+def build_root_dse(message_id: int, requested: list[str]) -> bytes:
+    """The rootDSE searchResEntry, limited to the requested attributes (none, or `*`, means all)."""
+    wanted = {attr.lower() for attr in requested}
+    everything = not wanted or "*" in wanted
+    attributes = b""
+    for name, values in _ROOT_DSE:
+        if not everything and name.lower() not in wanted:
+            continue
+        attributes += _tlv(
+            _SEQUENCE,
+            _tlv(_OCTET_STRING, name.encode())
+            + _tlv(_SET, b"".join(_tlv(_OCTET_STRING, v.encode()) for v in values)),
+        )
+    entry = _tlv(_OCTET_STRING, b"") + _tlv(_SEQUENCE, attributes)
+    return _tlv(_SEQUENCE, _encode_int(message_id) + _tlv(_SEARCH_RES_ENTRY, entry))
 
 
 def looks_like_jndi(base_dn: str, attributes: list[str]) -> bool:
@@ -388,8 +459,24 @@ class _LDAPProtocol(asyncio.Protocol):
                     ),
                     name="ldap-event",
                 )
-            # No entries, clean done — the client gets a valid, empty result.
-            self._send(build_search_done(message["message_id"]))
+            if not base_dn and message.get("scope") == 0:
+                # rootDSE: what every client reads first, anonymously, on a real DC.
+                self._send(build_root_dse(message["message_id"], attributes))
+                self._send(build_search_done(message["message_id"]))
+            elif looks_like_jndi(base_dn, attributes):
+                # A JNDI lookup gets the clean empty result Log4j is waiting for.
+                self._send(build_search_done(message["message_id"]))
+            else:
+                # Anonymous searches below the root are refused, as AD does.
+                self._send(
+                    build_search_done(
+                        message["message_id"],
+                        _OPERATIONS_ERROR,
+                        "000004DC: LdapErr: DSID-0C090A69, comment: In order to perform this "
+                        "operation a successful bind must be completed on the connection., "
+                        "data 0, v4563",
+                    )
+                )
             return
 
         if op == _UNBIND_REQUEST:

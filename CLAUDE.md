@@ -319,12 +319,21 @@ Three database/file-share engines aimed at the highest-value public-internet
 attack surfaces. All in-process asyncio, same buffer path as the others.
 
 - `engines/smb.py` — tcp/445, the top ransomware initial-access surface.
-  Parses the NetBIOS-framed SMB1/SMB2 negotiate, replies to an SMB1 negotiate
-  to keep the exploit tool talking, then classifies follow-up packets:
+  Parses the NetBIOS-framed SMB1/SMB2 negotiate. An SMB1-only negotiate (nmap,
+  exploit tools) gets an SMB1 reply shaped like Windows 7-10 (nmap's
+  `microsoft-ds` rule matches it) and follow-up packets are classified:
   `smb_exploit_attempt` (CRITICAL) on a DoublePulsar Trans2 SESSION_SETUP
   (0x000e) or EternalBlue pre-auth Trans2, `smb_session_setup` (HIGH) capturing
-  readable NTLM strings. Detection-focused, no real file server — same tier as
-  RDP.
+  readable NTLM strings. Anything that offers SMB2 (its own NEGOTIATE, or an
+  SMB1 multi-protocol negotiate listing `SMB 2.002`/`SMB 2.???`) goes to
+  `engines/smb2.py`: dialect 2.1, then the server side of NTLM session setup
+  using the RDP honeypot's `build_challenge`, so one host discloses one
+  identity. The AUTHENTICATE is recorded as `smb_ntlm_auth` (HIGH, with
+  `server_challenge_hex`, `nt_response_hex` and a hashcat `-m 5600` line,
+  `service="smb"`, cross-referenced by `credential_match` like RDP's) and
+  refused with `STATUS_LOGON_FAILURE`. Detection-focused, no real file server
+  and no tree connect — same tier as RDP. `tests/unit/test_attacker_tool_fidelity.py`
+  drives it with impacket and checks the captured response cracks.
 - `engines/postgresql.py` — tcp/5432. Declines SSL (`N`) so the client falls
   back to cleartext, parses the StartupMessage (user + database), requests
   cleartext auth, and captures the password from the PasswordMessage before
@@ -369,13 +378,22 @@ Five additions aimed at surfaces the original catalogue missed entirely.
   the clear, so every request is a credential capture (`service: "snmp"`, so
   planted community strings cross-reference). Only `public`/`private` are
   answered — a real agent is silent on a wrong community, and answering
-  everything would fingerprint the sensor in one packet.
+  everything would fingerprint the sensor in one packet. The agent has a small
+  ordered MIB (system group, `ifNumber`, a four-port `ifTable`), so GetNext and
+  GetBulk behave as against a real agent: each step returns the next OID, a
+  walk ends in `endOfMibView` (v1: `noSuchName`), a missing OID is
+  `noSuchObject`, and `sysUpTime` advances. Before that, every GetNext was
+  answered with sysDescr and `snmpwalk` aborted with "OID not increasing".
 - `engines/ldap.py` — tcp/389, BER by hand. Two populations: simple binds carry
   the DN and password in the clear (invalidCredentials keeps brute-forcers
   cycling), and Log4Shell's second stage arrives here as a searchRequest.
   `looks_like_jndi()` separates the two — a JNDI base object is an opaque token
   from the payload URL with no `dc=`/`cn=`/`ou=` components, or it asks for
-  `javaClassName`/`javaCodeBase`.
+  `javaClassName`/`javaCodeBase`. The persona is Active Directory (the bind
+  error text is AD's): the rootDSE (empty base, base scope) is readable
+  anonymously and lists naming contexts and capabilities, honouring the
+  requested attributes; other searches before a bind are `operationsError`,
+  as AD does with anonymous access disabled.
 - `engines/docker_api.py` — tcp/2375, aiohttp. An unauthenticated daemon is
   host compromise, not a foothold. `analyse_container_create()` inspects the
   create body and returns *named* reasons (host root bind, privileged, host PID
@@ -467,7 +485,17 @@ The pair that takes the catalogue to 25.
   `Audit-Id` and the `X-Kubernetes-Pf-*` flow-control UIDs that a real API
   server always sends, and errors use the `Status` object shape — their absence
   identifies a decoy in one request. It presents as `nginx` because that is
-  what actually fronts 6443 in practice.
+  what actually fronts 6443 in practice. It serves **TLS only** (a plaintext
+  6443 is unusable by `kubectl` and identifies itself to every scanner) with the
+  per-honeypot self-signed cert, and its identity is **stable**: commit, UIDs,
+  pod names, secret values and the flow-control UIDs derive from the honeypot
+  name (`_uid`), because a scanner that asks twice and gets two identities has
+  found the decoy; only `Audit-Id` varies. Discovery (`/api/v1`,
+  `/apis/{group}/{version}`, shortNames), `/healthz`, nodes, server-side Table
+  output (what makes `kubectl get pods` print `READY STATUS RESTARTS AGE`
+  instead of a bare `NAME AGE`) and `kubectl auth can-i` are served; `_RESOURCES`
+  drives both the discovery document and the generic empty-list handler.
+  Single-object GETs and watch are not modelled.
 
 ### HTTP realistic endpoints + sessions
 

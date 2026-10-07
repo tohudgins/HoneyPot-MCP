@@ -1351,13 +1351,13 @@ async def _pop3_probe(port: int, marker: str) -> tuple[bool, str, str]:
 
 
 async def _kubernetes_probe(port: int, marker: str) -> tuple[bool, str, str]:
-    """HTTP GET /version with marker in the User-Agent — lands in
-    payload['user_agent']."""
+    """HTTPS GET /version with marker in the User-Agent — lands in
+    payload['user_agent']. The API server only speaks TLS and ours is self-signed."""
     import httpx
 
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=5.0, verify=False) as client:  # noqa: S501
         resp = await client.get(
-            f"http://127.0.0.1:{port}/version",
+            f"https://127.0.0.1:{port}/version",
             headers={"User-Agent": f"HoneyPotSelfTest/{marker}"},
         )
     return True, f"HTTP {resp.status_code}", marker

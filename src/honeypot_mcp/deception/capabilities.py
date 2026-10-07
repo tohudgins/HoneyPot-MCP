@@ -237,10 +237,17 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         os_family="windows",
         roles=("file_share", "windows"),
         summary=(
-            "Negotiates SMB1/SMB2 and flags EternalBlue and DoublePulsar patterns. "
-            "The top ransomware initial-access surface."
+            "Negotiates SMB1/SMB2, captures NTLM logins (NetNTLMv2 with its hashcat line) and "
+            "flags EternalBlue and DoublePulsar patterns. The top ransomware initial-access "
+            "surface."
         ),
-        signature_events=("smb_exploit_attempt", "smb_session_setup", "smb_negotiate"),
+        signature_events=(
+            "smb_exploit_attempt",
+            "smb_ntlm_auth",
+            "smb_session_setup",
+            "smb_negotiate",
+        ),
+        captures_credentials_as="smb",
         pairs_well_with=("rdp", "ldap"),
         notes="The natural place to plant a decoy document.",
     ),

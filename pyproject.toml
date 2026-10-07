@@ -107,6 +107,9 @@ dev = [
     # A real, independent RDP client (pure Python, speaks CredSSP/NTLM and plain TLS) so the
     # RDP session tests exercise the protocol against something we did not write.
     "aardwolf>=0.2.16",
+    # The same for SMB2: impacket negotiates SMB2 and runs NTLM session setup, so the SMB
+    # capture test exercises the server against a client we did not write.
+    "impacket>=0.12",
 ]
 
 [project.urls]

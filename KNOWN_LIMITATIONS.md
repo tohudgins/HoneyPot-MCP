@@ -60,8 +60,9 @@ credential honeytokens. MySQL accepts the login and captures post-auth SQL
 dropper chain including the attacker's SSH key and target path. MongoDB
 answers `isMaster`/`buildInfo` believably and flags `dropDatabase` and
 ransom notes. Elasticsearch classifies recon and data-exfil query patterns.
-SMB classifies EternalBlue / DoublePulsar exploit probes and captures NTLM
-session-setup strings. VNC captures the RFB auth challenge/response. All of
+SMB classifies EternalBlue / DoublePulsar exploit probes and, over SMB2, captures
+NTLM logins as NetNTLMv2 with their hashcat line (and refuses them: there is no
+file server). VNC captures the RFB auth challenge/response. All of
 these are detection-focused protocol facades, not real servers — they hold
 automated tools and scanners (the overwhelming majority of traffic), not a
 skilled human probing manually.
@@ -146,7 +147,7 @@ part in it. `memcached` speaks TCP only — UDP/11211 is where reflection actual
 happens, and a UDP listener that answered spoofed traffic would enlist the
 honeypot in someone else's DDoS. The UDP engines (SNMP, SIP, DNS) do answer, but
 a reply is capped at a small multiple of the request (SNMP 4x, SIP 3x, DNS 2x —
-a `GetBulk` is cut back to a single varbind) and replies per source address are
+a `GetBulk` is cut back to as many varbinds as fit) and replies per source address are
 token-bucket rate limited, so the traffic they could add to a reflection is a few
 KB/s per victim. The cap is not 1x on purpose: at 1x an ordinary `snmpget` came
 back `tooBig` and a short SIP REGISTER got a 401 with no digest challenge, both
@@ -169,6 +170,48 @@ fingerprinting, and scanner rules are anchored regexes over the whole
 response. `http_identity.ExactHeaderResponse` exists for this — it suppresses
 the `Server` header and pins header order. `test_protocol_fidelity.py` quotes
 the nmap rule it satisfies.
+
+**Attacker tooling, not just scanners (2026-10-06).** Pointing `snmpwalk`, `ldapsearch`,
+`kubectl`, `smbclient`, impacket, `mariadb`, `redis-cli`, `psql` and nmap's scripts at the
+engines found defects that synthetic-byte unit tests had passed through, each now pinned by
+`tests/unit/test_attacker_tool_fidelity.py`:
+
+- **SNMP had no MIB, so `snmpwalk` stopped after one line** ("OID not increasing": every
+  GetNext was answered with sysDescr). It now serves a small ordered MIB (system group,
+  `ifNumber`, a four-port `ifTable`) with real GetNext/GetBulk semantics, `endOfMibView`,
+  `noSuchObject`/`noSuchName`, `notWritable` for Set, and a `sysUpTime` that advances.
+- **LDAP's rootDSE was empty** and every other search succeeded with no entries, which is not
+  what the Active Directory persona (the bind error text is AD's) does. The rootDSE now lists
+  naming contexts and capabilities, and other anonymous searches are `operationsError`.
+- **The Kubernetes API answered plain HTTP**, which `kubectl` cannot use, and gave a different
+  `gitCommit`, UID, pod name and flow-control UID on every request. It is TLS-only, its
+  identity is derived from the honeypot name, `/api/v1` and `/apis/{group}/{version}`
+  discovery, `/healthz`, `nodes`, shortNames and server-side Table output exist (so
+  `kubectl get pods` prints `READY STATUS RESTARTS AGE`, not a bare `NAME AGE`), and
+  `kubectl auth can-i` is answered. Not modelled: single-object GETs (`describe`, `get pod X`)
+  and watch; resources with no data (deployments, services, ...) return empty lists.
+  *Open:* a failed TLS handshake (or plaintext HTTP sent to the TLS port) closes the socket
+  with no alert, where Go answers with an alert or "Client sent an HTTP request to an HTTPS
+  server", so `nmap -sV` labels the port `m2ap?` rather than `ssl/http`. `openssl s_client`
+  and `kubectl` connect normally. (The HTTP engine's TLS mode shares the mechanism; that port
+  was not scanned.)
+- **SMB spoke SMB1 only.** Modern clients start with SMB2 and were disconnected, so no sprayer
+  could hand over a credential. SMB2 negotiate (2.1) and NTLM session setup are served; the
+  SMB1 persona now names the same host and domain as the NTLM challenge and the RDP honeypot,
+  and matches nmap's Windows 7–10 signature.
+- **MySQL never captured the password of a libmariadb client**, which names a placeholder
+  plugin and waits for an auth switch. The engine now sends the switch. It also files the
+  plugin name as `auth_plugin` instead of as the database, and answers `SHOW DATABASES`.
+  *Open:* the engine does not offer TLS, so a client that requires it (the `mariadb` client's
+  default since 11.4) refuses the server; `--skip-ssl` works, and so do hydra and libmysql.
+- **MSSQL answered every login in the TDS 7.2+ encoding**, which impacket (TDS 7.1) read as a
+  stray token, and omitted the account from `Login failed for user '...'`.
+- **PostgreSQL's startup errors lacked the `F`/`L`/`R` source fields** every real
+  ErrorResponse ends with; nmap now reads `PostgreSQL DB 14.10 - 14.15` instead of an
+  unversioned match. `version()` agrees with `server_version`, and command tags are real
+  (`CREATE TABLE`, `INSERT 0 1`) instead of `OK`.
+- **Redis** answered unknown commands in the Redis 5 wording and had no `CLIENT` command
+  (redis-py 5 sends `CLIENT SETINFO` on every connection).
 
 ## What is partially functional
 

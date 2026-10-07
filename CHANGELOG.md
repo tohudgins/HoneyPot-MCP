@@ -4,6 +4,37 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Real attacker tools against the engines
+
+Every in-process engine was deployed and attacked with the tools an intruder uses (nmap with
+version detection and scripts, snmpwalk, ldapsearch, kubectl, smbclient, impacket, mariadb,
+redis-cli, psql, hydra, SIPVicious). The decoys that passed their unit tests were still
+identifiable, or could not be used at all, by these:
+
+- **SMB2 NTLM capture.** The SMB honeypot closed on SMB2, so `smbclient`, impacket, NetExec
+  and Metasploit never reached a login. `engines/smb2.py` negotiates dialect 2.1 and plays the
+  server side of NTLM session setup: the response is captured as `smb_ntlm_auth` with a
+  hashcat `-m 5600` line (verified to crack against the password impacket used), planted
+  credentials with `service: smb` trip their token, and the login is refused. The SMB1 answer
+  now matches nmap's Windows 7–10 signature and names the same host/domain as the NTLM
+  challenge. `smb` declares `captures_credentials_as="smb"`; the ATT&CK dashboard was
+  regenerated.
+- **SNMP walks.** A small ordered MIB with GetNext/GetBulk semantics, `endOfMibView`,
+  `noSuchObject`/`noSuchName`, `notWritable` on Set and an advancing `sysUpTime`; before,
+  `snmpwalk` stopped at once ("OID not increasing").
+- **Kubernetes API.** TLS-only (plain HTTP made `kubectl` unusable), stable identity (the
+  commit, UIDs, pod names and flow-control UIDs were random per request), discovery, `/healthz`,
+  nodes, shortNames, server-side Table output and `auth can-i`: `kubectl get pods|nodes|secrets`
+  prints what a cluster prints.
+- **LDAP rootDSE** (naming contexts, capabilities) and AD-style refusal of anonymous searches.
+- **MySQL** AuthSwitch (libmariadb's password was never captured), `auth_plugin` no longer
+  misfiled as the database, `SHOW DATABASES`. **MSSQL** answers in the client's TDS version and
+  names the account in the login failure. **PostgreSQL** error frames carry `F`/`L`/`R`
+  (nmap now reports 14.10 - 14.15), a real `version()` string and real command tags.
+  **Redis** Redis 7 error wording and `CLIENT`/`ECHO`/`TIME`.
+- Found but not changed, in `KNOWN_LIMITATIONS.md`: MySQL does not offer TLS (clients that
+  require it refuse the server), and the Kubernetes API has no single-object GET or watch.
+
 ## A console behind the RDP login, and the last mail gaps
 
 - **The RDP desktop works.** Double-click the `cmd` icon, use Start, or Win+R `cmd`/`powershell`,

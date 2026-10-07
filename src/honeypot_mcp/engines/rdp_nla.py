@@ -220,6 +220,17 @@ def wrap_challenge(challenge: bytes) -> bytes:
     return _der(0xA1, _der(0x30, state + mech + response))
 
 
+_SPNEGO_OID = bytes.fromhex("2b0601050502")
+
+
+def negotiate_token_init() -> bytes:
+    """The SPNEGO NegTokenInit a server puts in its SMB2 NEGOTIATE response: a mechanism list
+    offering NTLM, which is what a workgroup or NTLM-only Windows host advertises."""
+    mech_types = _der(0x30, _der(0x06, _NTLM_OID))
+    init = _der(0x30, _der(0xA0, mech_types))
+    return _der(0x60, _der(0x06, _SPNEGO_OID) + _der(0xA0, init))
+
+
 # ── NTLM ────────────────────────────────────────────────────────────────────
 
 
