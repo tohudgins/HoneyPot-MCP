@@ -68,23 +68,30 @@ async def _register(name: str, hp_type) -> int:
     return port
 
 
-async def _events(event_type: str, *, wait: float = 4.0) -> list:
+async def _events(event_type: str) -> list:
+    """The persisted alerts of one type, read once the flusher has drained and stopped.
+
+    Polling while the flusher runs is a race on the in-memory SQLite database: all sessions
+    share one connection, so a poll's commit lands in the middle of the flusher's statements
+    ("cannot commit transaction - SQL statements in progress", ~40% of runs on Python 3.11).
+    Engines submit from spawned tasks, hence the short settle before draining. Call it once,
+    last: the buffer stays stopped for the rest of the test.
+    """
     from sqlalchemy import select
 
+    from honeypot_mcp.storage import event_buffer
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert
 
-    deadline = asyncio.get_running_loop().time() + wait
-    while True:
-        async with get_session() as session:
-            rows = (
-                (await session.execute(select(Alert).where(Alert.event_type == event_type)))
-                .scalars()
-                .all()
-            )
-        if rows or asyncio.get_running_loop().time() > deadline:
-            return list(rows)
-        await asyncio.sleep(0.1)
+    await asyncio.sleep(0.5)
+    await event_buffer.get_buffer().stop()
+    async with get_session() as session:
+        rows = (
+            (await session.execute(select(Alert).where(Alert.event_type == event_type)))
+            .scalars()
+            .all()
+        )
+    return list(rows)
 
 
 # ── SNMP: snmpwalk ──────────────────────────────────────────────────────────
