@@ -27,6 +27,11 @@ Captured per connection:
 * The auth_response itself is the `mysql_native_password` SHA1-of-SHA1
   scramble — equivalent to a hash-cracking target like John or Hashcat.
 
+TLS: the greeting advertises CLIENT_SSL. A TLS-capable client answers with a
+32-byte SSLRequest and starts its handshake on the same connection without waiting
+for us, then sends the real HandshakeResponse41 inside TLS (`_TLSTransport`). The
+login event carries `tls: true` when that happened.
+
 Login attempts are also fed to `credential_match` with `service="mysql"`,
 so planted CREDENTIAL honeytokens fire across MySQL just like the other
 services.
@@ -35,9 +40,11 @@ services.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import secrets
+import ssl
 import struct
 from typing import Any
 
@@ -46,6 +53,7 @@ from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory, shutdown_server
+from honeypot_mcp.engines.tls import build_server_ssl_context_async
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -59,21 +67,77 @@ log = logging.getLogger(__name__)
 # 8.0.36-0ubuntu0.22.04.1 is a current stock Ubuntu install fingerprint.
 _SERVER_VERSION = b"8.0.36-0ubuntu0.22.04.1"
 
-# CapabilityFlags bitmask we advertise. A superset of what real MySQL 8.0
-# emits with mysql_native_password + caching_sha2_password disabled.
-# Bits: CLIENT_LONG_PASSWORD | CLIENT_FOUND_ROWS | CLIENT_LONG_FLAG |
-# CLIENT_CONNECT_WITH_DB | CLIENT_NO_SCHEMA | CLIENT_COMPRESS |
-# CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION |
-# CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS |
-# CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
-_CAPABILITY_FLAGS = 0x807FE7FF
+# CapabilityFlags the greeting advertises, named so each bit is auditable. A
+# superset of what real MySQL 8.0 emits with mysql_native_password.
+_CLIENT_LONG_PASSWORD = 0x00000001
+_CLIENT_FOUND_ROWS = 0x00000002
+_CLIENT_LONG_FLAG = 0x00000004
+_CLIENT_CONNECT_WITH_DB = 0x00000008
+_CLIENT_NO_SCHEMA = 0x00000010
+_CLIENT_COMPRESS = 0x00000020
+_CLIENT_ODBC = 0x00000040
+_CLIENT_LOCAL_FILES = 0x00000080
+_CLIENT_IGNORE_SPACE = 0x00000100
+_CLIENT_PROTOCOL_41 = 0x00000200
+_CLIENT_INTERACTIVE = 0x00000400
+_CLIENT_SSL = 0x00000800
+_CLIENT_IGNORE_SIGPIPE = 0x00001000
+_CLIENT_TRANSACTIONS = 0x00002000
+_CLIENT_RESERVED = 0x00004000
+_CLIENT_SECURE_CONNECTION = 0x00008000
+_CLIENT_MULTI_STATEMENTS = 0x00010000
+_CLIENT_MULTI_RESULTS = 0x00020000
+_CLIENT_PS_MULTI_RESULTS = 0x00040000
+_CLIENT_PLUGIN_AUTH = 0x00080000
+_CLIENT_CONNECT_ATTRS = 0x00100000
+_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x00200000
+_CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS = 0x00400000
+_CLIENT_REMEMBER_OPTIONS = 0x80000000
+
+# Everything the engine has always advertised (0x807FE7FF), plus CLIENT_IGNORE_SIGPIPE: a
+# client-side no-op that real MySQL 8 sets, so nmap's `Capabilities flags` reads 65535.
+_BASE_CAPABILITY_FLAGS = (
+    _CLIENT_LONG_PASSWORD
+    | _CLIENT_FOUND_ROWS
+    | _CLIENT_LONG_FLAG
+    | _CLIENT_CONNECT_WITH_DB
+    | _CLIENT_NO_SCHEMA
+    | _CLIENT_COMPRESS
+    | _CLIENT_ODBC
+    | _CLIENT_LOCAL_FILES
+    | _CLIENT_IGNORE_SPACE
+    | _CLIENT_PROTOCOL_41
+    | _CLIENT_INTERACTIVE
+    | _CLIENT_IGNORE_SIGPIPE
+    | _CLIENT_TRANSACTIONS
+    | _CLIENT_RESERVED
+    | _CLIENT_SECURE_CONNECTION
+    | _CLIENT_MULTI_STATEMENTS
+    | _CLIENT_MULTI_RESULTS
+    | _CLIENT_PS_MULTI_RESULTS
+    | _CLIENT_PLUGIN_AUTH
+    | _CLIENT_CONNECT_ATTRS
+    | _CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+    | _CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS
+    | _CLIENT_REMEMBER_OPTIONS
+)
+# Real MySQL 8 offers TLS with an auto-generated certificate, and mariadb-client
+# >= 11.4 refuses a server that does not. The engine always holds a certificate
+# (`MySQLEngine.start` builds it), so CLIENT_SSL is always truthful.
+_CAPABILITY_FLAGS = _BASE_CAPABILITY_FLAGS | _CLIENT_SSL
 
 # Status flags. SERVER_STATUS_AUTOCOMMIT (0x0002).
 _STATUS_FLAGS = 0x0002
 
-# Client capability flags that say which optional HandshakeResponse41 fields follow.
-_CLIENT_CONNECT_WITH_DB = 0x00000008
-_CLIENT_PLUGIN_AUTH = 0x00080000
+# The certificate CN MySQL 8 gives the cert it auto-generates at first start.
+_TLS_COMMON_NAME = "MySQL_Server_8.0.36_Auto_Generated_Server_Certificate"
+
+# A client sends the 32-byte SSLRequest and then a ClientHello, with no reply
+# awaited in between; a peer that goes quiet after the SSLRequest is cut off
+# after this long (MySQL's own connect_timeout is 10s).
+_TLS_HANDSHAKE_TIMEOUT = 10.0
+_TLS_READ_CHUNK = 16 * 1024
+
 
 # Character set: utf8mb4_general_ci (0xff is wrong; 0x2D is utf8mb4_general_ci).
 _CHARSET = 0x2D
@@ -123,6 +187,7 @@ def _build_handshake_packet(salt_1: bytes, salt_2: bytes) -> bytes:
             bytes([21]),  # auth_plugin_data_length (20+null)
             b"\x00" * 10,  # reserved
             salt_2,
+            b"\x00",  # auth_plugin_data_part_2 is 13 bytes: the 12 of scramble and a NUL
             b"mysql_native_password\x00",
         ]
     )
@@ -319,11 +384,102 @@ def _classify_query(sql: str) -> tuple[str, AlertSeverity]:
     return "mysql_query", AlertSeverity.MEDIUM
 
 
+class _TLSTransport(asyncio.Transport):
+    """The decrypted side of a TLS session riding on `raw`, shaped like a transport.
+
+    `loop.start_tls` cannot be used here: the client sends its ClientHello straight
+    after the SSLRequest without waiting for us, so the read that delivered the
+    SSLRequest may already hold the first bytes of the handshake, and bytes already
+    handed to the protocol cannot be replayed into a new SSL transport. Driving the
+    session through memory BIOs lets the protocol feed those leftover bytes in itself.
+
+    The raw transport stays the one the connection limiter tracks, so the idle and
+    lifetime timers, the per-IP cap and `close_all` keep working unchanged; the write
+    backlog is the raw transport's, so `write_backlogged` sees what is really unsent.
+    """
+
+    def __init__(
+        self,
+        raw: asyncio.Transport,
+        sslobj: ssl.SSLObject,
+        incoming: ssl.MemoryBIO,
+        outgoing: ssl.MemoryBIO,
+    ) -> None:
+        super().__init__()
+        self._raw = raw
+        self._ssl = sslobj
+        self._incoming = incoming
+        self._outgoing = outgoing
+        self._closing = False
+        self.handshaken = False
+
+    def feed(self, data: bytes) -> None:
+        self._incoming.write(data)
+
+    def do_handshake(self) -> None:
+        self._ssl.do_handshake()
+        self.handshaken = True
+
+    def read(self, n: int) -> bytes:
+        return self._ssl.read(n)
+
+    def flush(self) -> None:
+        """Send whatever the TLS layer has queued (handshake records, alerts, tickets)."""
+        data = self._outgoing.read()
+        if data and not self._raw.is_closing():
+            self._raw.write(data)
+
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        if self.is_closing():
+            return
+        try:
+            self._ssl.write(bytes(data))
+        except ssl.SSLError:
+            self.abort()
+            return
+        self.flush()
+
+    def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if self.handshaken:
+            with contextlib.suppress(ssl.SSLError):
+                self._ssl.unwrap()  # queues our close_notify
+        self.flush()
+        self._raw.close()
+
+    def abort(self) -> None:
+        self._closing = True
+        self._raw.abort()
+
+    def is_closing(self) -> bool:
+        return self._closing or self._raw.is_closing()
+
+    def get_write_buffer_size(self) -> int:
+        return self._raw.get_write_buffer_size()
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        if name == "ssl_object":
+            return self._ssl
+        if name == "cipher":
+            return self._ssl.cipher()
+        return self._raw.get_extra_info(name, default)
+
+
 class _MySQLProtocol(asyncio.Protocol):
-    def __init__(self, honeypot_name: str, honeypot_id: int | None) -> None:
+    def __init__(
+        self, honeypot_name: str, honeypot_id: int | None, ssl_ctx: ssl.SSLContext
+    ) -> None:
         self._name = honeypot_name
         self._hp_id = honeypot_id
+        self._ssl_ctx = ssl_ctx
+        # `_transport` is what replies are written to: the raw transport until the
+        # client upgrades, then the TLS view of it.
         self._transport: asyncio.Transport | None = None
+        self._raw: asyncio.Transport | None = None
+        self._tls: _TLSTransport | None = None
+        self._handshake_timer: asyncio.TimerHandle | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = bytearray()
         self._packets = 0
@@ -337,7 +493,7 @@ class _MySQLProtocol(asyncio.Protocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
-        self._transport = transport
+        self._transport = self._raw = transport
         self._peer = transport.get_extra_info("peername") or ("0.0.0.0", 0)
 
         # Send the Initial Handshake Packet immediately. Real MySQL sends
@@ -354,8 +510,76 @@ class _MySQLProtocol(asyncio.Protocol):
         self._buf.clear()
         if self._transport is not None and not self._transport.is_closing():
             self._transport.close()
+        elif self._raw is not None and not self._raw.is_closing():
+            self._raw.close()
 
     def data_received(self, data: bytes) -> None:
+        t = self._transport
+        if t is None or t.is_closing():
+            return
+        if self._tls is not None:
+            self._receive_tls(data)
+        else:
+            self._receive_plain(data)
+
+    def _is_ssl_request(self, payload: bytes) -> bool:
+        """The 32-byte SSLRequest: a HandshakeResponse41 header with CLIENT_SSL set and
+        no username, sent before the client's TLS handshake."""
+        return (
+            self._tls is None
+            and self._pending_login is None
+            and len(payload) == 32
+            and struct.unpack_from("<I", payload)[0] & _CLIENT_SSL != 0
+        )
+
+    def _start_tls(self) -> None:
+        assert self._raw is not None
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        sslobj = self._ssl_ctx.wrap_bio(incoming, outgoing, server_side=True)
+        self._tls = _TLSTransport(self._raw, sslobj, incoming, outgoing)
+        self._transport = self._tls
+        self._handshake_timer = asyncio.get_running_loop().call_later(
+            _TLS_HANDSHAKE_TIMEOUT, self._handshake_expired
+        )
+
+    def _handshake_expired(self) -> None:
+        self._handshake_timer = None
+        if self._tls is not None and not self._tls.handshaken and self._raw is not None:
+            self._raw.abort()
+
+    def _receive_tls(self, data: bytes) -> None:
+        """Feed raw bytes to the TLS session and run whatever plaintext comes out
+        through the MySQL packet handler."""
+        tls = self._tls
+        assert tls is not None
+        tls.feed(data)
+        if not tls.handshaken:
+            try:
+                tls.do_handshake()
+            except ssl.SSLWantReadError:
+                tls.flush()
+                return
+            except (ssl.SSLError, OSError):
+                tls.flush()  # OpenSSL has queued the alert a real server would send
+                self._close()
+                return
+            if self._handshake_timer is not None:
+                self._handshake_timer.cancel()
+                self._handshake_timer = None
+        while not tls.is_closing():
+            try:
+                chunk = tls.read(_TLS_READ_CHUNK)
+            except ssl.SSLWantReadError:
+                break
+            except ssl.SSLError:  # includes the peer's close_notify and a truncated stream
+                self._close()
+                return
+            if not chunk:
+                break
+            self._receive_plain(chunk)
+        tls.flush()
+
+    def _receive_plain(self, data: bytes) -> None:
         t = self._transport
         if t is None or t.is_closing():
             return
@@ -382,6 +606,16 @@ class _MySQLProtocol(asyncio.Protocol):
                 payload = bytes(buf[pos + 4 : pos + 4 + payload_len])
                 pos += 4 + payload_len
                 if not self._authed:
+                    if self._is_ssl_request(payload):
+                        # Everything after this packet is the start of the TLS handshake,
+                        # not MySQL: the client does not wait for us between the SSLRequest
+                        # and its ClientHello, so the same read can carry both.
+                        leftover = bytes(buf[pos:])
+                        buf.clear()
+                        self._start_tls()
+                        if leftover:
+                            self._receive_tls(leftover)
+                        return
                     self._handle_login(seq, payload)
                 else:
                     self._handle_command(seq, payload)
@@ -414,14 +648,10 @@ class _MySQLProtocol(asyncio.Protocol):
         self._finish_login(seq, parsed)
 
     def _finish_login(self, seq: int, parsed: dict[str, Any]) -> None:
-        spawn(
-            self._record(
-                "mysql_login_attempt",
-                AlertSeverity.HIGH,
-                {**parsed, "service": "mysql", "salt_hex": self._salt.hex()},
-            ),
-            name="mysql-event",
-        )
+        payload = {**parsed, "service": "mysql", "salt_hex": self._salt.hex()}
+        if self._tls is not None:
+            payload["tls"] = True
+        spawn(self._record("mysql_login_attempt", AlertSeverity.HIGH, payload), name="mysql-event")
         # Accept the login and enter the command phase. This is a fake datastore
         # with no real data, so granting "access" is safe — and it's what lets
         # us capture the post-auth SQL (recon, INTO OUTFILE / UDF RCE attempts)
@@ -493,6 +723,9 @@ class _MySQLProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._buf.clear()
+        if self._handshake_timer is not None:
+            self._handshake_timer.cancel()
+            self._handshake_timer = None
 
 
 class MySQLEngine(HoneypotEngine):
@@ -507,9 +740,12 @@ class MySQLEngine(HoneypotEngine):
             if hp:
                 hp_id = hp.id
 
+        # Real MySQL 8 offers TLS with a self-generated certificate, and clients that
+        # require TLS (mariadb-client >= 11.4 by default) refuse a server that does not.
+        ssl_ctx = await build_server_ssl_context_async(name, common_name=_TLS_COMMON_NAME)
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
-            limited_factory(lambda: _MySQLProtocol(name, hp_id), self._limiter),
+            limited_factory(lambda: _MySQLProtocol(name, hp_id, ssl_ctx), self._limiter),
             host="0.0.0.0",
             port=port,
         )

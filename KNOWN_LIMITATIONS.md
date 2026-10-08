@@ -188,13 +188,18 @@ engines found defects that synthetic-byte unit tests had passed through, each no
   identity is derived from the honeypot name, `/api/v1` and `/apis/{group}/{version}`
   discovery, `/healthz`, `nodes`, shortNames and server-side Table output exist (so
   `kubectl get pods` prints `READY STATUS RESTARTS AGE`, not a bare `NAME AGE`), and
-  `kubectl auth can-i` is answered. Not modelled: single-object GETs (`describe`, `get pod X`)
-  and watch; resources with no data (deployments, services, ...) return empty lists.
-  *Open:* a failed TLS handshake (or plaintext HTTP sent to the TLS port) closes the socket
-  with no alert, where Go answers with an alert or "Client sent an HTTP request to an HTTPS
-  server", so `nmap -sV` labels the port `m2ap?` rather than `ssl/http`. `openssl s_client`
-  and `kubectl` connect normally. (The HTTP engine's TLS mode shares the mechanism; that port
-  was not scanned.)
+  `kubectl auth can-i` is answered. Single objects (`get pod X`, `describe`, `-o yaml`),
+  nodes, namespaces, secrets and RBAC objects resolve from one model (`_Cluster`), so a list,
+  a GET and a watch agree; a name that does not exist is a real `NotFound` Status and a
+  namespace that does not exist has no objects. Watch (`?watch=1`) replays current objects
+  as `ADDED` and ends at `timeoutSeconds` (capped at 30, 32 at once). Resources with no data
+  (deployments, services, ...) return empty lists; writes other than pod create are not
+  modelled. The TLS port is fronted by `engines/tls_front.py`: a pre-1.2 ClientHello gets
+  the `protocol_version` alert and plaintext HTTP gets Go's 400 text, so `nmap -sV` reports
+  `ssl/http nginx 1.25.3`. *Open:* the certificate is self-signed with `O=Internal` and
+  a one-year validity from first start, where a kubeadm cluster's is issued by a `kubernetes`
+  CA; a ClientHello of TLS 1.2+ that then fails inside the handshake (no shared cipher) still
+  closes without an alert.
 - **SMB spoke SMB1 only.** Modern clients start with SMB2 and were disconnected, so no sprayer
   could hand over a credential. SMB2 negotiate (2.1) and NTLM session setup are served; the
   SMB1 persona now names the same host and domain as the NTLM challenge and the RDP honeypot,
@@ -202,8 +207,15 @@ engines found defects that synthetic-byte unit tests had passed through, each no
 - **MySQL never captured the password of a libmariadb client**, which names a placeholder
   plugin and waits for an auth switch. The engine now sends the switch. It also files the
   plugin name as `auth_plugin` instead of as the database, and answers `SHOW DATABASES`.
-  *Open:* the engine does not offer TLS, so a client that requires it (the `mariadb` client's
-  default since 11.4) refuses the server; `--skip-ssl` works, and so do hydra and libmysql.
+  The greeting now offers TLS (`CLIENT_SSL`, nmap's `Capabilities flags: 65535`) with a
+  certificate named like MySQL 8's auto-generated one. The client's TLS handshake can
+  arrive in the same segment as its SSLRequest, so the engine drives TLS through memory
+  BIOs (`_TLSTransport`) rather than `start_tls`, which cannot replay bytes already read;
+  verified 30/30 logins from the `mariadb` client over TLS. `mariadb` >= 11.4 verifies the
+  server certificate by default and refuses a self-signed one (a real MySQL with its
+  auto-generated certificate fails the same way), so use `--ssl-verify-server-cert=0` or
+  `--skip-ssl`. *Open:* the certificate subject carries `O=Internal` and is self-issued,
+  where MySQL's is issued by an `..._Auto_Generated_CA_Certificate`.
 - **MSSQL answered every login in the TDS 7.2+ encoding**, which impacket (TDS 7.1) read as a
   stray token, and omitted the account from `Login failed for user '...'`.
 - **PostgreSQL's startup errors lacked the `F`/`L`/`R` source fields** every real

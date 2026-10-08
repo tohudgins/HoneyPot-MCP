@@ -277,7 +277,19 @@ pinning the cert SHA sees a stable identity across restarts. `cryptography`
 is a direct dep.
 
 HTTP: deploy with `config["tls"] = True` to serve HTTPS on the configured
-port. The engine wires the cert via aiohttp's `web.TCPSite(ssl_context=...)`.
+port. The listener is `engines/tls_front.py` (`start_tls_site`, a drop-in for
+`web.TCPSite(ssl_context=...).start()`), not a bare `TCPSite`: asyncio's TLS layer closes
+silently when the first bytes are not a usable ClientHello, so `nmap -sV` could not tell
+the port was HTTPS (`m2ap?`) and the `ssl-cert` script never ran. The front `MSG_PEEK`s the
+first 16 bytes (bounded: 5 s sniff deadline, 256 unclassified connections overall, 32 per
+source) and then hands a TLS 1.2+ ClientHello to asyncio untouched via
+`loop.connect_accepted_socket` (the handler still sees the real peer), answers a pre-1.2
+ClientHello with Go's `protocol_version` alert, and answers plaintext HTTP with
+`plaintext_reply`: fixed bytes (Go's one-line 400, the default, used by the Kubernetes API),
+a callable given the request's Host header, or `None` to close silently. The HTTP engine
+passes `http_personas.plaintext_on_tls_reply`, so Apache explains itself in its HTML page
+naming host and port, nginx sends its own 400 page, and IIS sends nothing. Any new TLS
+listener on an aiohttp runner must use `start_tls_site`.
 
 SMTP: STARTTLS uses `asyncio.start_tls()` to actually complete the TLS
 handshake (the previous behaviour announced STARTTLS but dropped on the
@@ -494,8 +506,18 @@ The pair that takes the catalogue to 25.
   `/apis/{group}/{version}`, shortNames), `/healthz`, nodes, server-side Table
   output (what makes `kubectl get pods` print `READY STATUS RESTARTS AGE`
   instead of a bare `NAME AGE`) and `kubectl auth can-i` are served; `_RESOURCES`
-  drives both the discovery document and the generic empty-list handler.
-  Single-object GETs and watch are not modelled.
+  drives both the discovery document and the generic empty-list handler. Objects come
+  from `_Cluster`, a pure function of the honeypot name, so a list, a single GET
+  (`get pod X`, `describe`, `-o yaml`, a missing name is a real `NotFound` Status) and a
+  `?watch=1` stream agree; namespaces the model does not have contain nothing. It
+  listens through `tls_front.start_tls_site`.
+- `engines/mysql.py` also offers TLS. The greeting advertises `CLIENT_SSL`; a TLS-capable
+  client sends a 32-byte SSLRequest and starts its handshake without waiting, so the same
+  read can hold both. `loop.start_tls` cannot replay bytes the protocol already received, so
+  the session is driven through `ssl.MemoryBIO` (`_TLSTransport`, which keeps the raw
+  transport as the one the connection limiter and write-backlog check track). Logins over
+  TLS carry `tls: true`. `mariadb` >= 11.4 verifies the certificate by default and refuses a
+  self-signed one, as it does a real MySQL; use `--ssl-verify-server-cert=0` to test.
 
 ### HTTP realistic endpoints + sessions
 

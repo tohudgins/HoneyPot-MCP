@@ -41,6 +41,7 @@ API reference: Kubernetes API v1.28.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import calendar
 import hashlib
@@ -216,17 +217,22 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _status(message: str, reason: str, code: int) -> dict[str, Any]:
+def _status(
+    message: str, reason: str, code: int, details: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """A Kubernetes `Status` object — the shape every k8s error uses."""
-    return {
+    body: dict[str, Any] = {
         "kind": "Status",
         "apiVersion": "v1",
         "metadata": {},
         "status": "Failure",
         "message": message,
         "reason": reason,
-        "code": code,
     }
+    if details:
+        body["details"] = details
+    body["code"] = code
+    return body
 
 
 def _uid(seed: str, *parts: str) -> str:
@@ -271,6 +277,7 @@ _RESOURCES: dict[str, tuple[tuple[str, str, bool], ...]] = {
         ("serviceaccounts", "ServiceAccount", True),
         ("services", "Service", True),
         ("configmaps", "ConfigMap", True),
+        ("events", "Event", True),
     ),
     "apps/v1": (
         ("deployments", "Deployment", True),
@@ -487,6 +494,41 @@ _TABLES: dict[str, tuple[list[_Column], Any]] = {
 }
 
 
+def _table_body(resource: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """The `meta.k8s.io` Table the API server returns for `Accept: ...;as=Table`."""
+    columns, cells = _TABLES.get(resource, _NAME_AGE)
+    return {
+        "kind": "Table",
+        "apiVersion": "meta.k8s.io/v1",
+        "metadata": {"resourceVersion": "48211"},
+        "columnDefinitions": [
+            {
+                "name": col,
+                "type": kind_,
+                "format": "name" if col == "Name" else "",
+                "description": col,
+                "priority": priority,
+            }
+            for col, kind_, priority in columns
+        ],
+        "rows": [
+            {
+                "cells": cells(item),
+                "object": {
+                    "kind": "PartialObjectMetadata",
+                    "apiVersion": "meta.k8s.io/v1",
+                    "metadata": item["metadata"],
+                },
+            }
+            for item in items
+        ],
+    }
+
+
+def _wants_table(request: web.Request) -> bool:
+    return "as=Table" in request.headers.get("Accept", "")
+
+
 def _list_response(
     request: web.Request,
     resource: str,
@@ -496,34 +538,8 @@ def _list_response(
     headers: dict[str, str],
 ) -> web.Response:
     """The list as kubectl asked for it: a Table when `Accept` says `as=Table`, else the List."""
-    if "as=Table" in request.headers.get("Accept", ""):
-        columns, cells = _TABLES.get(resource, _NAME_AGE)
-        body: dict[str, Any] = {
-            "kind": "Table",
-            "apiVersion": "meta.k8s.io/v1",
-            "metadata": {"resourceVersion": "48211"},
-            "columnDefinitions": [
-                {
-                    "name": col,
-                    "type": kind_,
-                    "format": "name" if col == "Name" else "",
-                    "description": col,
-                    "priority": priority,
-                }
-                for col, kind_, priority in columns
-            ],
-            "rows": [
-                {
-                    "cells": cells(item),
-                    "object": {
-                        "kind": "PartialObjectMetadata",
-                        "apiVersion": "meta.k8s.io/v1",
-                        "metadata": item["metadata"],
-                    },
-                }
-                for item in items
-            ],
-        }
+    if _wants_table(request):
+        body = _table_body(resource, items)
     else:
         body = {
             "kind": f"{kind}List",
@@ -532,6 +548,255 @@ def _list_response(
             "items": items,
         }
     return web.json_response(body, headers=headers, dumps=compact_dumps)
+
+
+def _typed(item: dict[str, Any], kind: str, api_version: str) -> dict[str, Any]:
+    """A single object carries `kind` and `apiVersion`, which list items omit."""
+    return {"kind": kind, "apiVersion": api_version, **item}
+
+
+def _object_response(
+    request: web.Request,
+    resource: str,
+    kind: str,
+    api_version: str,
+    item: dict[str, Any],
+    headers: dict[str, str],
+) -> web.Response:
+    """One object, or a one-row Table when kubectl asked for `as=Table` (`kubectl get pod X`)."""
+    body = (
+        _table_body(resource, [item]) if _wants_table(request) else _typed(item, kind, api_version)
+    )
+    return web.json_response(body, headers=headers, dumps=compact_dumps)
+
+
+def _resolve(path: str) -> tuple[str, str, str | None, str | None] | None:
+    """(group/version, resource, namespace, name) of a REST path, or None if it is not one."""
+    parts = [p for p in path.split("/") if p]
+    if parts[:2] == ["api", "v1"]:
+        group_version, rest = "v1", parts[2:]
+    elif len(parts) >= 3 and parts[0] == "apis":
+        group_version, rest = f"{parts[1]}/{parts[2]}", parts[3:]
+    else:
+        return None
+    namespace = None
+    if len(rest) >= 3 and rest[0] == "namespaces":
+        namespace, rest = rest[1], rest[2:]
+    if not rest:
+        return None
+    return group_version, rest[0], namespace, rest[1] if len(rest) > 1 else None
+
+
+_NAMESPACES = ("default", "kube-system", "production", "payments", "monitoring")
+# Workloads per namespace: (app, image). A namespace not listed here has no pods.
+_PODS: dict[str, tuple[tuple[str, str], ...]] = {
+    "default": (
+        ("payments-api", "registry.internal/payments-api:2.4.1"),
+        ("postgres", "postgres:15.4"),
+        ("redis", "redis:7.2-alpine"),
+    ),
+    "kube-system": (
+        ("coredns", "registry.k8s.io/coredns/coredns:v1.10.1"),
+        ("kube-proxy", "registry.k8s.io/kube-proxy:v1.28.4"),
+    ),
+}
+_SECRETS = (
+    ("default-token-x7k2p", "kubernetes.io/service-account-token", "token"),
+    ("registry-pull-secret", "kubernetes.io/dockerconfigjson", ".dockerconfigjson"),
+    ("postgres-credentials", "Opaque", "password"),
+)
+
+
+class _Cluster:
+    """The fictional cluster's objects: a pure function of the honeypot's name, so a list, a
+    single GET and a watch agree and every request sees the same cluster."""
+
+    def __init__(self, seed: str) -> None:
+        self.seed = seed
+
+    def _namespaces_in(self, namespace: str | None) -> tuple[str, ...]:
+        """The namespaces a query covers: all of them, one, or none if it does not exist."""
+        if namespace is None:
+            return _NAMESPACES
+        return (namespace,) if namespace in _NAMESPACES else ()
+
+    def namespaces(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "metadata": {
+                    "name": ns,
+                    "uid": _uid(self.seed, "namespace", ns),
+                    "resourceVersion": str(40 + n),
+                    "creationTimestamp": _CREATED,
+                    "labels": {"kubernetes.io/metadata.name": ns},
+                },
+                "spec": {"finalizers": ["kubernetes"]},
+                "status": {"phase": "Active"},
+            }
+            for n, ns in enumerate(_NAMESPACES)
+        ]
+
+    def nodes(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "metadata": {
+                    "name": _NODE,
+                    "uid": _uid(self.seed, "node", _NODE),
+                    "resourceVersion": "48190",
+                    "creationTimestamp": _CREATED,
+                    "labels": {
+                        "kubernetes.io/hostname": _NODE,
+                        "kubernetes.io/os": "linux",
+                        "kubernetes.io/arch": "amd64",
+                        "node-role.kubernetes.io/control-plane": "",
+                    },
+                },
+                "spec": {"providerID": f"aws:///us-east-1a/i-{_uid(self.seed, 'instance')[:17]}"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True", "reason": "KubeletReady"}],
+                    "addresses": [
+                        {"type": "InternalIP", "address": "10.0.1.42"},
+                        {"type": "Hostname", "address": _NODE},
+                    ],
+                    "nodeInfo": {
+                        "kubeletVersion": _K8S_VERSION,
+                        "osImage": "Ubuntu 22.04.3 LTS",
+                        "kernelVersion": "5.15.0-1051-aws",
+                        "containerRuntimeVersion": "containerd://1.7.8",
+                        "operatingSystem": "linux",
+                        "architecture": "amd64",
+                    },
+                },
+            }
+        ]
+
+    def pods(self, namespace: str | None) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for ns in self._namespaces_in(namespace):
+            for n, (app, image) in enumerate(_PODS.get(ns, ())):
+                suffix = hashlib.sha256(f"{self.seed}/{ns}/{app}".encode()).hexdigest()
+                items.append(
+                    {
+                        "metadata": {
+                            "name": f"{app}-{suffix[:10]}-{suffix[10:15]}",
+                            "namespace": ns,
+                            "uid": _uid(self.seed, "pod", ns, app),
+                            "resourceVersion": str(30000 + n),
+                            "creationTimestamp": _CREATED,
+                            "labels": {"app": app},
+                        },
+                        "spec": {
+                            "containers": [{"name": app, "image": image}],
+                            "nodeName": _NODE,
+                            "serviceAccountName": "default",
+                        },
+                        "status": {
+                            "phase": "Running",
+                            "hostIP": "10.0.1.42",
+                            "podIP": f"10.244.{1 if ns == 'default' else 0}.{n + 10}",
+                            "startTime": _CREATED,
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                            "containerStatuses": [
+                                {
+                                    "name": app,
+                                    "image": image,
+                                    "ready": True,
+                                    "restartCount": 0,
+                                    "started": True,
+                                    "state": {"running": {"startedAt": _CREATED}},
+                                }
+                            ],
+                        },
+                    }
+                )
+        return items
+
+    def secrets(self, namespace: str | None) -> list[dict[str, Any]]:
+        return [
+            {
+                "metadata": {
+                    "name": nm,
+                    "namespace": ns,
+                    "uid": _uid(self.seed, "secret", ns, nm),
+                    "creationTimestamp": _CREATED,
+                },
+                "type": kind,
+                "data": {key: _secret_data(self.seed, nm, key)},
+            }
+            for ns in self._namespaces_in(namespace)
+            for nm, kind, key in _SECRETS
+        ]
+
+    def serviceaccounts(self, namespace: str | None) -> list[dict[str, Any]]:
+        return [
+            {
+                "metadata": {
+                    "name": "default",
+                    "namespace": ns,
+                    "uid": _uid(self.seed, "serviceaccount", ns, "default"),
+                    "creationTimestamp": _CREATED,
+                }
+            }
+            for ns in self._namespaces_in(namespace)
+        ]
+
+    def clusterroles(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "metadata": {
+                    "name": "cluster-admin",
+                    "uid": _uid(self.seed, "clusterrole", "cluster-admin"),
+                    "creationTimestamp": _CREATED,
+                },
+                "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}],
+            }
+        ]
+
+    def clusterrolebindings(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "metadata": {
+                    "name": "cluster-admin",
+                    "uid": _uid(self.seed, "clusterrolebinding", "cluster-admin"),
+                    "creationTimestamp": _CREATED,
+                },
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "cluster-admin",
+                },
+                "subjects": [
+                    {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "Group",
+                        "name": "system:masters",
+                    }
+                ],
+            }
+        ]
+
+    def objects(
+        self, group_version: str, resource: str, namespace: str | None
+    ) -> list[dict[str, Any]] | None:
+        """Every object of a resource in scope, or None if the decoy has no data model for it
+        (the caller then serves an empty list / NotFound)."""
+        if group_version == "v1":
+            if resource == "namespaces" and namespace is None:
+                return self.namespaces()
+            if resource == "nodes" and namespace is None:
+                return self.nodes()
+            if resource == "pods":
+                return self.pods(namespace)
+            if resource == "secrets":
+                return self.secrets(namespace)
+            if resource == "serviceaccounts":
+                return self.serviceaccounts(namespace)
+        elif group_version == "rbac.authorization.k8s.io/v1" and namespace is None:
+            if resource == "clusterroles":
+                return self.clusterroles()
+            if resource == "clusterrolebindings":
+                return self.clusterrolebindings()
+        return None
 
 
 class KubernetesEngine(HoneypotEngine):
@@ -597,6 +862,8 @@ class KubernetesEngine(HoneypotEngine):
                 "X-Kubernetes-Pf-Flowschema-Uid": _uid(name, "flowschema"),
                 "X-Kubernetes-Pf-Prioritylevel-Uid": _uid(name, "prioritylevel"),
             }
+
+        cluster = _Cluster(name)
 
         async def version(request: web.Request) -> web.Response:
             await self._record(hp_id, request, "kubernetes_recon", AlertSeverity.MEDIUM, {})
@@ -665,23 +932,9 @@ class KubernetesEngine(HoneypotEngine):
 
         async def list_namespaces(request: web.Request) -> web.Response:
             await self._record(hp_id, request, "kubernetes_enumerate", AlertSeverity.HIGH, {})
-            items = [
-                {
-                    "metadata": {
-                        "name": ns,
-                        "uid": _uid(name, "namespace", ns),
-                        "resourceVersion": str(40 + n),
-                        "creationTimestamp": _CREATED,
-                        "labels": {"kubernetes.io/metadata.name": ns},
-                    },
-                    "spec": {"finalizers": ["kubernetes"]},
-                    "status": {"phase": "Active"},
-                }
-                for n, ns in enumerate(
-                    ("default", "kube-system", "production", "payments", "monitoring")
-                )
-            ]
-            return _list_response(request, "namespaces", "Namespace", "v1", items, headers())
+            return _list_response(
+                request, "namespaces", "Namespace", "v1", cluster.namespaces(), headers()
+            )
 
         async def list_nodes(request: web.Request) -> web.Response:
             await self._record(
@@ -691,59 +944,24 @@ class KubernetesEngine(HoneypotEngine):
                 AlertSeverity.HIGH,
                 {"resource": "nodes"},
             )
-            node = {
-                "metadata": {
-                    "name": _NODE,
-                    "uid": _uid(name, "node", _NODE),
-                    "resourceVersion": "48190",
-                    "creationTimestamp": _CREATED,
-                    "labels": {
-                        "kubernetes.io/hostname": _NODE,
-                        "kubernetes.io/os": "linux",
-                        "kubernetes.io/arch": "amd64",
-                        "node-role.kubernetes.io/control-plane": "",
-                    },
-                },
-                "spec": {"providerID": f"aws:///us-east-1a/i-{_uid(name, 'instance')[:17]}"},
-                "status": {
-                    "conditions": [{"type": "Ready", "status": "True", "reason": "KubeletReady"}],
-                    "addresses": [
-                        {"type": "InternalIP", "address": "10.0.1.42"},
-                        {"type": "Hostname", "address": _NODE},
-                    ],
-                    "nodeInfo": {
-                        "kubeletVersion": _K8S_VERSION,
-                        "osImage": "Ubuntu 22.04.3 LTS",
-                        "kernelVersion": "5.15.0-1051-aws",
-                        "containerRuntimeVersion": "containerd://1.7.8",
-                        "operatingSystem": "linux",
-                        "architecture": "amd64",
-                    },
-                },
-            }
-            return _list_response(request, "nodes", "Node", "v1", [node], headers())
+            return _list_response(request, "nodes", "Node", "v1", cluster.nodes(), headers())
 
         async def list_serviceaccounts(request: web.Request) -> web.Response:
-            namespace = request.match_info.get("ns", "default")
+            namespace = request.match_info.get("ns")
             await self._record(
                 hp_id,
                 request,
                 "kubernetes_enumerate",
                 AlertSeverity.HIGH,
-                {"namespace": namespace[:64], "resource": "serviceaccounts"},
+                {"namespace": (namespace or "*")[:64], "resource": "serviceaccounts"},
             )
-            items = [
-                {
-                    "metadata": {
-                        "name": "default",
-                        "namespace": namespace,
-                        "uid": _uid(name, "serviceaccount", namespace, "default"),
-                        "creationTimestamp": _CREATED,
-                    }
-                }
-            ]
             return _list_response(
-                request, "serviceaccounts", "ServiceAccount", "v1", items, headers()
+                request,
+                "serviceaccounts",
+                "ServiceAccount",
+                "v1",
+                cluster.serviceaccounts(namespace),
+                headers(),
             )
 
         async def list_empty(request: web.Request) -> web.Response:
@@ -810,99 +1028,37 @@ class KubernetesEngine(HoneypotEngine):
             )
 
         async def list_pods(request: web.Request) -> web.Response:
-            namespace = request.match_info.get("ns", "default")
+            namespace = request.match_info.get("ns")
             await self._record(
                 hp_id,
                 request,
                 "kubernetes_enumerate",
                 AlertSeverity.HIGH,
-                {"namespace": namespace[:64], "resource": "pods"},
+                {"namespace": (namespace or "*")[:64], "resource": "pods"},
             )
-
-            def pod(n: int, app: str, image: str) -> dict[str, Any]:
-                suffix = hashlib.sha256(f"{name}/{namespace}/{app}".encode()).hexdigest()
-                pod_name = f"{app}-{suffix[:10]}-{suffix[10:15]}"
-                return {
-                    "metadata": {
-                        "name": pod_name,
-                        "namespace": namespace,
-                        "uid": _uid(name, "pod", namespace, app),
-                        "resourceVersion": str(30000 + n),
-                        "creationTimestamp": _CREATED,
-                        "labels": {"app": app},
-                    },
-                    "spec": {
-                        "containers": [{"name": app, "image": image}],
-                        "nodeName": _NODE,
-                        "serviceAccountName": "default",
-                    },
-                    "status": {
-                        "phase": "Running",
-                        "hostIP": "10.0.1.42",
-                        "podIP": f"10.244.1.{n + 10}",
-                        "startTime": _CREATED,
-                        "conditions": [{"type": "Ready", "status": "True"}],
-                        "containerStatuses": [
-                            {
-                                "name": app,
-                                "image": image,
-                                "ready": True,
-                                "restartCount": 0,
-                                "started": True,
-                                "state": {"running": {"startedAt": _CREATED}},
-                            }
-                        ],
-                    },
-                }
-
-            items = [
-                pod(n, app, image)
-                for n, (app, image) in enumerate(
-                    (
-                        ("payments-api", "registry.internal/payments-api:2.4.1"),
-                        ("postgres", "postgres:15.4"),
-                        ("redis", "redis:7.2-alpine"),
-                    )
-                )
-            ]
-            return _list_response(request, "pods", "Pod", "v1", items, headers())
+            return _list_response(request, "pods", "Pod", "v1", cluster.pods(namespace), headers())
 
         async def list_secrets(request: web.Request) -> web.Response:
             # The prize. Secrets hold service-account tokens, registry pull
             # credentials and database passwords — reading them is usually the
             # whole cluster, not one workload.
-            namespace = request.match_info.get("ns", "default")
+            namespace = request.match_info.get("ns")
             await self._record(
                 hp_id,
                 request,
                 "kubernetes_secret_access",
                 AlertSeverity.CRITICAL,
                 {
-                    "namespace": namespace[:64],
+                    "namespace": (namespace or "*")[:64],
                     "note": (
                         "read cluster secrets anonymously — service-account tokens and "
                         "registry credentials, typically full cluster compromise"
                     ),
                 },
             )
-            items = [
-                {
-                    "metadata": {
-                        "name": nm,
-                        "namespace": namespace,
-                        "uid": _uid(name, "secret", namespace, nm),
-                        "creationTimestamp": _CREATED,
-                    },
-                    "type": kind,
-                    "data": {key: _secret_data(name, nm, key)},
-                }
-                for nm, kind, key in (
-                    ("default-token-x7k2p", "kubernetes.io/service-account-token", "token"),
-                    ("registry-pull-secret", "kubernetes.io/dockerconfigjson", ".dockerconfigjson"),
-                    ("postgres-credentials", "Opaque", "password"),
-                )
-            ]
-            return _list_response(request, "secrets", "Secret", "v1", items, headers())
+            return _list_response(
+                request, "secrets", "Secret", "v1", cluster.secrets(namespace), headers()
+            )
 
         async def list_rbac(request: web.Request) -> web.Response:
             await self._record(
@@ -913,47 +1069,118 @@ class KubernetesEngine(HoneypotEngine):
                 {"note": "mapping permissions — looking for a path to cluster-admin"},
             )
             clusterroles = request.path.endswith("clusterroles")
-            if clusterroles:
-                items: list[dict[str, Any]] = [
-                    {
-                        "metadata": {
-                            "name": "cluster-admin",
-                            "uid": _uid(name, "clusterrole", "cluster-admin"),
-                            "creationTimestamp": _CREATED,
-                        },
-                        "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}],
-                    }
-                ]
-            else:
-                items = [
-                    {
-                        "metadata": {
-                            "name": "cluster-admin",
-                            "uid": _uid(name, "clusterrolebinding", "cluster-admin"),
-                            "creationTimestamp": _CREATED,
-                        },
-                        "roleRef": {
-                            "apiGroup": "rbac.authorization.k8s.io",
-                            "kind": "ClusterRole",
-                            "name": "cluster-admin",
-                        },
-                        "subjects": [
-                            {
-                                "apiGroup": "rbac.authorization.k8s.io",
-                                "kind": "Group",
-                                "name": "system:masters",
-                            }
-                        ],
-                    }
-                ]
             return _list_response(
                 request,
                 "clusterroles" if clusterroles else "clusterrolebindings",
                 "ClusterRole" if clusterroles else "ClusterRoleBinding",
                 "rbac.authorization.k8s.io/v1",
-                items,
+                cluster.clusterroles() if clusterroles else cluster.clusterrolebindings(),
                 headers(),
             )
+
+        async def get_object(request: web.Request) -> web.Response:
+            """`kubectl get pod X`, `describe`, `-o yaml`: one object by name."""
+            info = request.match_info
+            group_version = f"{info['group']}/{info['version']}" if "group" in info else "v1"
+            resource, namespace, object_name = info["resource"], info.get("ns"), info["name"]
+            kind = next((k for r, k, _ in _RESOURCES.get(group_version, ()) if r == resource), None)
+            if kind is None or resource in _CREATE_ONLY:
+                return await catch_all(request)
+            if resource == "secrets":
+                event, severity = "kubernetes_secret_access", AlertSeverity.CRITICAL
+            elif group_version.startswith("rbac."):
+                event, severity = "kubernetes_rbac_enumerate", AlertSeverity.HIGH
+            else:
+                event, severity = "kubernetes_enumerate", AlertSeverity.HIGH
+            await self._record(
+                hp_id,
+                request,
+                event,
+                severity,
+                {
+                    "namespace": (namespace or "")[:64],
+                    "resource": resource[:64],
+                    "name": object_name[:120],
+                },
+            )
+            item = next(
+                (
+                    i
+                    for i in cluster.objects(group_version, resource, namespace) or []
+                    if i["metadata"]["name"] == object_name
+                ),
+                None,
+            )
+            if item is None:
+                group = group_version.split("/")[0] if "/" in group_version else ""
+                details = {"name": object_name[:120], "kind": resource}
+                if group:
+                    details["group"] = group
+                return web.json_response(
+                    _status(
+                        f'{resource} "{object_name[:120]}" not found', "NotFound", 404, details
+                    ),
+                    status=404,
+                    headers=headers(),
+                    dumps=compact_dumps,
+                )
+            return _object_response(request, resource, kind, group_version, item, headers())
+
+        watch_slots = asyncio.Semaphore(32)
+
+        async def watch(request: web.Request) -> web.StreamResponse:
+            """`kubectl get -w`: a chunked stream of watch events that ends at the client's
+            `timeoutSeconds` (capped). Current objects are replayed as ADDED unless the client
+            resumed from a resourceVersion."""
+            resolved = _resolve(request.path)
+            kind = None
+            if resolved is not None:
+                kind = next(
+                    (k for r, k, _ in _RESOURCES.get(resolved[0], ()) if r == resolved[1]), None
+                )
+            if resolved is None or kind is None or resolved[1] in _CREATE_ONLY:
+                return await catch_all(request)
+            group_version, resource, namespace, _name = resolved
+            await self._record(
+                hp_id,
+                request,
+                "kubernetes_secret_access" if resource == "secrets" else "kubernetes_enumerate",
+                AlertSeverity.CRITICAL if resource == "secrets" else AlertSeverity.HIGH,
+                {"namespace": (namespace or "*")[:64], "resource": resource[:64], "watch": True},
+            )
+            if watch_slots.locked():
+                return web.json_response(
+                    _status("Too many requests, please try again later.", "TooManyRequests", 429),
+                    status=429,
+                    headers=headers(),
+                    dumps=compact_dumps,
+                )
+            try:
+                timeout = max(1, min(int(request.query.get("timeoutSeconds", "30")), 30))
+            except ValueError:
+                timeout = 30
+            async with watch_slots:
+                response = web.StreamResponse(status=200, headers=headers())
+                response.headers["Server"] = _SERVER_BANNER
+                response.content_type = "application/json"
+                response.enable_chunked_encoding()
+                await response.prepare(request)
+                try:
+                    if request.query.get("resourceVersion", "") in ("", "0"):
+                        for item in cluster.objects(group_version, resource, namespace) or []:
+                            event = {"type": "ADDED", "object": _typed(item, kind, group_version)}
+                            await response.write(compact_dumps(event).encode() + b"\n")
+                    await asyncio.sleep(timeout)
+                    await response.write_eof()
+                except (ConnectionError, asyncio.CancelledError):
+                    pass
+            return response
+
+        @web.middleware
+        async def watch_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+            if request.method == "GET" and request.query.get("watch", "").lower() in ("1", "true"):
+                return await watch(request)
+            return await handler(request)
 
         async def create_pod(request: web.Request) -> web.Response:
             body = await self._read_json(request)
@@ -1032,7 +1259,7 @@ class KubernetesEngine(HoneypotEngine):
             )
 
         app = web.Application(
-            middlewares=[server_identity_middleware(_SERVER_BANNER)],
+            middlewares=[server_identity_middleware(_SERVER_BANNER), watch_middleware],
             client_max_size=MAX_REQUEST_BYTES,
         )
         router = app.router
@@ -1062,6 +1289,10 @@ class KubernetesEngine(HoneypotEngine):
         router.add_get("/api/v1/namespaces/{ns}/{resource}", list_empty)
         router.add_get("/apis/{group}/{version}/{resource}", list_empty)
         router.add_get("/apis/{group}/{version}/namespaces/{ns}/{resource}", list_empty)
+        router.add_get("/api/v1/{resource}/{name}", get_object)
+        router.add_get("/api/v1/namespaces/{ns}/{resource}/{name}", get_object)
+        router.add_get("/apis/{group}/{version}/{resource}/{name}", get_object)
+        router.add_get("/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}", get_object)
         router.add_route("*", "/{tail:.*}", catch_all)
         return app
 
@@ -1078,9 +1309,12 @@ class KubernetesEngine(HoneypotEngine):
         # TLS first, so an API that answers plain HTTP on 6443 is identified (and unusable by
         # kubectl) before the first request. The self-signed cert persists across restarts.
         from honeypot_mcp.engines.tls import build_server_ssl_context_async
+        from honeypot_mcp.engines.tls_front import start_tls_site
 
         ssl_context = await build_server_ssl_context_async(name, common_name="kube-apiserver")
-        await web.TCPSite(runner, "0.0.0.0", port, ssl_context=ssl_context).start()
+        # Go's net/http answers a failed handshake with a TLS alert and plaintext HTTP with a
+        # fixed 400 line; `start_tls_site` does the same, so `nmap -sV` sees ssl/http.
+        await start_tls_site(runner, "0.0.0.0", port, ssl_context)  # noqa: S104
         cid = f"k8s-{secrets.token_hex(8)}"
         self._runners[cid] = runner
         log.info("Kubernetes API honeypot '%s' listening on port %d", name, port)

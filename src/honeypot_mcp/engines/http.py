@@ -63,8 +63,10 @@ from honeypot_mcp.engines.http_personas import (
     HTTPPersona,
     get_persona,
     pick_random_persona_id,
+    plaintext_on_tls_reply,
 )
 from honeypot_mcp.engines.http_templates import get_template
+from honeypot_mcp.engines.tls_front import start_tls_site
 from honeypot_mcp.http_identity import (
     MAX_REQUEST_BYTES,
     clip,
@@ -631,8 +633,20 @@ class HTTPEngine(HoneypotEngine):
 
             ssl_context = await build_server_ssl_context_async(name, common_name=name)
 
-        site = web.TCPSite(runner, "0.0.0.0", port, ssl_context=ssl_context)
-        await site.start()
+        if ssl_context is not None:
+            # Not `web.TCPSite(ssl_context=...)`: that closes silently when the handshake
+            # cannot start, where a real server sends a TLS alert or an HTTP 400 — and
+            # `nmap -sV` then cannot tell the port is HTTPS at all.
+            await start_tls_site(  # noqa: S104
+                runner,
+                "0.0.0.0",
+                port,
+                ssl_context,
+                plaintext_reply=plaintext_on_tls_reply(persona, port),
+            )
+        else:
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
 
         container_id = f"http-{secrets.token_hex(8)}"
         self._runners[container_id] = (runner, name)

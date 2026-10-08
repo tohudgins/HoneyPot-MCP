@@ -19,7 +19,9 @@ internally consistent — for instance, an Nginx persona must NOT advertise
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
+from email.utils import formatdate
 
 
 @dataclass(frozen=True)
@@ -162,3 +164,68 @@ def pick_random_persona_id() -> str:
 
 def all_persona_ids() -> list[str]:
     return list(_PERSONAS.keys())
+
+
+_APACHE_PLAIN_ON_TLS = """<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+<html><head>
+<title>400 Bad Request</title>
+</head><body>
+<h1>Bad Request</h1>
+<p>Your browser sent a request that this server could not understand.<br />
+Reason: You're speaking plain HTTP to an SSL-enabled server port.<br />
+ Instead use the HTTPS scheme to access this URL, please.<br />
+</p>
+<hr>
+<address>{server} Server at {host} Port {port}</address>
+</body></html>
+"""
+
+_NGINX_PLAIN_ON_TLS = """<html>\r
+<head><title>400 The plain HTTP request was sent to HTTPS port</title></head>\r
+<body>\r
+<center><h1>400 Bad Request</h1></center>\r
+<center>The plain HTTP request was sent to HTTPS port</center>\r
+<hr><center>{server}</center>\r
+</body>\r
+</html>\r
+"""
+
+
+def plaintext_on_tls_reply(persona: HTTPPersona, port: int) -> Callable[[str | None], bytes | None]:
+    """What this persona's server writes when plain HTTP arrives on its TLS port.
+
+    Each stack answers differently and a scanner compares: Apache explains itself in an HTML
+    page naming the host and port, nginx sends its own 400 page, and IIS (HTTP.sys) says
+    nothing and drops the connection. The reply is built per connection because `Date` must
+    be current; `host` is the request's Host header when it had one.
+    """
+    server = persona.server_header
+
+    def reply(host: str | None) -> bytes | None:
+        if server.startswith("Microsoft-IIS"):
+            return None
+        if server.startswith("nginx"):
+            body = _NGINX_PLAIN_ON_TLS.format(server=server).encode("latin-1")
+            head = (
+                "HTTP/1.1 400 Bad Request\r\n"
+                f"Server: {server}\r\n"
+                f"Date: {formatdate(usegmt=True)}\r\n"
+                "Content-Type: text/html\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            )
+        else:
+            body = _APACHE_PLAIN_ON_TLS.format(
+                server=server, host=host or "localhost", port=port
+            ).encode("latin-1")
+            head = (
+                "HTTP/1.1 400 Bad Request\r\n"
+                f"Date: {formatdate(usegmt=True)}\r\n"
+                f"Server: {server}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "Content-Type: text/html; charset=iso-8859-1\r\n\r\n"
+            )
+        return head.encode("latin-1") + body
+
+    return reply

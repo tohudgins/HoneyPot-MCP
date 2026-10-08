@@ -32,8 +32,17 @@ identifiable, or could not be used at all, by these:
   names the account in the login failure. **PostgreSQL** error frames carry `F`/`L`/`R`
   (nmap now reports 14.10 - 14.15), a real `version()` string and real command tags.
   **Redis** Redis 7 error wording and `CLIENT`/`ECHO`/`TIME`.
-- Found but not changed, in `KNOWN_LIMITATIONS.md`: MySQL does not offer TLS (clients that
-  require it refuse the server), and the Kubernetes API has no single-object GET or watch.
+- **The open gaps from that sweep, closed.** `engines/tls_front.py` fronts TLS listeners (the
+  Kubernetes API and the HTTP engine's `tls` mode): a pre-1.2 ClientHello gets Go's
+  `protocol_version` alert and plaintext HTTP gets a reply, instead of a silent close that left
+  `nmap -sV` printing `m2ap?` and the `ssl-cert` script unrun. The HTTP engine's plaintext reply is
+  the persona's own (Apache's explanatory page naming host and port, nginx's 400 page, nothing
+  from IIS); the Kubernetes API uses Go's one-line 400. MySQL offers TLS (`CLIENT_SSL`) and
+  completes it through memory BIOs, because the client's ClientHello can arrive in the same
+  segment as its SSLRequest and `start_tls` cannot replay bytes already read (30/30 logins from
+  the `mariadb` client). The Kubernetes decoy resolves single objects, namespaces, nodes and
+  RBAC from one model, answers `describe`/`get pod X`/`-o yaml`, a real `NotFound` for a missing
+  name, empty results for a namespace that does not exist, and `?watch=1`.
 
 ## A console behind the RDP login, and the last mail gaps
 

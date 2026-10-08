@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import socket
 import struct
@@ -245,17 +246,20 @@ async def _k8s():
 
 
 async def test_kubernetes_api_speaks_tls_only():
-    """kube-apiserver has no plaintext listener; kubectl cannot use one that does."""
+    """kube-apiserver has no plaintext listener; like Go's net/http, plaintext HTTP to the
+    TLS port is answered with a fixed 400 and never reaches the application."""
     import httpx
 
     engine, cid, port = await _k8s()
     try:
         async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
             assert (await client.get(f"https://127.0.0.1:{port}/version")).status_code == 200
-            with pytest.raises(httpx.HTTPError):
-                await client.get(f"http://127.0.0.1:{port}/version")
+            plain = await client.get(f"http://127.0.0.1:{port}/version")
     finally:
         await engine.stop(cid)
+    assert plain.status_code == 400
+    assert plain.text == "Client sent an HTTP request to an HTTPS server.\n"
+    assert "gitVersion" not in plain.text
 
 
 async def test_kubernetes_identity_is_stable_across_requests():
@@ -640,3 +644,75 @@ async def test_redis_client_subcommands_that_libraries_send_on_connect_are_answe
     assert setname == b"+OK\r\n" and setinfo == b"+OK\r\n"
     assert getname == b"$7\r\nscanner\r\n"
     assert b"name=scanner" in listing and b"cmd=client|list" in listing
+
+
+# ── Kubernetes: single objects, describe, watch ─────────────────────────────
+
+
+async def test_kubernetes_single_object_gets_agree_with_the_list_and_missing_ones_404_like_k8s():
+    """`kubectl get pod X`, `describe` and `-o yaml` GET one object by name; before, every one
+    of them was a 404 no real cluster gives for a pod it just listed."""
+    import httpx
+
+    engine, cid, port = await _k8s()
+    accept = "application/json;as=Table;v=v1;g=meta.k8s.io,application/json"
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
+            base = f"https://127.0.0.1:{port}"
+            listed = (await client.get(base + "/api/v1/namespaces/default/pods")).json()["items"][0]
+            name = listed["metadata"]["name"]
+            one = (await client.get(base + f"/api/v1/namespaces/default/pods/{name}")).json()
+            table = (
+                await client.get(
+                    base + f"/api/v1/namespaces/default/pods/{name}", headers={"Accept": accept}
+                )
+            ).json()
+            missing = await client.get(base + "/api/v1/namespaces/default/pods/nope")
+            namespace = (await client.get(base + "/api/v1/namespaces/payments")).json()
+            no_namespace = await client.get(base + "/api/v1/namespaces/bogus")
+            node = (await client.get(base + "/api/v1/nodes/ip-10-0-1-42.ec2.internal")).json()
+            other_ns = (await client.get(base + "/api/v1/namespaces/bogus/pods")).json()
+            system = (await client.get(base + "/api/v1/namespaces/kube-system/pods")).json()
+            events = (await client.get(base + "/api/v1/namespaces/default/events")).json()
+    finally:
+        await engine.stop(cid)
+    assert one == {"kind": "Pod", "apiVersion": "v1", **listed}
+    assert table["kind"] == "Table" and [r["cells"][0] for r in table["rows"]] == [name]
+    assert missing.status_code == 404
+    assert missing.json()["details"] == {"name": "nope", "kind": "pods"}
+    assert missing.json()["message"] == 'pods "nope" not found'
+    assert namespace["kind"] == "Namespace" and namespace["metadata"]["name"] == "payments"
+    assert no_namespace.status_code == 404
+    assert node["kind"] == "Node"
+    assert other_ns["items"] == [], "a namespace that does not exist has no pods"
+    assert {i["metadata"]["name"].rsplit("-", 2)[0] for i in system["items"]} == {
+        "coredns",
+        "kube-proxy",
+    }
+    assert events["kind"] == "EventList" and events["items"] == []
+
+
+async def test_kubernetes_watch_replays_current_objects_then_ends_at_timeoutseconds():
+    import httpx
+
+    engine, cid, port = await _k8s()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            base = f"https://127.0.0.1:{port}"
+            started = asyncio.get_running_loop().time()
+            fresh = await client.get(
+                base + "/api/v1/namespaces/default/pods?watch=true&timeoutSeconds=1"
+            )
+            resumed = await client.get(
+                base
+                + "/api/v1/namespaces/default/pods?watch=true&timeoutSeconds=1&resourceVersion=30002"
+            )
+            elapsed = asyncio.get_running_loop().time() - started
+    finally:
+        await engine.stop(cid)
+    events = [json.loads(line) for line in fresh.text.splitlines()]
+    assert [e["type"] for e in events] == ["ADDED"] * 3
+    assert all(e["object"]["kind"] == "Pod" for e in events)
+    assert fresh.headers["Transfer-Encoding"] == "chunked"
+    assert resumed.text == "", "a client that resumed from a resourceVersion is not replayed"
+    assert 1.5 < elapsed < 6, "each watch ends at the client's timeoutSeconds"
