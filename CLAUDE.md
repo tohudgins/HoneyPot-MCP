@@ -291,6 +291,16 @@ passes `http_personas.plaintext_on_tls_reply`, so Apache explains itself in its 
 naming host and port, nginx sends its own 400 page, and IIS sends nothing. Any new TLS
 listener on an aiohttp runner must use `start_tls_site`.
 
+The certificate itself is shaped per service by `tls.CertProfile` (CN, optional issuer CN,
+validity, SANs, key usage, EKU): `ensure_cert(name, profile=...)` / `build_server_ssl_context(_async)`
+take one. Kubernetes and MySQL are leaves from a named CA (the CA key is generated and
+discarded, since servers send only the leaf), RDP is self-signed and named for the computer
+FQDN (`_cert_profile` in rdp.py, so `ssl-cert` and `rdp-ntlm-info` agree), and the default is
+a bare backdated `CN=<name>` with no organisation and no `localhost` SAN. A persisted cert
+that no longer matches its profile, or has < 30 days left, is reissued. A new TLS engine
+should pass the profile of the service it impersonates, and callers that read the cert back
+(RDP's CredSSP public key) must pass the same profile or the file ping-pongs.
+
 SMTP: STARTTLS uses `asyncio.start_tls()` to actually complete the TLS
 handshake (the previous behaviour announced STARTTLS but dropped on the
 ClientHello — itself a fingerprint). After upgrade, the engine clears

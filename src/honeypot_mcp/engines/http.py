@@ -590,6 +590,12 @@ def _generate_decoy(path: str) -> tuple[str, str]:
     return "", "text/plain"
 
 
+def _local_port(request: web.Request) -> int:
+    """The port the client connected to, for the places a server names its own port."""
+    sockname = request.transport.get_extra_info("sockname") if request.transport else None
+    return int(sockname[1]) if sockname and len(sockname) > 1 else 80
+
+
 class HTTPEngine(HoneypotEngine):
     """Runs an aiohttp application in a background asyncio task."""
 
@@ -862,7 +868,9 @@ class HTTPEngine(HoneypotEngine):
                 data = backup_download(honeypot_name, target)
                 if data is None:
                     return web.Response(
-                        text=persona.render_not_found(request.headers.get("Host", "localhost")),
+                        text=persona.render_not_found(
+                            request.headers.get("Host", "localhost"), _local_port(request)
+                        ),
                         content_type="text/html",
                         status=404,
                         headers=response_headers,
@@ -1105,7 +1113,7 @@ class HTTPEngine(HoneypotEngine):
                 )
             else:
                 resp = web.Response(
-                    text=persona.render_not_found(host_header),
+                    text=persona.render_not_found(host_header, _local_port(request)),
                     content_type="text/html",
                     status=404,
                     headers=response_headers,

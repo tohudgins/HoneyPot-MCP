@@ -24,6 +24,24 @@ from dataclasses import dataclass
 from email.utils import formatdate
 
 
+def split_host_port(host_header: str, default_port: int) -> tuple[str, int]:
+    """`(hostname, port)` from a Host header value; `default_port` when it has no port."""
+    value = (host_header or "").strip()
+    if value.startswith("["):  # [v6]:port
+        host, _, rest = value[1:].partition("]")
+        host = f"[{host}]"
+        rest = rest.lstrip(":")
+    elif value.count(":") == 1:
+        host, _, rest = value.partition(":")
+    else:  # no port, or a bare IPv6 literal
+        host, rest = value, ""
+    try:
+        port = int(rest) if rest else default_port
+    except ValueError:
+        port = default_port
+    return host, port if 0 < port < 65536 else default_port
+
+
 @dataclass(frozen=True)
 class HTTPPersona:
     id: str
@@ -38,10 +56,15 @@ class HTTPPersona:
     jitter_ms_min: int
     jitter_ms_max: int
 
-    def render_not_found(self, host: str) -> str:
+    def render_not_found(self, host_header: str, local_port: int = 80) -> str:
+        """The persona's 404 page. Apache's signature line names the host without any port and
+        then the port the request used: the Host header's if it carried one, else the one the
+        connection arrived on (a hard-coded 80 on an 8443 listener is a one-request tell)."""
+        host, port = split_host_port(host_header, local_port)
         return self.not_found_template.format(
             server=self.server_header,
             host=host or "localhost",
+            port=port,
         )
 
 
@@ -54,7 +77,7 @@ _APACHE_404 = """<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
 <h1>Not Found</h1>
 <p>The requested URL was not found on this server.</p>
 <hr>
-<address>{server} Server at {host} Port 80</address>
+<address>{server} Server at {host} Port {port}</address>
 </body></html>
 """
 

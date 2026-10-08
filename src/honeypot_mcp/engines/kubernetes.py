@@ -51,11 +51,13 @@ import re
 import secrets
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from aiohttp import web
 
 from honeypot_mcp.engines.base import HoneypotEngine
+from honeypot_mcp.engines.tls import SERVER_AUTH, CertProfile
 from honeypot_mcp.http_identity import (
     MAX_REQUEST_BYTES,
     compact_dumps,
@@ -79,6 +81,26 @@ _K8S_BUILD_DATE = "2023-11-15T16:58:20Z"
 # When the fictional cluster was created; every object's age is measured from here.
 _CREATED = "2026-06-03T09:12:44Z"
 _NODE = "ip-10-0-1-42.ec2.internal"
+
+# What `kubeadm init` issues for the API server: a leaf from a CA named `kubernetes`, subject
+# `kube-apiserver` with no organisation, valid a year from cluster creation, the in-cluster
+# service names and addresses as SANs, serverAuth only.
+_CERT_PROFILE = CertProfile(
+    common_name="kube-apiserver",
+    issuer_common_name="kubernetes",
+    days=365,
+    not_before=datetime.strptime(_CREATED, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC),
+    dns_names=(
+        _NODE,
+        "kubernetes",
+        "kubernetes.default",
+        "kubernetes.default.svc",
+        "kubernetes.default.svc.cluster.local",
+    ),
+    ip_addresses=("10.96.0.1", "10.0.1.42"),
+    key_usage=True,
+    extended_key_usage=(SERVER_AUTH,),
+)
 # kube-apiserver sets no Server header of its own; nginx-ingress in front of it
 # is by far the most common thing on 6443 that does.
 _SERVER_BANNER = "nginx/1.25.3"
@@ -1311,7 +1333,7 @@ class KubernetesEngine(HoneypotEngine):
         from honeypot_mcp.engines.tls import build_server_ssl_context_async
         from honeypot_mcp.engines.tls_front import start_tls_site
 
-        ssl_context = await build_server_ssl_context_async(name, common_name="kube-apiserver")
+        ssl_context = await build_server_ssl_context_async(name, profile=_CERT_PROFILE)
         # Go's net/http answers a failed handshake with a TLS alert and plaintext HTTP with a
         # fixed 400 line; `start_tls_site` does the same, so `nmap -sV` sees ssl/http.
         await start_tls_site(runner, "0.0.0.0", port, ssl_context)  # noqa: S104

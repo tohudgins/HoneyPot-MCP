@@ -53,7 +53,7 @@ from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory, shutdown_server
-from honeypot_mcp.engines.tls import build_server_ssl_context_async
+from honeypot_mcp.engines.tls import CertProfile, build_server_ssl_context_async
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -129,8 +129,14 @@ _CAPABILITY_FLAGS = _BASE_CAPABILITY_FLAGS | _CLIENT_SSL
 # Status flags. SERVER_STATUS_AUTOCOMMIT (0x0002).
 _STATUS_FLAGS = 0x0002
 
-# The certificate CN MySQL 8 gives the cert it auto-generates at first start.
-_TLS_COMMON_NAME = "MySQL_Server_8.0.36_Auto_Generated_Server_Certificate"
+# The certificate MySQL 8 generates at first start: a leaf `..._Auto_Generated_Server_Certificate`
+# issued by a `..._Auto_Generated_CA_Certificate`, valid ten years, no SAN, no key usage.
+_CERT_PROFILE = CertProfile(
+    common_name="MySQL_Server_8.0.36_Auto_Generated_Server_Certificate",
+    issuer_common_name="MySQL_Server_8.0.36_Auto_Generated_CA_Certificate",
+    days=3650,
+    dns_names=(),
+)
 
 # A client sends the 32-byte SSLRequest and then a ClientHello, with no reply
 # awaited in between; a peer that goes quiet after the SSLRequest is cut off
@@ -742,7 +748,7 @@ class MySQLEngine(HoneypotEngine):
 
         # Real MySQL 8 offers TLS with a self-generated certificate, and clients that
         # require TLS (mariadb-client >= 11.4 by default) refuse a server that does not.
-        ssl_ctx = await build_server_ssl_context_async(name, common_name=_TLS_COMMON_NAME)
+        ssl_ctx = await build_server_ssl_context_async(name, profile=_CERT_PROFILE)
         loop = asyncio.get_event_loop()
         server = await loop.create_server(
             limited_factory(lambda: _MySQLProtocol(name, hp_id, ssl_ctx), self._limiter),

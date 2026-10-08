@@ -43,6 +43,15 @@ identifiable, or could not be used at all, by these:
   the `mariadb` client). The Kubernetes decoy resolves single objects, namespaces, nodes and
   RBAC from one model, answers `describe`/`get pod X`/`-o yaml`, a real `NotFound` for a missing
   name, empty results for a namespace that does not exist, and `?watch=1`.
+- **Certificates have the shape of the service.** One generic self-signed `O=Internal` cert with
+  a `localhost` SAN served every engine, and `ssl-cert` / `openssl s_client` read it first.
+  `tls.CertProfile` now describes each: Kubernetes is `CN=kube-apiserver` from a CA named
+  `kubernetes` (one year from the cluster's creation, service-name and IP SANs, serverAuth),
+  MySQL is the `..._Auto_Generated_Server_Certificate` from an auto-generated CA (ten years, no
+  SAN), RDP is self-signed and named for the computer FQDN the NTLM challenge discloses, and the
+  default is a bare backdated `CN=<name>`. Persisted certificates that no longer match, or have
+  under 30 days left, are reissued. Apache's 404 page no longer claims `Port 80` on every
+  listener and no longer prints the Host header's port as part of the host name.
 
 ## A console behind the RDP login, and the last mail gaps
 

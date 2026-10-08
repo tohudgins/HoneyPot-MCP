@@ -59,7 +59,12 @@ from honeypot_mcp.engines.rdp_nla import (
 )
 from honeypot_mcp.engines.rdp_session import run_session
 from honeypot_mcp.engines.rdp_shell import Identity, extract_urls, looks_like_download
-from honeypot_mcp.engines.tls import build_server_ssl_context_async, ensure_cert
+from honeypot_mcp.engines.tls import (
+    REMOTE_DESKTOP_AUTH,
+    CertProfile,
+    build_server_ssl_context_async,
+    ensure_cert,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -387,7 +392,9 @@ async def _handle_rdp_client(
     # Building the context before replying removes the gap, and pausing the transport
     # across the reply closes what is left of it.
     try:
-        ssl_ctx = await build_server_ssl_context_async(honeypot_name)
+        ssl_ctx = await build_server_ssl_context_async(
+            honeypot_name, profile=_cert_profile(honeypot_name, config)
+        )
     except Exception as e:
         # The handler wrapper swallows exceptions, which would leave this socket
         # open with no timer: close it ourselves, like a real server that fails
@@ -715,7 +722,11 @@ async def _handle_nla(
         return None
 
     result = await run_credssp(
-        reader, writer, ident, authorize=authorize, public_key=_server_public_key(honeypot_name)
+        reader,
+        writer,
+        ident,
+        authorize=authorize,
+        public_key=_server_public_key(honeypot_name, config),
     )
     if result.get("accepted"):
         mcs_pdu = await _read_first_frame(reader, writer)
@@ -767,14 +778,26 @@ async def _handle_nla(
         await writer.wait_closed()
 
 
-def _server_public_key(honeypot_name: str) -> bytes | None:
+def _cert_profile(honeypot_name: str, config: dict[str, Any] | None) -> CertProfile:
+    """The self-signed certificate Windows generates for Remote Desktop: named for the computer
+    (the same FQDN the NTLM CHALLENGE discloses, so `rdp-ntlm-info` and `ssl-cert` agree), valid
+    about six months, and carrying the Remote Desktop Authentication usage."""
+    return CertProfile(
+        common_name=identity_for(honeypot_name, config).dns_computer,
+        days=182,
+        key_usage=True,
+        extended_key_usage=(REMOTE_DESKTOP_AUTH,),
+    )
+
+
+def _server_public_key(honeypot_name: str, config: dict[str, Any] | None = None) -> bytes | None:
     """The TLS certificate's RSA public key (PKCS#1 DER), which CredSSP binds the
     exchange to. None if it cannot be read, which only disables sessions over NLA."""
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-        cert_path, _ = ensure_cert(honeypot_name)
+        cert_path, _ = ensure_cert(honeypot_name, profile=_cert_profile(honeypot_name, config))
         cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
         return cert.public_key().public_bytes(Encoding.DER, PublicFormat.PKCS1)
     except Exception as e:

@@ -196,10 +196,11 @@ engines found defects that synthetic-byte unit tests had passed through, each no
   (deployments, services, ...) return empty lists; writes other than pod create are not
   modelled. The TLS port is fronted by `engines/tls_front.py`: a pre-1.2 ClientHello gets
   the `protocol_version` alert and plaintext HTTP gets Go's 400 text, so `nmap -sV` reports
-  `ssl/http nginx 1.25.3`. *Open:* the certificate is self-signed with `O=Internal` and
-  a one-year validity from first start, where a kubeadm cluster's is issued by a `kubernetes`
-  CA; a ClientHello of TLS 1.2+ that then fails inside the handshake (no shared cipher) still
-  closes without an alert.
+  `ssl/http nginx 1.25.3`. The certificate is what `kubeadm init` issues: `CN=kube-apiserver`
+  from a CA named `kubernetes`, no organisation, valid a year from the cluster's creation
+  date, the in-cluster service names and IPs as SANs, `serverAuth` only (see `CertProfile`
+  below). *Open:* a ClientHello of TLS 1.2+ that then fails inside the handshake (no shared
+  cipher) still closes without an alert.
 - **SMB spoke SMB1 only.** Modern clients start with SMB2 and were disconnected, so no sprayer
   could hand over a credential. SMB2 negotiate (2.1) and NTLM session setup are served; the
   SMB1 persona now names the same host and domain as the NTLM challenge and the RDP honeypot,
@@ -214,14 +215,30 @@ engines found defects that synthetic-byte unit tests had passed through, each no
   verified 30/30 logins from the `mariadb` client over TLS. `mariadb` >= 11.4 verifies the
   server certificate by default and refuses a self-signed one (a real MySQL with its
   auto-generated certificate fails the same way), so use `--ssl-verify-server-cert=0` or
-  `--skip-ssl`. *Open:* the certificate subject carries `O=Internal` and is self-issued,
-  where MySQL's is issued by an `..._Auto_Generated_CA_Certificate`.
+  `--skip-ssl`. The certificate is `CN=MySQL_Server_8.0.36_Auto_Generated_Server_Certificate`
+  issued by `..._Auto_Generated_CA_Certificate`, ten years, no SAN.
 - **MSSQL answered every login in the TDS 7.2+ encoding**, which impacket (TDS 7.1) read as a
   stray token, and omitted the account from `Login failed for user '...'`.
 - **PostgreSQL's startup errors lacked the `F`/`L`/`R` source fields** every real
   ErrorResponse ends with; nmap now reads `PostgreSQL DB 14.10 - 14.15` instead of an
   unversioned match. `version()` agrees with `server_version`, and command tags are real
   (`CREATE TABLE`, `INSERT 0 1`) instead of `OK`.
+- **Certificates were one generic self-signed `O=Internal` certificate** with a `localhost`
+  SAN, which `ssl-cert` and `openssl s_client` read straight after the handshake. They now
+  have the shape of the service (`tls.CertProfile`): Kubernetes and MySQL are leaves from a
+  named CA (the CA key is generated for the purpose and discarded, as servers send only the
+  leaf); RDP is self-signed, named for the computer FQDN the NTLM challenge discloses
+  (`rdp-ntlm-info` and the certificate agree), valid about six months, with the Remote Desktop
+  Authentication usage; the default is a bare snakeoil-style `CN=<name>` with no organisation
+  and no `localhost` SAN, backdated a stable 1-13 months. A persisted certificate that no
+  longer matches its profile (an upgrade, a changed hostname) or has under 30 days left is
+  reissued, as an operator would renew it, so a deployment upgraded to this version presents
+  a new certificate once. *Open:* the HTTP and SMTP certificates are named after the honeypot
+  or its configured hostname, which is a guess at the real hostname; the RSA key is always
+  2048-bit.
+- **Apache's 404 page hard-coded `Port 80`** and included any port in the Host header in the
+  host name. It now names the host without a port and the port the request used (the Host
+  header's, else the one the connection arrived on).
 - **Redis** answered unknown commands in the Redis 5 wording and had no `CLIENT` command
   (redis-py 5 sends `CLIENT SETINFO` on every connection).
 
