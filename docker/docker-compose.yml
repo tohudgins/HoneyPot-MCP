@@ -193,6 +193,7 @@ services:
       - ./cowrie/build_persona_fs.py:/hp-src/build_persona_fs.py:ro
       - ../src/honeypot_mcp/engines/cowrie_fs.py:/hp-src/cowrie_fs.py:ro
       - ../src/honeypot_mcp/engines/ssh_personas.py:/hp-src/ssh_personas.py:ro
+      - ../src/honeypot_mcp/engines/cowrie_sitecustomize.py:/hp-src/cowrie_sitecustomize.py:ro
     restart: "no"
     # Root, so it can write the fresh (root-owned) volume; harmless otherwise — no
     # capabilities, no network, read-only root filesystem, and it exits in a second.
@@ -241,6 +242,16 @@ services:
       - COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1
       # Bound what an attacker-directed wget/curl can pull (Cowrie's default is 10 MiB).
       - COWRIE_HONEYPOT_DOWNLOAD_LIMIT_SIZE=2097152
+      # Algorithm offer and telnet opening, narrowed to the persona's OpenSSH (the values of
+      # `ssh_personas.cowrie_env_vars`; a test fails if they drift). Key exchange, host keys
+      # and telnet are applied by the sitecustomize the init job puts in /cowrie/persona/patch.
+      - COWRIE_SSH_CIPHERS=aes128-ctr,aes192-ctr,aes256-ctr
+      - COWRIE_SSH_MACS=hmac-sha2-256,hmac-sha2-512,hmac-sha1
+      - COWRIE_SSH_COMPRESSION=none,zlib@openssh.com
+      - HONEYPOT_SSH_KEX=curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521
+      - HONEYPOT_SSH_HOSTKEYS=rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-ed25519
+      - HONEYPOT_TELNET_ISSUE=Ubuntu 22.04.3 LTS
+      - PYTHONPATH=/cowrie/persona/patch:/cowrie/cowrie-git/src
       # Egress off: Cowrie's emulated wget/curl/tftp/nc bind their outgoing socket
       # to this address, and loopback makes every connect to a real host fail.
       # Set COWRIE_OUT_ADDR=0.0.0.0 to let it download malware samples (then

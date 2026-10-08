@@ -424,8 +424,10 @@ def _rewrite_home(root: Node, *, user: str, family: str, rng: random.Random) -> 
         node[A_CTIME] = _BASE_CTIME + rng.randint(0, 20_000_000)
 
 
-def persona_tar(fs_pickle: bytes) -> bytes:
-    """A tar archive holding just `fs.pickle`, for `put_archive(PERSONA_DIR, …)`.
+def persona_tar(fs_pickle: bytes, sitecustomize: bytes | None = None) -> bytes:
+    """A tar archive for `put_archive(PERSONA_DIR, …)`: `fs.pickle`, and (when given)
+    `patch/sitecustomize.py`, which Python imports first inside the container because the
+    engine puts `PERSONA_DIR/patch` on `PYTHONPATH` (see `cowrie_sitecustomize`).
 
     It is extracted *into* the volume mounted at `PERSONA_DIR`: Docker checks the
     extraction path against the read-only root filesystem, so a path inside the
@@ -436,4 +438,13 @@ def persona_tar(fs_pickle: bytes) -> bytes:
         info.size = len(fs_pickle)
         info.mode = 0o644
         tar.addfile(info, io.BytesIO(fs_pickle))
+        if sitecustomize is not None:
+            directory = tarfile.TarInfo("patch")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            tar.addfile(directory)
+            patch = tarfile.TarInfo("patch/sitecustomize.py")
+            patch.size = len(sitecustomize)
+            patch.mode = 0o644
+            tar.addfile(patch, io.BytesIO(sitecustomize))
     return buf.getvalue()

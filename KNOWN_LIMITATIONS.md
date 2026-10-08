@@ -241,6 +241,17 @@ engines found defects that synthetic-byte unit tests had passed through, each no
   header's, else the one the connection arrived on).
 - **Redis** answered unknown commands in the Redis 5 wording and had no `CLIENT` command
   (redis-py 5 sends `CLIENT SETINFO` on every connection).
+- **Cowrie announced itself.** `nmap -sV` labelled the telnet port "Cowrie Honeypot telnetd"
+  (an `IAC DO NAWS` + `login:` opening has its own nmap rule), and `ssh-audit` reported an
+  OpenSSH 9.2 banner offering `3des-cbc`, `cast128-cbc`, `hmac-md5`, `diffie-hellman-group14-sha1`,
+  a bare `ssh-rsa` host key and `zlib`, none of which OpenSSH 9.2 sends. Telnet now opens like a
+  Linux telnetd (`DO TTYPE, TSPEED, XDISPLOC, NEW-ENVIRON`, the distro issue, `<host> login:`;
+  nmap reports `Linux telnetd`) and the SSH offer is narrowed to the persona's real defaults,
+  in its order (`engines/cowrie_sitecustomize.py`, mounted into the container). *Open:* the
+  offer is a strict subset, not a copy: Twisted has no `chacha20-poly1305`, AES-GCM, `-etm`
+  MACs, `sntrup761x25519` or the group-exchange/group16/group18 key exchanges, so a HASSH
+  server fingerprint still differs from a real OpenSSH's and `ssh-audit`'s version guess is a
+  range, not the banner's version.
 
 ## What is partially functional
 

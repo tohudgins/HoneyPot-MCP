@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.resources
 import io
 import ipaddress
 import json
@@ -40,6 +41,15 @@ log = logging.getLogger(__name__)
 _MAX_BASE_PICKLE_BYTES = 16 * 1024 * 1024
 
 
+def _sitecustomize_source() -> bytes:
+    """`cowrie_sitecustomize.py` as bytes, read through the package so it works from a wheel."""
+    return (
+        importlib.resources.files("honeypot_mcp.engines")
+        .joinpath("cowrie_sitecustomize.py")
+        .read_bytes()
+    )
+
+
 def _deliver_persona_fs(container: Any, persona: Any, hostname: str, seed: str) -> None:
     """Copy a persona-specific filesystem into a created (not yet started) container.
 
@@ -62,7 +72,7 @@ def _deliver_persona_fs(container: Any, persona: Any, hostname: str, seed: str) 
             raise ValueError("no usable filesystem pickle in the Cowrie image")
         base = extracted.read()
     built = build_persona_fs(base, persona, hostname, seed)
-    if not container.put_archive(PERSONA_DIR, persona_tar(built)):
+    if not container.put_archive(PERSONA_DIR, persona_tar(built, _sitecustomize_source())):
         raise RuntimeError("Docker refused the persona filesystem archive")
 
 
@@ -385,7 +395,9 @@ class SSHEngine(HoneypotEngine):
                 log.warning(
                     "Could not install the persona filesystem for SSH honeypot '%s' (%s). "
                     "Falling back to Cowrie's bundled one: its /etc and /home will not "
-                    "match the %s persona.",
+                    "match the %s persona, and the fingerprint hardening in "
+                    "cowrie_sitecustomize (SSH key-exchange/host-key offer, telnet opening) "
+                    "is not installed.",
                     name,
                     e,
                     persona.id,

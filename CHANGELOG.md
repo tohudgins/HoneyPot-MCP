@@ -52,6 +52,15 @@ identifiable, or could not be used at all, by these:
   default is a bare backdated `CN=<name>`. Persisted certificates that no longer match, or have
   under 30 days left, are reissued. Apache's 404 page no longer claims `Port 80` on every
   listener and no longer prints the Host header's port as part of the host name.
+- **Cowrie no longer announces itself to nmap and ssh-audit.** Sweeping the SSH/Telnet
+  honeypots found `nmap -sV` printing "Cowrie Honeypot telnetd" (a rule for the `IAC DO NAWS` +
+  `login:` opening) and an SSH offer (3des-cbc, cast128-cbc, hmac-md5, group14-sha1, bare
+  ssh-rsa, zlib) that contradicts the OpenSSH banner. A `sitecustomize` delivered into the
+  container with the persona filesystem narrows the offer to the persona's OpenSSH defaults and
+  makes telnet open like a Linux telnetd (`Linux telnetd` in nmap). Checked on the real image by
+  a Docker-gated test that reads the KEXINIT and the telnet opening. Also: the SMB honeytoken
+  test's poll raced the flusher on in-memory SQLite (~44% on Python 3.11) and multidict is bumped
+  for an advisory.
 
 ## A console behind the RDP login, and the last mail gaps
 

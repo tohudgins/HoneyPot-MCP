@@ -39,6 +39,13 @@ def main() -> int:
     OUT.write_bytes(built)
     OUT.chmod(0o644)
     print(f"wrote {OUT} ({len(built)} bytes) for persona={persona_id} hostname={hostname}")
+    # The container-side fingerprint hardening, imported first by Python via PYTHONPATH.
+    patch = OUT.parent / "patch" / "sitecustomize.py"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_bytes((SRC / "cowrie_sitecustomize.py").read_bytes())
+    patch.chmod(0o644)
+    patch.parent.chmod(0o755)
+    print(f"wrote {patch}")
     return 0
 
 

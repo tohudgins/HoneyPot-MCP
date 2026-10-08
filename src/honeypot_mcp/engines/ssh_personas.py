@@ -21,6 +21,7 @@ because mismatched fingerprint surfaces is itself a fingerprint.
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass
 
@@ -102,6 +103,36 @@ def pick_hostname(persona: SSHPersona) -> str:
     return secrets.choice(persona.hostname_pool)
 
 
+# What the persona's OpenSSH offers, narrowed to what Twisted conch implements, in OpenSSH's own
+# order. Twisted has no chacha20-poly1305, AES-GCM, `-etm` MACs or sntrup761, so the offer is a
+# strict *subset* of the real one: every name here is one OpenSSH 8.0-9.2 sends by default, and
+# nothing OpenSSH dropped (3des-cbc, cast128-cbc, hmac-md5, diffie-hellman-group14-sha1, a bare
+# ssh-rsa host key on 8.8+) is, which is what made `ssh-audit` contradict the banner.
+_CIPHERS = "aes128-ctr,aes192-ctr,aes256-ctr"
+_MACS = "hmac-sha2-256,hmac-sha2-512,hmac-sha1"
+_COMPRESSION = "none,zlib@openssh.com"
+_KEX = (
+    "curve25519-sha256,curve25519-sha256@libssh.org,"
+    "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521"
+)
+_HOSTKEYS_8_8_PLUS = "rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-ed25519"
+# Before 8.8 `ssh-rsa` (SHA-1) was still a default host-key algorithm.
+_HOSTKEYS_BEFORE_8_8 = "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ecdsa-sha2-nistp256,ssh-ed25519"
+
+
+def hostkey_algorithms(persona: SSHPersona) -> str:
+    """The host-key signature algorithms the persona's OpenSSH offers (comma list)."""
+    match = re.search(r"OpenSSH_(\d+)\.(\d+)", persona.ssh_version_string)
+    version = (int(match.group(1)), int(match.group(2))) if match else (9, 0)
+    return _HOSTKEYS_8_8_PLUS if version >= (8, 8) else _HOSTKEYS_BEFORE_8_8
+
+
+def telnet_issue(persona: SSHPersona) -> str:
+    """What a telnetd prints before `login:`: the release as `/etc/issue.net` words it, without
+    the parenthesised codename `os-release` adds ("Debian GNU/Linux 12", not "... (bookworm)")."""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", persona.distro_pretty_name)
+
+
 def cowrie_env_vars(
     persona: SSHPersona, hostname: str, *, allow_egress: bool = False
 ) -> dict[str, str]:
@@ -138,5 +169,17 @@ def cowrie_env_vars(
         # malware), so an attacker chooses what this container fetches. Cap the
         # size of what it will keep; the default is 10 MiB.
         "COWRIE_HONEYPOT_DOWNLOAD_LIMIT_SIZE": "2097152",
+        # Algorithm offer: ciphers, MACs and compression are `[ssh]` options; key exchange,
+        # host keys and the telnet opening are not, so `engines/cowrie_sitecustomize.py`
+        # (delivered into the container with the persona filesystem) reads the HONEYPOT_*
+        # variables below. PYTHONPATH replaces the image's, so it names that directory first
+        # and then the image's own `/cowrie/cowrie-git/src`.
+        "COWRIE_SSH_CIPHERS": _CIPHERS,
+        "COWRIE_SSH_MACS": _MACS,
+        "COWRIE_SSH_COMPRESSION": _COMPRESSION,
+        "HONEYPOT_SSH_KEX": _KEX,
+        "HONEYPOT_SSH_HOSTKEYS": hostkey_algorithms(persona),
+        "HONEYPOT_TELNET_ISSUE": telnet_issue(persona),
+        "PYTHONPATH": "/cowrie/persona/patch:/cowrie/cowrie-git/src",
         **({} if allow_egress else {"COWRIE_HONEYPOT_OUT_ADDR": "127.0.0.1"}),
     }

@@ -1468,6 +1468,21 @@ to reduce alert latency.
   `ssh.py` creates the container, extracts the rewritten pickle into an anonymous
   volume at `/cowrie/persona`, then starts it; failure falls back to Cowrie's default
   with a warning. The compose stack builds the same file in `cowrie-persona-init`.
+- **Cowrie's fingerprint is patched from inside the container.** nmap names a telnet
+  service that opens `IAC DO NAWS` + `login:` "Cowrie Honeypot telnetd", and Twisted's SSH
+  offer (3des-cbc, cast128-cbc, hmac-md5, group14-sha1, bare `ssh-rsa`) contradicts the
+  OpenSSH banner. `cowrie_env_vars` sets `COWRIE_SSH_CIPHERS/MACS/COMPRESSION` (real `[ssh]`
+  options) plus `HONEYPOT_SSH_KEX/HOSTKEYS/TELNET_ISSUE`, and `engines/cowrie_sitecustomize.py`
+  (a plain file, imported by Python as `sitecustomize` via `PYTHONPATH=/cowrie/persona/patch:
+  /cowrie/cowrie-git/src`, delivered by `persona_tar` with the persona filesystem) installs an
+  import hook that patches `cowrie.ssh.factory` (narrow the KEXINIT offer) and
+  `cowrie.telnet.userauth` (open with `DO TTYPE/TSPEED/XDISPLOC/NEW-ENVIRON`, then the issue
+  and `<host> login: `). The offer is a strict *subset* of the persona's real OpenSSH (Twisted
+  has no chacha20/GCM/`-etm`/sntrup). `PYTHONPATH` replaces the image's, so it must keep
+  `/cowrie/cowrie-git/src`. If the persona filesystem cannot be delivered the container falls
+  back without the patch and a warning says so. The compose values are literals pinned to
+  `cowrie_env_vars` by `test_compose_sensor_carries_the_same_algorithm_environment_as_the_engine`;
+  `tests/integration/test_cowrie_fingerprint.py` reads the wire of the real image.
 - **Transient DB errors are retried, permanent ones are not.** `EventBuffer._write_retrying`.
 - `tls_dir` / `reports_dir` are settings; tests redirect both to `tmp_path` (conftest).
 
