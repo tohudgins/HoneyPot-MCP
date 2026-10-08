@@ -186,7 +186,7 @@ async def test_real_cowrie_presents_the_personas_ssh_offer_and_a_linux_telnetds_
         assert opening.rstrip().endswith(b" login:")
     finally:
         for name in deployed:
-            await honeypot_stop(name=name)
+            await honeypot_stop(name=name, remove=True)
         await event_buffer.get_buffer().stop()
         await close_db()
         if previous_url is None:
