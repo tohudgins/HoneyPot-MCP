@@ -294,10 +294,18 @@ def render(spec: FirewallSpec) -> str:
         lines.append(f"\t\ttcp dport {admin} drop")
     else:
         lines.append(f"\t\ttcp dport {admin} accept")
-    if spec.tcp_ports:
-        lines.append(f"\t\ttcp dport {{ {_set_list(spec.tcp_ports)} }} accept")
-    if spec.udp_ports:
-        lines.append(f"\t\tudp dport {{ {_set_list(spec.udp_ports)} }} accept")
+    # A port an engine listens on only because a public port is redirected to it (80>8080) must be
+    # reachable through the redirect and not directly: accepted unconditionally, a scan of the whole
+    # port range finds 8080 open beside 80, and a real host never answers POP3 on both 110 and 1110.
+    # `ct status dnat` is set on redirected packets and never on a direct connection.
+    for proto, ports in (("tcp", spec.tcp_ports), ("udp", spec.udp_ports)):
+        targets = {r.to for r in spec.redirects if r.proto == proto}
+        direct = [p for p in ports if p not in targets]
+        redirected = [p for p in ports if p in targets]
+        if direct:
+            lines.append(f"\t\t{proto} dport {{ {_set_list(direct)} }} accept")
+        if redirected:
+            lines.append(f"\t\t{proto} dport {{ {_set_list(redirected)} }} ct status dnat accept")
     lines.append("\t}")
 
     if spec.redirects:

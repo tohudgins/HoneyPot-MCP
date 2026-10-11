@@ -159,13 +159,15 @@ def test_only_the_planned_ports_answer_even_though_other_services_are_listening(
     lab.load(_spec())
     answers = {port: lab.probe(port) for port in (*_LISTENING, 80, 110)}
     reachable = {port for port, ok in answers.items() if ok}
-    assert reachable == {8080, 3389, 1110, 2200, 80, 110}, answers
+    # 8080 and 1110 are listening too but exist only as the targets of 80 and 110: reachable through
+    # the redirect, not directly (a port scan must not find a second POP3 beside the first).
+    assert reachable == {3389, 2200, 80, 110}, answers
 
 
 @skip_docker
 def test_honeypot_ports_are_never_rate_limited_but_admin_ssh_is(lab):
     lab.load(_spec())
-    honeypot = sum(lab.probe(8080) for _ in range(25))
+    honeypot = sum(lab.probe(80) for _ in range(25))
     assert honeypot == 25, "an attacker must be able to hammer a honeypot port"
     admin = [lab.probe(2200) for _ in range(14)]
     assert sum(admin) >= 5, "a normal login must always get through"
@@ -176,10 +178,10 @@ def test_honeypot_ports_are_never_rate_limited_but_admin_ssh_is(lab):
 def test_an_admin_allow_list_locks_everyone_else_out_and_lets_the_operator_in(lab):
     lab.load(_spec(admin_allow=(f"{lab.attacker_ip}/32",)))
     assert lab.probe(2200), "the operator's address is allowed"
-    assert lab.probe(8080), "honeypot ports ignore the allow-list"
+    assert lab.probe(80), "honeypot ports ignore the allow-list"
     lab.load(_spec(admin_allow=("203.0.113.0/24",)))
     assert not lab.probe(2200), "everyone else is refused"
-    assert lab.probe(8080)
+    assert lab.probe(80)
 
 
 @skip_docker
@@ -218,4 +220,4 @@ def test_loading_is_repeatable_and_leaves_other_tables_alone(lab):
     assert "inet hp_fw" in tables and "inet someone_else" in tables
     assert tables.count("inet hp_fw") == 1
     # The ruleset is still correct after being loaded three times over.
-    assert lab.probe(8080) and not lab.probe(8000)
+    assert lab.probe(80) and not lab.probe(8000)

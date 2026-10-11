@@ -61,11 +61,30 @@ def test_input_is_default_drop_and_opens_only_the_admin_port_and_the_engine_port
     chain = _chain(text, "input")
     assert "policy drop" in chain
     accepted_ports = set(re.findall(r"tcp dport (\d+|\{[^}]*\}) accept", chain))
-    assert accepted_ports == {"2200", "{ 1110, 3389, 8080 }"}
+    assert accepted_ports == {"2200", "{ 3389 }"}
+    # 1110 and 8080 exist only because 110 and 80 are redirected to them
+    redirected = set(re.findall(r"tcp dport (\{[^}]*\}) ct status dnat accept", chain))
+    assert redirected == {"{ 1110, 8080 }"}
     # The control plane, metrics and the console are not listed anywhere in the ruleset.
     for port in ("8000", "9090", "8090", "8888", "2375", "22 "):
         assert not re.search(rf"dport[^\n]*\b{port.strip()}\b", chain), port
     assert "udp dport" not in chain, "no UDP honeypot, no UDP rule"
+
+
+def test_a_port_that_exists_only_as_a_redirect_target_is_not_reachable_directly():
+    """A scan of the whole port range against the live droplet found 8080, 1110, 1143, 1389, 2121,
+    4445 and 8873 open beside 80, 110, 143, ...: the post-redirect ports were accepted for any
+    packet. A real host does not answer POP3 on both 110 and 1110, so the decoy was fingerprintable
+    by a port scan alone. The redirect targets are accepted only for redirected packets."""
+    chain = _chain(render(_spec()), "input")
+    for target in ("1110", "8080"):
+        unconditional = re.findall(rf"tcp dport [^\n]*\b{target}\b[^\n]*accept", chain)
+        assert unconditional and all("ct status dnat" in line for line in unconditional), target
+    # A port that is public in its own right stays reachable without the redirect.
+    assert re.search(r"tcp dport \{ 3389 \} accept", chain)
+    # Same for UDP: SNMP's 161>1161
+    udp = _chain(render(_spec(udp_ports=(1161,), redirects=(Redirect(161, 1161, "udp"),))), "input")
+    assert "udp dport { 1161 } ct status dnat accept" in udp
 
 
 def test_privileged_public_ports_are_redirected_only_when_addressed_to_this_host():

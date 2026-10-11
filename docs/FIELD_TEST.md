@@ -83,7 +83,44 @@ these were invisible to the unit tests:
 The first two are why the test rig for the backup script now runs the real embedded script against a
 fake container filesystem instead of a stub that ignores it.
 
-Behaviours of the real services that the probes revealed, and that are not defects in recording:
+## Live checks that no script can replace
+
+Run these once from outside against your own VPS (all were run against the droplet above):
+
+- **Scan the whole port range and compare.** `nmap` without root does a slow connect scan (about
+  45 minutes for 65,535 ports); a short asyncio connect scanner with 1,500 concurrent connections
+  and a 1.5 s timeout covers it in about a minute. Expect exactly the public honeypot ports plus
+  the admin SSH port. The first run found **seven extra ports** (1110, 1143, 1389, 2121, 4445, 8080,
+  8873): the post-redirect ports were reachable directly, so a scan showed POP3 on both 110 and
+  1110. The firewall now accepts redirect targets only for redirected packets (`ct status dnat`),
+  proven against real nftables by `tests/integration/test_firewall_rules.py`. Re-render the
+  firewall and load it (`harden-host.sh finalize`) on a host built before this change.
+- **Fingerprint with a real scanner.** `nmap -sV --version-intensity 9` over the honeypot ports
+  identified every TCP engine as the product it imitates (ProFTPD, Dovecot, Asterisk, MySQL 8.0.36,
+  SQL Server 2019, Docker 24.0.7, Redis 7.0.5, MongoDB 5.0.14, ...). It also reports mixed
+  hostnames and a Windows plus Linux OS mix for one address; that is a coherence tell if the
+  estate mixes both families (see `deception_plan`'s coherence check).
+- **Threat-intel enrichment.** Put `VIRUSTOTAL_API_KEY`, `ABUSEIPDB_API_KEY` and the two GeoLite2
+  paths in the VPS `.env`, restart, then `enrich_ip` a real attacker: all three sources answered on
+  the first try.
+- **Webhook delivery and signatures.** Temporarily set `WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true`,
+  run a tiny receiver on the VPS, subscribe every format at `critical`, trigger criticals with
+  `field_test.py`, and compare: all eight formats delivered every event, and the JSON body's
+  `X-HoneyPot-Signature` matched an independent HMAC. Then **remove the setting and restart**; the
+  policy refusing a loopback destination again is the check that you did.
+- **Canary callbacks.** The callback server is loopback-only by design, so test it from the VPS:
+  `curl http://127.0.0.1:18888/t/<token-id>` flips the token to `triggered` with a CRITICAL alert
+  for both the plain and `.png` forms. An unknown id still answers 200, so a scanner cannot tell
+  real tokens from fake ones.
+- **Packet capture.** Needs the unit drop-in in `deploy/honeypot-mcp.service`; `pcap_extract` by
+  source address returned 1,157 packets of the field test, valid per `tcpdump -r`.
+- **Natural language.** Registered in Claude Code over the SSH tunnel, a viewer-scoped prompt
+  produced a correct analyst brief, and an operator-scoped prompt planned, deployed, self-tested
+  and tore down a two-sensor deception plus an AWS honeytoken, touching nothing it had not created.
+
+## Behaviours of real services that are not recording defects
+
+What the probes revealed about the services themselves:
 
 - **paramiko reports "Channel closed" for an SSH exec request** (`ssh host cmd`) against Cowrie,
   because Cowrie closes the channel before answering the request. The OpenSSH client gets the output
