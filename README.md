@@ -292,6 +292,7 @@ accept commands.
 
 Before exposing a VPS, run `scripts/preflight.sh` (see the go-live checklist in DEPLOY.md): it checks the control plane, bind addresses, disk, ports, backups, and probes every sensor end to end.
 To harden the host first (default-drop firewall, a validating Docker guard so the service never holds root-equivalent access, sandboxed units, key-only SSH, moved control ports), follow [docs/HARDENING.md](docs/HARDENING.md): the honeypots stay fully reachable, everything around them does not.
+After deploying, prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one, and `scripts/field_test_tools.py` exercises all 65 MCP tools at their roles ([docs/FIELD_TEST.md](docs/FIELD_TEST.md)). A quiet sensor on a real VPS is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
 
 **Internal tripwire.** Put honeypots on ports nothing legitimate uses. Anything on your
 LAN that connects is by definition not supposed to be — a compromised laptop sweeping

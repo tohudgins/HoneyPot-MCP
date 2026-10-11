@@ -4,6 +4,27 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Field test: proving a live deployment, and what it found
+
+Two scripts that run from a machine other than the VPS, documented in
+[docs/FIELD_TEST.md](docs/FIELD_TEST.md). `scripts/field_test.py` attacks every deployed engine
+through its public port with a real client (paramiko, redis-py, pymongo, pymysql, asyncpg, impacket,
+ldap3, httpx, kubectl, rsync) and checks the downloaded database for the expected event types from
+the attacker's address: 23 probe groups over 22 engines, all recorded. `scripts/field_test_tools.py`
+calls all 65 MCP tools at their proper roles (78 checks, including refusals across roles, a
+live-provisioned API key that is refused the moment it is revoked, and a honeytoken round trip: a
+planted credential used through a real SSH login raises a CRITICAL alert and marks the token
+triggered). It fails if a registered tool is neither called nor explicitly skipped.
+
+Run against a real DigitalOcean droplet it found, besides the three bugs in the entry below:
+`fetch_backup.sh --samples` reported "0 files" with a clean verdict while the Cowrie containers held
+32 downloads and 18 TTY recordings (it looked in `/cowrie/var/lib/cowrie`; the image keeps its state
+under `/cowrie/cowrie-git`; a missing directory is now a failure), and `http_active_recon`
+overwrote `http_credential_submit` once a session had made five requests, so a login attempt by a
+scanner that had crawled first was filed as recon. The backup test rig's fake `docker exec` ignored
+the script it was given, which is why the first could not fail a test; it now runs the real script
+against a fake container filesystem. New tests fail against the old code.
+
 ## Getting the data off the droplet: `scripts/fetch_backup.sh`
 
 A laptop-side script for the end of a run (and mid-run): it takes a consistent backup on the VPS,

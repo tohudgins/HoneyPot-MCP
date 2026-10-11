@@ -169,6 +169,48 @@ async def test_repeat_visits_escalate_severity(http_server):
 
 
 @pytest.mark.asyncio
+async def test_a_login_attempt_after_crawling_is_still_a_credential_submission(http_server):
+    """A scanner that maps the site first and then tries a login (the usual order, with a
+    cookie jar) crossed the recon threshold, and the escalation overwrote the event type: the
+    attempt was filed as `http_active_recon`, so "which credentials were tried" came up short.
+    Found by a field test with a real httpx client against a live droplet."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+
+    port = http_server
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        async with httpx.AsyncClient() as client:
+            for i in range(7):
+                await client.get(f"http://127.0.0.1:{port}/path-{i}")
+            await client.post(
+                f"http://127.0.0.1:{port}/admin/login",
+                data={"username": "admin", "password": "hunter2"},
+            )
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+
+    async with get_session() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(Alert).where(Alert.event_type == "http_credential_submit")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].payload["post_data"]["username"] == "admin"
+    assert rows[0].payload["session_hits"] > 5, "the attempt came after the recon threshold"
+
+
+@pytest.mark.asyncio
 async def test_https_serves_over_tls(https_server):
     """TLS-enabled honeypot accepts an HTTPS connection. We disable cert
     verification because the cert is self-signed — a real attacker won't

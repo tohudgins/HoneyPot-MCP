@@ -253,6 +253,15 @@ engines found defects that synthetic-byte unit tests had passed through, each no
   server fingerprint still differs from a real OpenSSH's and `ssh-audit`'s version guess is a
   range, not the banner's version.
 
+**Session fidelity gaps seen with real clients (field test, 2026-10).** All of these record the
+attack completely; they are places where the session does not look like the real service to a
+client that goes further. The rsync honeypot returns the module list and records the anonymous
+access and the file request, but a real `rsync` client then times out waiting for a file list.
+Cowrie's emulated `head` rejects `head -2` (`-n 2` works), where a real `head` accepts both. A
+paramiko client reports "Channel closed" for an SSH exec request (`ssh host cmd`) because Cowrie
+closes the channel before answering it; OpenSSH's client gets the output and exit status, and the
+command is recorded either way. See [docs/FIELD_TEST.md](docs/FIELD_TEST.md).
+
 ## What is partially functional
 
 **Credential tokens.** The match-and-escalate pipeline (see above) fires when

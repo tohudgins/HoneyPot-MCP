@@ -951,11 +951,15 @@ class HTTPEngine(HoneypotEngine):
             event_type = "http_credential_submit" if post_data else "http_probe"
 
             # Active-recon escalation: a session with many hits indicates the
-            # scanner is mapping the site, not a one-shot probe.
+            # scanner is mapping the site, not a one-shot probe. Only a plain
+            # probe is relabelled: a credential submission stays one, because a
+            # scanner that crawled first and then tried a login is still trying
+            # a login, and "credentials tried" is the question an analyst asks.
             sid, sess, is_new = _get_or_create_session(request)
             if sess["hits"] >= _RECON_THRESHOLD and severity == AlertSeverity.LOW:
                 severity = AlertSeverity.MEDIUM
-                event_type = "http_active_recon"
+                if event_type == "http_probe":
+                    event_type = "http_active_recon"
 
             # Recon-path interception: serve plausible bait instead of the
             # usual template/404 fallback. Severity escalates to MEDIUM because
