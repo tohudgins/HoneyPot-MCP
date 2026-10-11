@@ -474,6 +474,17 @@ prevent.
 
 ## Operational notes
 
+- **Host hardening reduces risk and does not remove it** (`docs/HARDENING.md`, "Residual risks").
+  Cowrie shares the host's kernel, so a kernel or container-runtime exploit from inside a container
+  escapes; the in-process engines share a process with the control plane, so a code-execution bug in
+  an engine yields the control plane (its sandbox bounds what that process can do, not whether it can
+  be taken); HTTPS egress from the service is open for webhooks and threat intel. The container-egress
+  rules on Docker's own bridges were verified by hand on a real `dockerd` (and by the firewall text
+  tests), not by an automated test, because they need a Docker daemon whose bridges this suite does
+  not control. The Docker guard checks the structure of a create request, not what runs inside the
+  image, so it assumes the pinned Cowrie image is what it claims. SMTP and DNS honeypots look like an
+  open relay/resolver to an automated check and several cloud acceptable-use policies prohibit those:
+  leave them out of a first run on a cloud provider.
 - **One server owns the sensors.** A second server process on the same database starts
   read-only (queries, triage, reports work; deploy/stop/pause/clone/configure/pcap_control
   refuse) and **takes over by itself when the owner exits**, re-establishing the sensors

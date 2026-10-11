@@ -61,36 +61,35 @@ Pick any provider. The cheapest tier is fine — 1 vCPU, 1 GB RAM, 25 GB disk.
 
 Pick **Ubuntu 22.04 LTS** as the OS. Note the public IPv4 address.
 
-### 2. First SSH — and move the admin port off 22
+### 2. First SSH — create your admin user, then harden (the script moves the port)
 
 ```bash
 ssh root@<your-ip>
 ```
 
-The first thing you do, before *anything* else: move the admin SSH to a
-non-default port so the honeypot can bind 22 later.
+Create a non-root admin account with your **deploy-only** public key. Root login and password
+login are about to be disabled, so do this first and keep the provider's web console open as a
+safety net:
 
 ```bash
-# Edit the SSH server config
-sed -i 's/^#\?Port .*/Port 2200/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-
-# Make sure your public key is in place BEFORE restart, or you lock yourself out
-# (If the provider's web console option exists, keep that tab open as a safety net)
-cat ~/.ssh/authorized_keys  # confirm your key is here
-
-systemctl restart ssh
+adduser --disabled-password --gecos "" deploy
+usermod -aG sudo deploy
+echo "deploy ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/deploy && chmod 440 /etc/sudoers.d/deploy
+install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+echo "<your deploy-only public key>" > /home/deploy/.ssh/authorized_keys
+chown deploy:deploy /home/deploy/.ssh/authorized_keys && chmod 600 /home/deploy/.ssh/authorized_keys
 ```
 
-From your laptop, re-connect on the new port to confirm:
+From your laptop, confirm the key works **before** going on:
 
 ```bash
-ssh -p 2200 root@<your-ip>
+ssh -i ~/.ssh/honeypot_deploy deploy@<your-ip>      # logged in as deploy: good
 ```
 
-If this works, you have a safe management channel. If not, use the
-provider's web console to debug — do NOT close your current SSH session
-until you've confirmed.
+Moving sshd off port 22 and turning off root/password login is done by
+`deploy/harden-host.sh` in step 5, in two phases so you cannot lock yourself out: first sshd
+listens on 22 *and* 2200 until you have logged in on 2200, then it moves to 2200 only. Do not
+edit `sshd_config` by hand.
 
 ### 3. Install Docker + clone the repo (5 min)
 
@@ -98,14 +97,13 @@ until you've confirmed.
 # Docker — the SSH/Cowrie engine manages honeypot containers through it
 curl -fsSL https://get.docker.com | sh
 
-# Python + uv to run the MCP server
-apt update && apt install -y python3-pip python3-venv git
+# uv to build the Python environment (step 5 builds it)
+apt update && apt install -y git
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 
 git clone https://github.com/tohudgins/HoneyPot-MCP.git /opt/honeypot-mcp
 cd /opt/honeypot-mcp
-uv sync --extra dev
 ```
 
 > **Architecture — read this once.** The MCP server is the *control plane*:
@@ -119,6 +117,10 @@ uv sync --extra dev
 > it over stdio per chat — fine for testing, wrong for 24/7 collection.)
 
 ### 4. Configure (2 min)
+
+> **On the VPS, skip to step 5**: it installs `deploy/env.production.example`, the hardened
+> profile (loopback binds, moved ports, three role tokens, console off). What follows explains
+> every setting, for a laptop or for changing the profile.
 
 ```bash
 cp .env.example .env
@@ -164,7 +166,9 @@ DATABASE_URL=sqlite+aiosqlite:///./data/honeypot_mcp.db
 #   > revoke alice's API key          (api_key_revoke, takes effect in ~30s)
 #   > list active API keys            (api_key_list)
 
-# REQUIRED for canary tokens to fire from the internet
+# Canary tokens that call back over the internet need the callback server reachable. The
+# production profile binds it to loopback (a first run uses no URL canaries); to use them set
+# CANARY_CALLBACK_HOST=0.0.0.0, open its port in the firewall, and:
 CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
 
 # RECOMMENDED — sign up for the free tiers, paste real keys here. Leave them
@@ -185,133 +189,142 @@ highest-signal pivot for spotting hosting/VPN/botnet networks). Place both
 under `config/`. Each is independently optional; a missing one just leaves its
 fields out. MaxMind's license forbids redistribution, so neither is in the repo.
 
-> **Secure the control-plane port.** `MCP_PORT` (8000) can deploy honeypots and
-> read all captured data. It's bearer-token authenticated (`MCP_AUTH_TOKEN`,
-> required — the daemon refuses to start without it), but treat the token as
-> defence-in-depth, not the only layer: keep `MCP_HOST=127.0.0.1` and reach it
-> over an SSH tunnel (step 7). If several people need it, put a TLS reverse
-> proxy (Caddy/nginx) in front on 443 rather than binding 8000 to `0.0.0.0` —
-> the token travels in clear text over plain HTTP.
+> **Secure the control-plane port.** `MCP_PORT` can deploy honeypots and
+> read all captured data. It's bearer-token authenticated (`MCP_AUTH_TOKEN` or
+> `MCP_AUTH_TOKENS` — the daemon refuses to start without one), but treat the token as
+> defence-in-depth, not the only layer: keep `MCP_HOST=127.0.0.1`, let the firewall make the
+> port unreachable from outside, and reach it over an SSH tunnel (step 7). The production
+> profile also moves it off 8000 (to 18443); that only keeps a stray `localhost:8000` from
+> being this server, the protection is the loopback bind, the firewall and the tokens. If
+> several people need it, put a TLS reverse proxy (Caddy/nginx) in front on 443 rather than
+> binding it to `0.0.0.0` — the token travels in clear text over plain HTTP.
 
-### 5. Run the server as a persistent daemon (2 min)
+### 5. Run the server as a persistent daemon (5 min)
 
-Install the bundled systemd unit so the control plane runs 24/7 and survives
-reboots and crashes (the startup `reconcile` step re-establishes running
-honeypots automatically):
+Everything in this step and the next is scripted and explained in
+[HARDENING.md](HARDENING.md); this is the short version. The service runs as its own
+unprivileged user, in a systemd sandbox, **not** in the `docker` group (it reaches Docker only
+through a validating guard process), and it listens only on loopback.
 
 ```bash
-# Dedicated non-login user
-sudo useradd --system --home /opt/honeypot-mcp --shell /usr/sbin/nologin honeypot
-# Docker access for the SSH/Cowrie engine — see the tradeoff below before running
-sudo usermod -aG docker honeypot
+cd /opt/honeypot-mcp
 
-# Build the venv from the lock (the unit runs .venv/bin/honeypot-mcp directly)
-cd /opt/honeypot-mcp && sudo uv sync --frozen --no-dev
+# 1. Build the venv with an interpreter the service user can execute. A plain `uv sync` as root
+#    puts Python under /root/.local/share/uv/python, which the service cannot reach (the unit
+#    dies with "Permission denied").
+sudo rm -rf .venv
+sudo UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12
 
-# Code, .venv and .env stay root-owned and read-only to the service; only the
-# data directories are writable (the unit's ReadWritePaths= lists exactly these).
+# 2. Users, sshd (listening on 22 AND 2200 for now), kernel hardening, Docker daemon settings,
+#    unattended security updates, and the systemd units. Touches no firewall rule.
+sudo deploy/harden-host.sh prepare --admin-user deploy
+#    -> from a NEW terminal confirm:  ssh -p 2200 deploy@<vps-ip>
+
+# 3. Production configuration: three role tokens, everything on loopback, moved ports.
+sudo install -m 0640 -o root -g honeypot deploy/env.production.example .env
+sudo $EDITOR .env          # replace the three CHANGE_ME_* tokens (openssl rand -hex 32 each)
 sudo chown -R root:root /opt/honeypot-mcp
-sudo mkdir -p /opt/honeypot-mcp/{data,reports,tls,pcap}
-sudo chown honeypot:honeypot /opt/honeypot-mcp/{data,reports,tls,pcap}
-sudo chmod 0700 /opt/honeypot-mcp/{data,reports,tls,pcap}
-sudo chown root:honeypot /opt/honeypot-mcp/.env && sudo chmod 0640 /opt/honeypot-mcp/.env
+sudo install -d -m 0700 -o honeypot -g honeypot data reports tls pcap
+sudo chown root:honeypot .env && sudo chmod 0640 .env
 
-sudo cp deploy/honeypot-mcp.service /etc/systemd/system/
-sudo systemctl daemon-reload
+# 4. Start it. The Docker guard starts first (the unit requires it).
 sudo systemctl enable --now honeypot-mcp
-sudo systemctl status honeypot-mcp        # should be active (running)
-journalctl -u honeypot-mcp -f             # live logs
+sudo systemctl status honeypot-mcp honeypot-docker-guard   # both active (running)
+journalctl -u honeypot-mcp -f                              # live logs
 ```
 
-The unit is sandboxed (`ProtectSystem=strict`, no capabilities, `MemoryMax=1G`,
-`TasksMax=512`, `LimitNOFILE=65536`, IP/Unix/netlink sockets only). Tune
-`MemoryMax` to the machine. Packet capture (`PCAP_ENABLED=true`) needs the
-`CAP_NET_RAW`/`CAP_NET_ADMIN` + `AF_PACKET` drop-in documented at the bottom of
-the unit file. Honeypot ports below 1024 (22, 80, …) are not bound directly —
-the unit has no `CAP_NET_BIND_SERVICE`; deploy on a high port and redirect
-(`iptables -t nat -A PREROUTING -p tcp --dport 22 -j REDIRECT --to-port 2222`),
-or add `CAP_NET_BIND_SERVICE` to both capability lines in a drop-in.
+The unit is sandboxed (`ProtectSystem=strict`, no capabilities, a syscall deny-list,
+`ProtectProc=invisible`, `MemoryMax=1G`, `TasksMax=512`, IP/Unix/netlink sockets only;
+`systemd-analyze security` scores it 1.4 and the guard 0.6). Tune `MemoryMax` to the machine.
+Packet capture (`PCAP_ENABLED=true`) needs the `CAP_NET_RAW`/`CAP_NET_ADMIN` + `AF_PACKET`
+drop-in documented at the bottom of the unit file. Honeypot ports below 1024 (80, 110, ...) are
+not bound directly (the unit has no `CAP_NET_BIND_SERVICE`): deploy the engine on a high port
+and let the firewall redirect (`80>8080`, step 6). The SSH/Telnet honeypots are Docker
+containers whose published ports (22, 23) Docker forwards itself.
 
-> **The `docker` group is root-equivalent.** Anyone who can talk to the Docker
-> socket can start a privileged container that mounts `/`. The daemon parses
-> attacker payloads all day, so a bug that reaches Docker calls is root on the
-> host — the systemd sandbox does not change that. If you don't need SSH/Telnet
-> (Cowrie) honeypots, skip the `usermod` and drop `docker.service` from the
-> unit's `Requires=`. A socket proxy (`tecnativa/docker-socket-proxy`, as in
-> `docker/docker-compose.yml`) restricts API *endpoints* but not request bodies,
-> so it narrows the exposure rather than removing it. Use a dedicated host.
+> **Why the guard.** Membership in the `docker` group is root-equivalent: anyone who can talk
+> to the daemon can start a privileged container that mounts `/`. This service parses
+> attacker-controlled bytes all day, so a bug in it must not reach that. The guard
+> (`honeypot-docker-guard.service`, `hardening/docker_guard.py`) forwards only the Cowrie
+> container operations the SSH engine makes, from the pinned image with the engine's own
+> security settings, and refuses everything else with 403: no privileged containers, no host
+> mounts, no exec, no other images. See HARDENING.md.
 
-The daemon serves the MCP endpoint at `http://127.0.0.1:8000/mcp`, plus the
-canary callback (`:8888`) and Prometheus `/metrics` (`127.0.0.1:9090`).
+The daemon serves the MCP endpoint at `http://127.0.0.1:18443/mcp` and Prometheus `/metrics` on
+`127.0.0.1:19090`; the console is disabled and the canary callback server is loopback-only.
 
-### 6. Open the firewall (1 min)
+### 6. Load the firewall (3 min)
 
-Open **only the honeypot ports and the canary callback** — never the MCP
-control port (8000) or metrics (9090). You choose which honeypots to run in
-step 8; open the ports you plan to use:
-
-- 22 (SSH honeypot — biggest traffic generator)
-- 23 (Telnet — optional, Mirai-class volume)
-- 80, 443 (HTTP/HTTPS honeypot)
-- 3389 (RDP — second-biggest after SSH)
-- 21 (FTP), 2525 (SMTP) — optional
-- 8888 (canary callbacks)
-- **2200** (your admin SSH, moved earlier)
-- UDP 53 (DNS honeypot) — optional
+Open **only the honeypot ports and your admin SSH port**. Nothing else is reachable: not the
+control plane, not metrics, not a service somebody installs later. The honeypot ports are open
+to the whole internet with no rate limit, geo-block or ban: they exist to be attacked. The
+admin SSH port is rate-limited per source and can be restricted to your own address.
 
 ```bash
-ufw allow 2200/tcp comment 'admin SSH'
-ufw allow 22/tcp 23/tcp 80/tcp 443/tcp 3389/tcp 21/tcp 2525/tcp 8888/tcp
-ufw allow 53/udp
-ufw --force enable
-# NB: 8000 (MCP control) and 9090 (metrics) are deliberately NOT opened.
+# Moves sshd to 2200 ONLY (port 22 becomes the SSH honeypot), loads the nftables firewall, and
+# arms a rollback timer: if you cannot log in afterwards, do nothing and it removes itself.
+sudo deploy/harden-host.sh finalize --admin-user deploy --confirm-admin-port-tested \
+    --ports "80>8080,3389,110>1110" --docker-ports 22,23
+#    -> from a NEW terminal confirm you can still log in:  ssh -p 2200 deploy@<vps-ip>
+sudo deploy/harden-host.sh confirm      # persists the firewall and the guard across reboots
 ```
 
-> **ufw does not protect Docker-published ports.** Docker inserts its own
-> iptables rules ahead of ufw's, so a container port published as
-> `-p 3000:3000` is reachable from the internet even with ufw denying it. That
-> is why every non-honeypot port in this repo's compose files is published on
-> `127.0.0.1` only (Grafana, Prometheus, metrics, console). Keep it that way;
-> to filter Docker traffic use the `DOCKER-USER` chain, not ufw.
+`--ports "80>8080,3389,110>1110"` means: the world connects to 80 and the HTTP engine listens
+on 8080; RDP listens on 3389; POP3 is reached on 110 and listens on 1110. Deploy each engine on
+its *listening* port in step 8 (HTTP on 8080, POP3 on 1110). Add `--admin-allow <your-ip>/32`
+to let only your own address reach admin SSH, and `--egress limited --dns <resolver>` to let
+Cowrie fetch malware samples (see HARDENING.md, "Malware sample capture").
+
+> **ufw does not protect Docker-published ports**, which is one reason this uses nftables
+> directly: Docker's published ports are forwarded, not input, so the firewall's `forward`
+> chain is where a container's outbound connections are refused (a hijacked Cowrie cannot scan,
+> relay or reach the cloud metadata service).
 
 ### 7. Connect your MCP client over an SSH tunnel (2 min)
 
 From your laptop, tunnel the control port so you can drive the daemon without
-exposing it to the internet:
+exposing it to the internet. Use a key that exists only for this host:
 
 ```bash
-ssh -p 2200 -N -L 8000:127.0.0.1:8000 honeypot@<vps-ip> &
+ssh -i ~/.ssh/honeypot_deploy -p 2200 -N -L 18443:127.0.0.1:18443 deploy@<vps-ip> &
 ```
 
 Then register the daemon with Claude Code as a networked MCP server, passing
-the bearer token you set in `MCP_AUTH_TOKEN`:
+a bearer token. **Use the `viewer` token for reading** and `operator` only while you deploy:
 
 ```bash
-claude mcp add --transport http honeypot-mcp http://127.0.0.1:8000/mcp \
-  --header "Authorization: Bearer <your-MCP_AUTH_TOKEN>"
+claude mcp add --transport http honeypot-mcp http://127.0.0.1:18443/mcp \
+  --header "Authorization: Bearer <your-viewer-or-operator-token>"
 ```
 
 (Claude Desktop: add an `mcpServers` entry with `"url":
-"http://127.0.0.1:8000/mcp"` and a `"headers": {"Authorization": "Bearer
-<token>"}` — a URL, not a spawn command.) Without the token the server answers
+"http://127.0.0.1:18443/mcp"` and a `"headers": {"Authorization": "Bearer
+<token>"}` — a URL, not a spawn command.) Without a valid token the server answers
 `401`. Every deploy you make now lands in the daemon on the VPS and keeps
-running after you disconnect.
+running after you disconnect. A `viewer` session cannot even see the deploy tools. The tunnel
+allows 6 new SSH connections a minute from one address; one long-lived tunnel is one connection.
 
 ### 8. Deploy honeypots and wire an alert channel (2 min)
 
-In a chat with the connected client:
+Connect with the `operator` token for this step. In a chat with the connected client, deploy on
+the ports the engines **listen** on (the firewall maps the public ports to them, step 6):
 
 ```
-> Deploy an SSH honeypot on port 22.
-> Deploy an HTTP honeypot on port 80.
+> Deploy an SSH honeypot on port 22.            (Cowrie in Docker; Docker publishes 22)
+> Deploy an HTTP honeypot on port 8080.         (the world reaches it on 80)
 > Deploy an RDP honeypot on port 3389.
+> Deploy a POP3 honeypot on port 1110.          (the world reaches it on 110)
 > alert_subscribe url=https://hooks.slack.com/services/... severity_threshold=high
 > honeypot_self_test <name>      # confirm the pipeline end-to-end
 ```
 
 `honeypot_self_test` sends a synthetic probe and confirms it lands as an alert
 within ~1s (`alert_received: True`). Because the daemon is persistent, these
-honeypots keep collecting after your chat and your SSH tunnel close.
+honeypots keep collecting after your chat and your SSH tunnel close. Leave the SMTP and DNS
+honeypots out of a first run on a cloud provider: to an automated relay or resolver check they
+look like an open relay / open resolver, which several providers' acceptable-use policies
+prohibit (nothing is ever relayed or resolved, but the check cannot tell). When you are done
+deploying, switch the client to the `viewer` token.
 
 ### 9. (Optional) Bring up the Grafana dashboards
 
@@ -364,22 +377,36 @@ Run the checks before you open the firewall to the world. They take seconds and 
 mistakes that are cheap now and expensive once traffic arrives:
 
 ```bash
+# harden-host.sh finalize prints this command with the right ports for your layout.
 scripts/preflight.sh \
-  --ports 22,80,3389,25,110,143 \
-  --metrics-url http://127.0.0.1:9090 \
-  --mcp-url http://127.0.0.1:8000/mcp --token "$OPERATOR_TOKEN" \
+  --ports 80,3389,110,22 --listen-ports 1110,3389,8080,22 --admin-port 2200 \
+  --metrics-url http://127.0.0.1:19090 \
+  --mcp-url http://127.0.0.1:18443/mcp --token "$OPERATOR_TOKEN" \
   --backup-dir /var/backups/honeypot
 ```
 
-It checks the control plane (a token, and a strong one), that the console and metrics are
-bound to loopback, `.env` permissions, a persistent database, free disk against
-`MIN_FREE_DISK_MB` (plus the packet-capture ring), Docker, that every port you plan to use
-is free, and that the port you are SSH'd in on is not one a honeypot is about to take (the
-lock-out). Against the running server it asks `/readyz`, confirms this process owns the
-sensors, that each sensor answers, that a synthetic probe to **each** sensor becomes an alert
-(`honeypot_self_test`), and that someone is subscribed to alerts. It exits non-zero on any
-failure, so it can gate a script; `--strict` also fails on warnings. The self-test leaves a
-clearly marked probe alert behind, so run it before go-live (or pass `--no-self-test`).
+Run it as root on the VPS: the host checks read the firewall and the effective sshd
+configuration, and probe the Docker guard as the service user. It checks the control plane (a
+token, and a strong one), that the console and metrics are bound to loopback, `.env`
+permissions, a persistent database, free disk against `MIN_FREE_DISK_MB` (plus the
+packet-capture ring), Docker, that every port you plan to use is free, and that the port you
+are SSH'd in on is not one a honeypot is about to take (the lock-out). **On the host** it also
+checks that nothing listens on a public address except the ports you named (`--listen-ports`
+is what the engines bind after the firewall's redirects; `--ports` is what the world
+connects to), that the nftables firewall is loaded with a default-drop input chain, that the
+service is not in the `docker` group and its Docker socket is the guard (which refuses a
+daemon-wide call), that sshd is key-only and allow-listed, that the kernel hardening applied,
+and that security updates are on. Against the running server it asks `/readyz`, confirms this
+process owns the sensors, that each sensor answers, that a synthetic probe to **each** sensor
+becomes an alert (`honeypot_self_test`), and that someone is subscribed to alerts. It exits
+non-zero on any failure, so it can gate a script; `--strict` also fails on warnings. The
+self-test leaves a clearly marked probe alert behind, so run it before go-live (or pass
+`--no-self-test`).
+
+Two things it will tell you that are not bugs: a port you have *already* deployed a honeypot
+on shows as "in use" (the port check is for before you deploy; the "public listeners" check is
+the one that covers the deployed state), and `--no-host-checks` skips the Linux checks when you
+run it from a laptop.
 
 **A sensible first estate** is small, so a surprise is easy to attribute: SSH (Cowrie), HTTP,
 RDP, SMTP and POP3. `deception_plan` describes the rest.
@@ -516,13 +543,16 @@ non-fatal).
 | Cowrie not catching anything but port is open | Cowrie image not pulled, or the container died | `docker logs honeypot-<name>` (the SSH engine names containers `honeypot-<honeypot-name>`); `honeypot_health <name>` |
 | Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on consumer side | `alert_subscriptions_list` shows `last_error` |
 | Out of disk space | Alert payloads accumulating | Run `alerts_prune` more aggressively, or set up a cron job |
-| Host SSH down (locked out) | You forgot to move admin SSH off 22 before starting the honeypot | Use provider web console; edit `/etc/ssh/sshd_config`; restart sshd |
-| Client can't connect / tools don't appear | Daemon not running, tunnel down, or wrong/missing bearer token (401) | `systemctl status honeypot-mcp`; re-open `ssh -L 8000:127.0.0.1:8000 …`; confirm the `Authorization: Bearer` header matches `MCP_AUTH_TOKEN` in `.env` |
+| Host SSH down (locked out) | The admin port was changed by hand, or the firewall blocks you | Use the provider web console; `deploy/harden-host.sh` never changes both at once (see step 2) |
+| Client can't connect / tools don't appear | Daemon not running, tunnel down, or wrong/missing bearer token (401) | `systemctl status honeypot-mcp`; re-open `ssh -p 2200 -L 18443:127.0.0.1:18443 …`; confirm the `Authorization: Bearer` header matches a token in `MCP_AUTH_TOKENS`. A `viewer` token cannot see the deploy tools |
 | Daemon exits immediately on start with an auth message | `MCP_TRANSPORT=http` but `MCP_AUTH_TOKEN` is unset (fail-closed) | Set `MCP_AUTH_TOKEN` (`openssl rand -hex 32`), or `MCP_ALLOW_UNAUTHENTICATED=true` if you front it with your own auth |
-| SSH honeypots won't deploy | Daemon's user isn't in the `docker` group | `sudo usermod -aG docker honeypot` then `systemctl restart honeypot-mcp` |
+| SSH honeypots won't deploy (`403 ... honeypot docker guard`) | The Docker guard refused the request, or is not running. The service is deliberately **not** in the `docker` group; do not add it | `systemctl status honeypot-docker-guard`; `journalctl -u honeypot-docker-guard -n 30` names the refused rule |
 | Daemon won't start / crashes on boot | Config or DB error | `journalctl -u honeypot-mcp -e` — the last lines show the traceback |
 | Honeypots vanished after a reboot | Expected — they're re-established on daemon start | `reconcile` runs on startup; confirm with `honeypot_list`. If any show ERROR, check `journalctl` |
-| Need to read Prometheus metrics from another host | Port 9090 is bound locally for security | SSH-tunnel it: `ssh -L 9090:127.0.0.1:9090 honeypot@<vps>` |
+| Need to read Prometheus metrics from another host | Metrics are bound to loopback (19090) for security | SSH-tunnel it: `ssh -p 2200 -L 19090:127.0.0.1:19090 deploy@<vps>` |
+| Service dies with `status=203/EXEC ... Permission denied` | The venv's Python is under `/root/.local/share/uv/python`, which the service user cannot execute | `rm -rf .venv && UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12` (`harden-host.sh prepare` checks this) |
+| `finalize` says sshd is not listening on 2200 | sshd re-binds a moment after the reload, or the new config was rejected | It waits and, if sshd never comes up, restores port 22 for you. Check `journalctl -u ssh` and `sshd -t` |
+| Locked out after `finalize` | The firewall rules block your address | Do nothing: the rollback timer removes the firewall after `--rollback-seconds`. Or use the provider console and `nft delete table inet hp_fw` |
 
 ---
 
@@ -573,7 +603,7 @@ data-loss one, and `honeypot_event_queue_depth` in `/metrics` shows the trend.
 recording is worse than one that is obviously down.
 
 ```bash
-curl -s localhost:9090/readyz | jq
+curl -s localhost:19090/readyz | jq     # 9090 outside the production profile
 ```
 
 The compose stack already wires the container healthcheck to `/readyz`.
@@ -617,9 +647,10 @@ Migrations run automatically at startup, so the procedure is:
 
 ```bash
 ./scripts/backup.sh /var/backups/honeypot   # 1. always, before anything
-git pull && uv sync --extra dev             # 2. update
-docker compose -f docker/docker-compose.yml up -d --build   # 3. restart
-curl -s localhost:9090/readyz               # 4. confirm it came back collecting
+git pull                                    # 2. update (then rebuild the venv with the
+sudo UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12   # shared interpreter)
+sudo systemctl restart honeypot-docker-guard honeypot-mcp   # 3. restart (compose stack: docker compose up -d --build)
+curl -s localhost:19090/readyz              # 4. confirm it came back collecting (9090 outside the production profile)
 ```
 
 Step 4 matters: a failed migration falls back to `create_all()` so the server

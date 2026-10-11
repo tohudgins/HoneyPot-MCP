@@ -171,18 +171,42 @@ def check_bind_addresses(s: Settings) -> list[Check]:
 
 def check_env_permissions(path: Path | None = None) -> Check:
     """The `.env` the server itself reads (beside the code), not whichever one is in the
-    directory this happens to be run from."""
+    directory this happens to be run from.
+
+    The documented production layout is `root:honeypot 0640`: the service reads it through its
+    own group and nobody else can. So the group is allowed read access *when it is a dedicated
+    group* (a user's private group, or `honeypot`); anything readable or writable by "other"
+    fails, and so does a group that can write the file.
+    """
     env = path or (_PROJECT_ROOT / ".env")
     if not env.exists():
         return Check(".env permissions", SKIP, f"no .env file at {env}")
-    mode = stat.S_IMODE(env.stat().st_mode)
-    if mode & 0o077:
+    info = env.stat()
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o007 or mode & 0o020:
         return Check(
             ".env permissions",
             FAIL,
             f"mode {mode:o}: other local accounts can read the control-plane token",
-            f"chmod 600 {env}",
+            f"chmod 640 {env} (root:honeypot) or 600",
         )
+    if mode & 0o040:
+        try:
+            import grp
+
+            group = grp.getgrgid(info.st_gid)
+            members = [m for m in group.gr_mem if m != group.gr_name]
+            name = group.gr_name
+        except (ImportError, KeyError):
+            name, members = str(info.st_gid), []
+        dedicated = name == "honeypot" or (not members and info.st_gid >= 100)
+        if not dedicated:
+            return Check(
+                ".env permissions",
+                FAIL,
+                f"mode {mode:o} with group {name!r}: that group's members can read the token",
+                f"chgrp honeypot {env} && chmod 640 {env}, or chmod 600",
+            )
     return Check(".env permissions", PASS, f"mode {mode:o}")
 
 
@@ -596,10 +620,16 @@ def _admin_port() -> int | None:
 async def run(args: argparse.Namespace) -> list[Check]:
     s = get_settings()
     ports = args.ports or []
+    admin_port = args.admin_port or _admin_port()
     checks = static_checks(
-        s, ports=ports, admin_port=_admin_port(),
+        s, ports=ports, admin_port=admin_port,
         backup_dir=Path(args.backup_dir) if args.backup_dir else None,
     )  # fmt: skip
+    if not args.no_host_checks:
+        from honeypot_mcp.hardening.hostcheck import host_checks
+
+        listening = args.listen_ports or ports
+        checks.extend(host_checks(listening, admin_port, [p for p, _ in (*ports, *listening)]))
     if args.metrics_url:
         checks.append(await check_readiness(args.metrics_url))
     if args.mcp_url:
@@ -623,6 +653,20 @@ def main(argv: list[str] | None = None) -> int:
         "--ports",
         type=_ports,
         help="honeypot ports you plan to use, e.g. 22,80,3389,53/udp,5060/both",
+    )
+    parser.add_argument(
+        "--listen-ports",
+        type=_ports,
+        help="ports the engines will LISTEN on after any firewall redirect (e.g. 8080,1110,3389,22); "
+        "defaults to --ports. Used to find unplanned public listeners.",
+    )
+    parser.add_argument(
+        "--admin-port", type=int, help="admin SSH port (default: read from SSH_CONNECTION)"
+    )
+    parser.add_argument(
+        "--no-host-checks",
+        action="store_true",
+        help="skip the Linux host checks (firewall, sshd, ...)",
     )
     parser.add_argument("--metrics-url", help="e.g. http://127.0.0.1:9090 (checks /readyz)")
     parser.add_argument(

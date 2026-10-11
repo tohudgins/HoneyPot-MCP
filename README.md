@@ -291,6 +291,7 @@ accept commands.
 | Catch **real internet attack traffic** | a $5 throwaway VPS | ~30 min ([docs/DEPLOY.md](docs/DEPLOY.md)) |
 
 Before exposing a VPS, run `scripts/preflight.sh` (see the go-live checklist in DEPLOY.md): it checks the control plane, bind addresses, disk, ports, backups, and probes every sensor end to end.
+To harden the host first (default-drop firewall, a validating Docker guard so the service never holds root-equivalent access, sandboxed units, key-only SSH, moved control ports), follow [docs/HARDENING.md](docs/HARDENING.md): the honeypots stay fully reachable, everything around them does not.
 
 **Internal tripwire.** Put honeypots on ports nothing legitimate uses. Anything on your
 LAN that connects is by definition not supposed to be — a compromised laptop sweeping

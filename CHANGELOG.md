@@ -4,6 +4,38 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Host hardening for a public VPS
+
+Everything around the honeypots is now locked down while the honeypots themselves stay open to the
+whole internet (`docs/HARDENING.md`). Rehearsed end to end on an Ubuntu 22.04 systemd host with a real
+`dockerd`, an attacker container and the MCP client over an SSH tunnel:
+
+- **Docker guard** (`hardening/docker_guard.py`, `honeypot-docker-guard.service`): the service is no
+  longer in the root-equivalent `docker` group. It reaches Docker through a validating proxy that
+  forwards only the Cowrie container operations the SSH engine makes (pinned image, `honeypot-*`
+  names, the engine's own security settings, labelled containers only) and refuses privileged
+  containers, host mounts, exec, other images and every daemon-wide call. The container spec moved
+  to `engines/cowrie_limits.py` so the engine and the guard read one definition.
+- **Firewall** (`hardening/firewall.py`): default-drop input with exactly the planned honeypot ports
+  and a rate-limited admin SSH port; privileged ports redirected to the engines'; containers cannot
+  start connections or reach the host (or, in the opt-in `limited` mode, only public web servers at a
+  capped rate, never private space or the metadata service); the service user can only answer,
+  resolve and open HTTPS.
+- **`deploy/harden-host.sh`** (`prepare`/`finalize`/`confirm`/`status`/`teardown`): key-only sshd with
+  local forwarding only, kernel hardening, Docker daemon settings (`userland-proxy`/`icc` off),
+  unattended security updates, and a two-phase SSH move that cannot lock you out (sshd on both ports
+  first; the firewall loads with a rollback timer).
+- **Units**: `honeypot-mcp.service` tightened (syscall deny-list, `ProtectProc=invisible`, no core
+  dumps; systemd score 1.4), the guard (0.6) and firewall units added. **`deploy/env.production.example`**
+  moves the control plane (18443), metrics (19090) and canary (18888, loopback) off their defaults,
+  turns the console off and uses three role tokens.
+- **Pre-flight host checks** (`hardening/hostcheck.py`): unplanned public listeners, firewall loaded,
+  service not in the docker group, the guard refusing a daemon-wide call, sshd, sysctl, updates.
+- Bugs the rehearsal found that tests had passed: the documented `uv sync` as root left the service
+  unable to execute its interpreter; re-running `prepare` reopened port 22; the guard's `chown` is
+  forbidden by its own syscall filter; sshd was checked for its new port before it had re-bound; the
+  pre-flight rejected the documented `root:honeypot 0640` `.env` and probed the guard as root.
+
 ## Real attacker tools against the engines
 
 Every in-process engine was deployed and attacked with the tools an intruder uses (nmap with

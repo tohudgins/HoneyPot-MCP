@@ -1,0 +1,24 @@
+# Loads the honeypot host firewall (nftables table `inet hp_fw`) at boot.
+#
+# The ruleset is rendered once by deploy/harden-host.sh (from the honeypot ports you name) into
+# /etc/honeypot/firewall.nft. Only this table is created and deleted; Docker's tables and the
+# rest of the host's rules are never touched. `harden-host.sh confirm` enables this unit; until
+# then a rollback timer removes the table if you have locked yourself out.
+
+[Unit]
+Description=HoneyPot host firewall (nftables table inet hp_fw)
+Documentation=file:///opt/honeypot-mcp/docs/HARDENING.md
+Wants=network-pre.target
+Before=network-pre.target
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/honeypot/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/honeypot/firewall.nft
+ExecStop=/usr/sbin/nft delete table inet hp_fw
+
+[Install]
+WantedBy=multi-user.target

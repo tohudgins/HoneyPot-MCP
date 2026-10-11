@@ -76,35 +76,17 @@ def _deliver_persona_fs(container: Any, persona: Any, hostname: str, seed: str) 
         raise RuntimeError("Docker refused the persona filesystem archive")
 
 
-# Pinned to an explicit release (3.0.15 is what `latest` and `3.0` resolved to
-# when this was pinned). `:latest` meant every fresh host — and every
-# `images.pull` after an upstream push — silently ran whatever was newest.
-# Bump deliberately, together with a run of the Docker-gated capture test.
-COWRIE_IMAGE = "cowrie/cowrie:3.0.15"
-
-# Resource ceiling for the attacker-facing container. Cowrie is a Python
-# emulator that an attacker drives interactively, so it must not be able to
-# starve the host. Mirrors docker/docker-compose.yml's cowrie-ssh service.
-COWRIE_MEM_LIMIT = "256m"
-COWRIE_PIDS_LIMIT = 128
-COWRIE_NANO_CPUS = 500_000_000  # 0.5 CPU
-# Cowrie's JSON event stream goes to stdout, so the docker json-file log *is*
-# the evidence channel; cap it or a long brute-force run fills the disk.
-COWRIE_LOG_MAX_SIZE = "10m"
-COWRIE_LOG_MAX_FILES = "3"
-# Read-only root filesystem; the only writable paths are small tmpfs mounts.
-# uid/gid 999 is the image's `cowrie` user. SDK-deployed honeypots are
-# ephemeral, so samples and tty replays living in memory is acceptable here
-# (the event stream, including each sample's hash, is already in the logs); the
-# compose stack mounts a persistent volume for them instead.
-COWRIE_TMPFS = {
-    "/tmp": "rw,size=16m",
-    "/cowrie/var/lib/cowrie": "rw,size=64m,uid=999,gid=999,mode=0755",
-    "/cowrie/var/log/cowrie": "rw,size=32m,uid=999,gid=999,mode=0755",
-}
-# Ports Cowrie listens on inside the container, before any host publishing.
-COWRIE_INTERNAL_PORT = 2222
-COWRIE_TELNET_PORT = 2223
+from honeypot_mcp.engines.cowrie_limits import (  # noqa: E402 (a spec shared with the Docker guard)
+    COWRIE_IMAGE,
+    COWRIE_INTERNAL_PORT,
+    COWRIE_LOG_MAX_FILES,
+    COWRIE_LOG_MAX_SIZE,
+    COWRIE_MEM_LIMIT,
+    COWRIE_NANO_CPUS,
+    COWRIE_PIDS_LIMIT,
+    COWRIE_TELNET_PORT,
+    COWRIE_TMPFS,
+)
 
 # Cowrie JSON log patterns we care about
 _EVENT_MAP = {

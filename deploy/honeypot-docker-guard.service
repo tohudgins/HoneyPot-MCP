@@ -1,0 +1,74 @@
+# The Docker guard: the only process on the host that both parses a request from the honeypot
+# service and holds Docker access. It forwards the handful of Cowrie container operations the SSH
+# engine makes and refuses everything else (hardening/docker_guard.py), so the honeypot service
+# never needs to be in the `docker` group.
+#
+# Runs as its own user (`hp-guard`, a member of `docker`), listens on a unix socket only the
+# honeypot service's group can open, and is sandboxed harder than the service itself: it needs no
+# network at all, only the Docker socket.
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin hp-guard
+#   sudo usermod -aG docker hp-guard
+#   (the honeypot user must NOT be in the docker group)
+
+[Unit]
+Description=HoneyPot Docker guard (validating proxy for the Docker socket)
+After=docker.service
+Requires=docker.service
+Before=honeypot-mcp.service
+
+[Service]
+Type=simple
+User=hp-guard
+# The socket is created with this group (the honeypot service's), mode 0660.
+Group=honeypot
+SupplementaryGroups=docker
+RuntimeDirectory=honeypot-docker
+RuntimeDirectoryMode=0750
+WorkingDirectory=/opt/honeypot-mcp
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/honeypot-mcp/.venv/bin/python -m honeypot_mcp.hardening.docker_guard \
+    --listen /run/honeypot-docker/docker.sock \
+    --upstream /var/run/docker.sock \
+    --group honeypot \
+    --allow-user honeypot
+Restart=always
+RestartSec=2
+
+LimitNOFILE=4096
+TasksMax=64
+MemoryMax=128M
+LimitCORE=0
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+# Unix sockets only: this process opens no network connection of any kind.
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @module @raw-io @reboot @swap @debug @cpu-emulation @obsolete @resources
+SystemCallErrorNumber=EPERM
+UMask=0117
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

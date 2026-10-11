@@ -1313,6 +1313,38 @@ beyond its owner. A default umask makes `cp .env.example .env` mode 0644, which
 on a shared host hands the control-plane token — and with it every captured
 credential — to any local account.
 
+### Host hardening (`hardening/`, `deploy/`)
+
+A public honeypot host is attacked on purpose, so hardening is about what surrounds the decoys,
+never about making them less reachable: every honeypot port stays open to everyone with no rate
+limit, ban or geo-block. `docs/HARDENING.md` is the guide; the invariants worth knowing:
+
+- **The service is not in the `docker` group.** It talks to `hardening/docker_guard.py`
+  (`honeypot-docker-guard.service`), a separate process that forwards only the Cowrie container
+  operations the SSH engine makes and 403s everything else. Its create-body policy is built from
+  `engines/cowrie_limits.py`, the same constants `ssh.py` reads, and
+  `test_the_engines_own_create_requests_pass_the_guard` runs the real engine and checks its request
+  passes: change the engine's container settings and that test (and the guard) must change with it.
+  The guard runs under a syscall deny-list that forbids `chown`, so it must never ask to.
+- **`hardening/firewall.py` renders the nftables ruleset** (table `inet hp_fw`, the only thing it
+  touches): default-drop input, redirects only for `fib daddr type local` (a bare `dport 80
+  redirect` also caught containers' outbound web requests), container egress closed or `limited`,
+  the service user's output restricted. `harden-host.sh` calls the module's CLI so the ports the
+  operator names once are the ports the firewall and the pre-flight both use (`--print-listen`).
+- **`hardening/hostcheck.py`** adds the Linux host checks to `preflight.py` (public listeners vs
+  the planned ports, firewall loaded, docker access, guard probed *as the service user*, sshd, sysctl,
+  updates). Pure parsers take text so they are tested off Linux. `preflight.check_env_permissions`
+  accepts the documented `root:honeypot 0640` layout.
+- **`deploy/harden-host.sh`** is `prepare` (sshd on 22 *and* the admin port) -> `finalize` (admin
+  port only, firewall loaded with a rollback timer) -> `confirm` -> `status` / `teardown`. Re-running
+  `prepare` after `finalize` must not reopen port 22; sshd re-binds after the reload returns, so
+  the script polls for the listener instead of checking once.
+- **The venv needs an interpreter the service user can execute.** `uv sync` as root puts Python
+  under `/root/.local/share/uv/python`; build with `UV_PYTHON_INSTALL_DIR=/opt/uv-python`.
+- Verified on an Ubuntu 22.04 systemd rehearsal host with a real dockerd (see HARDENING.md); the
+  Docker-gated `tests/integration/test_firewall_rules.py` and `test_docker_guard.py` repeat the
+  firewall-in-a-real-kernel and engine-through-the-guard checks.
+
 ### Security boundaries
 
 A security review found two crossable boundaries; both are now enforced and

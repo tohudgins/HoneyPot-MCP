@@ -90,6 +90,35 @@ def test_env_file_permissions(tmp_path):
     assert pf.check_env_permissions(env).status == pf.PASS
 
 
+def test_the_documented_root_honeypot_0640_layout_passes_and_a_shared_group_does_not(
+    tmp_path, monkeypatch
+):
+    """DEPLOY.md installs `.env` as root:honeypot 0640 so the service reads it through its own
+    group. The check used to fail that layout, so a correctly deployed host never passed."""
+    import grp
+    import os
+
+    env = tmp_path / ".env"
+    env.write_text("MCP_AUTH_TOKEN=x")
+    env.chmod(0o640)
+
+    def group(gid, name, members=()):
+        return grp.struct_group((name, "x", gid, list(members)))
+
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: group(gid, "honeypot"))
+    assert pf.check_env_permissions(env).status == pf.PASS
+    # A group several accounts share (staff, users, a team group) is not private to the service.
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: group(gid, "staff", ["alice", "bob"]))
+    shared = pf.check_env_permissions(env)
+    assert shared.status == pf.FAIL and "staff" in shared.detail
+    # World access and group write are never fine.
+    env.chmod(0o644)
+    assert pf.check_env_permissions(env).status == pf.FAIL
+    env.chmod(0o660)
+    assert pf.check_env_permissions(env).status == pf.FAIL
+    assert os.name == "posix"
+
+
 def test_database_must_survive_a_restart(tmp_path):
     assert (
         pf.check_database(settings(database_url="sqlite+aiosqlite:///:memory:")).status == pf.FAIL
