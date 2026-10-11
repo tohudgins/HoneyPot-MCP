@@ -69,12 +69,19 @@ SHIMS = {
         #!/usr/bin/env bash
         exec shasum -a 256 "$@"
         """,
-    # `docker ps` lists FAKE_CONTAINERS; `docker exec NAME ...` replays FAKE_SAMPLE_DIR as a tar.
+    # `docker ps` lists FAKE_CONTAINERS. `docker exec NAME python3 -c <b64 script>` runs the script
+    # the fetcher really sent, with /cowrie remapped into FAKE_FS - so a wrong path in the script
+    # fails here instead of silently reporting "0 files" on a real VPS. FAKE_NO_PYTHON=1 mimics a
+    # container with no python3 (exec exits 126).
     "docker": """\
         #!/usr/bin/env bash
         case "$1" in
           ps) for c in $FAKE_CONTAINERS; do echo "$c"; done ;;
-          exec) [ -n "${FAKE_SAMPLE_DIR:-}" ] && tar -cf - -C "$FAKE_SAMPLE_DIR" downloads tty 2>/dev/null ;;
+          exec)
+            [ "${FAKE_NO_PYTHON:-}" = 1 ] && exit 126
+            b64="$(printf '%s' "$5" | sed -E "s/.*b64decode\\('([^']*)'\\).*/\\1/")"
+            printf '%s' "$b64" | base64 -d \\
+              | sed "s#\\"/cowrie#\\"${FAKE_FS:-/nonexistent-fake-fs}/cowrie#g" | python3 - ;;
           *) exit 1 ;;
         esac
         """,
@@ -381,18 +388,24 @@ def test_delete_remote_happens_only_after_a_verified_transfer(rig):
     )
 
 
-def test_samples_are_quarantined_without_permissions_and_symlinks_are_dropped(rig, tmp_path):
-    rig.seed(*HEALTHY)
-    samples = tmp_path / "cowrie"
+def _container_fs(tmp_path, root="cowrie/cowrie-git/var/lib/cowrie"):
+    """A fake container filesystem holding Cowrie's state at `root` (the real image's layout by
+    default), with a symlink planted in downloads as a hostile archive would."""
+    fs = tmp_path / "fs"
+    samples = fs / root
     (samples / "downloads").mkdir(parents=True)
     (samples / "tty").mkdir()
     (samples / "downloads" / ("a" * 64)).write_bytes(b"\x7fELF fake dropper")
     (samples / "downloads" / ("b" * 64)).write_bytes(b"#!/bin/sh\nrm -rf /\n")
     (samples / "tty" / ("c" * 64)).write_bytes(b"session")
     (samples / "downloads" / "evil-link").symlink_to("/etc/passwd")
-    done = rig.fetch(
-        "--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh", "FAKE_SAMPLE_DIR": str(samples)}
-    )
+    return fs
+
+
+def test_samples_are_quarantined_without_permissions_and_symlinks_are_dropped(rig, tmp_path):
+    rig.seed(*HEALTHY)
+    fs = _container_fs(tmp_path)
+    done = rig.fetch("--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh", "FAKE_FS": str(fs)})
     assert done.returncode == 0, done.stdout + done.stderr
 
     quarantine = _backup_dirs(rig)[0] / "samples-QUARANTINE"
@@ -413,12 +426,41 @@ def test_samples_are_quarantined_without_permissions_and_symlinks_are_dropped(ri
     assert "LIVE MALWARE" in (quarantine / "README.txt").read_text()
 
 
-def test_samples_with_nothing_to_copy_is_not_an_error(rig):
+def test_cowrie_data_in_the_older_layout_is_found_too(rig, tmp_path):
     rig.seed(*HEALTHY)
-    done = rig.fetch(
-        "--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh"}
-    )  # no FAKE_SAMPLE_DIR: empty output
-    assert done.returncode == 0
+    fs = _container_fs(tmp_path, "cowrie/var/lib/cowrie")
+    done = rig.fetch("--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh", "FAKE_FS": str(fs)})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "honeypot-hp-ssh: 3 file(s)" in done.stdout
+
+
+def test_an_empty_cowrie_data_directory_is_zero_files_not_an_error(rig, tmp_path):
+    rig.seed(*HEALTHY)
+    fs = tmp_path / "fs"
+    (fs / "cowrie/cowrie-git/var/lib/cowrie/downloads").mkdir(parents=True)
+    done = rig.fetch("--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh", "FAKE_FS": str(fs)})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "honeypot-hp-ssh: 0 file(s)" in done.stdout
+
+
+def test_a_container_whose_cowrie_directory_cannot_be_found_is_a_failure_not_zero_files(
+    rig, tmp_path
+):
+    """The bug this pins: the script looked in /cowrie/var/lib/cowrie, the real image keeps its
+    state under /cowrie/cowrie-git, and every run reported "0 file(s)" - indistinguishable from
+    "no malware yet" - while the container held dozens of samples."""
+    rig.seed(*HEALTHY)
+    fs = tmp_path / "fs"
+    (fs / "cowrie/somewhere/else").mkdir(parents=True)
+    done = rig.fetch("--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh", "FAKE_FS": str(fs)})
+    assert done.returncode != 0
+    assert "samples were NOT collected" in done.stderr + done.stdout
+
+
+def test_a_container_without_python_is_skipped_as_not_cowrie(rig):
+    rig.seed(*HEALTHY)
+    done = rig.fetch("--samples", env={"FAKE_CONTAINERS": "honeypot-hp-ssh", "FAKE_NO_PYTHON": "1"})
+    assert done.returncode == 0, done.stdout + done.stderr
     assert "nothing to copy" in done.stdout
 
 

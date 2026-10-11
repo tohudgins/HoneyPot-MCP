@@ -252,9 +252,14 @@ if [ "$SAMPLES" = 1 ]; then
   # Python inside the container, because `docker cp` does not see a tmpfs. The script is passed
   # base64-encoded so no shell quoting can mangle it.
   PYSRC='import os, sys, tarfile
+# Cowrie keeps its state under /cowrie/cowrie-git in the image the honeypots use, and under /cowrie in
+# others; look in both and exit 3 (not an empty archive) when neither exists.
+root = next((r for r in ("/cowrie/cowrie-git/var/lib/cowrie", "/cowrie/var/lib/cowrie") if os.path.isdir(r)), None)
+if root is None:
+    sys.exit(3)
 t = tarfile.open(fileobj=sys.stdout.buffer, mode="w|")
 for d in ("downloads", "tty"):
-    p = "/cowrie/var/lib/cowrie/" + d
+    p = os.path.join(root, d)
     if os.path.isdir(p):
         t.add(p, arcname=d)
 t.close()'
@@ -266,7 +271,12 @@ t.close()'
   for c in $CONTAINERS; do
     case "$c" in *[!A-Za-z0-9_.-]*|"") continue ;; esac
     TMP_TAR="$QDIR/.$c.tar"
-    if remote "sudo -n docker exec $c python3 -c \"import base64;exec(base64.b64decode('$B64'))\"" > "$TMP_TAR" 2>/dev/null && [ -s "$TMP_TAR" ]; then
+    rc=0; remote "sudo -n docker exec $c python3 -c \"import base64;exec(base64.b64decode('$B64'))\"" > "$TMP_TAR" 2>/dev/null || rc=$?
+    if [ "$rc" = 3 ]; then
+      # The container is running but Cowrie's data directory is in neither known place: report it as a
+      # failure. "0 files" here would be indistinguishable from "no malware yet" and hide a real loss.
+      warn "  $c: Cowrie's data directory was not found in the container; samples were NOT collected"; FAILED=1
+    elif [ "$rc" = 0 ] && [ -s "$TMP_TAR" ]; then
       if tar -tf "$TMP_TAR" | awk '/^\// {bad=1} /(^|\/)\.\.(\/|$)/ {bad=1} !/^(downloads|tty)(\/|$)/ {bad=1} END {exit bad}'; then
         mkdir -p "$QDIR/$c"; tar -xf "$TMP_TAR" -C "$QDIR/$c"; strip_unsafe "$QDIR/$c"
         find "$QDIR/$c" -type f -exec chmod 000 {} + 2>/dev/null || true
@@ -276,7 +286,7 @@ t.close()'
         warn "  $c: the sample archive had unsafe paths; skipped"; FAILED=1
       fi
     else
-      say "  $c: nothing to copy (no downloads yet, or not a Cowrie container)"
+      say "  $c: nothing to copy (not a Cowrie container)"
     fi
     rm -f "$TMP_TAR"
   done
