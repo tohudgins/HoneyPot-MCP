@@ -130,12 +130,36 @@ limits make it a poor tool for harm, not an impossible one. Closed is the defaul
 
 ## End of the run
 
+Run this **from your laptop** (it needs `ssh`, `tar` and `sqlite3` there; macOS has all three):
+
 ```bash
-scripts/backup.sh /var/backups/honeypot                     # the database is the evidence
+scripts/fetch_backup.sh --host <droplet-ip> --key ~/.ssh/honeypot_deploy \
+    --dest ~/hp-backups --samples --expect-types ssh,telnet,http,ftp,rdp,smb
+```
+
+It takes a consistent backup on the VPS, streams it back over one SSH connection, **checks the
+transfer** (the database's SHA-256 here must equal the one computed on the VPS) and the
+database (`PRAGMA integrity_check`), pulls Cowrie's downloaded files and TTY recordings into a
+`samples-QUARANTINE/` folder (stripped of every permission bit, symlinks removed, SHA-256 list
+beside them; they are live malware), and prints a **report that says whether the run worked**:
+the time window, events per sensor, dead sensors, sensors that recorded nothing, hours with no
+activity at all, top sources and credentials, honeytoken trips, platform alerts, and a
+PASS/WARN/FAIL verdict. It treats the VPS as hostile: the archive's paths are checked before
+anything is unpacked. It is safe to run mid-run (take one after the first night: a suspended
+account would otherwise take the data with it) and as often as you like; each run is a separate
+backup. Re-read a backup you already have with `scripts/fetch_backup.sh report <backup-dir>`.
+
+```bash
 sudo deploy/harden-host.sh teardown --i-have-a-backup       # stop, remove containers and firewall
 ```
 
-Copy the backup off the host, then **destroy the VPS**. Do not reuse it for anything else.
+Then **destroy the VPS** in the provider console (a powered-off droplet keeps its disk and is, as
+far as I know, still billed). Do not reuse it for anything else. The backup holds secrets
+(`.env` tokens, honeytoken values, TLS keys): store it where you would store the `.env`.
+Cowrie's downloads live in a tmpfs, which `docker cp` cannot read, so the script runs Python
+inside the container to copy them; they exist only while the container does, so fetch before
+teardown. Packet capture is a bounded ring (100 MB x 10 by default): use `pcap_extract` for the
+attackers you care about during the run.
 
 ## What was verified, and how
 

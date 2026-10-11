@@ -452,7 +452,8 @@ cmd_teardown() {
   run systemctl stop "$ROLLBACK_UNIT.timer" 2>/dev/null || true
   run nft delete table inet hp_fw 2>/dev/null || true
   say "honeypots stopped, containers removed, firewall removed. sshd stays hardened on port $ADMIN_PORT."
-  say "The data is in $INSTALL_DIR/data; copy it off, then destroy the VPS."
+  say "The database is in $INSTALL_DIR/data. If you have not already, run scripts/fetch_backup.sh from your laptop NOW,"
+  say "then destroy the VPS. (Cowrie's downloaded samples lived in the containers just removed; fetch_backup.sh --samples must run BEFORE teardown.)"
 }
 
 case "$CMD" in

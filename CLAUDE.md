@@ -1335,6 +1335,15 @@ limit, ban or geo-block. `docs/HARDENING.md` is the guide; the invariants worth 
   the planned ports, firewall loaded, docker access, guard probed *as the service user*, sshd, sysctl,
   updates). Pure parsers take text so they are tested off Linux. `preflight.check_env_permissions`
   accepts the documented `root:honeypot 0640` layout.
+- **`scripts/fetch_backup.sh`** (laptop side) pulls a backup, verifies it (SHA-256 vs the VPS,
+  `integrity_check`), quarantines Cowrie samples and prints the run report. The VPS is hostile:
+  archive paths are listed and refused if they leave `honeypot-<stamp>/` before anything is
+  unpacked, symlinks are deleted after. Everything shares one ControlMaster connection because
+  admin SSH is limited to 6 new connections a minute. It must keep working under macOS bash 3.2
+  (no `mapfile`, no associative arrays). Report rows are `LEVEL|message` from SQL run on a read-only
+  connection with `trusted_schema=OFF`; self-test probes (`selftest_` marker) and platform alerts
+  (`0.0.0.0`) are excluded from "attacker activity". Cowrie's samples are in a tmpfs that
+  `docker cp` cannot read, so the script runs Python inside the container.
 - **`deploy/harden-host.sh`** is `prepare` (sshd on 22 *and* the admin port) -> `finalize` (admin
   port only, firewall loaded with a rollback timer) -> `confirm` -> `status` / `teardown`. Re-running
   `prepare` after `finalize` must not reopen port 22; sshd re-binds after the reload returns, so

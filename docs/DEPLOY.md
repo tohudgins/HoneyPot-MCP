@@ -453,6 +453,22 @@ you'll have a substantial dataset.
 > generate_report format=markdown
 ```
 
+### 12. Getting your data off the droplet (and checking the run worked)
+
+From your laptop, any time (it is read-only on the honeypots and safe mid-run):
+
+```bash
+scripts/fetch_backup.sh --host <droplet-ip> --key ~/.ssh/honeypot_deploy --dest ~/hp-backups --samples
+```
+
+It pulls a consistent backup, verifies the transfer and the database, quarantines any malware
+samples, and prints a report: events per sensor, sensors that are dead or silent, outages,
+top sources and credentials, honeytoken trips, and a PASS/WARN/FAIL verdict. A sensor with no
+events early on is a warning, not a failure (some protocols are scanned rarely); *every* sensor
+silent means suspect the network path. Details, the `--delete-remote` and `--expect-types`
+options, and what is and is not in a backup: [HARDENING.md](HARDENING.md#end-of-the-run). Turning
+the droplet off does not save the data: copy it off first, then destroy the droplet.
+
 ---
 
 ## Home lab deploy

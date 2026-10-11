@@ -4,6 +4,22 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Getting the data off the droplet: `scripts/fetch_backup.sh`
+
+A laptop-side script for the end of a run (and mid-run): it takes a consistent backup on the VPS,
+streams it back over one SSH connection (the admin port allows 6 new connections a minute),
+verifies the transfer (the database's SHA-256 here equals the VPS's) and the database
+(`integrity_check`), quarantines Cowrie's downloaded files and TTY recordings (no permission bits,
+symlinks removed, SHA-256 list), and prints a report that answers "did the run work": time window,
+events per sensor, dead or silent sensors, hours with no activity, top sources and credentials,
+honeytoken trips, platform alerts, and a PASS/WARN/FAIL verdict (`--expect-types` names the
+honeypots you deployed). The VPS is treated as hostile: archive paths are checked before unpacking.
+Self-test probes and platform alerts are not counted as attacker activity. Works with macOS's bash
+3.2. Run once over a real sshd with `sudo`, a real `docker exec` into a real Cowrie container, and
+a real tmpfs: `docker cp` returns nothing for a tmpfs path, so samples are copied by running Python
+inside the container. 19 unit tests drive the real `backup.sh` through fake `ssh`/`sudo`/`docker`
+shims, including a hostile archive, a checksum mismatch and symlinks.
+
 ## Host hardening for a public VPS
 
 Everything around the honeypots is now locked down while the honeypots themselves stay open to the

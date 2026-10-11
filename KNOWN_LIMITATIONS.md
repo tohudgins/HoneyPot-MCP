@@ -474,6 +474,12 @@ prevent.
 
 ## Operational notes
 
+- **`scripts/fetch_backup.sh` reports on SQLite backups only** (a PostgreSQL backup is fetched but
+  not analysed) and only from containers that are running when it runs: Cowrie's downloads and TTY
+  recordings live in a tmpfs and are gone once the container is removed or restarts, so fetch before
+  `teardown`. Its verdict rests on the alerts the honeypots recorded; a sensor that is up but
+  unreachable from the internet looks the same as a quiet one, which is why every-sensor-silent is
+  called out separately. It was exercised over a real sshd but not against a real DigitalOcean droplet.
 - **Host hardening reduces risk and does not remove it** (`docs/HARDENING.md`, "Residual risks").
   Cowrie shares the host's kernel, so a kernel or container-runtime exploit from inside a container
   escapes; the in-process engines share a process with the control plane, so a code-execution bug in
