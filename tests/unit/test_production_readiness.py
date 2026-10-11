@@ -152,15 +152,49 @@ async def test_owner_only_env_is_silent(tmp_path):
     assert warn_on_world_readable_env(env) is None
 
 
-async def test_group_readable_env_is_also_reported(tmp_path):
-    """Group-readable is the multi-tenant case, and just as exposed."""
+def _with_group(monkeypatch, name, members=(), gid=1001):
+    """Make the group that owns the test file look like `name` with `members`."""
+    import grp
+
+    monkeypatch.setattr(
+        grp, "getgrgid", lambda _gid: grp.struct_group((name, "x", gid, list(members)))
+    )
+
+
+async def test_group_readable_env_is_also_reported_when_the_group_is_shared(tmp_path, monkeypatch):
+    """Group-readable is the multi-tenant case, and just as exposed: every member of a group
+    several accounts share (staff, users, a team) can read the control-plane token."""
     from honeypot_mcp.config import warn_on_world_readable_env
 
     env = tmp_path / ".env"
     env.write_text("x=1\n")
     env.chmod(0o640)
+    _with_group(monkeypatch, "staff", ["alice", "bob"], gid=20)
 
     assert warn_on_world_readable_env(env) is not None
+
+
+async def test_the_documented_root_honeypot_0640_layout_is_silent(tmp_path, monkeypatch):
+    """DEPLOY.md installs `.env` as root:honeypot 0640 so the service reads it through its own
+    group. Warning about the layout the docs prescribe teaches the operator to ignore the warning
+    that matters, and the pre-flight check already accepts it: they must agree."""
+    from honeypot_mcp.config import warn_on_world_readable_env
+
+    env = tmp_path / ".env"
+    env.write_text("x=1\n")
+    env.chmod(0o640)
+    _with_group(monkeypatch, "honeypot")
+    assert warn_on_world_readable_env(env) is None
+
+    # A group that only this service can be in is the same thing under another name.
+    _with_group(monkeypatch, "svc-private", gid=1002)
+    assert warn_on_world_readable_env(env) is None
+
+    # Group *write*, group execute and any "other" access are never fine, whatever the group.
+    for mode in (0o660, 0o650, 0o644, 0o604):
+        env.chmod(mode)
+        _with_group(monkeypatch, "honeypot")
+        assert warn_on_world_readable_env(env) is not None, oct(mode)
 
 
 async def test_missing_env_is_not_an_error(tmp_path):

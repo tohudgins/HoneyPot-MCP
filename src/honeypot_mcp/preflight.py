@@ -191,15 +191,9 @@ def check_env_permissions(path: Path | None = None) -> Check:
             f"chmod 640 {env} (root:honeypot) or 600",
         )
     if mode & 0o040:
-        try:
-            import grp
+        from honeypot_mcp.config import env_group
 
-            group = grp.getgrgid(info.st_gid)
-            members = [m for m in group.gr_mem if m != group.gr_name]
-            name = group.gr_name
-        except (ImportError, KeyError):
-            name, members = str(info.st_gid), []
-        dedicated = name == "honeypot" or (not members and info.st_gid >= 100)
+        name, dedicated = env_group(env)
         if not dedicated:
             return Check(
                 ".env permissions",

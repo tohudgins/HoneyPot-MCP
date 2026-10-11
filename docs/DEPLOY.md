@@ -68,8 +68,9 @@ ssh root@<your-ip>
 ```
 
 Create a non-root admin account with your **deploy-only** public key. Root login and password
-login are about to be disabled, so do this first and keep the provider's web console open as a
-safety net:
+login are about to be disabled, so do this first. (The provider's browser console will stop
+working too, because it logs in as root: the safety net is the rollback timer plus the Recovery
+Console password in "Getting back in" below.)
 
 ```bash
 adduser --disabled-password --gecos "" deploy
@@ -94,8 +95,10 @@ edit `sshd_config` by hand.
 ### 3. Install Docker + clone the repo (5 min)
 
 ```bash
-# Docker — the SSH/Cowrie engine manages honeypot containers through it
-curl -fsSL https://get.docker.com | sh
+# Docker — the SSH/Cowrie engine manages honeypot containers through it. Ubuntu's own
+# `docker.io` package is what the hardening was rehearsed and run with (Docker 29.1.3 on
+# 22.04); the get.docker.com script installs a different build that was not tested.
+sudo apt-get update && sudo apt-get install -y docker.io
 
 # uv to build the Python environment (step 5 builds it)
 apt update && apt install -y git
@@ -420,8 +423,10 @@ RDP, SMTP and POP3. `deception_plan` describes the rest.
       CRITICAL alerts.
 - [ ] A backup exists (`scripts/backup.sh`) and the database is not on the volume that
       holds the packet-capture ring.
-- [ ] Your own SSH access is on a port the honeypots do not use, and you have a second way in
-      (the provider's console).
+- [ ] Your own SSH access is on a port the honeypots do not use, and you have a second way in:
+      the provider's **Recovery Console** (VNC, works without sshd) with a recovery password set
+      for `deploy` (see "Getting back in" below). The browser Droplet Console is **not** a way in
+      once the host is hardened.
 
 **During the run: do not tune.** If something looks wrong, write it down and keep collecting.
 A changed configuration halfway through makes the data uninterpretable, and a honeypot that is
@@ -559,7 +564,7 @@ non-fatal).
 | Cowrie not catching anything but port is open | Cowrie image not pulled, or the container died | `docker logs honeypot-<name>` (the SSH engine names containers `honeypot-<honeypot-name>`); `honeypot_health <name>` |
 | Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on consumer side | `alert_subscriptions_list` shows `last_error` |
 | Out of disk space | Alert payloads accumulating | Run `alerts_prune` more aggressively, or set up a cron job |
-| Host SSH down (locked out) | The admin port was changed by hand, or the firewall blocks you | Use the provider web console; `deploy/harden-host.sh` never changes both at once (see step 2) |
+| Host SSH down (locked out) | The admin port was changed by hand, or the firewall blocks you | The browser **Droplet Console does not work** once hardened (it logs in as root). Use the **Recovery Console** with the `deploy` recovery password; see "Getting back in" below |
 | Client can't connect / tools don't appear | Daemon not running, tunnel down, or wrong/missing bearer token (401) | `systemctl status honeypot-mcp`; re-open `ssh -p 2200 -L 18443:127.0.0.1:18443 …`; confirm the `Authorization: Bearer` header matches a token in `MCP_AUTH_TOKENS`. A `viewer` token cannot see the deploy tools |
 | Daemon exits immediately on start with an auth message | `MCP_TRANSPORT=http` but `MCP_AUTH_TOKEN` is unset (fail-closed) | Set `MCP_AUTH_TOKEN` (`openssl rand -hex 32`), or `MCP_ALLOW_UNAUTHENTICATED=true` if you front it with your own auth |
 | SSH honeypots won't deploy (`403 ... honeypot docker guard`) | The Docker guard refused the request, or is not running. The service is deliberately **not** in the `docker` group; do not add it | `systemctl status honeypot-docker-guard`; `journalctl -u honeypot-docker-guard -n 30` names the refused rule |
@@ -568,7 +573,35 @@ non-fatal).
 | Need to read Prometheus metrics from another host | Metrics are bound to loopback (19090) for security | SSH-tunnel it: `ssh -p 2200 -L 19090:127.0.0.1:19090 deploy@<vps>` |
 | Service dies with `status=203/EXEC ... Permission denied` | The venv's Python is under `/root/.local/share/uv/python`, which the service user cannot execute | `rm -rf .venv && UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12` (`harden-host.sh prepare` checks this) |
 | `finalize` says sshd is not listening on 2200 | sshd re-binds a moment after the reload, or the new config was rejected | It waits and, if sshd never comes up, restores port 22 for you. Check `journalctl -u ssh` and `sshd -t` |
-| Locked out after `finalize` | The firewall rules block your address | Do nothing: the rollback timer removes the firewall after `--rollback-seconds`. Or use the provider console and `nft delete table inet hp_fw` |
+| Locked out after `finalize` | The firewall rules block your address | Do nothing: the rollback timer removes the firewall after `--rollback-seconds`. If you already ran `confirm`, see "Getting back in" below |
+
+### Getting back in
+
+Hardening disables root login and password logins over SSH, so DigitalOcean's browser **Droplet
+Console** (which connects over the network as root with keys its agent fetches) fails with "all
+authentication methods failed". That is expected and not something to fix by loosening sshd. Two
+real ways back in if your SSH key or port stops working:
+
+1. **The rollback timer** undoes a bad firewall within `--rollback-seconds` of `finalize` (unless
+   you ran `confirm`). It does not undo a wrong SSH port.
+2. **The Recovery Console** (Droplet page -> Access -> Recovery Console): a VNC session, like a
+   keyboard and monitor on the machine, available even if sshd or the network is broken. It needs
+   a local password, and the setup leaves every account password-less, so set one for `deploy`
+   *before you need it*:
+
+   ```bash
+   openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24 > ~/.ssh/honeypot_recovery_password
+   chmod 600 ~/.ssh/honeypot_recovery_password
+   printf 'deploy:%s\n' "$(tr -d '\n' < ~/.ssh/honeypot_recovery_password)" \
+     | ssh -p 2200 deploy@<ip> 'sudo chpasswd'
+   ```
+
+   sshd still refuses passwords (`PasswordAuthentication no`, `AuthenticationMethods publickey`),
+   so the password only works at the console. From there `sudo nft delete table inet hp_fw`
+   removes the firewall and `sudo systemctl restart ssh` restarts sshd. Pasting does not work in
+   the Recovery Console, so keep the password typeable (the command above drops `/+=`).
+
+If both fail, the data is the only thing worth saving: rebuild the droplet and start over.
 
 ---
 

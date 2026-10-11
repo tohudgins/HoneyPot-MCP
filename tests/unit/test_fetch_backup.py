@@ -446,3 +446,84 @@ def test_unusual_values_are_refused_before_anything_connects(rig, args):
     done = rig.run(*args)
     assert done.returncode == 2
     assert not rig.dest.exists()
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_a_wal_mode_backup_is_reported_without_side_files_or_changing_a_byte(rig):
+    """The server runs its database in WAL mode and `.backup` keeps that in the file header. A plain
+    read-only open of a WAL database needs its -shm/-wal side files ("unable to open database file"
+    otherwise), which a downloaded snapshot does not have: on the real droplet the transfer verified
+    and then every report query failed, because every test database before this one was in rollback
+    mode. The snapshot must be read as `immutable`: no side files, no writes, checksum intact."""
+    con = sqlite3.connect(rig.db)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.close()
+    rig.seed(*HEALTHY)
+    done = rig.fetch()
+    assert done.returncode == 0, done.stdout + done.stderr
+
+    (backup,) = _backup_dirs(rig)
+    db = backup / "honeypot_mcp.db"
+    assert db.read_bytes()[18:20] == b"\x02\x02", "the fixture is really a WAL-mode snapshot"
+    report = (backup / "report.txt").read_text()
+    assert "[PASS] database integrity_check is ok" in report, report
+    assert "[PASS] 4 attacker events from 3 source addresses" in report, report
+    assert "unable to open" not in report
+    assert not list(backup.glob("honeypot_mcp.db-*")), "no -shm/-wal files beside the evidence"
+
+    before = _sha256(db)
+    again = rig.run("report", str(backup))
+    assert again.returncode == 0 and "[PASS] 4 attacker events" in again.stdout
+    assert _sha256(db) == before and not list(backup.glob("honeypot_mcp.db-*"))
+
+
+@pytest.mark.parametrize("folder", ["my backups", "run #1", "100%25 done", "what?"])
+def test_a_destination_with_uri_special_characters_still_opens_the_database(rig, folder):
+    """The database is opened through a `file:` URI, so a space, `#`, `%` or `?` in the path must be
+    escaped or sqlite reads the wrong file (or none)."""
+    rig.seed(*HEALTHY)
+    done = rig.fetch("--dest", str(rig.tmp / folder))
+    assert done.returncode == 0, done.stdout + done.stderr
+    (backup,) = sorted((rig.tmp / folder).glob("honeypot-*"))
+    assert "[PASS] 4 attacker events from 3 source addresses" in (backup / "report.txt").read_text()
+
+
+def test_internal_sources_are_the_platforms_own_traffic_and_public_neighbours_of_those_ranges_are_not(
+    rig,
+):
+    """On the droplet the Docker bridge address (172.17.0.1) is the source Cowrie sees for the
+    self-tests and the pre-flight probes, and only some of those events carry the self-test marker:
+    the first real report counted it as an attacker with 28 events. Private ranges cannot be the
+    internet, so they are reported on their own line; but an address just outside a private range is
+    a real source and must stay (172.32.x is public, 172.31.x is not; 192.169.x is public)."""
+    sensors, alerts = HEALTHY
+    internal = [
+        "172.17.0.1",
+        "10.0.0.5",
+        "192.168.1.9",
+        "169.254.169.254",
+        "172.31.255.255",
+        "fd12::1",
+        "FE80::1",
+    ]
+    public_neighbours = ["172.32.0.1", "172.15.0.1", "192.169.0.1", "11.0.0.1"]
+    extra = [
+        (1, ip, "ssh_session_connect", "{}", "LOW", f"2026-10-11 06:0{i}:00.1")
+        for i, ip in enumerate(internal + public_neighbours)
+    ]
+    rig.seed(sensors, [*alerts, *extra])
+    rig.fetch()
+    report = (_backup_dirs(rig)[0] / "report.txt").read_text()
+
+    assert "[PASS] 8 attacker events from 7 source addresses" in report, report
+    assert "[INFO] 7 event(s) came from internal addresses" in report, report
+    top_sources = report.split("--- top sources")[1].split("\n--- ")[0]
+    for ip in public_neighbours:
+        assert ip in top_sources, f"{ip} is a public address and must be reported"
+    for ip in internal:
+        assert ip.lower() not in top_sources.lower(), f"{ip} is internal and must not be a 'source'"

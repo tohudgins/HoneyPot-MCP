@@ -378,6 +378,26 @@ class Settings(BaseSettings):
 _settings: Settings | None = None
 
 
+def env_group(path: Path) -> tuple[str, bool]:
+    """`(group name, dedicated)` for the group that owns `path`.
+
+    A group is *dedicated* when only the service can be in it: the `honeypot` group the
+    production layout uses, or a user's own private group (no members besides itself, an ordinary
+    id). A group several accounts share (`staff`, `users`, a team) is not, and a `.env` readable
+    by it hands the control-plane token to every member. Returns `("?", False)` where groups are
+    unavailable (Windows) or the id has no name.
+    """
+    try:
+        import grp
+
+        info = path.stat()
+        group = grp.getgrgid(info.st_gid)
+    except (ImportError, KeyError, OSError):
+        return "?", False
+    members = [m for m in group.gr_mem if m != group.gr_name]
+    return group.gr_name, group.gr_name == "honeypot" or (not members and group.gr_gid >= 100)
+
+
 def warn_on_world_readable_env(env_path: Path | None = None) -> str | None:
     """Warn if the `.env` file is readable by anyone but its owner.
 
@@ -398,8 +418,11 @@ def warn_on_world_readable_env(env_path: Path | None = None) -> str | None:
     except OSError:
         return None
 
-    # Anything set in the group or other triads.
+    # Anything set in the group or other triads is exposure, except the documented production
+    # layout: group *read* only, and the group is private to the service (root:honeypot 0640).
     if not mode & 0o077:
+        return None
+    if not mode & 0o037 and env_group(path)[1]:
         return None
     message = (
         f"{path} is mode {oct(mode & 0o777)} — readable beyond its owner. It holds the "

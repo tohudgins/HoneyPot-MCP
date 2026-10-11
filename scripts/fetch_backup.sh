@@ -83,23 +83,31 @@ sha256_of() {
 
 # Rows are `LEVEL|message` so the verdict below is just a list. Everything runs on a read-only
 # connection with the schema untrusted: the database came from a host we do not trust.
-q() { sqlite3 -readonly -batch -separator '|' "$DB" "PRAGMA trusted_schema=OFF; $PRELUDE $1"; }
-qt() { sqlite3 -readonly -batch -header -column "$DB" "PRAGMA trusted_schema=OFF; $PRELUDE $1"; }
+q() { sqlite3 -readonly -batch -separator '|' "$DBOPEN" "PRAGMA trusted_schema=OFF; $PRELUDE $1"; }
+qt() { sqlite3 -readonly -batch -header -column "$DBOPEN" "PRAGMA trusted_schema=OFF; $PRELUDE $1"; }
 
-# `act` is attacker activity: not a platform alert (0.0.0.0), not loopback, and not one of our own
-# self-test probes (which carry a selftest_ marker).
-PRELUDE="CREATE TEMP VIEW act AS SELECT * FROM alerts WHERE source_ip NOT IN ('0.0.0.0','127.0.0.1','::1','') AND IFNULL(CAST(payload AS TEXT),'') NOT LIKE '%selftest_%'; CREATE TEMP VIEW ref AS SELECT IFNULL(MAX(timestamp), datetime('now')) AS t FROM alerts;"
+# `act` is attacker activity: not a platform alert (0.0.0.0), not an internal address and not one
+# of our own self-test probes (which carry a selftest_ marker). Internal means loopback, link-local
+# and the private ranges (10/8, 172.16/12, 192.168/16): an attacker on the internet cannot appear
+# from those, but the platform does (the Docker bridge 172.17.0.1 is the source Cowrie sees for
+# the self-tests and the pre-flight probes, and only some of those events carry the marker).
+PRELUDE="CREATE TEMP VIEW act AS SELECT * FROM alerts WHERE source_ip NOT IN ('0.0.0.0','127.0.0.1','::1','') AND source_ip NOT GLOB '10.*' AND source_ip NOT GLOB '192.168.*' AND source_ip NOT GLOB '169.254.*' AND source_ip NOT GLOB '172.1[6-9].*' AND source_ip NOT GLOB '172.2[0-9].*' AND source_ip NOT GLOB '172.3[01].*' AND LOWER(source_ip) NOT GLOB 'fe80:*' AND LOWER(source_ip) NOT GLOB 'fc*' AND LOWER(source_ip) NOT GLOB 'fd*' AND IFNULL(CAST(payload AS TEXT),'') NOT LIKE '%selftest_%'; CREATE TEMP VIEW ref AS SELECT IFNULL(MAX(timestamp), datetime('now')) AS t FROM alerts;"
 
 report() {
   local target="$1" out failures=0 warnings=0
   if [ -d "$target" ]; then DB="$target/honeypot_mcp.db"; OUTDIR="$target"; else DB="$target"; OUTDIR="$(dirname "$target")"; fi
   [ -f "$DB" ] || die "no database at $DB" 2
+  # The server's database is in WAL mode, and a plain read-only open of a WAL database needs its
+  # -shm/-wal side files to exist ("unable to open database file" otherwise). `immutable=1` opens
+  # the downloaded snapshot without any side files and without writing a byte, so the bytes the
+  # checksum vouched for stay exactly as they were. Percent-escape the characters a URI cares about.
+  DBOPEN="file:$(printf '%s' "$DB" | sed -e 's/%/%25/g' -e 's/?/%3f/g' -e 's/#/%23/g' -e 's/ /%20/g')?immutable=1"
   out="$OUTDIR/report.txt"
   {
     printf 'HoneyPot-MCP run report  (generated %s)\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
     printf 'database: %s\n\n' "$DB"
 
-    local integrity; integrity="$(sqlite3 -readonly -batch "$DB" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+    local integrity; integrity="$(sqlite3 -readonly -batch "$DBOPEN" 'PRAGMA integrity_check;' 2>&1 | head -1)"
     printf -- '--- time window (attacker activity, self-tests excluded)\n'
     qt "SELECT MIN(timestamp) AS first_event, MAX(timestamp) AS last_event, ROUND((julianday(MAX(timestamp))-julianday(MIN(timestamp)))*24,1) AS hours, COUNT(*) AS events, COUNT(DISTINCT source_ip) AS source_ips FROM act;"
     printf '\n--- sensors\n'
@@ -138,6 +146,7 @@ report() {
             gaps AS (SELECT COUNT(*) AS n FROM h WHERE SUBSTR(t,1,13) NOT IN (SELECT DISTINCT SUBSTR(timestamp,1,13) FROM act) AND t IS NOT NULL)
        SELECT 'WARN|'||n||' hour(s) between the first and last event had no activity at all (a sleeping scanner, or an outage: compare with the hour table)' FROM gaps WHERE n > 3;"
     q "SELECT 'INFO|honeytoken '||label||' was TRIGGERED at '||triggered_at FROM honeytokens WHERE LOWER(status)='triggered';"
+    q "SELECT 'INFO|'||n||' event(s) came from internal addresses (loopback, the Docker bridge, private ranges): the platform''s own probes and container traffic, not attackers, and not counted above' FROM (SELECT COUNT(*) AS n FROM alerts WHERE source_ip NOT IN ('0.0.0.0','') AND source_ip NOT IN (SELECT source_ip FROM act)) WHERE n>0;"
     if [ -n "$EXPECT_TYPES" ]; then
       local t
       for t in $(printf '%s' "$EXPECT_TYPES" | tr ',' ' '); do
