@@ -170,6 +170,10 @@ class Alert(Base):
     __table_args__ = (
         Index("ix_alerts_timestamp_severity", "timestamp", "severity"),
         Index("ix_alerts_source_ip_timestamp", "source_ip", "timestamp"),
+        # `honeypot_list`, `honeypot_status` and the sensor tables count alerts per sensor. With no
+        # index on this column that is a full scan: 51 s on 4.9M rows on the live droplet, 0.02 s
+        # with it (a covering index, no table read).
+        Index("ix_alerts_honeypot_id", "honeypot_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

@@ -4,6 +4,22 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Found at 5 million rows: the per-sensor count scanned the whole table
+
+Reading the data the morning after the first night: one SIP source sent about 190 events a second
+and the database grew from 1.1M to 4.9M alerts (3.8 GB, past the 4 GB droplet's RAM). `honeypot_list`,
+the most basic tool, took 51 seconds because `alerts.honeypot_id` had no index and the per-sensor
+count read every row. Migration `0016_alert_honeypot_idx` adds it (a covering index, so no table
+read): 0.02 s on a 1.1M-row copy and 2.7 s live (1.5 s of that is connection overhead), 34 s to build
+on the 4.9M-row table. A test pins the query plan. A rate-limit rule on the flooder (the shipped
+`suppression_add` remedy) cut ingest from 198 to 11 events a second and the service's CPU from 112%
+to 23%, the first live proof of that tool against a real flood.
+
+Not fixed by this: `alerts_stats` (27 s all-time, over 100 s over a one-hour window) and `soc_brief`
+(over 100 s) still time out at this size, because their aggregates read millions of rows and the
+table no longer fits in memory. Extra composite indexes did not change the query plans in a local
+test, so the answer is bounding what is stored (flood guard, rollups), not more indexes.
+
 ## The platform stopped recording its own probes as an attacker; dashboards work from a backup
 
 Found by reading the live data and by opening the dashboards on a restored backup in a browser.
