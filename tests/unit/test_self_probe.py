@@ -182,6 +182,41 @@ async def test_probe_to_a_non_loopback_local_address_is_also_claimed():
         await server.wait_closed()
 
 
+async def test_a_probe_through_nat_is_claimed_under_the_gateway_address_too():
+    """Found on the live droplet: the watchdog probes each Cowrie container through its published
+    port from 127.0.0.1, and the container sees that connection from the Docker bridge gateway with
+    the port unchanged. Only the loopback tuple was registered, so every probe (1,060 connect/close
+    pairs per sensor in nine hours) was recorded as an attacker called 172.17.0.1."""
+    from honeypot_mcp import self_probe
+    from honeypot_mcp.engines.base import tcp_probe
+
+    seen: list[tuple[str, int]] = []
+
+    class _Server(asyncio.Protocol):
+        def connection_made(self, transport):
+            seen.append(transport.get_extra_info("peername"))
+            transport.close()
+
+    loop = asyncio.get_running_loop()
+    server = await loop.create_server(_Server, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert (await tcp_probe(port, also_as=("172.17.0.1",)))["alive"] is True
+        for _ in range(250):
+            await asyncio.sleep(0.02)
+            if seen:
+                break
+        assert seen, "server never saw the probe"
+        probe_port = seen[0][1]
+        # What the container would observe after the NAT: the gateway, the same port.
+        assert self_probe.claim("172.17.0.1", probe_port) is True
+        # Only that exact port is claimed: a real peer at the gateway address is still an attacker.
+        assert self_probe.claim("172.17.0.1", probe_port + 1) is False
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 async def test_claim_covers_every_event_from_one_probe_connection():
     """A claim is per-connection, not per-event.
 

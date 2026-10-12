@@ -4,6 +4,23 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The platform stopped recording its own probes as an attacker; dashboards work from a backup
+
+Found by reading the live data and by opening the dashboards on a restored backup in a browser.
+
+The watchdog probes each Cowrie container through its published port from `127.0.0.1`; the
+container sees that connection from the Docker bridge gateway (`172.17.0.1`) with the port
+unchanged, and only the loopback address was registered with the self-probe filter, so every probe
+was recorded as an attacker: 1,060 connect/close pairs per sensor in nine hours, listed as a source
+in campaign analysis and "top attackers". `tcp_probe` now also claims its bound port under the
+container's bridge gateway. Live: 48 such events in six minutes before the fix, none in four after.
+
+The Grafana `Active honeypots` tile was the only panel on the Prometheus datasource and read "No
+data" anywhere without Prometheus (a laptop reading a backup); it now counts running rows in the
+`honeypots` table. The threat map's default basemap resolves to CARTO's free tiles, which now stamp
+"API KEY REQUIRED" over every tile while still answering HTTP 200; it is now an explicit keyless,
+label-free Esri Dark Gray Base layer. Tests pin both and fail on the old dashboards.
+
 ## Management tools tested on live traffic: two real bugs
 
 `scripts/field_test_ops.py` (see [docs/FIELD_TEST.md](docs/FIELD_TEST.md)) uses the triage,

@@ -33,7 +33,12 @@ def _source_address_for(host: str, port: int) -> str | None:
         return None
 
 
-async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) -> dict[str, Any]:
+async def tcp_probe(
+    port: int,
+    host: str = "127.0.0.1",
+    timeout: float = 2.0,
+    also_as: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Default health-check primitive: open a TCP connection and immediately close.
     Confirms the OS is actually accepting connections on the port — catches
     cases where a server crashed but the engine's internal state still says
@@ -58,6 +63,14 @@ async def tcp_probe(port: int, host: str = "127.0.0.1", timeout: float = 2.0) ->
             with contextlib.suppress(OSError):
                 sock.bind((source_ip, 0))
                 self_probe.register(sock.getsockname())
+                # The same bound port, as the far side will see it after NAT. A container reached
+                # through a published port sees the host's own connection from the bridge gateway
+                # (172.17.0.1), not from 127.0.0.1, with the port unchanged: without this the
+                # claim never matched and the watchdog's probe of each Cowrie container showed up
+                # as an attacker, 1,060 connect/close pairs per sensor in nine hours.
+                local_port = sock.getsockname()[1]
+                for alias in also_as:
+                    self_probe.register((alias, local_port))
 
         loop = asyncio.get_running_loop()
         await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=timeout)

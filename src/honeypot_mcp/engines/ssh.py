@@ -506,13 +506,20 @@ class SSHEngine(HoneypotEngine):
                 c = self._client.containers.get(container_id)
                 networks = (c.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
                 ips = [n.get("IPAddress") for n in networks.values() if n.get("IPAddress")]
+                gateways = [n.get("Gateway") for n in networks.values() if n.get("Gateway")]
                 return {
                     "docker_status": c.status,
                     "running": c.status == "running",
                     "container_ips": ips,
+                    "gateways": gateways,
                 }
             except docker.errors.NotFound:
-                return {"docker_status": "not_found", "running": False, "container_ips": []}
+                return {
+                    "docker_status": "not_found",
+                    "running": False,
+                    "container_ips": [],
+                    "gateways": [],
+                }
 
         state = await loop.run_in_executor(None, _docker_state)
         if not state["running"]:
@@ -525,7 +532,7 @@ class SSHEngine(HoneypotEngine):
 
         from honeypot_mcp.engines.base import tcp_probe
 
-        tcp = await tcp_probe(port)
+        tcp = await tcp_probe(port, also_as=tuple(state.get("gateways", ())))
         if not tcp["alive"]:
             for ip in state["container_ips"]:
                 tcp = await tcp_probe(self._PRIMARY_CONTAINER_PORT, host=ip)
