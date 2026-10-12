@@ -38,6 +38,7 @@ import asyncio
 import logging
 import re
 import secrets
+from datetime import UTC, datetime
 from typing import Any
 
 from honeypot_mcp.config import get_settings
@@ -223,7 +224,7 @@ def build_search_done(message_id: int, result_code: int = _SUCCESS, diagnostic: 
 _DOMAIN_DN = "DC=corp,DC=local"
 _DC_HOST = "DC01.corp.local"
 _ROOT_DSE: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("currentTime", ("20261006201500.0Z",)),
+    ("currentTime", ()),  # filled in per request by `build_root_dse` from the real clock
     ("subschemaSubentry", (f"CN=Aggregate,CN=Schema,CN=Configuration,{_DOMAIN_DN}",)),
     (
         "dsServiceName",
@@ -263,12 +264,21 @@ _ROOT_DSE: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+def directory_time(now: datetime | None = None) -> str:
+    """AD's generalized time, `YYYYMMDDHHMMSS.0Z`. It was the constant 20261006201500.0Z, six days
+    behind when an nmap `ldap-rootdse` scan found it: every real domain controller reports the
+    actual time, so a frozen clock is a one-query tell."""
+    return (now or datetime.now(UTC)).strftime("%Y%m%d%H%M%S") + ".0Z"
+
+
 def build_root_dse(message_id: int, requested: list[str]) -> bytes:
     """The rootDSE searchResEntry, limited to the requested attributes (none, or `*`, means all)."""
     wanted = {attr.lower() for attr in requested}
     everything = not wanted or "*" in wanted
     attributes = b""
     for name, values in _ROOT_DSE:
+        if name == "currentTime":
+            values = (directory_time(),)
         if not everything and name.lower() not in wanted:
             continue
         attributes += _tlv(

@@ -52,7 +52,9 @@ from typing import Any
 
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._bounds import write_backlogged
+from honeypot_mcp.engines._host_identity import KERNEL_RELEASE
 from honeypot_mcp.engines._tasks import spawn
+from honeypot_mcp.engines._uptime import uptime_seconds
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory, shutdown_server
 from honeypot_mcp.storage import queries
@@ -78,7 +80,7 @@ _INFO_RESPONSE = (
     "redis_git_dirty:0\r\n"
     "redis_build_id:abcdef0123456789\r\n"
     "redis_mode:standalone\r\n"
-    "os:Linux 5.15.0-101-generic x86_64\r\n"
+    f"os:Linux {KERNEL_RELEASE} x86_64\r\n"
     "arch_bits:64\r\n"
     "multiplexing_api:epoll\r\n"
     "process_id:1\r\n"
@@ -111,6 +113,15 @@ _INFO_RESPONSE = (
     "# Keyspace\r\n"
     "db0:keys=0,expires=0,avg_ttl=0\r\n"
 )
+
+
+_UPTIME_LINE = "uptime_in_seconds:84231\r\n"
+assert _UPTIME_LINE in _INFO_RESPONSE, "the INFO template and its uptime line must stay in step"
+
+
+def _info_response() -> str:
+    """INFO with an uptime that keeps counting (it was a frozen 84231 s)."""
+    return _INFO_RESPONSE.replace(_UPTIME_LINE, f"uptime_in_seconds:{uptime_seconds()}\r\n")
 
 
 def _bulk_string(s: str) -> bytes:
@@ -469,7 +480,7 @@ class _RedisProtocol(asyncio.Protocol):
             return
 
         if verb == "INFO":
-            t.write(_bulk_string(_INFO_RESPONSE))
+            t.write(_bulk_string(_info_response()))
             spawn(
                 self._record(
                     "redis_info_probe", AlertSeverity.MEDIUM, {"args": _clip_args(args[1:])}

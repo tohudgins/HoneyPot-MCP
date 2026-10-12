@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import re
 import secrets
@@ -158,7 +159,13 @@ _MAX_PACKETS_PER_CONN = 1024
 _MAX_WRITE_BUFFER = 256 * 1024
 
 
-def _build_handshake_packet(salt_1: bytes, salt_2: bytes) -> bytes:
+# A MySQL connection id is a per-server counter, so every connection sees a higher one than the
+# last. The greeting used the constant 12345, which nmap's `mysql-info` prints ("Thread ID: 12345")
+# on every scan: a decoy tell. Start somewhere a busy server plausibly is.
+_CONNECTION_IDS = itertools.count(secrets.randbelow(4000) + 800)
+
+
+def _build_handshake_packet(salt_1: bytes, salt_2: bytes, thread_id: int) -> bytes:
     """Build the MySQL 4.1+ Initial Handshake Packet.
 
     Layout (after the standard MySQL packet header):
@@ -183,7 +190,7 @@ def _build_handshake_packet(salt_1: bytes, salt_2: bytes) -> bytes:
             bytes([10]),
             _SERVER_VERSION,
             b"\x00",
-            struct.pack("<I", 12345),  # thread_id
+            struct.pack("<I", thread_id),  # connection id
             salt_1,
             b"\x00",  # filler
             struct.pack("<H", cap_lower),
@@ -507,7 +514,7 @@ class _MySQLProtocol(asyncio.Protocol):
         salt_1 = secrets.token_bytes(8)
         salt_2 = secrets.token_bytes(12)
         self._salt = salt_1 + salt_2
-        transport.write(_build_handshake_packet(salt_1, salt_2))
+        transport.write(_build_handshake_packet(salt_1, salt_2, next(_CONNECTION_IDS)))
         self._sent_handshake = True
 
         spawn(self._record("mysql_connection", AlertSeverity.LOW, {}), name="mysql-event")

@@ -56,6 +56,7 @@ from typing import Any
 
 from aiohttp import web
 
+from honeypot_mcp.engines._host_identity import KERNEL_RELEASE, OS_PRETTY_NAME
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.tls import SERVER_AUTH, CertProfile
 from honeypot_mcp.http_identity import (
@@ -682,8 +683,8 @@ class _Cluster:
                     ],
                     "nodeInfo": {
                         "kubeletVersion": _K8S_VERSION,
-                        "osImage": "Ubuntu 22.04.3 LTS",
-                        "kernelVersion": "5.15.0-1051-aws",
+                        "osImage": OS_PRETTY_NAME,
+                        "kernelVersion": KERNEL_RELEASE,
                         "containerRuntimeVersion": "containerd://1.7.8",
                         "operatingSystem": "linux",
                         "architecture": "amd64",

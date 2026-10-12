@@ -43,6 +43,7 @@ from typing import Any
 
 from aiohttp import web
 
+from honeypot_mcp.engines._host_identity import KERNEL_RELEASE, OS_PRETTY_NAME
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.http_identity import (
     MAX_REQUEST_BYTES,
@@ -62,7 +63,7 @@ _DOCKER_VERSION = "24.0.7"
 _API_VERSION = "1.43"
 _MIN_API_VERSION = "1.12"
 _GO_VERSION = "go1.20.10"
-_KERNEL_VERSION = "5.15.0-88-generic"
+_KERNEL_VERSION = KERNEL_RELEASE
 _SERVER_BANNER = f"Docker/{_DOCKER_VERSION} (linux)"
 
 # Image names that only appear in cryptomining and botnet campaigns. Matching
@@ -304,7 +305,7 @@ class DockerAPIEngine(HoneypotEngine):
                     "SwapLimit": True,
                     "CpuCfsPeriod": True,
                     "KernelVersion": _KERNEL_VERSION,
-                    "OperatingSystem": "Ubuntu 22.04.3 LTS",
+                    "OperatingSystem": OS_PRETTY_NAME,
                     "OSVersion": "22.04",
                     "OSType": "linux",
                     "Architecture": "x86_64",

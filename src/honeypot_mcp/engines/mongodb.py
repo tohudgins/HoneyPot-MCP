@@ -32,6 +32,7 @@ from typing import Any
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
+from honeypot_mcp.engines._uptime import uptime_seconds
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory, shutdown_server
 from honeypot_mcp.storage import queries
@@ -225,9 +226,9 @@ def _server_status_reply() -> dict[str, Any]:
         "version": _MONGO_VERSION,
         "process": "mongod",
         "pid": 1,
-        "uptime": 84231.0,
-        "uptimeMillis": 84231000,
-        "uptimeEstimate": 84231,
+        "uptime": float(uptime_seconds()),
+        "uptimeMillis": uptime_seconds() * 1000,
+        "uptimeEstimate": uptime_seconds(),
         "localTime": datetime.now(UTC),
         "connections": {"current": 1, "available": 838859, "totalCreated": 42},
         "network": {"bytesIn": 1874, "bytesOut": 29184, "numRequests": 12},

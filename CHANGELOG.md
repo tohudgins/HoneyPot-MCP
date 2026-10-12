@@ -4,6 +4,17 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Decoy tells found by stock nmap scripts: frozen clocks, constant ids, three kernels on one host
+
+Running the NSE scripts (`ldap-rootdse`, `mysql-info`, `mongodb-info`, `redis-info`, `docker-version`)
+against the live droplet showed what a scanner sees. The LDAP rootDSE `currentTime` was frozen six days in
+the past; every MySQL connection reported thread id 12345; Redis and MongoDB uptime never advanced; and
+Redis, the Docker API and the Kubernetes node reported three different kernels although they share one
+IP. LDAP now reports the real clock (`directory_time`), MySQL ids count up from a random start, uptimes
+grow from one shared base (`engines/_uptime.py`), and `engines/_host_identity.py` is the single source of
+the kernel and OS string. `tests/unit/test_engine_identity.py` pins each; every test was checked to fail
+against the old behaviour.
+
 ## Notifications carry reputation; sensor ids are never reused; stopped sensors can be removed
 
 **Slack, Teams and email now show who the attacker is.** A notification used to carry only the event,
