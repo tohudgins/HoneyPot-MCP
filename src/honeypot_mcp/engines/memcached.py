@@ -38,6 +38,7 @@ from typing import Any
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._bounds import write_backlogged
 from honeypot_mcp.engines._tasks import spawn
+from honeypot_mcp.engines._uptime import uptime_seconds
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.conn_limit import ConnectionLimiter, limited_factory, shutdown_server
 from honeypot_mcp.storage import queries
@@ -70,21 +71,31 @@ _MAX_STAGED_KEYS = 64
 _MAX_WRITE_BUFFER = 512 * 1024
 
 
+_BASE_UPTIME_SECONDS = 864_000  # ten days: a cache that has been serving a while
+_PID = 10010  # a daemon's pid does not change between connections
+
+
 def _stats_lines(uptime: int, conn_id: int) -> list[str]:
     """A believable `stats` block for memcached 1.6.x.
 
     nmap identifies memcached from this response, and the numbers have to look
     like a server that has been up for a while — an all-zero counter set is as
-    obvious as an empty banner.
+    obvious as an empty banner. Counters grow with `uptime`, so two scans an
+    hour apart see a server that kept working in between, and hits + misses
+    stays equal to `cmd_get` as it does on the real thing.
     """
+    elapsed = max(0, uptime - _BASE_UPTIME_SECONDS)
+    gets = 2 * elapsed
+    misses = gets // 14
+    sets = elapsed // 4
     return [
-        f"STAT pid {10000 + (conn_id % 5000)}",
+        f"STAT pid {_PID}",
         f"STAT uptime {uptime}",
         f"STAT time {int(time.time())}",
         f"STAT version {_MEMCACHED_VERSION}",
         "STAT pointer_size 64",
-        "STAT rusage_user 4.128000",
-        "STAT rusage_system 9.216000",
+        f"STAT rusage_user {4.128 + elapsed * 0.0004:.6f}",
+        f"STAT rusage_system {9.216 + elapsed * 0.0009:.6f}",
         "STAT max_connections 1024",
         f"STAT curr_connections {3 + (conn_id % 7)}",
         f"STAT total_connections {1024 + conn_id}",
@@ -94,25 +105,25 @@ def _stats_lines(uptime: int, conn_id: int) -> list[str]:
         "STAT response_obj_count 1",
         "STAT read_buf_count 8",
         "STAT read_buf_bytes 131072",
-        "STAT cmd_get 184213",
-        "STAT cmd_set 41082",
+        f"STAT cmd_get {184213 + gets}",
+        f"STAT cmd_set {41082 + sets}",
         "STAT cmd_flush 0",
         "STAT cmd_touch 0",
-        "STAT get_hits 171904",
-        "STAT get_misses 12309",
+        f"STAT get_hits {171904 + gets - misses}",
+        f"STAT get_misses {12309 + misses}",
         "STAT get_expired 884",
         "STAT delete_hits 402",
         "STAT delete_misses 91",
         "STAT incr_hits 0",
         "STAT decr_hits 0",
-        "STAT bytes_read 28472913",
-        "STAT bytes_written 991284471",
+        f"STAT bytes_read {28472913 + elapsed * 180}",
+        f"STAT bytes_written {991284471 + elapsed * 5000}",
         "STAT limit_maxbytes 67108864",
         "STAT accepting_conns 1",
         "STAT threads 4",
         f"STAT bytes {2_400_000 + conn_id * 17}",
         "STAT curr_items 8421",
-        "STAT total_items 41082",
+        f"STAT total_items {41082 + sets}",
         "STAT evictions 0",
         "STAT reclaimed 331",
     ]
@@ -127,7 +138,6 @@ class _MemcachedProtocol(asyncio.Protocol):
         self._transport: asyncio.Transport | None = None
         self._peer: tuple[str, int] = ("0.0.0.0", 0)
         self._buf = bytearray()
-        self._started = time.time()
         # Keys this peer has staged with a large value — the second half of the
         # amplification pattern only matters for keys it actually set.
         self._staged: dict[str, int] = {}
@@ -227,7 +237,7 @@ class _MemcachedProtocol(asyncio.Protocol):
             return True
 
         if command == "stats":
-            uptime = int(time.time() - self._started) + 864_000
+            uptime = uptime_seconds(_BASE_UPTIME_SECONDS)
             body = "\r\n".join(_stats_lines(uptime, self._conn_id)) + "\r\nEND\r\n"
             self._send(body.encode())
             # `stats` is how a reflector is measured: the response is ~1.5 KB

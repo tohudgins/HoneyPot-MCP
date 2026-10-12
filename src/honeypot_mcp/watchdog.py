@@ -35,6 +35,9 @@ from honeypot_mcp.storage.models import AlertSeverity, Honeypot, HoneypotStatus
 log = logging.getLogger(__name__)
 
 CHECK_INTERVAL_SECONDS = 30
+CONFIRM_FAILURES = 2  # consecutive failed sweeps before a sensor is declared dead
+UNSTABLE_BLIPS = 3  # recovered single failures within the window that make a sensor "unstable"
+UNSTABLE_WINDOW_SECONDS = 3600.0
 
 
 class HoneypotWatchdog:
@@ -45,6 +48,11 @@ class HoneypotWatchdog:
         # Honeypot IDs we've already alerted about — so a single failure doesn't
         # flood the alert stream every interval. Cleared when health recovers.
         self._reported_dead: set[int] = set()
+        # Consecutive failed probes per honeypot, and when each last had a blip (failed once and
+        # recovered), so a self-healing restart is not a CRITICAL page but a loop is still noticed.
+        self._failing: dict[int, int] = {}
+        self._blips: dict[int, list[float]] = {}
+        self._last_unstable: dict[int, float] = {}
         # Monotonic timestamp of the last retention sweep. 0.0 means "never" so
         # the first cycle after startup runs it immediately when enabled.
         self._last_prune_at: float = 0.0
@@ -157,12 +165,17 @@ class HoneypotWatchdog:
                 continue
 
             if health.get("alive"):
+                if self._failing.pop(hp.id, 0) and hp.id not in self._reported_dead:
+                    await self._note_blip(hp.id, hp.name)
                 self._reported_dead.discard(hp.id)
                 if hp.status is HoneypotStatus.ERROR:
                     await self._mark_recovered(hp.id, hp.name)
                 continue
 
-            if hp.id in self._reported_dead:
+            # One failed probe is a blip (a container restarting takes a few seconds); only a
+            # failure that survives into the next sweep is an outage worth a CRITICAL page.
+            self._failing[hp.id] = self._failing.get(hp.id, 0) + 1
+            if self._failing[hp.id] < CONFIRM_FAILURES or hp.id in self._reported_dead:
                 continue
             self._reported_dead.add(hp.id)
             await self._mark_dead(hp.id, hp.name, health)
@@ -202,6 +215,36 @@ class HoneypotWatchdog:
             current = samples.get(label)
             if label not in low and (current is None or current.free_mb >= threshold * 1.1):
                 self._disk_low.discard(label)
+
+    async def _note_blip(self, hp_id: int, hp_name: str) -> None:
+        """A probe failed once and the next one passed: not an outage, but a sensor that keeps
+        doing it is unhealthy. Raise one HIGH alert per hour for it instead of a CRITICAL each time."""
+        now = time.monotonic()
+        recent = [t for t in self._blips.get(hp_id, []) if now - t < UNSTABLE_WINDOW_SECONDS]
+        recent.append(now)
+        self._blips[hp_id] = recent
+        log.info(
+            "Honeypot %r failed one probe and recovered (%d in the last hour)", hp_name, len(recent)
+        )
+        if (
+            len(recent) < UNSTABLE_BLIPS
+            or now - self._last_unstable.get(hp_id, -1e9) < UNSTABLE_WINDOW_SECONDS
+        ):
+            return
+        self._last_unstable[hp_id] = now
+        await submit_event(
+            PendingEvent(
+                honeypot_id=hp_id,
+                source_ip="0.0.0.0",
+                event_type="honeypot_unstable",
+                payload={
+                    "name": hp_name,
+                    "failed_probes_in_last_hour": len(recent),
+                    "note": "the sensor keeps failing a probe and recovering (a restart loop?)",
+                },
+                severity=AlertSeverity.HIGH,
+            )
+        )
 
     async def _mark_recovered(self, hp_id: int, hp_name: str) -> None:
         """Flip a honeypot that is answering again back to RUNNING.

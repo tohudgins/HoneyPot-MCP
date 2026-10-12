@@ -216,6 +216,11 @@ async def blocklist_push_cloudflare(
     return await _finish(tool, target, args, result, excluded)
 
 
+_CF_OPERATION_TIMEOUT = 30.0  # seconds to wait for one bulk operation
+_CF_POLL_INTERVAL = 0.5
+_CF_CHUNK = 1000  # items Cloudflare accepts in one create call
+
+
 async def _cloudflare_push(
     account_id: str,
     list_id: str,
@@ -261,27 +266,59 @@ async def _cloudflare_push(
     if dry_run or not to_add:
         return {"added": to_add, "skipped": skipped, "failed": [], "dry_run": dry_run}
 
-    # 2. Push new items in batches (Cloudflare accepts up to 1000 per call)
+    # 2. Push new items in batches (Cloudflare accepts up to 1000 per call). Creating items is an
+    # asynchronous bulk operation and an account may have only ONE pending: the next chunk is
+    # refused until this one finishes, and a 200 only means "accepted", not "on the list".
     added: list[str] = []
     failed: list[dict[str, str]] = []
+    ops_url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{account_id}/rules/lists/bulk_operations"
+    )
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for chunk_start in range(0, len(to_add), 1000):
-            chunk = to_add[chunk_start : chunk_start + 1000]
+        for chunk_start in range(0, len(to_add), _CF_CHUNK):
+            chunk = to_add[chunk_start : chunk_start + _CF_CHUNK]
             payload = [{"ip": ip, "comment": f"honeypot-mcp:{hours}h"} for ip in chunk]
             try:
                 resp = await client.post(base, headers=headers, json=payload)
-            except httpx.HTTPError as e:
+                error = None
+                if 200 <= resp.status_code < 300:
+                    operation_id = (resp.json().get("result") or {}).get("operation_id")
+                    if operation_id:
+                        error = await _cloudflare_wait(client, ops_url, headers, operation_id)
+                else:
+                    error = f"HTTP {resp.status_code}"
+            except (httpx.HTTPError, ValueError, AttributeError) as e:
                 # Earlier chunks already went through; losing track of them
                 # because a later one timed out would misreport the blocklist.
-                failed.extend({"ip": ip, "error": type(e).__name__} for ip in chunk)
-                continue
-            if 200 <= resp.status_code < 300:
+                error = type(e).__name__
+            if error is None:
                 added.extend(chunk)
             else:
-                for ip in chunk:
-                    failed.append({"ip": ip, "error": f"HTTP {resp.status_code}"})
+                failed.extend({"ip": ip, "error": error} for ip in chunk)
 
     return {"added": added, "skipped": skipped, "failed": failed, "dry_run": dry_run}
+
+
+async def _cloudflare_wait(
+    client: httpx.AsyncClient, ops_url: str, headers: dict[str, str], operation_id: str
+) -> str | None:
+    """Wait for a bulk operation; None when it completed, otherwise why it did not."""
+    if not _CF_ID_RE.fullmatch(operation_id):
+        return "unexpected operation id"
+    deadline = asyncio.get_running_loop().time() + _CF_OPERATION_TIMEOUT
+    while True:
+        resp = await client.get(f"{ops_url}/{operation_id}", headers=headers)
+        if resp.status_code != 200:
+            return f"operation status HTTP {resp.status_code}"
+        result = resp.json().get("result") or {}
+        status = result.get("status")
+        if status == "completed":
+            return None
+        if status == "failed":
+            return f"operation failed: {str(result.get('error', 'unknown'))[:120]}"
+        if asyncio.get_running_loop().time() >= deadline:
+            return f"operation still {status or 'pending'} after {_CF_OPERATION_TIMEOUT:g}s"
+        await asyncio.sleep(_CF_POLL_INTERVAL)
 
 
 # ── pfSense ─────────────────────────────────────────────────────────────────
@@ -297,7 +334,7 @@ async def blocklist_push_pfsense(
     dry_run: bool = False,
     verify_tls: bool = True,
 ) -> dict[str, Any]:
-    """Push offender IPs to a pfSense firewall alias via the Netgate v2 REST API.
+    """Push offender IPs to a pfSense firewall alias via the pfrest v2 REST API.
 
     The alias must already exist and be of type `host` or `network`. After
     updating the alias, the API call to `/firewall/apply` actually commits
@@ -378,13 +415,15 @@ async def _pfsense_push(
     dry_run: bool,
     verify_tls: bool,
 ) -> dict[str, Any]:
-    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    # pfrest (the pfSense REST API package) authenticates with `X-API-Key`, addresses an alias by
+    # its integer `id` rather than its name, and updates it with PATCH; there is no PUT.
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
     base = base_url.rstrip("/")
 
     async with httpx.AsyncClient(timeout=15.0, verify=verify_tls) as client:
-        # 1. Read the current alias
+        # 1. Find the alias (the plural endpoint filters by name and returns each entry's id)
         resp = await client.get(
-            f"{base}/api/v2/firewall/alias", headers=headers, params={"name": alias_name}
+            f"{base}/api/v2/firewall/aliases", headers=headers, params={"name": alias_name}
         )
         if resp.status_code != 200:
             return {
@@ -393,33 +432,45 @@ async def _pfsense_push(
                 "failed": [{"ip": "*", "error": f"alias read HTTP {resp.status_code}"}],
                 "dry_run": dry_run,
             }
-        body = resp.json()
-        data = body.get("data") or body
-        # Address list can be a space-separated string or an array depending
-        # on pfSense's serialiser — normalise.
-        addresses_raw = data.get("address") or data.get("addresses") or []
-        if isinstance(addresses_raw, str):
-            existing = set(addresses_raw.split())
-        else:
-            existing = set(addresses_raw)
+        rows = resp.json().get("data") or []
+        # A filter is a request, not a guarantee: take only the alias that is exactly the one named.
+        alias = next((r for r in rows if r.get("name") == alias_name and "id" in r), None)
+        if alias is None:
+            return {
+                "added": [],
+                "skipped": [],
+                "failed": [{"ip": "*", "error": f"alias {alias_name!r} not found"}],
+                "dry_run": dry_run,
+            }
+        addresses_raw = alias.get("address") or []
+        # Older serialisers return a space-separated string, pfrest v2 an array.
+        existing = addresses_raw.split() if isinstance(addresses_raw, str) else list(addresses_raw)
+        known = set(existing)
 
-        to_add = [ip for ip in offenders if ip not in existing]
-        skipped = [ip for ip in offenders if ip in existing]
+        to_add = [ip for ip in offenders if ip not in known]
+        skipped = [ip for ip in offenders if ip in known]
 
         if dry_run or not to_add:
             return {"added": to_add, "skipped": skipped, "failed": [], "dry_run": dry_run}
 
-        # 2. PUT whole alias with merged address list
-        merged = sorted(existing | set(to_add))
-        put_body = dict(data)
-        put_body["address"] = " ".join(merged)
-        put_resp = await client.put(f"{base}/api/v2/firewall/alias", headers=headers, json=put_body)
+        # 2. PATCH the alias. `detail` is positional with `address`, so keep the existing order,
+        # pad any missing descriptions, and append ours: sorting would misalign every comment.
+        details = [str(d) for d in (alias.get("detail") or [])]
+        details += [""] * (len(existing) - len(details))
+        patch_body = {
+            "id": alias["id"],
+            "address": existing + to_add,
+            "detail": details[: len(existing)] + ["honeypot-mcp"] * len(to_add),
+        }
+        put_resp = await client.patch(
+            f"{base}/api/v2/firewall/alias", headers=headers, json=patch_body
+        )
         if not 200 <= put_resp.status_code < 300:
             return {
                 "added": [],
                 "skipped": skipped,
                 "failed": [
-                    {"ip": ip, "error": f"PUT HTTP {put_resp.status_code}"} for ip in to_add
+                    {"ip": ip, "error": f"PATCH HTTP {put_resp.status_code}"} for ip in to_add
                 ],
                 "dry_run": dry_run,
             }
@@ -571,15 +622,19 @@ async def _waf_push(
         return {"added": to_add, "skipped": skipped, "failed": failed_up_front, "dry_run": dry_run}
 
     merged = sorted(existing | set(to_add))
+    update: dict[str, Any] = {
+        "Name": ip_set_name,
+        "Id": ip_set_id,
+        "Scope": scope,
+        "Addresses": merged,
+        "LockToken": lock_token,
+    }
+    # UpdateIPSet replaces the description with whatever it is given, so omitting it would blank
+    # the operator's own description of the set on every push.
+    if ip_set.get("Description"):
+        update["Description"] = ip_set["Description"]
     try:
-        await asyncio.to_thread(
-            client.update_ip_set,
-            Name=ip_set_name,
-            Id=ip_set_id,
-            Scope=scope,
-            Addresses=merged,
-            LockToken=lock_token,
-        )
+        await asyncio.to_thread(client.update_ip_set, **update)
     except Exception as e:
         return {
             "added": [],

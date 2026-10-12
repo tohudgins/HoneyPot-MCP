@@ -103,14 +103,66 @@ async def test_error_honeypot_still_down_stays_in_error_without_realerting(monke
     assert alerts == ["still-down"], f"re-alerted on an already-dead honeypot: {alerts}"
 
 
-async def test_running_honeypot_that_fails_is_marked_error(monkeypatch):
-    """The original behaviour still holds."""
+async def test_one_failed_probe_is_a_blip_and_two_in_a_row_is_an_outage(monkeypatch):
+    """A Docker restart takes seconds. Paging CRITICAL for that, every few minutes, trained the
+    operator to ignore the channel; an outage that survives into the next sweep still pages."""
     import honeypot_mcp.watchdog as watchdog_mod
     from honeypot_mcp.storage.models import HoneypotStatus
 
     hp_id = await _add("dying", HoneypotStatus.RUNNING)
     monkeypatch.setattr(watchdog_mod, "get_engine", lambda _t: _engine_reporting(False))
+    wd = watchdog_mod.HoneypotWatchdog()
+    alerts: list[str] = []
 
-    await watchdog_mod.HoneypotWatchdog()._check_all()
+    async def _capture(hp, name, health):
+        alerts.append(name)
 
-    assert await _status_of(hp_id) is HoneypotStatus.ERROR
+    monkeypatch.setattr(wd, "_mark_dead", _capture)
+
+    await wd._check_all()
+    assert alerts == [], "a single failed probe must not page"
+    await wd._check_all()
+    assert alerts == ["dying"]
+    assert await _status_of(hp_id) is HoneypotStatus.RUNNING  # _mark_dead is stubbed here
+
+
+async def test_a_failed_probe_that_recovers_never_marks_the_sensor_dead(monkeypatch):
+    import honeypot_mcp.watchdog as watchdog_mod
+    from honeypot_mcp.storage.models import HoneypotStatus
+
+    hp_id = await _add("blippy", HoneypotStatus.RUNNING)
+    answers = iter([False, True, False, True])
+    monkeypatch.setattr(watchdog_mod, "get_engine", lambda _t: _engine_reporting(next(answers)))
+    wd = watchdog_mod.HoneypotWatchdog()
+
+    for _ in range(4):
+        await wd._check_all()
+
+    assert await _status_of(hp_id) is HoneypotStatus.RUNNING
+    assert wd._reported_dead == set()
+
+
+async def test_a_sensor_that_keeps_blipping_raises_one_high_instability_alert(monkeypatch):
+    """The restart loop that prompted this was only noticed because it paged. Debouncing must not
+    make it silent: three recovered blips in an hour is one HIGH alert, not three CRITICALs."""
+    import honeypot_mcp.watchdog as watchdog_mod
+    from honeypot_mcp.storage.models import AlertSeverity, HoneypotStatus
+
+    await _add("loopy", HoneypotStatus.RUNNING)
+    answers = iter([False, True] * 5)
+    monkeypatch.setattr(watchdog_mod, "get_engine", lambda _t: _engine_reporting(next(answers)))
+    sent = []
+
+    async def _submit(event):
+        sent.append(event)
+
+    monkeypatch.setattr(watchdog_mod, "submit_event", _submit)
+    wd = watchdog_mod.HoneypotWatchdog()
+
+    for _ in range(10):
+        await wd._check_all()
+
+    assert [(e.event_type, e.severity) for e in sent] == [
+        ("honeypot_unstable", AlertSeverity.HIGH)
+    ], "exactly one instability alert (cooldown), and no honeypot_health_failed"
+    assert sent[0].payload["failed_probes_in_last_hour"] == 3

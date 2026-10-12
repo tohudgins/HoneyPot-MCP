@@ -406,6 +406,15 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Exfiltration Over C2 Channel",
         "Exfiltration",
     ),
+    # ── Initial Access ───────────────────────────────────────────────────────
+    (
+        # An unauthenticated Redis that accepts CONFIG SET / SET is the entry point of the common
+        # Redis campaigns (write an SSH key or a cron job through `dir`/`dbfilename`).
+        re.compile(r"redis_(config_set|key_set)", re.I),
+        "T1190",
+        "Exploit Public-Facing Application",
+        "Initial Access",
+    ),
     # ── Discovery ────────────────────────────────────────────────────────────
     (
         re.compile(
@@ -418,7 +427,11 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     (
         # Listing NFS exports or rsync modules is remote share discovery, and
         # ATT&CK names it precisely.
-        re.compile(r"(nfs_export_enumeration|rsync_module_enumeration|nfs_portmap_dump)", re.I),
+        re.compile(
+            r"(nfs_export_enumeration|nfs_mount_probe|rsync_module_enumeration|"
+            r"rsync_module_access|rsync_unknown_module|nfs_portmap_dump)",
+            re.I,
+        ),
         "T1135",
         "Network Share Discovery",
         "Discovery",
@@ -426,7 +439,9 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     (
         # SIP sweeps and extension guessing are service/host enumeration.
         re.compile(
-            r"(sip_scan|sip_options_probe|sip_extension_probe|nfs_portmap_query|nfs_request)", re.I
+            r"(sip_scan|sip_options_probe|sip_extension_probe|sip_(request|invite)\b|"
+            r"nfs_portmap_query|nfs_portmap_probe|nfs_request|nfs_unknown_program)",
+            re.I,
         ),
         "T1046",
         "Network Service Discovery",
@@ -435,7 +450,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     (
         # ATT&CK's Containers matrix names this exactly — listing containers
         # and images on a runtime you do not own.
-        re.compile(r"(docker_api_(enumerate|list)|kubernetes_(enumerate|recon|probe))", re.I),
+        re.compile(r"(docker_api_(enumerate|list|probe)|kubernetes_(enumerate|recon|probe))", re.I),
         "T1613",
         "Container and Resource Discovery",
         "Discovery",
@@ -451,7 +466,7 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     ),
     (
         re.compile(
-            r"(recon.query|info.probe|version\(\)|buildinfo|servetstatus|"
+            r"(recon.query|info.probe|version\(\)|buildinfo|servetstatus|redis_config_get|"
             r"server.status|health.probe|current_user|version.probe)",
             re.I,
         ),
@@ -478,6 +493,13 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         re.compile(r"(web.scan|nikto|dirb|gobuster|wfuzz|active.recon)", re.I),
         "T1595.003",
         "Active Scanning: Wordlist Scanning",
+        "Reconnaissance",
+    ),
+    (
+        # A malformed or protocol-less probe is what a scanner sends to fingerprint a service.
+        re.compile(r"((ldap|rdp|snmp|rsync|sip)_invalid_probe|http_(recon_)?probe)", re.I),
+        "T1595",
+        "Active Scanning",
         "Reconnaissance",
     ),
     (

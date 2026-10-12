@@ -130,3 +130,48 @@ async def test_exploit_is_not_mistaken_for_brute_force():
 async def test_unrecognised_input_maps_to_nothing():
     """The mapper must not invent techniques for arbitrary strings."""
     assert await map_to_attack(["completely_unrelated_gibberish_xyz"]) == []
+
+
+@pytest.mark.parametrize(
+    ("event_type", "technique"),
+    [
+        # Types that the live droplet recorded thousands of times and the mapper used to ignore.
+        ("redis_config_set", "T1190"),
+        ("redis_key_set", "T1190"),
+        ("redis_config_get", "T1082"),
+        ("docker_api_probe", "T1613"),
+        ("nfs_mount_probe", "T1135"),
+        ("rsync_module_access", "T1135"),
+        ("sip_invite", "T1046"),
+        ("sip_request", "T1046"),
+        ("SIP_INVITE", "T1046"),  # payload terms arrive in the case the attacker used
+        ("ldap_invalid_probe", "T1595"),
+        ("http_recon_probe", "T1595"),
+    ],
+)
+async def test_attacker_behaviour_seen_on_the_live_droplet_is_mapped(event_type, technique):
+    from honeypot_mcp.intel.mitre import map_to_attack
+
+    mapped = {m["technique_id"] for m in await map_to_attack([event_type])}
+    assert technique in mapped, (event_type, mapped)
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "telnet_session_connect",
+        "telnet_session_closed",
+        "ssh_session_closed",
+        "smb_connection",
+        "mysql_connection",
+        "honeypot_health_failed",
+        "honeypot_unstable",
+        "flood_summary",
+    ],
+)
+async def test_connection_and_platform_bookkeeping_is_not_claimed_as_a_technique(event_type):
+    """A TCP connection or the platform's own health alert is not an ATT&CK technique; mapping them
+    would inflate every tactic count on the dashboard."""
+    from honeypot_mcp.intel.mitre import map_to_attack
+
+    assert await map_to_attack([event_type]) == []

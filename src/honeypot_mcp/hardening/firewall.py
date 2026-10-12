@@ -63,6 +63,8 @@ _BRIDGES = ("docker0", "br-*")
 # Container egress ceiling and new-connection budget in "limited" mode.
 _EGRESS_KBYTES_PER_SECOND = 512
 _EGRESS_NEW_PER_MINUTE = 30
+# Concurrent connections one source may hold open to a published container port.
+_CONTAINER_CONNECTIONS_PER_SOURCE = 128
 # Everything a container must never reach: private, loopback, link-local (includes the cloud
 # metadata address), carrier-grade NAT, benchmarking, multicast and reserved space.
 _NON_PUBLIC_V4 = (
@@ -253,6 +255,15 @@ def render(spec: FirewallSpec) -> str:
             "\t\tsize 8192",
             "\t}",
         ]
+    if spec.docker_ports:
+        for family, kind in (("v4", "ipv4_addr"), ("v6", "ipv6_addr")):
+            lines += [
+                f"\tset conn_{family} {{",
+                f"\t\ttype {kind}",
+                "\t\tflags dynamic",
+                "\t\tsize 8192",
+                "\t}",
+            ]
     for family, kind, networks in (("v4", "ipv4_addr", allow4), ("v6", "ipv6_addr", allow6)):
         if networks:
             lines += [
@@ -324,6 +335,18 @@ def render(spec: FirewallSpec) -> str:
         lines.append("\t}")
 
     lines += ["\tchain forward {", "\t\ttype filter hook forward priority -10; policy accept;"]
+    if spec.docker_ports:
+        # Cowrie runs in a container and has no per-source limit of its own. One host opening
+        # hundreds of sessions held it at its memory ceiling and it was OOM-killed every few
+        # minutes (the in-process engines cap this themselves: conn_limit). `ct original
+        # proto-dst` is the public port, which DNAT has already rewritten in this hook.
+        published = _set_list(spec.docker_ports)
+        for family, saddr in (("v4", "ip saddr"), ("v6", "ip6 saddr")):
+            lines.append(
+                f"\t\tmeta l4proto tcp ct original proto-dst {{ {published} }} ct state new "
+                f"add @conn_{family} {{ {saddr} ct count over {_CONTAINER_CONNECTIONS_PER_SOURCE} }} "
+                "counter drop"
+            )
     if spec.docker_bridges:
         for bridge in _BRIDGES:
             if spec.docker_egress == "limited":

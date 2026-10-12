@@ -214,9 +214,14 @@ class _PfClient:
         return None
 
     async def get(self, _url: str, headers: Any = None, params: Any = None) -> MagicMock:  # noqa: ARG002
+        # pfrest v2: the plural endpoint returns a list of aliases, each with its integer id.
         resp = MagicMock()
         resp.status_code = 200
-        resp.json = MagicMock(return_value={"data": {"address": ""}})
+        resp.json = MagicMock(
+            return_value={
+                "data": [{"id": 1, "name": (params or {}).get("name"), "address": [], "detail": []}]
+            }
+        )
         return resp
 
 

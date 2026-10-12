@@ -4,6 +4,47 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## One host could OOM-kill the Telnet sensor; health pages are debounced; blocklist pushes match the real APIs
+
+**The Telnet sensor restarted 67 times in five hours.** One address opened ~2,400 sessions in six minutes
+(about 570 connections a minute from ten sources in all); every open Cowrie session costs memory on top of an
+idle ~100 MiB, so the 256 MiB container hit its limit within minutes. Docker killed and restarted it, the
+port refused connections for a few seconds each time, and the watchdog raised a CRITICAL
+`honeypot_health_failed` every time. `docker inspect` shows `OOMKilled=false` after a restart (the flag is
+reset), so only `docker events` showed the cause. The in-process engines already cap sessions per source
+(`conn_limit`); a container had no cap. The firewall now limits concurrent connections per source to the
+published container ports (`ct count over 128`, IPv4 and IPv6), measured live: 220 held connections from
+one host, 131 admitted and 89 dropped, and connections are accepted again as soon as they close. The Cowrie
+memory ceiling is 512 MiB.
+
+**A blip is no longer a page.** The watchdog needs two consecutive failed sweeps before it declares a sensor
+dead. A sensor that fails one probe and recovers three times in an hour raises one HIGH
+`honeypot_unstable` alert instead, so a restart loop stays visible without paging every time.
+
+**ATT&CK coverage measured against what was actually captured.** Mapping the 152 event types seen so far
+(5.0M alerts) left 3.5% of alerts unmapped. Most of that was bookkeeping (connections, session open/close,
+client fingerprints), which is deliberately not a technique, but real behaviour was missing: Redis `CONFIG
+SET`/`SET` (T1190, the entry point of the common Redis campaigns), `CONFIG GET` (T1082), Docker API probes
+(T1613), NFS mount probes and rsync module access (T1135), SIP requests and INVITEs (T1046) and malformed
+protocol probes (T1595). Unmapped is now 2.1%, all bookkeeping, and the ATT&CK dashboard was regenerated from
+the mapper. A test pins that connection and platform events stay unmapped, since mapping them would inflate
+every tactic count.
+
+**Memcached `stats` no longer restarts its uptime on every connection** and keeps one pid; counters grow with
+uptime and `get_hits + get_misses` stays equal to `cmd_get`.
+
+**The three blocklist push tools were only ever tested against mocks of themselves.** Checked against the
+vendors' own contracts they were wrong, or incomplete, in four places. pfSense: the REST API (pfrest v2)
+authenticates with `X-API-Key`, addresses an alias by integer `id` from `GET /firewall/aliases`, and updates
+with `PATCH`; the tool sent `Authorization`, queried by name and used a `PUT` that does not exist, so it
+failed against a real appliance. Cloudflare: creating list items is an asynchronous bulk operation and an
+account may have one pending, so chunks sent back to back were refused after the first, and a 200 was
+reported as "added" before the change had happened; each operation is now awaited and a failed or stuck one
+is reported as failed. AWS WAF: `UpdateIPSet` replaces the description, so every push blanked the
+operator's own; it is now preserved. The tests drive real `httpx` through strict stubs of each contract and
+botocore's `Stubber`, which validates against the WAFv2 service model; all were checked to fail against the
+previous code.
+
 ## Decoy tells found by stock nmap scripts: frozen clocks, constant ids, three kernels on one host
 
 Running the NSE scripts (`ldap-rootdse`, `mysql-info`, `mongodb-info`, `redis-info`, `docker-version`)

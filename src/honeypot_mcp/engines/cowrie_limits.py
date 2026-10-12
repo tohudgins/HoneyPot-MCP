@@ -17,8 +17,11 @@ COWRIE_IMAGE = "cowrie/cowrie:3.0.15"
 # Resource ceiling for the attacker-facing container. Cowrie is a Python
 # emulator that an attacker drives interactively, so it must not be able to
 # starve the host. Mirrors docker/docker-compose.yml's cowrie-ssh service.
-COWRIE_MEM_LIMIT = "256m"
-COWRIE_MEM_LIMIT_BYTES = 256 * 1024 * 1024
+# 512 MiB: an idle Cowrie already holds ~100 MiB and every open session adds ~100 KB, so at 256 MiB
+# a botnet opening hundreds of telnet sessions a minute killed the container (OOM) every few
+# minutes. The firewall also caps concurrent sessions per source (hardening/firewall.py).
+COWRIE_MEM_LIMIT = "512m"
+COWRIE_MEM_LIMIT_BYTES = 512 * 1024 * 1024
 COWRIE_PIDS_LIMIT = 128
 COWRIE_NANO_CPUS = 500_000_000  # 0.5 CPU
 # Cowrie's JSON event stream goes to stdout, so the docker json-file log *is*

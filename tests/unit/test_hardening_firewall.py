@@ -274,3 +274,26 @@ def test_a_bad_specification_exits_2_and_prints_the_reason_without_writing_anyth
     assert main([*argv, "--out", str(out)]) == 2
     assert "firewall:" in capsys.readouterr().err
     assert not out.exists(), "a rejected ruleset must never be written where it could be loaded"
+
+
+def test_a_single_source_cannot_hold_unlimited_sessions_open_to_a_container_port():
+    """One host opened ~2,400 telnet sessions in six minutes and kept the Cowrie container at its
+    memory ceiling, so it was OOM-killed and restarted every few minutes (each restart a CRITICAL
+    health alert). Containers have no per-source limit of their own, so the firewall supplies one
+    for exactly the ports Docker publishes, and counts concurrent connections rather than rate."""
+    text = render(_spec(docker_ports=(22, 23)))
+    forward = _chain(text, "forward")
+    for family, saddr in (("v4", "ip saddr"), ("v6", "ip6 saddr")):
+        assert re.search(
+            rf"ct original proto-dst \{{ 22, 23 \}} ct state new add @conn_{family} "
+            rf"\{{ {saddr} ct count over \d+ \}} counter drop",
+            forward,
+        ), family
+        assert re.search(rf"set conn_{family} \{{[^}}]*flags dynamic", text), family
+    # The limit must be applied before the bridge rules, which end in an unconditional drop.
+    assert forward.index("ct count over") < forward.index('iifname "docker0" ct state new drop')
+
+
+def test_no_container_ports_means_no_connection_cap_rule():
+    text = render(_spec(docker_ports=()))
+    assert "ct count" not in text and "conn_v4" not in text

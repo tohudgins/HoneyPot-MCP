@@ -76,3 +76,23 @@ def test_every_engine_on_the_host_reports_the_same_kernel_and_os():
     assert docker_api._KERNEL_VERSION == host.KERNEL_RELEASE
     node = kubernetes._Cluster("any-seed").nodes()[0]["status"]["nodeInfo"]
     assert node["kernelVersion"] == host.KERNEL_RELEASE and node["osImage"] == host.OS_PRETTY_NAME
+
+
+def _stats(uptime: int, conn_id: int = 1) -> dict[str, str]:
+    from honeypot_mcp.engines.memcached import _stats_lines
+
+    return dict(line.split(" ", 2)[1:] for line in _stats_lines(uptime, conn_id))
+
+
+def test_memcached_stats_keep_working_between_scans():
+    """`memcached-info` printed the same pid and a restarted uptime on every connection."""
+    from honeypot_mcp.engines.memcached import _BASE_UPTIME_SECONDS as base
+
+    first, later = _stats(base), _stats(base + 3600, conn_id=9)
+    assert first["pid"] == later["pid"], "a daemon keeps its pid across connections"
+    assert int(later["uptime"]) - int(first["uptime"]) == 3600
+    for counter in ("cmd_get", "cmd_set", "bytes_read", "bytes_written", "total_items"):
+        assert int(later[counter]) > int(first[counter]), counter
+    for stats in (first, later):
+        assert int(stats["get_hits"]) + int(stats["get_misses"]) == int(stats["cmd_get"])
+        assert stats["cmd_set"] == stats["total_items"]
