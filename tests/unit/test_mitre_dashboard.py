@@ -270,18 +270,45 @@ def test_tactic_timeline_is_not_stacked():
     assert panel["fieldConfig"]["defaults"]["custom"]["stacking"]["mode"] == "none"
 
 
-# ── Threat map: basemap must not render place labels ────────────────────────
+# ── Threat map: basemap must need no API key and render no place labels ─────
 
 
-def test_threat_map_basemap_has_no_labels():
-    """CARTO's default XYZ raster basemap renders place names in each
-    region's local language with no English-only variant available on the
-    free basemaps.cartocdn.com endpoint — the fix is not showing labels at
-    all (the adjacent 'Top countries' table already carries that detail),
-    not chasing a tile provider that promises consistent English."""
+def test_threat_map_basemap_needs_no_api_key_and_has_no_labels():
+    """Two failures of the same panel, found by opening the dashboard on a real backup.
+
+    The first: Grafana's `default` basemap resolves to CARTO's free raster endpoint, which renders
+    place names in each region's local language, so labels were turned off. The second, later: that
+    endpoint began stamping "API KEY REQUIRED" across every tile while still answering HTTP 200,
+    so nothing looked broken until a person opened the map. The basemap is now an explicit,
+    keyless, label-free layer (Esri's Dark Gray *Base*; the labels are a separate layer we do not
+    add). The 'Top countries' table beside it carries the place names."""
     path = ROOT / "docker" / "grafana" / "dashboards" / "02-threat-map.json"
     dashboard = json.loads(path.read_text())
     geomap_panels = [p for p in dashboard["panels"] if p.get("type") == "geomap"]
     assert geomap_panels, "no geomap panel found in the threat map dashboard"
     for panel in geomap_panels:
-        assert panel["options"]["basemap"]["config"].get("showLabels") is False
+        basemap = panel["options"]["basemap"]
+        assert basemap["type"] == "xyz", "`default` is CARTO, which now demands an API key"
+        url = basemap["config"]["url"]
+        assert "cartocdn" not in url and "{apikey}" not in url.lower() and "key=" not in url
+        assert "World_Dark_Gray_Base" in url, "a base layer carries no place labels"
+
+
+def test_dashboards_need_nothing_but_the_database():
+    """The dashboards are read from a downloaded backup on a laptop as often as from the live
+    stack. A panel on the Prometheus datasource ('Active honeypots') showed 'No data' there, because
+    there is no Prometheus; the honeypots table is the source of truth and is always present."""
+    for name in ("01-overview.json", "02-threat-map.json", "03-mitre-coverage.json"):
+        dashboard = json.loads((ROOT / "docker" / "grafana" / "dashboards" / name).read_text())
+
+        def walk(panels):
+            for panel in panels:
+                yield panel
+                yield from walk(panel.get("panels", []))
+
+        for panel in walk(dashboard["panels"]):
+            uids = {
+                t.get("datasource", panel.get("datasource", {})).get("uid")
+                for t in panel.get("targets", [])
+            }
+            assert uids <= {"honeypot-db"}, (name, panel.get("title"), uids)

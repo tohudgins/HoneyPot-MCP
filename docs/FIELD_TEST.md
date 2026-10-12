@@ -106,8 +106,10 @@ docker run -d --name hp-grafana -p 127.0.0.1:3000:3000 \
 Open http://localhost:3000 and set the time range to the days the run covered: the dashboards
 default to the last 24 hours, so a backup older than that shows empty panels until you widen it.
 Bind it to localhost only: this Grafana can query the whole database, including captured
-credentials and honeytoken values. The Prometheus panels need the live metrics endpoint and stay
-empty; every SQLite panel (12 across the three dashboards in the first run) returned rows.
+credentials and honeytoken values. Every panel reads the database alone (the "Active honeypots" tile
+used to need Prometheus and showed "No data" on a laptop; a test now pins that), and the map uses a
+keyless label-free Esri base layer, because Grafana's default CARTO basemap now stamps "API KEY
+REQUIRED" across every tile while still answering HTTP 200. All 12 data panels returned rows.
 The same restored database also runs the MCP server locally over stdio for the analysis tools.
 
 ## What the first live run found

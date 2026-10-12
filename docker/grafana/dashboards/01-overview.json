@@ -132,13 +132,16 @@
         "y": 0
       },
       "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "honeypot_active_honeypots"
+          "queryText": "SELECT COUNT(*) AS value FROM honeypots WHERE status = 'running'",
+          "queryType": "table",
+          "timeColumns": [],
+          "rawQueryText": "SELECT COUNT(*) AS value FROM honeypots WHERE status = 'running'"
         }
       ],
       "options": {
