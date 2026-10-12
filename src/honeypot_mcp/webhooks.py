@@ -925,6 +925,11 @@ def render_syslog(event: PendingEvent, sub: Subscription) -> bytes:
 # are throttled — a SIEM wants every event, and silently dropping one would
 # corrupt the record it exists to keep.
 _HUMAN_CHANNELS = frozenset({"slack", "teams", "email"})
+# Returned (with ok=True) for an event the throttle declined to send. Recorded as `suppressed_count`,
+# never as a delivery: counted as one, it overstated what reached the channel (13,025 "deliveries"
+# of a Slack subscription that had received a handful of messages) and, as a "success", reset
+# failure_count and cleared last_error, so a broken webhook looked healthy.
+THROTTLED = "throttled"
 
 
 class _NotifyThrottle:
@@ -1677,7 +1682,7 @@ class WebhookDelivery:
                 # we simply declined to interrupt a human twice for the same
                 # thing. Recording it as an error would make a healthy
                 # subscription look broken.
-                return True, None
+                return True, THROTTLED
             return await self._dispatch_human(event, sub, fmt, suppressed)
 
         # HTTP-shaped formats
@@ -1759,7 +1764,15 @@ class WebhookDelivery:
 
     async def _record_outcome(self, sub_id: int, ok: bool, err: str | None) -> None:
         async with get_session() as session:
-            if ok:
+            if ok and err == THROTTLED:
+                # Declined on purpose: not a delivery, and not evidence the channel works, so it
+                # must not touch delivery_count, last_delivery_at, failure_count or last_error.
+                await session.execute(
+                    update(Subscription)
+                    .where(Subscription.id == sub_id)
+                    .values(suppressed_count=Subscription.suppressed_count + 1)
+                )
+            elif ok:
                 await session.execute(
                     update(Subscription)
                     .where(Subscription.id == sub_id)

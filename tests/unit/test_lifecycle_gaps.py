@@ -195,13 +195,14 @@ async def test_prune_leaves_data_alone_when_the_archive_fails():
 
     async def _boom(*_args, **_kwargs):
         raise OSError("disk full")
+        yield  # pragma: no cover - makes this an async generator like the real iterator
 
-    original = queries.serialise_alerts_before
-    queries.serialise_alerts_before = _boom  # type: ignore[assignment]
+    original = queries.iter_alert_archive_chunks
+    queries.iter_alert_archive_chunks = _boom  # type: ignore[assignment]
     try:
         result = await alerts_module.alerts_prune(older_than_days=90)
     finally:
-        queries.serialise_alerts_before = original  # type: ignore[assignment]
+        queries.iter_alert_archive_chunks = original  # type: ignore[assignment]
 
     assert "error" in result
     assert "nothing was deleted" in result["error"]

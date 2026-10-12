@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from honeypot_mcp import retention
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
@@ -370,22 +371,19 @@ async def alerts_prune(
     cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
 
     archive_info: dict[str, Any] | None = None
+    max_id: int | None = None
     if archive:
         try:
-            async with get_session() as session:
-                content = await queries.serialise_alerts_before(session, cutoff)
-            if content:
-                archive_info = write_artifact(
-                    content,
-                    prefix=f"alerts-archive-before-{cutoff.date().isoformat()}",
-                    extension="jsonl",
-                    output_path=archive_path,
-                )
-                # write_artifact reports failure as a returned {"error": ...},
-                # not an exception — a bad path or full disk used to sail past
-                # the guard and the delete ran with no archive on disk.
-                if "error" in archive_info:
-                    raise OSError(archive_info["error"])
+            # Streamed in chunks (retention.archive_alerts): the whole archive used to be built as
+            # one string in memory, gigabytes on a table of millions of rows. A failure raises, and
+            # nothing is deleted unless every row it would remove is on disk first.
+            max_id, archive_info = await retention.archive_alerts(
+                cutoff,
+                prefix=f"alerts-archive-before-{cutoff.date().isoformat()}",
+                output_path=archive_path,
+            )
+            if max_id is None:
+                max_id = 0  # nothing old enough to archive: no alert is deletable
         except Exception as e:
             # Refusing to delete is the safe failure. Pruning anyway would
             # destroy exactly the data the archive existed to keep.
@@ -401,8 +399,8 @@ async def alerts_prune(
                 "hint": "Fix the archive destination, or pass archive=False to delete regardless.",
             }
 
-    async with get_session() as session:
-        result = await queries.prune_alerts_before(session, cutoff)
+    alerts_deleted, events_deleted = await retention.delete_before(cutoff, max_id)
+    result = {"alerts_deleted": alerts_deleted, "attacker_events_deleted": events_deleted}
     await record_action(
         "alerts_prune",
         summary=(

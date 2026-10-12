@@ -348,21 +348,34 @@ async def run(a: argparse.Namespace) -> int:
         await sw.expect(o, "suppression_remove", {"rule_id": rid}, "removes it", lambda d: d)
     else:
         sw.record(o, "suppression_remove", "removes it", False, f"no rule id in {sup}")
+    # Never stop a capture that is running: this sweep runs against live deployments, and the
+    # earlier version called action="stop" and silently ended packet capture on the droplet.
+    cap = await sw.call(v, "pcap_status", None)
+    running = bool(cap[0] and isinstance(cap[1], dict) and cap[1].get("running"))
     await sw.expect(
         o,
         "pcap_control",
-        {"action": "stop"},
-        "explains when capture is unavailable/off",
+        {"action": "start"},
+        "start is safe to repeat (and explains itself when capture is unavailable)",
         lambda d: d is not None,
     )
     ok, data = await sw.call(o, "pcap_extract", {"source_ip": me})
-    sw.record(
-        o,
-        "pcap_extract",
-        "capture is off: a clear refusal naming the cause, not a crash",
-        (not ok) and "capture" in str(data).lower(),
-        str(data),
-    )
+    if running:
+        sw.record(
+            o,
+            "pcap_extract",
+            "capture is on: extracts a file for this source",
+            ok and bool(isinstance(data, dict) and data.get("path")),
+            str(data),
+        )
+    else:
+        sw.record(
+            o,
+            "pcap_extract",
+            "capture is off: a clear refusal naming the cause, not a crash",
+            (not ok) and "capture" in str(data).lower(),
+            str(data),
+        )
 
     print("== honeytoken round trip (plant -> real SSH login -> CRITICAL -> TRIGGERED)")
     cred = await sw.expect(

@@ -315,6 +315,7 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
             "format": s.format,
             "active": s.active,
             "delivery_count": s.delivery_count,
+            "suppressed_count": s.suppressed_count,
             "failure_count": s.failure_count,
             "last_delivery_at": s.last_delivery_at.isoformat() if s.last_delivery_at else None,
             "last_error": (s.last_error or "")[:160] or None,

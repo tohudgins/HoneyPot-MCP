@@ -313,22 +313,6 @@ async def get_or_create_profile(session: AsyncSession, ip: str) -> AttackerProfi
 RETENTION_CHUNK_ROWS = 2000
 
 
-async def prune_alerts_before(session: AsyncSession, cutoff) -> dict[str, int]:
-    """Delete alerts and attacker_events older than `cutoff`. Returns the count
-    of rows removed from each table — a SOC analyst can confirm scope before
-    re-running."""
-    from sqlalchemy import delete
-
-    alert_result = await session.execute(delete(Alert).where(Alert.timestamp < cutoff))
-    event_result = await session.execute(
-        delete(AttackerEvent).where(AttackerEvent.timestamp < cutoff)
-    )
-    return {
-        "alerts_deleted": alert_result.rowcount or 0,  # type: ignore[attr-defined]
-        "attacker_events_deleted": event_result.rowcount or 0,  # type: ignore[attr-defined]
-    }
-
-
 async def delete_alerts_chunk(
     session: AsyncSession,
     cutoff,
@@ -476,9 +460,10 @@ async def iter_alert_archive_chunks(
     """Yield `(json_lines, last_alert_id)` for alerts older than `cutoff`, in id
     order, `chunk_rows` at a time (keyset pagination on the primary key).
 
-    The streaming counterpart to `serialise_alerts_before`: memory stays flat
-    however large the archive is, and the caller learns the highest id it has
-    seen so a following delete can be confined to exactly what was archived.
+    Shared by the manual `alerts_prune` tool and the unattended retention sweep
+    (`retention.archive_alerts`): memory stays flat however large the archive is, and the caller
+    learns the highest id it has seen so a following delete can be confined to exactly what was
+    archived.
     """
     last_id = 0
     while True:
@@ -502,21 +487,3 @@ async def iter_alert_archive_chunks(
         # grow with the archive.
         session.expunge_all()
         yield lines, last_id
-
-
-async def serialise_alerts_before(session: AsyncSession, cutoff) -> str:
-    """JSON Lines of every alert older than `cutoff`, for archival.
-
-    One JSON object per line rather than one big array: an archive of a busy
-    year is large, and JSONL streams into `jq`, Splunk, an S3 upload or a
-    `for line in open(...)` loop without loading the whole file. Full payloads
-    are kept — the point of an archive is that it is the record of last resort,
-    so digesting it the way the list tools do would defeat it.
-
-    This builds the whole archive as one string; the unattended retention sweep
-    uses `iter_alert_archive_chunks` instead.
-    """
-    lines: list[str] = []
-    async for chunk, _last_id in iter_alert_archive_chunks(session, cutoff):
-        lines.extend(chunk)
-    return "\n".join(lines)
