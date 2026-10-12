@@ -23,7 +23,10 @@ COWRIE_IMAGE = "cowrie/cowrie:3.0.15"
 COWRIE_MEM_LIMIT = "512m"
 COWRIE_MEM_LIMIT_BYTES = 512 * 1024 * 1024
 COWRIE_PIDS_LIMIT = 128
-COWRIE_NANO_CPUS = 500_000_000  # 0.5 CPU
+# One CPU. At 0.5 a telnet sensor under a real botnet used 0.46 CPU and was throttled in ~90% of
+# scheduling periods (a stalled event loop is slow to accept, so health probes timed out); at 1.0
+# the same load was throttled in 1%.
+COWRIE_NANO_CPUS = 1_000_000_000
 # Cowrie's JSON event stream goes to stdout, so the docker json-file log *is*
 # the evidence channel; cap it or a long brute-force run fills the disk.
 COWRIE_LOG_MAX_SIZE = "10m"

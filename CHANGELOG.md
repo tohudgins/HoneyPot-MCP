@@ -40,6 +40,13 @@ published container ports (`ct count over 128`, IPv4 and IPv6), measured live: 2
 one host, 131 admitted and 89 dropped, and connections are accepted again as soon as they close. The Cowrie
 memory ceiling is 512 MiB.
 
+**Then the CPU quota was the next limit.** With memory fixed, a few health probes still failed under load.
+The container's cgroup showed why: at its 0.5-CPU quota it used 0.46 CPU and was throttled in ~90% of
+scheduling periods, and a throttled event loop is slow to accept. The host was 52% idle, so both Cowrie
+containers now get one CPU: the same load was throttled in 1% of periods afterwards (`dockerd` itself uses
+~40% of a core on this traffic, because Cowrie's JSON event stream is the evidence channel and passes through
+Docker's log driver).
+
 **A blip is no longer a page.** The watchdog needs two consecutive failed sweeps before it declares a sensor
 dead. A sensor that fails one probe and recovers three times in an hour raises one HIGH
 `honeypot_unstable` alert instead, so a restart loop stays visible without paging every time.
