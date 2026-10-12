@@ -284,7 +284,7 @@ async def _alert(event_type: str, severity, source_ip: str = "192.0.2.10"):
     `_enrich_alert_async` task. That task outlives the test, re-opens a session
     after the fixture has closed the database, and poisons whichever module
     happens to run next — which is how this file broke `test_vnc.py` on one
-    Python version and nothing else. `_is_enrichable_ip` filters TEST-NET, so
+    Python version and nothing else. `is_enrichable_ip` filters TEST-NET, so
     no background task is created and the test owns its own lifetime.
     """
     from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event

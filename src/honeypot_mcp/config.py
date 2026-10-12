@@ -317,6 +317,12 @@ class Settings(BaseSettings):
     # human channels: the first pages, repeats ride along as "+N suppressed". 0 disables it.
     # Honeytoken triggers are never coalesced.
     notify_critical_repeat_seconds: float = 300.0
+    # A Slack/Teams/email notification adds a "Reputation" block (location, network, AbuseIPDB and
+    # VirusTotal verdicts) looked up through the same per-IP cache as the background enrichment,
+    # only when a message is actually about to be sent (after the throttle has decided), waiting at
+    # most this long. A slow or failing lookup never delays or blocks the alert. 0 turns it off.
+    # Cost: at most one lookup per message sent (49 messages in a 20 h run of 619 source IPs).
+    notify_enrich_timeout_seconds: float = 4.0
     # Per-(source address, event type) cap on events STORED each minute (see flood_guard.py). The
     # rest are counted and summarised in one `flood_summary` event per window, so volume stays
     # visible. CRITICAL events and honeytoken hits are never dropped. 0 disables the guard.

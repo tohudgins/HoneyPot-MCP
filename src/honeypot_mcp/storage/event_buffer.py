@@ -485,7 +485,7 @@ class EventBuffer:
                             timestamp=ev.timestamp,
                         )
                     )
-                if ev.severity == AlertSeverity.CRITICAL and _is_enrichable_ip(ev.source_ip):
+                if ev.severity == AlertSeverity.CRITICAL and is_enrichable_ip(ev.source_ip):
                     to_enrich.append((alert, ev.source_ip))
                 if ev.honeytoken_id is not None and ev.event_type.startswith(
                     "honeytoken_triggered_"
@@ -624,7 +624,7 @@ async def _match_honeytokens(event: PendingEvent) -> bool:
     return False
 
 
-def _is_enrichable_ip(ip: str) -> bool:
+def is_enrichable_ip(ip: str) -> bool:
     """Only globally routable addresses are worth an external lookup — this
     excludes loopback, RFC1918, link-local, CGNAT (100.64/10), TEST-NET,
     multicast and anything else `ipaddress` marks as non-global."""
@@ -665,7 +665,7 @@ def _schedule_enrichment(alert_id: int, ip: str) -> None:
     task.add_done_callback(_enrich_tasks.discard)
 
 
-async def _lookup_enrichment(ip: str) -> dict[str, Any]:
+async def lookup_enrichment(ip: str) -> dict[str, Any]:
     from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
     from honeypot_mcp.intel.geoip import lookup_geoip
     from honeypot_mcp.intel.virustotal import lookup_virustotal
@@ -695,7 +695,7 @@ async def _enrich_ip(ip: str, alert_ids: list[int]) -> None:
     try:
         try:
             async with _enrich_sem.get():
-                enrichment = await _lookup_enrichment(ip)
+                enrichment = await lookup_enrichment(ip)
         finally:
             # Detach: alerts flushed from here on start a fresh lookup (which
             # the intel cache then answers for free).

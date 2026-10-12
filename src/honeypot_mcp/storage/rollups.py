@@ -17,7 +17,7 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import event, func, literal_column, select, union_all
+from sqlalchemy import event, func, literal_column, select, text, union_all
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
@@ -265,3 +265,26 @@ async def first_last_seen(
             )
         ).one()
     return first, last
+
+
+async def detach_sensor(session: AsyncSession, honeypot_id: int) -> None:
+    """Re-file a removed sensor's rollup rows under "no sensor" (id 0), merging counts.
+
+    Removing a sensor sets `alerts.honeypot_id` to NULL; the rollups must follow or they stop
+    agreeing with the alerts (per-sensor hit counts, and any statistic keyed by sensor, would keep
+    crediting an id that no longer exists). Two set-based statements, constant memory, and the
+    upsert merges with rows that already exist under id 0.
+    """
+    await session.execute(
+        text(
+            "INSERT INTO alert_rollups (bucket, severity, event_type, source_ip, honeypot_id, count) "
+            "SELECT bucket, severity, event_type, source_ip, 0, count FROM alert_rollups "
+            "WHERE honeypot_id = :id "
+            "ON CONFLICT (bucket, severity, event_type, source_ip, honeypot_id) "
+            "DO UPDATE SET count = alert_rollups.count + excluded.count"
+        ),
+        {"id": honeypot_id},
+    )
+    await session.execute(
+        text("DELETE FROM alert_rollups WHERE honeypot_id = :id"), {"id": honeypot_id}
+    )

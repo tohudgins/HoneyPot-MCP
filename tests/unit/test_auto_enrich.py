@@ -153,21 +153,21 @@ async def test_loopback_critical_skips_enrichment(stub_intel):
 @pytest.mark.asyncio
 async def test_enrichable_ip_classification():
     """Direct unit test of the IP-routability classifier."""
-    from honeypot_mcp.storage.event_buffer import _is_enrichable_ip
+    from honeypot_mcp.storage.event_buffer import is_enrichable_ip
 
     # Routable public addresses → True
-    assert _is_enrichable_ip("8.8.8.8") is True
-    assert _is_enrichable_ip("1.1.1.1") is True
+    assert is_enrichable_ip("8.8.8.8") is True
+    assert is_enrichable_ip("1.1.1.1") is True
 
     # Loopback / private / link-local / zero / TEST-NET / garbage → False
-    assert _is_enrichable_ip("127.0.0.1") is False
-    assert _is_enrichable_ip("10.0.0.1") is False
-    assert _is_enrichable_ip("192.168.1.1") is False
-    assert _is_enrichable_ip("172.16.0.1") is False
-    assert _is_enrichable_ip("169.254.1.1") is False
-    assert _is_enrichable_ip("0.0.0.0") is False
+    assert is_enrichable_ip("127.0.0.1") is False
+    assert is_enrichable_ip("10.0.0.1") is False
+    assert is_enrichable_ip("192.168.1.1") is False
+    assert is_enrichable_ip("172.16.0.1") is False
+    assert is_enrichable_ip("169.254.1.1") is False
+    assert is_enrichable_ip("0.0.0.0") is False
     # TEST-NET ranges (RFC 5737) — reserved for documentation, not enrichable
-    assert _is_enrichable_ip("192.0.2.1") is False
-    assert _is_enrichable_ip("203.0.113.42") is False
-    assert _is_enrichable_ip("") is False
-    assert _is_enrichable_ip("not-an-ip") is False
+    assert is_enrichable_ip("192.0.2.1") is False
+    assert is_enrichable_ip("203.0.113.42") is False
+    assert is_enrichable_ip("") is False
+    assert is_enrichable_ip("not-an-ip") is False

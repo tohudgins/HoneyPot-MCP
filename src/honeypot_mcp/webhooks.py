@@ -89,7 +89,7 @@ from sqlalchemy import select, update
 from honeypot_mcp import __version__
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.storage.event_buffer import PendingEvent
+from honeypot_mcp.storage.event_buffer import PendingEvent, is_enrichable_ip, lookup_enrichment
 from honeypot_mcp.storage.models import AlertSeverity, Subscription
 
 log = logging.getLogger(__name__)
@@ -1114,6 +1114,62 @@ def _notify_facts(event: PendingEvent) -> list[tuple[str, str]]:
     return facts
 
 
+def reputation_facts(enrichment: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """The few lines a person triaging an alert wants about the source: where it is, whose
+    network, and what AbuseIPDB and VirusTotal say. Anything unavailable is left out (no key set,
+    rate limited, not in the database) rather than shown as noise."""
+    if not enrichment:
+        return []
+    geo = enrichment.get("geoip") or {}
+    abuse = enrichment.get("abuseipdb") or {}
+    vt = enrichment.get("virustotal") or {}
+    facts: list[tuple[str, str]] = []
+
+    country = geo.get("country") or (abuse.get("country_name") if abuse.get("available") else "")
+    place = f"{country} ({geo['city']})" if country and geo.get("city") else country
+    if place:
+        facts.append(("Location", str(place)))
+
+    owner = (abuse.get("isp") if abuse.get("available") else "") or (
+        vt.get("as_owner") if vt.get("available") else ""
+    )
+    asn = vt.get("asn") if vt.get("available") else None
+    network = " · ".join(part for part in ((f"AS{asn}" if asn else ""), str(owner or "")) if part)
+    if network:
+        facts.append(("Network", network))
+
+    if abuse.get("available"):
+        reports = abuse.get("total_reports", 0)
+        facts.append(
+            ("AbuseIPDB", f"{abuse.get('abuse_confidence_score', 0)}/100 · {reports:,} report(s)")
+        )
+    if vt.get("available"):
+        facts.append(
+            (
+                "VirusTotal",
+                f"{vt.get('malicious_votes', 0)} of {vt.get('total_engines', 0)} engines",
+            )
+        )
+    return facts
+
+
+async def reputation_for(event: PendingEvent) -> list[tuple[str, str]]:
+    """Look the source up, waiting at most `notify_enrich_timeout_seconds`.
+
+    Uses the same cache as the background enrichment (VirusTotal 30 min, AbuseIPDB 15 min, GeoIP
+    24 h), so a repeat costs nothing and the lookup is one the flusher would have made anyway. Any
+    failure or timeout yields no reputation: the alert itself must never wait on a third party.
+    """
+    timeout = get_settings().notify_enrich_timeout_seconds
+    if timeout <= 0 or not event.source_ip or not is_enrichable_ip(event.source_ip):
+        return []
+    try:
+        return reputation_facts(await asyncio.wait_for(lookup_enrichment(event.source_ip), timeout))
+    except Exception as e:  # noqa: BLE001 - a notification is not worth failing over
+        log.debug("Reputation lookup for %s skipped: %s", event.source_ip, e)
+        return []
+
+
 def _notify_title(event: PendingEvent) -> str:
     return f"{event.severity.value.upper()} · {_humanize_event_type(_one_line(event.event_type))}"
 
@@ -1125,7 +1181,9 @@ def _honeypot_label(event: PendingEvent) -> str:
     return f"honeypot #{event.honeypot_id}"
 
 
-def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+def render_slack(
+    event: PendingEvent, sub: Subscription, reputation: list[tuple[str, str]] | None = None
+) -> tuple[bytes, dict[str, str]]:
     """Slack incoming webhook, Block Kit.
 
     `text` is set as well as `blocks` because Slack uses it for the mobile
@@ -1170,6 +1228,19 @@ def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
                 ],
             }
         )
+    if reputation:
+        # Its own section (Slack allows 10 fields each): where the attacker is, whose network it
+        # is, and what the reputation services say. Values come from third-party APIs, so they are
+        # escaped like everything else shown to a human.
+        blocks.append(
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*{label}*\n{_slack_escape(value)}"}
+                    for label, value in reputation[:6]
+                ],
+            }
+        )
     if event.honeytoken_id is not None:
         blocks.append(
             {
@@ -1195,7 +1266,9 @@ def render_slack(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
     return body, {"Content-Type": "application/json", "User-Agent": "HoneyPot-MCP/1.0"}
 
 
-def render_teams(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[str, str]]:
+def render_teams(
+    event: PendingEvent, sub: Subscription, reputation: list[tuple[str, str]] | None = None
+) -> tuple[bytes, dict[str, str]]:
     """Microsoft Teams incoming webhook.
 
     Emits a MessageCard rather than an Adaptive Card. Adaptive Cards are the
@@ -1217,6 +1290,8 @@ def render_teams(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
     facts.insert(1, {"name": "Time", "value": f"{event.timestamp.isoformat()}"})
     if event.honeytoken_id is not None:
         facts.append({"name": "Honeytoken", "value": f"#{event.honeytoken_id} triggered"})
+    for label, value in reputation or []:
+        facts.append({"name": label, "value": _teams_escape(value)})
 
     card = {
         "@type": "MessageCard",
@@ -1240,7 +1315,9 @@ def render_teams(event: PendingEvent, sub: Subscription) -> tuple[bytes, dict[st
     return body, {"Content-Type": "application/json", "User-Agent": "HoneyPot-MCP/1.0"}
 
 
-def render_email(event: PendingEvent, sub: Subscription) -> tuple[str, str]:
+def render_email(
+    event: PendingEvent, sub: Subscription, reputation: list[tuple[str, str]] | None = None
+) -> tuple[str, str]:
     """(subject, body) for an SMTP notification.
 
     Plain text on purpose. These land in mail clients, ticketing systems and
@@ -1277,6 +1354,9 @@ def render_email(event: PendingEvent, sub: Subscription) -> tuple[str, str]:
     if facts:
         lines += ["", "Captured details:"]
         lines += [f"  {label:<12}: {_one_line(value)}" for label, value in facts]
+    if reputation:
+        lines += ["", "Threat intel:"]
+        lines += [f"  {label:<12}: {_one_line(value)}" for label, value in reputation]
     lines += [
         "",
         "--",
@@ -1716,15 +1796,18 @@ class WebhookDelivery:
             if suppressed
             else ""
         )
+        # Only here, after the throttle has decided this message is really being sent, so the
+        # lookups are bounded by messages sent, not by events seen.
+        reputation = await reputation_for(event)
 
         if fmt == "email":
-            subject, body = render_email(event, sub)
+            subject, body = render_email(event, sub, reputation)
             if note:
                 body = f"{body}\n\n({note}.)"
             return await _send_email(sub, subject, body)
 
         if fmt == "slack":
-            payload_bytes, headers = render_slack(event, sub)
+            payload_bytes, headers = render_slack(event, sub, reputation)
             if note:
                 doc = json.loads(payload_bytes)
                 doc["attachments"][0]["blocks"].append(
@@ -1732,7 +1815,7 @@ class WebhookDelivery:
                 )
                 payload_bytes = json.dumps(doc).encode("utf-8")
         else:  # teams
-            payload_bytes, headers = render_teams(event, sub)
+            payload_bytes, headers = render_teams(event, sub, reputation)
             if note:
                 doc = json.loads(payload_bytes)
                 doc["sections"][0]["facts"].append({"name": "Suppressed", "value": note})

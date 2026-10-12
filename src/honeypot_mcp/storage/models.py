@@ -140,6 +140,11 @@ class HoneytokenStatus(str, enum.Enum):
 
 class Honeypot(Base):
     __tablename__ = "honeypots"
+    # SQLite reuses the highest rowid after a delete unless the table is AUTOINCREMENT, so removing
+    # the newest sensor and deploying another gave the new one the old id and quietly attached the
+    # old sensor's history (alerts and rollups carry the id) to it. PostgreSQL's sequences never
+    # reuse an id; this makes SQLite match.
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)

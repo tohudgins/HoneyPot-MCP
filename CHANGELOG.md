@@ -4,6 +4,31 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Notifications carry reputation; sensor ids are never reused; stopped sensors can be removed
+
+**Slack, Teams and email now show who the attacker is.** A notification used to carry only the event,
+so whoever was paged had to look the address up. A "Reputation" block now shows location, network,
+the AbuseIPDB score with its report count, and VirusTotal's engine verdicts: for example
+`United States (Dallas) · AS36352 · RackNerd LLC · AbuseIPDB 71/100 · 66 report(s) · VirusTotal 0 of 92
+engines` on a real SIP toll-fraud scanner. It is looked up through the per-IP cache the background
+enrichment already uses (VirusTotal 30 min, AbuseIPDB 15 min, GeoIP 24 h), **only when a message is
+actually about to be sent** (after the throttle has decided), waiting at most
+`NOTIFY_ENRICH_TIMEOUT_SECONDS` (4; 0 turns it off); a slow or failing third party never delays or
+blocks the alert. Cost, from the real 20-hour run of 619 source IPs: 29 distinct CRITICAL sources
+(27 public), 49 distinct (type, source) pairs and at most 6 CRITICAL sources in the busiest hour, so
+at most a few dozen lookups a day against the free tiers' 500 (VirusTotal) and 1,000 (AbuseIPDB). Third-party text is escaped
+like everything else shown to a human. The machine formats (JSON, ECS, CEF, Splunk, Loki, Datadog)
+are unchanged: the SIEM enriches those.
+
+**A removed sensor's id was handed to the next sensor.** SQLite reuses the highest rowid after a
+delete, so removing the newest sensor and deploying another gave the new one the old id and quietly
+attached the old sensor's alerts and rollups to it. The table is AUTOINCREMENT now (migration 0019,
+which seeds the counter past every id ever referenced by alerts or rollups, not just surviving rows).
+Removal also left the rollups pointing at the removed sensor while the raw alerts were NULLed, so the
+rollups stopped agreeing with the alerts; they are re-filed under "no sensor" in step. And
+`honeypot_stop(name=..., remove=True)` on an already-stopped sensor did nothing and answered
+`stopped: []`, so a stopped sensor could never be removed and its name stayed reserved; it now is.
+
 ## Answers checked against SQL; prune no longer needs gigabytes; notification counters told the truth
 
 **The read tools are checked against independent SQL.** `scripts/field_test_oracle.py` runs the

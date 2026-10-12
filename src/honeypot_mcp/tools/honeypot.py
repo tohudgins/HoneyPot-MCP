@@ -17,7 +17,7 @@ from honeypot_mcp.deception.capabilities import BY_TYPE
 from honeypot_mcp.engines import get_engine
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage import queries
+from honeypot_mcp.storage import queries, rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
 from honeypot_mcp.tool_hints import hints
@@ -371,7 +371,7 @@ async def honeypot_stop(
                     continue
                 if status and hp.status.value != status:
                     continue
-                if hp.status is HoneypotStatus.STOPPED:
+                if hp.status is HoneypotStatus.STOPPED and not remove:
                     continue
                 targets.append(hp)
 
@@ -382,11 +382,15 @@ async def honeypot_stop(
         failed: list[dict[str, str]] = []
         timed_out: list[str] = []
         for hp in targets:
-            if hp.status == HoneypotStatus.STOPPED:
+            was_stopped = hp.status == HoneypotStatus.STOPPED
+            # An already-stopped sensor has nothing to stop, but `remove` must still delete it: this
+            # used to `continue` unconditionally, so a stopped sensor could never be removed and
+            # its row and name stayed reserved forever, with `stopped: []` as the only answer.
+            if was_stopped and not remove:
                 continue
             try:
                 engine = get_engine(hp.type)
-                if hp.container_id:
+                if hp.container_id and not was_stopped:
                     await asyncio.wait_for(
                         engine.stop(hp.container_id, remove=remove),
                         timeout=_ENGINE_STOP_TIMEOUT_SECONDS,
@@ -409,10 +413,12 @@ async def honeypot_stop(
                 # Never `session.delete(hp)`: with a plain relationship SQLAlchemy
                 # loads every alert the sensor ever captured (full JSON payloads)
                 # just to NULL its honeypot_id one object at a time — gigabytes on a
-                # busy sensor. Two set-based statements do the same in constant memory.
+                # busy sensor. Set-based statements do the same in constant memory. The rollups
+                # carry the sensor id too, so they are re-filed under "no sensor" in step.
                 await session.execute(
                     update(Alert).where(Alert.honeypot_id == hp.id).values(honeypot_id=None)
                 )
+                await rollups.detach_sensor(session, hp.id)
                 await session.execute(delete(Honeypot).where(Honeypot.id == hp.id))
                 session.expunge(hp)
             else:
