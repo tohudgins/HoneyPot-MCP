@@ -253,6 +253,17 @@ engines found defects that synthetic-byte unit tests had passed through, each no
   server fingerprint still differs from a real OpenSSH's and `ssh-audit`'s version guess is a
   range, not the banner's version.
 
+**What public traffic can trip (2026-10).** Honeytokens fire only when someone uses a tracked value,
+so what a scanner can *find* decides what it can trip. Today that is the HTTP decoys: a tracked MySQL
+credential as the database login and a tracked canary URL as an error webhook in `/.env`,
+`/config.json` and `/wp-config.php`, with the canary answered on the honeypot's public port. Not
+covered: the cloud keys in those files and in `/.aws/credentials` are random lookalikes that exist in
+no AWS account (a token that fires when used needs a real decoy IAM user and the cloud forwarder, see
+`examples/cloud-forwarders`); `/.kube/config` carries a random token; the FTP, Redis, Cowrie,
+Elasticsearch and mail decoys serve static or random content, so a credential found there is not
+tracked. Which of those a scanner reads and replays on a given host is observed, not assumed: check
+`honeytoken_list` after a run.
+
 **Session fidelity gaps seen with real clients (field test, 2026-10).** All of these record the
 attack completely; they are places where the session does not look like the real service to a
 client that goes further. The rsync honeypot returns the module list and records the anonymous

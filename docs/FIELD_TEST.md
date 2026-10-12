@@ -66,6 +66,50 @@ CRITICAL alert and mark the token `triggered`.
 skipped with the reason. The sweep **fails if a registered tool is neither called nor skipped**, so a
 newly added tool cannot go untested unnoticed.
 
+## 3. Management and analysis on real traffic: `field_test_ops.py`
+
+Part two shows every tool answers. This part asks whether the answers are *right* on what the
+internet actually sent, and whether actions really change the live system. It picks its subjects
+from the data (the busiest source, the CRITICAL-heaviest source), so run it once the deployment has
+been collecting for a few hours.
+
+```bash
+uv run scripts/field_test_ops.py --url http://127.0.0.1:18443/mcp --tokens ~/.ssh/honeypot_mcp_tokens \
+    --host 203.0.113.7 --my-ip <your public ip> --out ops-report.md   # add --report-abuse to file one AbuseIPDB report
+```
+
+Triage (acknowledge a real attacker's alerts and see the queue, the records and the audit log
+agree), analysis (profile, journey, ATT&CK mapping, campaigns, clusters, coverage and a report for
+real attackers; the profile must carry reputation and geography), remediation (blocklist and STIX
+exports; a rate-limit rule on a real flooder must cut the live ingest rate by 80%, skipped honestly
+when no flood is active), and operations (pause a real sensor and watch its public port close,
+resume it, read a real sensor's log, pull a real attacker's packets from the capture ring).
+
+## Seeing the data yourself
+
+Everything above can also be read on your own machine from a backup, with no SSH:
+`scripts/fetch_backup.sh` the data, then point the project's Grafana dashboards (overview, threat
+map, MITRE ATT&CK coverage) at a copy of the database. A downloaded snapshot is in WAL mode, which
+Grafana's read-only mount cannot open, so make a rollback-mode copy first:
+
+```bash
+mkdir -p ~/hp-grafana && cp ~/hp-backups/<latest>/honeypot_mcp.db ~/hp-grafana/
+sqlite3 ~/hp-grafana/honeypot_mcp.db "PRAGMA journal_mode=DELETE;"
+docker run -d --name hp-grafana -p 127.0.0.1:3000:3000 \
+  -e GF_SECURITY_ADMIN_PASSWORD=<choose one> -e GF_INSTALL_PLUGINS=frser-sqlite-datasource \
+  -e GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=frser-sqlite-datasource \
+  -v "$PWD/docker/grafana/provisioning:/etc/grafana/provisioning:ro" \
+  -v "$PWD/docker/grafana/dashboards:/etc/grafana/dashboards:ro" \
+  -v ~/hp-grafana:/mcp-data:ro grafana/grafana:11.3.0
+```
+
+Open http://localhost:3000 and set the time range to the days the run covered: the dashboards
+default to the last 24 hours, so a backup older than that shows empty panels until you widen it.
+Bind it to localhost only: this Grafana can query the whole database, including captured
+credentials and honeytoken values. The Prometheus panels need the live metrics endpoint and stay
+empty; every SQLite panel (12 across the three dashboards in the first run) returned rows.
+The same restored database also runs the MCP server locally over stdio for the analysis tools.
+
 ## What the first live run found
 
 Run against a DigitalOcean droplet (Ubuntu 22.04, 22 engines) after the unit suite passed. All of
@@ -79,6 +123,8 @@ these were invisible to the unit tests:
 | Backup `--samples` | The script looked in `/cowrie/var/lib/cowrie`; the image keeps its state under `/cowrie/cowrie-git`. Every run said "0 files" with a clean verdict while the containers held 32 downloads and 18 TTY recordings | both roots searched; "directory not found" is a failure, never "0 files" |
 | `field_test.py` (HTTP) | After 5 requests in a session, `http_active_recon` overwrote `http_credential_submit`, so a login attempt by a scanner that had crawled first was filed as recon | only a plain probe is relabelled |
 | `field_test.py` (probes) | SIP: a bare `REGISTER` is classified as extension enumeration (by design); `sip_register_attempt` needs a digest | expectation fixed, both sent |
+| `field_test_ops.py` (operations) | `honeypot_pause` returned `paused` while the port kept answering and recording: `pause()` is a no-op for every engine that is not a Docker container | pausing an in-process sensor closes its listener, resume starts a fresh one on the same port |
+| `field_test_ops.py` (triage) | Triaging a real flooder twice: a filter re-selected the 500 newest matches (already triaged) and overwrote the first analyst's disposition, note and name, and never reached older untriaged alerts | a filter selects untriaged alerts only; naming ids re-triages deliberately |
 
 The first two are why the test rig for the backup script now runs the real embedded script against a
 fake container filesystem instead of a stub that ignores it.

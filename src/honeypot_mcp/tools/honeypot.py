@@ -471,7 +471,13 @@ async def honeypot_pause(name: str) -> dict[str, Any]:
 
         engine = get_engine(hp.type)
         if hp.container_id:
-            await engine.pause(hp.container_id)
+            if engine.native_pause:
+                await engine.pause(hp.container_id)
+            else:
+                # An in-process engine has nothing to freeze, and its pause() used to be a no-op:
+                # the status said PAUSED while the port kept answering and recording. Pausing now
+                # closes the listener, so the status is true; resume starts a fresh one.
+                await engine.stop(hp.container_id)
         hp.status = HoneypotStatus.PAUSED
 
     await record_action(
@@ -501,8 +507,16 @@ async def honeypot_resume(name: str) -> dict[str, Any]:
             return {"error": f"Honeypot '{name}' is not paused (status={hp.status.value})."}
 
         engine = get_engine(hp.type)
-        if hp.container_id:
-            await engine.resume(hp.container_id)
+        if engine.native_pause:
+            if hp.container_id:
+                await engine.resume(hp.container_id)
+        else:
+            try:
+                hp.container_id = await engine.start(hp.name, hp.port, dict(hp.config or {}))
+            except Exception as e:  # noqa: BLE001 - report it, leave the sensor paused
+                return {
+                    "error": f"Could not resume '{name}' on port {hp.port}: {e}. It stays paused."
+                }
         hp.status = HoneypotStatus.RUNNING
 
     await record_action(

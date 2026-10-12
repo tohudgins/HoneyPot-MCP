@@ -166,6 +166,12 @@ async def triage_alerts(
         q = q.where(Alert.severity == severity)
     if since is not None:
         q = q.where(Alert.timestamp >= since)
+    if not alert_ids:
+        # A filter selects the untriaged alerts only. Without this, triaging a noisy source twice
+        # re-selected the 500 newest matches (already triaged) and overwrote the first analyst's
+        # disposition, note and name; and with the cap, a repeat run never reached the older
+        # untriaged ones. Naming ids explicitly is the deliberate way to re-triage.
+        q = q.where(Alert.acknowledged.is_(False))
 
     # Fetch one beyond the cap so we can tell "exactly at the limit" from
     # "there is more".

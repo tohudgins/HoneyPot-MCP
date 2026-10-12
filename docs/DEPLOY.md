@@ -169,10 +169,18 @@ DATABASE_URL=sqlite+aiosqlite:///./data/honeypot_mcp.db
 #   > revoke alice's API key          (api_key_revoke, takes effect in ~30s)
 #   > list active API keys            (api_key_list)
 
-# Canary tokens that call back over the internet need the callback server reachable. The
-# production profile binds it to loopback (a first run uses no URL canaries); to use them set
-# CANARY_CALLBACK_HOST=0.0.0.0, open its port in the firewall, and:
-CANARY_PUBLIC_URL=http://<your-vps-ip>:8888
+# Canary URLs and what a scanner can find. The callback server (port 18888) binds loopback and the
+# firewall closes it, so nothing is exposed by default. If an HTTP honeypot answers on port 80, point
+# the public URL at that instead: it serves /t/<token> itself (unknown ids are an ordinary 404), so
+# a canary URL embedded in a decoy can call back from the internet with no new open port.
+CANARY_PUBLIC_URL=http://<your-vps-ip>
+# Create the bait AFTER setting this and restarting, because the URL is baked into each token:
+#   > create a canary URL token labelled env-canary           (honeytoken_create, canary_url)
+#   > generate one mysql credential labelled env-mysql         (honeytoken_generate_credentials)
+# The HTTP honeypot then serves the credential as the database login, and the canary URL as an
+# error-reporting webhook, in /.env, /config.json and /wp-config.php. A scanner that replays the
+# login against your MySQL honeypot, or follows the URL, trips a CRITICAL alert. Revoke a token and
+# the decoys stop serving it within 30 seconds. Cloud keys in the decoys stay random on purpose.
 
 # RECOMMENDED — sign up for the free tiers, paste real keys here. Leave them
 # EMPTY otherwise: any non-empty placeholder is treated as a key.

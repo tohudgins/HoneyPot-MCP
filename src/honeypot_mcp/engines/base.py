@@ -77,6 +77,10 @@ class HoneypotEngine(ABC):
     for starting/stopping containers or processes and ingesting events into the DB.
     """
 
+    # True only where `pause`/`resume` genuinely suspend the instance in place (a Docker
+    # container). Otherwise the pause/resume tools stop the listener and start a fresh one.
+    native_pause = False
+
     @abstractmethod
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         """Start a new honeypot instance.

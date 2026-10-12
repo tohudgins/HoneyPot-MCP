@@ -4,6 +4,27 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Management tools tested on live traffic: two real bugs
+
+`scripts/field_test_ops.py` (see [docs/FIELD_TEST.md](docs/FIELD_TEST.md)) uses the triage,
+analysis, remediation and operations tools on what the internet actually sent and asserts on the
+answers, not their shape. It found two bugs the unit tests could not.
+
+`honeypot_pause` was a lie for every in-process engine: it returned `paused` while the port kept
+answering and recording, because `pause()` is a no-op for anything that is not a Docker container.
+Pausing now closes the listener and resume starts a fresh one on the same port (a resume that cannot
+bind says so and leaves the sensor paused); Docker-backed SSH/Telnet keep their real pause.
+Proven live: `hp-vnc`'s public port closed on pause and reopened on resume.
+
+Bulk triage by filter re-selected the 500 newest matches whether or not they were already triaged
+and overwrote the first analyst's disposition, note and name; with the cap a repeat run never reached
+older untriaged alerts. A filter now selects untriaged alerts only, and naming ids re-triages
+deliberately. Both fixes have regression tests that fail on the old code.
+
+Also confirmed on live data: every alert from a real attacker carries GeoIP, VirusTotal and
+AbuseIPDB (196 of 196 CRITICALs sampled); campaign analysis groups the Mirai-style loader sources;
+all 12 SQLite panels in the three Grafana dashboards return rows from a restored backup.
+
 ## Public traffic can trip tokens; repeated CRITICALs no longer flood a channel
 
 Two findings from the live droplet, both fixed and proven from outside.

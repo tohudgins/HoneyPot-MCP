@@ -171,6 +171,10 @@ def _retag_for_protocol(event_type: str, protocol: str | None) -> str:
 
 
 class SSHEngine(HoneypotEngine):
+    # Docker can freeze the container, so pause/resume below are real. Every in-process engine
+    # leaves this False and the tools pause it by closing its listener instead.
+    native_pause = True
+
     # Which of Cowrie's two listeners this engine publishes as its primary
     # service. `TelnetEngine` flips it to 2223 rather than duplicating the
     # whole container-launch path — one image serves both protocols, and the
