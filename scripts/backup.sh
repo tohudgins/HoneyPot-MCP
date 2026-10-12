@@ -5,11 +5,16 @@
 # from the repo; captured attack data cannot, and neither can the honeytoken
 # values — a token whose secret is lost can never be attributed if it fires.
 #
-# SQLite is backed up with the `.backup` command rather than `cp`, because the
-# server runs in WAL mode: copying the .db file while a write is in flight
-# yields a file that opens fine and is missing recent transactions. `.backup`
-# takes a consistent snapshot of a live database. That distinction is the whole
-# reason this script exists instead of a one-line cp in the docs.
+# SQLite is backed up with `VACUUM INTO` rather than `cp`, because the server
+# runs in WAL mode: copying the .db file while a write is in flight yields a
+# file that opens fine and is missing recent transactions. `VACUUM INTO` writes a
+# consistent snapshot of a live database in ONE read transaction, and the copy
+# is a compact rollback-mode file (no -wal/-shm side files, so it opens
+# read-only anywhere, Grafana included). It replaced `.backup`, which copies in
+# small steps and restarts whenever the server writes between steps: on a 3.8 GB
+# database taking ~190 events a second it ran 38 minutes and never finished,
+# where `VACUUM INTO` took 203 s. That distinction is the whole reason this
+# script exists instead of a one-line cp in the docs.
 set -euo pipefail
 
 # The backup holds the database, honeytoken values, TLS keys and .env. Set the
@@ -49,7 +54,8 @@ fi
 IS_POSTGRES=0
 case "${DATABASE_URL:-}" in postgresql*) [ -z "${HONEYPOT_DB_PATH:-}" ] && IS_POSTGRES=1 ;; esac
 if [ "$IS_POSTGRES" = 0 ] && [ -f "$DB_PATH" ]; then
-  sqlite3 "$DB_PATH" ".backup '$OUT/honeypot_mcp.db'"
+  # Single quotes in a path would end the SQL string early: double them.
+  sqlite3 "$DB_PATH" "VACUUM INTO '${OUT//\'/\'\'}/honeypot_mcp.db'"
   echo "  database  -> $OUT/honeypot_mcp.db ($(du -h "$OUT/honeypot_mcp.db" | cut -f1))"
 elif [ "$IS_POSTGRES" = 1 ]; then
   # Strip the async driver suffix; pg_dump speaks libpq URLs. The password is

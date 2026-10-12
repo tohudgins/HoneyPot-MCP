@@ -1328,9 +1328,13 @@ table, so it is the only signal that separates "running" from "collecting".
 Alert on it, not on `/healthz`. It also 503s on a runaway ingest backlog, since
 the unbounded queue becomes a memory problem before a data-loss one.
 
-`scripts/backup.sh` uses SQLite's `.backup`, never `cp`: the server runs in WAL
-mode, so a file copy taken mid-write opens cleanly and is quietly missing
-recent transactions. `restore.sh` refuses to run while the server is up,
+`scripts/backup.sh` uses SQLite's `VACUUM INTO`, never `cp` and no longer `.backup`: the server
+runs in WAL mode, so a file copy taken mid-write opens cleanly and is quietly missing recent
+transactions. `.backup` copies in small steps and restarts whenever the server writes between
+steps: on the live 3.8 GB database (about 190 events a second) it ran 38 minutes and never
+finished, while `VACUUM INTO` (one read transaction, writers unblocked in WAL mode) took 203 s and
+gives a compact rollback-mode file that opens read-only anywhere. `restore.sh` refuses to run while
+the server is up,
 because restoring underneath a live process leaves it writing into a replaced
 file it still holds open.
 

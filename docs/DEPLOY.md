@@ -678,11 +678,15 @@ attributed if it fires later.
 
 Two details the script exists to get right:
 
-- **It uses SQLite's `.backup`, never `cp`.** The server runs in WAL mode, so
+- **It uses SQLite's `VACUUM INTO`, never `cp`.** The server runs in WAL mode, so
   copying the `.db` file while a write is in flight produces a file that opens
   cleanly and is quietly missing recent transactions — the worst way for a
-  backup to fail. Verified: a `.backup` of a 5,000-row uncheckpointed database
-  restores all 5,000.
+  backup to fail. `VACUUM INTO` takes a consistent snapshot in one read
+  transaction without blocking the server, and the copy is a compact
+  rollback-mode file (no `-wal`/`-shm`). It replaced `.backup`, which copies in
+  small steps and restarts whenever the server writes between steps: on a
+  3.8 GB database taking ~190 events a second it ran 38 minutes and never
+  finished, where `VACUUM INTO` took 203 s.
 - **The backup contains secrets** — `.env`, honeytoken values, captured
   credentials. It is written mode 600 and should be stored wherever you keep
   the `.env` itself.
