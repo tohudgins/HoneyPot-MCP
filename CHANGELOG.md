@@ -4,6 +4,34 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Answers checked against SQL; prune no longer needs gigabytes; notification counters told the truth
+
+**The read tools are checked against independent SQL.** `scripts/field_test_oracle.py` runs the
+analysis tools on a copy of a frozen real backup and compares each answer with plain SQL over the
+alert table: `alerts_stats` over five window shapes, per-sensor hits, `soc_brief` counts and queue
+order, `alerts_recent` filters, `alerts_search`, `threat_timeline`, `analyze_attacker`/journey for
+heavy and light sources (count and first/last seen to the microsecond), the blocklist's membership,
+and cross-tool invariants. On 4,896,441 real alerts: 67 checks, 0 failed, 28 s; changing one rollup
+count by one makes the total, severity split, top sources and per-sensor hits fail.
+
+**`alerts_prune` streams.** The manual tool built the whole archive as one string and deleted with
+one statement: on copies of the live database 1,000,000 rows peaked at 1.35 GB (about 6.6 GB for the
+real table on a 4 GB host). The retention sweep already streamed, so both now share
+`retention.archive_alerts` / `delete_before`: 4,000,000 rows archived in 54 s at 181 MB peak, integrity
+ok, lifetime rollups untouched; a `.partial` file is renamed only when complete, a caller-named path
+is never overwritten, a failure deletes nothing, deletion is confined to archived ids and chunked.
+
+**A throttled notification was counted as a delivery.** The Slack subscription reported 13,025
+deliveries in nine hours while its channel had received a handful of messages: a suppressed event
+returned success and was recorded as one. Worse, that "success" reset `failure_count` and cleared
+`last_error`, so a broken webhook would have looked healthy as soon as the throttle swallowed the next
+event. Throttled events now increment `suppressed_count` (migration 0018, shown by
+`alert_subscriptions_list`) and touch nothing else.
+
+**The field-test sweep stopped packet capture on the live droplet.** It called `pcap_control stop`
+(written when capture was off) and ended capture on a deployment where it was on; it now starts
+capture (idempotent) and checks `pcap_extract` against the real state. Capture was restarted at once.
+
 ## The telnet sensor was being OOM-killed every few minutes; backups; status behind the guard
 
 The first full backup of the 3.8 GB database finished with one warning: 33 health failures on the
