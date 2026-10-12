@@ -17,6 +17,19 @@ admin port; `harden-host.sh` passes it through). Nothing listens in the range ex
 outside: LIST, SIZE and RETR agree (158 bytes), the tracked credential is in the file, and the first FTP
 file transfer the deployment has recorded is `ftp_file_download`, HIGH, `bait_served`.
 
+**The same class of defect on NFS: `showmount -e` could not work.** NFS clients ask the portmapper on port 111
+where mountd is before they touch 2049; only 2049 was open, so `showmount -e`, `rpcinfo -p` and nmap's
+`nfs-*` scripts got nothing, and the sensor's headline detection (`nfs_export_enumeration`) could not fire
+from the internet. The engine now sits on an internal port with both 111 and 2049 redirected to it (firewall
+`2049>12049,111>12049`; the sensor was redeployed on 12049 with the old ruleset kept). Reaching it exposed a
+second defect: the portmapper answered every version in the v2 format, so nmap's RPC library failed with
+"data string too short" (the lenient `rpcinfo` binary accepted it). It now speaks v2, v3 (`GETADDR`, `rpcb`
+`DUMP`: netid, universal address, owner) and v4, and answers any other version with `PROG_MISMATCH` and the
+supported range, as rpcbind does. Live: nmap identifies `rpcbind 2-4` and `nfs 3-4`, `rpcinfo` lists the
+services, and `nfs-showmount` discloses the export list and is recorded as `nfs_export_enumeration`, HIGH.
+Tests decode the replies with an independent strict XDR parser to the last byte. Not served: UDP (macOS
+`showmount`) and post-mount NFS operations (`nfs-ls`/`nfs-statfs` still fail).
+
 ## Bait in the FTP listing, and a prompt-injection field test
 
 **`passwords.txt` on the FTP decoy now carries a tracked credential** (an FTP token first, else the MySQL

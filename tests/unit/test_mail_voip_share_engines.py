@@ -18,6 +18,7 @@ import asyncio
 import base64
 import contextlib
 import os
+import re
 import socket
 import struct
 

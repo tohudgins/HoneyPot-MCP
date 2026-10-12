@@ -292,6 +292,14 @@ names; without an opened range that connection is dropped, so a real client logs
 `LIST`, `RETR` and `STOR` times out. The first live run recorded 9 anonymous logins and not one listing,
 download or upload for exactly this reason. Nothing listens in the range except during a session.
 
+If you deploy the NFS honeypot, run it on an internal port and redirect both NFS ports to it:
+`--ports "...,2049>12049,111>12049"` and deploy `nfs` on **12049**. NFS clients (`showmount`, nmap's
+`nfs-*` and `rpcinfo` scripts) ask the portmapper on 111 where mountd is before they ever touch 2049;
+with only 2049 open they got nothing, so the sensor's headline detection (`nfs_export_enumeration`) could
+not fire. The engine answers the portmapper in versions 2, 3 and 4 (libtirpc and nmap ask for 3/4 first)
+and always points clients back at 2049. TCP only: a client that insists on UDP (macOS `showmount`) is not
+served.
+
 > **ufw does not protect Docker-published ports**, which is one reason this uses nftables
 > directly: Docker's published ports are forwarded, not input, so the firewall's `forward`
 > chain is where a container's outbound connections are refused (a hijacked Cowrie cannot scan,
