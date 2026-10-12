@@ -454,3 +454,43 @@ async def test_the_postgres_lock_survives_an_idle_in_transaction_timeout():
                 text("ALTER DATABASE honeypot_test RESET idle_in_transaction_session_timeout")
             )
         await admin.dispose()
+
+
+@pytest.mark.asyncio
+async def test_analysis_mode_opens_the_data_without_starting_or_owning_any_sensor(monkeypatch):
+    """A restored backup lists every sensor as RUNNING. Opening it for analysis on a laptop must not
+    try to re-launch them (ports, Docker), take ownership, or start capture and notifications."""
+    from honeypot_mcp import instance_lock, server
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.tools.honeypot import honeypot_deploy
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("analysis mode started something that belongs to the sensor host")
+
+    monkeypatch.setattr(get_settings(), "analysis_mode", True)
+    monkeypatch.setattr(server, "reconcile_running_honeypots", forbidden)
+    monkeypatch.setattr(server, "adopt_labelled_containers", forbidden)
+    monkeypatch.setattr(instance_lock, "acquire", forbidden)
+    monkeypatch.setattr(server._OwnerServices, "start", forbidden)
+    event_buffer.reset_for_tests()
+
+    async with server.lifespan(server.mcp):
+        assert instance_lock.sensors_owned() is False
+        out = await honeypot_deploy(type="http")
+        assert "analysis mode" in out["error"], out
+        # Reads are unaffected.
+        assert (await server.ping())["status"]
+
+    event_buffer.reset_for_tests()
+
+
+def test_leaving_analysis_mode_restores_the_normal_read_only_message():
+    from honeypot_mcp import instance_lock
+
+    instance_lock.set_analysis_mode()
+    assert "analysis mode" in instance_lock.read_only_error()["error"]
+    instance_lock.set_ownership(False, instance_lock.Holder(pid=7))
+    assert "analysis mode" not in instance_lock.read_only_error()["error"]
+    instance_lock.set_ownership(True)
+    assert instance_lock.read_only_error() is None

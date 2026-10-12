@@ -112,6 +112,11 @@ class Settings(BaseSettings):
     # default, so nobody loses data they didn't opt into discarding.
     retention_days: int = 0
 
+    # Open the database to analyse it, not to run sensors: no honeypots are (re)started, no capture,
+    # canary, watchdog, notifications or retention run, and the process never takes sensor ownership.
+    # Use this on a restored backup, where the recorded sensors must not be launched on your laptop.
+    analysis_mode: bool = False
+
     # Alert (watchdog CRITICAL event, /readyz 503) when a volume the server writes to has
     # less than this many MB free. A full disk silently ends collection: the listeners
     # keep answering while events stop persisting. 0 disables the check.

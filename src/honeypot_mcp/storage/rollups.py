@@ -203,6 +203,13 @@ async def stats(
     }
 
 
+async def event_type_counts(session: AsyncSession, since: datetime | None = None) -> dict[str, int]:
+    """{event_type: alerts} for a window, every type (the stats call only returns the top N)."""
+    w = window(since)
+    rows = await session.execute(select(w.c.event_type, func.sum(w.c.n)).group_by(w.c.event_type))
+    return {str(r[0]): int(r[1]) for r in rows.all()}
+
+
 async def hit_counts(
     session: AsyncSession, honeypot_ids: list[int] | None = None
 ) -> dict[int, int]:

@@ -172,3 +172,35 @@ async def test_a_padded_ip_or_absurd_window_is_handled_not_misreported():
     assert out["total_alerts"] == 12
     huge = await analyze_attacker_journey(IP, hours=10**9)  # was OverflowError
     assert huge["total_alerts"] == 12
+
+
+async def test_a_phase_proven_by_exact_counts_names_its_technique_even_when_the_sample_missed_it():
+    """The journey's sample is the earliest, latest and most severe events. A run of low-severity
+    brute-force attempts in the middle of a long history is therefore absent from it, yet the exact
+    per-type counts say the phase happened. It used to be listed with 2,570 events and no ATT&CK
+    technique, which reads as an unmapped phase in a report."""
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.analysis import analyze_attacker_journey
+
+    start = datetime.now(UTC) - timedelta(hours=2)
+    async with get_session() as session:
+        for i in range(700):
+            brute = 300 <= i < 305
+            session.add(
+                Alert(
+                    source_ip=IP,
+                    event_type="ssh_login_failed" if brute else "ssh_command_input",
+                    severity=AlertSeverity.LOW if brute else AlertSeverity.HIGH,
+                    timestamp=start + timedelta(seconds=i),
+                    payload={"username": "root"} if brute else {"input": "uname -a"},
+                )
+            )
+    out = await analyze_attacker_journey(IP)
+
+    credential = next(p for p in out["phases"] if p["phase"] == "Credential Access")
+    assert credential["event_count"] == 5 and credential["event_count_exact"] is True
+    assert credential["events_shown"] == 0, (
+        "the sample must not contain them, or this proves nothing"
+    )
+    assert {t["technique_id"] for t in credential["techniques"]} >= {"T1110.001"}

@@ -218,6 +218,101 @@ async def map_ttps(
     return await map_to_attack(terms)
 
 
+@mcp.tool(**hints("attack_summary"))
+async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
+    """MITRE ATT&CK summary of everything captured: tactics, techniques, and how many alerts each.
+
+    Maps every event type seen in the window (exact counts, from the rollups, so it is fast on
+    millions of alerts) to its techniques. Connection and session bookkeeping is deliberately
+    unmapped; it is listed with its share so the coverage figure is honest. Mapping is by event
+    type: payload text can add techniques for one attacker (see `map_ttps`, which reads payloads).
+    An alert whose event type maps to several techniques counts under each of them; a tactic's
+    total counts each alert once.
+
+    Args:
+        since_hours: Restrict to the last N hours. Omit for everything.
+    """
+    from datetime import timedelta
+
+    from honeypot_mcp.intel.mitre import TACTIC_ORDER, map_to_attack
+
+    since = None
+    if since_hours is not None:
+        if since_hours <= 0:
+            return {"error": "since_hours must be greater than 0."}
+        since = datetime.now(UTC) - timedelta(hours=since_hours)
+    async with get_session() as session:
+        counts = await rollups.event_type_counts(session, since)
+
+    techniques: dict[str, dict[str, Any]] = {}
+    tactic_types: dict[str, dict[str, int]] = {}
+    unmapped: dict[str, int] = {}
+    for event_type, n in counts.items():
+        ttps = await map_to_attack([event_type])
+        if not ttps:
+            unmapped[event_type] = n
+            continue
+        for ttp in ttps:
+            row = techniques.setdefault(
+                ttp["technique_id"],
+                {
+                    "technique_id": ttp["technique_id"],
+                    "technique_name": ttp["technique_name"],
+                    "tactic": ttp["tactic"],
+                    "alerts": 0,
+                    "event_types": {},
+                },
+            )
+            row["alerts"] += n
+            row["event_types"][event_type] = n
+            tactic_types.setdefault(ttp["tactic"], {})[event_type] = n
+
+    tactics = []
+    for tactic in sorted(
+        tactic_types, key=lambda t: TACTIC_ORDER.index(t) if t in TACTIC_ORDER else 99
+    ):
+        rows = sorted(
+            (row for row in techniques.values() if row["tactic"] == tactic),
+            key=lambda r: -r["alerts"],
+        )
+        tactics.append(
+            {
+                "tactic": tactic,
+                "alerts": sum(tactic_types[tactic].values()),
+                "techniques": [
+                    {
+                        "technique_id": r["technique_id"],
+                        "technique_name": r["technique_name"],
+                        "alerts": r["alerts"],
+                        "top_event_types": [
+                            {"type": t, "alerts": c}
+                            for t, c in sorted(r["event_types"].items(), key=lambda kv: -kv[1])[:5]
+                        ],
+                    }
+                    for r in rows
+                ],
+            }
+        )
+    total = sum(counts.values())
+    unmapped_total = sum(unmapped.values())
+    return {
+        "window": f"last {since_hours}h" if since_hours is not None else "all time",
+        "total_alerts": total,
+        "mapped_alerts": total - unmapped_total,
+        "mapped_share": round((total - unmapped_total) / total, 4) if total else 0.0,
+        "event_types_seen": len(counts),
+        "tactics": tactics,
+        "unmapped": [
+            {"type": t, "alerts": c}
+            for t, c in sorted(unmapped.items(), key=lambda kv: -kv[1])[:20]
+        ],
+        "note": (
+            "Unmapped event types are connection/session bookkeeping or generic command carriers "
+            "whose technique comes from the payload (use map_ttps with an ip for that)."
+        ),
+    }
+
+
 @mcp.tool(**hints("generate_report"))
 async def generate_report(
     title: str = "Attack Analysis Report",
@@ -631,11 +726,23 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
     exact_phase_counts: dict[str, int] = {}
     if sampled:
         for event_type, count in type_counts.items():
-            tactic = _primary_tactic(await map_to_attack([event_type]))
+            ttps = await map_to_attack([event_type])
+            tactic = _primary_tactic(ttps)
             exact_phase_counts[tactic] = exact_phase_counts.get(tactic, 0) + count
-            phases.setdefault(
+            phase = phases.setdefault(
                 tactic, {"phase": tactic, "events": [], "_tech_ids": set(), "techniques": []}
             )
+            # The sample may hold none of this type (it is earliest, latest and most severe), but
+            # the exact count says the phase happened, so it must name the technique too.
+            for ttp in ttps:
+                if ttp["technique_id"] not in phase["_tech_ids"]:
+                    phase["_tech_ids"].add(ttp["technique_id"])
+                    phase["techniques"].append(
+                        {
+                            "technique_id": ttp["technique_id"],
+                            "technique_name": ttp["technique_name"],
+                        }
+                    )
 
     phases_list = []
     for name, data in phases.items():

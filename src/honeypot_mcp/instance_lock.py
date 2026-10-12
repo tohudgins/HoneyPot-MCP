@@ -353,16 +353,33 @@ _state: dict[str, Any] = {"owned": True, "holder": None}
 def set_ownership(owned: bool, holder: Holder | None = None) -> None:
     _state["owned"] = owned
     _state["holder"] = holder
+    _state["analysis"] = False
 
 
 def sensors_owned() -> bool:
     return bool(_state["owned"])
 
 
+def set_analysis_mode() -> None:
+    """This process reads a copy of captured data and owns nothing, by design."""
+    set_ownership(False, None)
+    _state["analysis"] = True
+
+
 def read_only_error() -> dict[str, Any] | None:
     """The error a sensor-changing tool returns in a read-only process, else None."""
     if _state["owned"]:
         return None
+    if _state.get("analysis"):
+        return {
+            "error": (
+                "This HoneyPot MCP server is in analysis mode (ANALYSIS_MODE=true): it reads a "
+                "copy of captured data and runs no sensors, so starting, stopping or "
+                "reconfiguring them is not possible here. Alerts, analysis, MITRE mapping, "
+                "triage, reports and exports work normally."
+            ),
+            "hint": "Change sensors from the server that runs on the sensor host.",
+        }
     holder: Holder = _state["holder"] or Holder()
     return {
         "error": (

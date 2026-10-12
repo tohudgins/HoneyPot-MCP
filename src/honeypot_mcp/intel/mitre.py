@@ -160,7 +160,8 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Lateral Movement",
     ),
     (
-        re.compile(r"rdp.{0,40}(handshake|mcs|connection|nla_negotiate|nla_probe|session)", re.I),
+        # An established RDP session: someone authenticated and is using the desktop.
+        re.compile(r"rdp.{0,40}session", re.I),
         "T1021.001",
         "Remote Services: Remote Desktop Protocol",
         "Lateral Movement",
@@ -407,6 +408,14 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Exfiltration",
     ),
     # ── Initial Access ───────────────────────────────────────────────────────
+    (
+        # An RDP port reached from the internet is External Remote Services. It is Lateral Movement
+        # only once someone is inside (see the session rule), and a stranger's handshake is not.
+        re.compile(r"rdp.{0,40}(handshake|mcs|connection|nla_negotiate|nla_probe)", re.I),
+        "T1133",
+        "External Remote Services",
+        "Initial Access",
+    ),
     (
         # An unauthenticated Redis that accepts CONFIG SET / SET is the entry point of the common
         # Redis campaigns (write an SSH key or a cron job through `dir`/`dbfilename`).

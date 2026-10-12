@@ -71,7 +71,7 @@ Current tool modules:
 - `tools/honeypot.py` — deploy/list/stop/configure/clone, plus `honeypot_health` (probe) and `honeypot_self_test` (end-to-end pipeline check)
 - `tools/honeytoken.py` — token CRUD + AWS/credential/file generators
 - `tools/alerts.py` — recent/get/search/stats/acknowledge/export/prune
-- `tools/analysis.py` — enrich, profile, session reconstruction, `analyze_attacker_journey` (cross-honeypot kill-chain timeline), campaign correlation, MITRE mapping, reports, blocklist + STIX exports
+- `tools/analysis.py` — enrich, profile, session reconstruction, `analyze_attacker_journey` (cross-honeypot kill-chain timeline), campaign correlation, MITRE mapping (`map_ttps`; `attack_summary` maps every event type seen, from the rollups, by tactic), reports, blocklist + STIX exports
 - `tools/integrations.py` — webhook subscriptions, suppression rules
 - `tools/blocklist_push.py` — push blocked IPs to Cloudflare / AWS WAF / pfSense
 - `tools/deception.py` — the intent-level tools: `deception_plan`,

@@ -466,6 +466,13 @@ you'll have a substantial dataset.
 > generate_report format=markdown
 ```
 
+Leaving it unattended: the database grew about 4 GB a day on the first run (one source can be
+most of the traffic), so a 78 GB disk is a two-week runway, not a deployment. Set
+`MIN_FREE_DISK_MB` to about two days of growth (the first run used `10000`): below it the watchdog
+raises a CRITICAL alert, where the default `500` only fires when a full disk has already stopped
+collection. Copy the data off (step 12) at least every ten days. A sensor that fails one health
+probe and recovers is logged, not paged; three in an hour raises one HIGH `honeypot_unstable`.
+
 ### 12. Getting your data off the droplet (and checking the run worked)
 
 From your laptop, any time (it is read-only on the honeypots and safe mid-run):
@@ -481,6 +488,50 @@ events early on is a warning, not a failure (some protocols are scanned rarely);
 silent means suspect the network path. Details, the `--delete-remote` and `--expect-types`
 options, and what is and is not in a backup: [HARDENING.md](HARDENING.md#end-of-the-run). Turning
 the droplet off does not save the data: copy it off first, then destroy the droplet.
+
+### 13. Analyse the data later (analysis mode)
+
+The server can open a backup for analysis without running any sensor. Set `ANALYSIS_MODE=true` and
+point `DATABASE_URL` at a **copy** of the database. Without it, a restored database lists every
+sensor as RUNNING and the server would try to launch all of them on your laptop (ports, Docker).
+In this mode nothing is started: no honeypots, packet capture, canary, watchdog, notifications or
+retention, and the sensor-changing tools answer that they are unavailable. Alerts, ATT&CK mapping,
+campaigns, triage, reports and exports work normally. Opening a database also upgrades its schema,
+so always work on a copy, never on the only copy of the evidence:
+
+```bash
+B=$(ls -dt ~/hp-backups/honeypot-* | head -1)
+mkdir -p ~/hp-analysis && cp -c "$B/honeypot_mcp.db" ~/hp-analysis/   # macOS clone; Linux: cp --reflink=auto
+claude mcp add honeypot-analysis \
+  -e ANALYSIS_MODE=true -e MCP_TRANSPORT=stdio -e REPORTS_DIR=$HOME/hp-analysis/reports \
+  -e DATABASE_URL=sqlite+aiosqlite:///$HOME/hp-analysis/honeypot_mcp.db \
+  -- /path/to/HoneyPot-MCP/.venv/bin/python -m honeypot_mcp.server
+```
+
+| To answer | Tool |
+|---|---|
+| What happened, what needs triage | `soc_brief`, `alerts_stats`, `alerts_recent`, `alerts_search` |
+| Which ATT&CK techniques | `attack_summary` (the whole run, by tactic, exact counts), `map_ttps` (an IP, event types or text), `deception_coverage` |
+| Who is this attacker, what did they do in order | `analyze_attacker`, `analyze_attacker_journey`, `analyze_session` |
+| Which sources act together | `analyze_campaign`, `fingerprint_clusters` (SSH client fingerprints) |
+| Record a verdict | `alerts_acknowledge` (a source, an event type or ids; sets true/false positive) |
+| Hand it on | `generate_report` (markdown or html), `export_stix`, `export_blocklist`, `alerts_export` |
+
+Measured on the first real run (4.9M alerts, 3.7 GB): opening it takes seconds and each of these
+calls returns in well under two seconds, because statistics read pre-aggregated rollups and not
+the alerts table. Event types that are connection or session bookkeeping are deliberately not
+mapped to a technique, so the ATT&CK numbers count behaviour, not connections.
+
+For a first pass without a chat, one command does the lot (about ten seconds on that run):
+
+```bash
+scripts/analyze_backup.py ~/hp-backups/honeypot-<timestamp> --top 5 --hours 168
+```
+
+It works on a copy, runs the server in analysis mode over real MCP stdio, and writes
+`~/hp-analysis/reports/analysis-summary.md` (headline numbers, the ATT&CK table by tactic, the
+busiest sources' journeys, campaigns and clusters) next to the HTML/Markdown reports, the STIX
+bundle and the blocklist. Triage and follow-up questions then go to the MCP client above.
 
 ---
 

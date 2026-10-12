@@ -4,6 +4,29 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Ready to leave running: analyse the data later without a sensor, and the ATT&CK numbers checked
+
+**Analysis mode.** A restored backup lists every sensor as RUNNING, so opening it with the normal server would
+try to launch all 23 of them (ports, Docker) on a laptop; read-only mode only existed when another process held
+the lock. `ANALYSIS_MODE=true` opens the database and starts nothing: no honeypots, capture, canary, watchdog,
+notifications or retention, and the sensor-changing tools say so. Smoke-tested over real MCP stdio on a clone of
+the 3.7 GB backup: all 65 tools load, answers on 4.9M alerts take under two seconds, and the whole post-run
+sequence (mapping, journeys, campaigns, reports, STIX, blocklist, bulk triage) runs in about ten seconds.
+`scripts/analyze_backup.py <backup>` does it in one command and writes `analysis-summary.md` beside the reports.
+
+**`attack_summary`: the whole run by ATT&CK tactic.** There was no tool for "which techniques did this run
+produce, and how many alerts each". It maps every event type seen (exact counts from the rollups) in kill-chain
+order, reports what is deliberately unmapped and the mapped share (98.3% on the first run, 33 techniques).
+
+**Two mapping errors found by reading that output as an analyst would.** RDP connections and handshakes from the
+internet were filed under Lateral Movement (T1021.001, 4,888 alerts); they are External Remote Services (T1133,
+Initial Access), and only an established session stays T1021.001. And `analyze_attacker_journey` could list a
+phase with 2,570 events and no technique, because techniques came only from the sampled events (earliest, latest,
+most severe) while the exact counts proved the phase happened.
+
+**For an unattended run:** the database grew ~4 GB a day, so the disk-space alert (`MIN_FREE_DISK_MB`, default
+500) fires only after collection has stopped; the deploy guide now says to set it to about two days of growth.
+
 ## One host could OOM-kill the Telnet sensor; health pages are debounced; blocklist pushes match the real APIs
 
 **The Telnet sensor restarted 67 times in five hours.** One address opened ~2,400 sessions in six minutes

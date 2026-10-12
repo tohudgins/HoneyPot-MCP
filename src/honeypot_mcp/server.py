@@ -222,6 +222,19 @@ async def lifespan(app: FastMCP):
     await init_db()
     log.info("Database ready.")
 
+    if settings.analysis_mode:
+        instance_lock.set_analysis_mode()
+        log.warning(
+            "ANALYSIS MODE: reading %s. No sensors, capture, canary, watchdog or notifications "
+            "are started; honeypot statuses are as of when the data was captured.",
+            settings.database_url.split("///")[-1] or "the database",
+        )
+        try:
+            yield
+        finally:
+            await close_db()
+        return
+
     # Exactly one process owns the sensors for a database. A second one (a second
     # chat's stdio server, say) comes up read-only instead of fighting the first over
     # its ports and raising false CRITICAL alerts about them, and takes over if the
