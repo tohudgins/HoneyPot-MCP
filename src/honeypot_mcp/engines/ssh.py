@@ -285,6 +285,9 @@ class SSHEngine(HoneypotEngine):
         # /proc/version, accounts, home directory) from here once it is delivered
         # into the container; see `_deliver_persona_fs`.
         env["COWRIE_SHELL_FILESYSTEM"] = PERSONA_PICKLE_PATH
+        # Artifact clean-up runs inside the container (see cowrie_sitecustomize.prune_artifacts).
+        env["HONEYPOT_JANITOR_INTERVAL"] = str(get_settings().cowrie_janitor_interval_seconds)
+        env["HONEYPOT_MAX_TTY"] = str(get_settings().cowrie_max_tty_files)
 
         log.info(
             "SSH honeypot '%s' deploying as persona=%s hostname=%s",
@@ -569,10 +572,18 @@ class SSHEngine(HoneypotEngine):
         def _status() -> dict:
             try:
                 c = self._client.containers.get(container_id)
+                # Everything comes from the container's own record: `c.image` would make the SDK
+                # fetch the image (`GET /images/<id>/json`), which the host's Docker guard refuses,
+                # so this tool failed on every Docker-backed sensor in the hardened deployment.
+                attrs = c.attrs
+                state = attrs.get("State", {})
                 return {
                     "docker_status": c.status,
-                    "image": c.image.tags[0] if c.image.tags else COWRIE_IMAGE,
-                    "started_at": c.attrs.get("State", {}).get("StartedAt"),
+                    "image": attrs.get("Config", {}).get("Image") or COWRIE_IMAGE,
+                    "started_at": state.get("StartedAt"),
+                    # A sensor that keeps getting OOM-killed still shows "running" between kills.
+                    "restart_count": attrs.get("RestartCount", 0),
+                    "oom_killed": bool(state.get("OOMKilled")),
                 }
             except docker.errors.NotFound:
                 return {"docker_status": "not_found"}

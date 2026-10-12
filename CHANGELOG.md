@@ -4,6 +4,35 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The telnet sensor was being OOM-killed every few minutes; backups; status behind the guard
+
+The first full backup of the 3.8 GB database finished with one warning: 33 health failures on the
+telnet sensor. Following it found that **`honeypot-hp-telnet` had been OOM-killed 246 times in 20
+hours** (54 in the last 12), each time discarding every session, recording and sample in the
+container and showing as "running" in between. The container's memory cgroup counts the kernel
+memory of every file in its tmpfs on top of the `size=` cap, which does not limit the *number* of
+files: 54,000 files cost ~80 MiB of a 256 MiB limit. 99.8% of the 43,591 files in `downloads/` were
+0-byte `tmp…`/`redir_…` leftovers of failed fetches (egress is closed by default and Cowrie never
+removes them), and the 10,654 session recordings came to ~85 MB against a 64 MB tmpfs, so the
+directory was also full and new recordings and real downloads were failing to write.
+
+The fix runs inside the container as part of the existing `sitecustomize` patch
+(`cowrie_sitecustomize.prune_artifacts`): empty download leftovers older than five minutes are
+deleted and only the newest 5,000 recordings are kept (settings
+`cowrie_janitor_interval_seconds` and `cowrie_max_tty_files`, `COWRIE_JANITOR_INTERVAL_SECONDS` /
+`COWRIE_MAX_TTY_FILES` in `.env`; 0 disables it; symlinks are never
+followed). A first design that used `docker exec` from the host was refused by the Docker guard,
+which denies `exec` by design; the guard was left alone. The patch applies to containers created
+after the change, so existing sensors need a stop/redeploy.
+
+Also found on the way, each with a test that fails on the old code. `honeypot_status` on any
+Docker-backed sensor failed with a 403 from the guard (`container.image` makes the SDK fetch the
+image): it worked on every in-process sensor and broke on every Cowrie one in the hardened
+deployment; it now reads the container's own record and also reports `restart_count` and
+`oom_killed`, because a flapping sensor reads "running" between kills. And `scripts/backup.sh` used
+`sqlite3 .backup`, which ran 38 minutes on the live database without finishing; it uses
+`VACUUM INTO` (203 s on the same database; the full fetch of 3.8 GB takes about 10 minutes).
+
 ## Built for scale: statistics read rollups, one flood cannot fill the table, PostgreSQL parity
 
 The previous entry fixed one scan; the cause was the design. Every aggregate read the alert table,

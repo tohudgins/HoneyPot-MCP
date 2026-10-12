@@ -23,6 +23,8 @@ environment variables the engine sets from the persona:
     HONEYPOT_SSH_KEX        comma list; offered key exchanges, in order (only those Twisted has)
     HONEYPOT_SSH_HOSTKEYS   comma list; offered host-key algorithms, in order (only those with a key)
     HONEYPOT_TELNET_ISSUE   the distro name a telnetd prints before the login prompt
+    HONEYPOT_JANITOR_INTERVAL  seconds between artifact clean-ups (default 300; 0 turns it off)
+    HONEYPOT_MAX_TTY        session recordings to keep, newest first (default 5000; -1 keeps all)
 
 Nothing runs when it is imported under any other name, so the host process and the tests can
 import it to exercise the patch functions.
@@ -30,10 +32,13 @@ import it to exercise the patch functions.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.abc
 import importlib.util
 import os
 import sys
+import threading
+import time
 from types import ModuleType
 from typing import Any
 
@@ -74,6 +79,7 @@ def restrict_ssh_offer(
 
 
 def patch_ssh_factory(module: ModuleType) -> None:
+    start_janitor()
     factory_cls = module.CowrieSSHFactory
     original = factory_cls.buildProtocol
     key_exchanges, host_keys = _csv("HONEYPOT_SSH_KEX"), _csv("HONEYPOT_SSH_HOSTKEYS")
@@ -99,6 +105,7 @@ def telnet_greeting(issue: str, hostname: str) -> bytes:
 
 
 def patch_telnet_userauth(module: ModuleType) -> None:
+    start_janitor()
     proto = module.HoneyPotTelnetAuthProtocol
     issue = os.environ.get("HONEYPOT_TELNET_ISSUE", "").strip()
 
@@ -118,6 +125,100 @@ def patch_telnet_userauth(module: ModuleType) -> None:
         self.transport.write(telnet_greeting(banner or issue, hostname))
 
     proto.connectionMade = connectionMade
+
+
+# ── Artifact janitor ─────────────────────────────────────────────────────────────────────────
+#
+# Cowrie keeps session recordings (`tty/`) and download records (`downloads/`) under
+# `var/lib/cowrie`, which the container mounts as tmpfs. Two properties of that are fatal under a
+# botnet. The memory cgroup counts every file's inode and dentry on top of the tmpfs `size=` cap
+# (which does not limit the *number* of files), and with egress closed every failed `wget`/`curl`
+# leaves a 0-byte `tmp…`/`redir_…` file that nothing ever removes. On the live droplet that was
+# 43,591 empty files plus 10,654 recordings (~85 MB against a 64 MB tmpfs): ~80 MiB of a 256 MiB
+# limit, the telnet container OOM-killed 246 times in 20 hours, and the directory full, so new
+# recordings and real downloads were failing to write. The cleanup runs here, inside the container,
+# because the host's Docker guard deliberately refuses `exec`.
+
+_DATA_ROOTS = ("/cowrie/cowrie-git/var/lib/cowrie", "/cowrie/var/lib/cowrie")
+_MIN_AGE_SECONDS = 300
+_janitor_started = False
+
+
+def prune_artifacts(
+    roots: tuple[str, ...], keep_tty: int, min_age: float = _MIN_AGE_SECONDS
+) -> dict[str, int] | None:
+    """Delete 0-byte download leftovers older than `min_age` seconds and all but the newest
+    `keep_tty` recordings. Never follows or removes through a symlink (file names are
+    attacker-influenced). A negative `keep_tty` keeps every recording. None if there is no data
+    directory (so "looked in the wrong place" is distinguishable from "nothing to do")."""
+    root = next((r for r in roots if os.path.isdir(r)), None)
+    if root is None:
+        return None
+    now = time.time()
+    result = {"empty_downloads": 0, "tty_pruned": 0, "tty_kept": 0}
+
+    def entries(path: str) -> list[tuple[str, os.stat_result]]:
+        found: list[tuple[str, os.stat_result]] = []
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                            continue
+                        found.append((entry.path, entry.stat(follow_symlinks=False)))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return found
+
+    for path, st in entries(os.path.join(root, "downloads")):
+        if st.st_size == 0 and now - st.st_mtime > min_age:
+            try:
+                os.unlink(path)
+                result["empty_downloads"] += 1
+            except OSError:
+                pass
+
+    recordings = sorted(entries(os.path.join(root, "tty")), key=lambda item: item[1].st_mtime)
+    if keep_tty >= 0 and len(recordings) > keep_tty:
+        for path, _ in recordings[: len(recordings) - keep_tty]:
+            try:
+                os.unlink(path)
+                result["tty_pruned"] += 1
+            except OSError:
+                pass
+    result["tty_kept"] = len(recordings) - result["tty_pruned"]
+    return result
+
+
+def _janitor_loop(interval: float, keep_tty: int) -> None:
+    # First pass soon after start (a restarted container can already be near its limit), then on
+    # the interval. Any failure is swallowed: housekeeping must never take the honeypot down.
+    time.sleep(min(60.0, interval))
+    while True:
+        with contextlib.suppress(Exception):
+            prune_artifacts(_DATA_ROOTS, keep_tty)
+        time.sleep(interval)
+
+
+def start_janitor() -> None:
+    """Start the cleanup thread once, in a process that is actually running Cowrie (called when a
+    patched Cowrie module is imported, so `docker exec python3 -c` never gets one)."""
+    global _janitor_started
+    if _janitor_started:
+        return
+    _janitor_started = True
+    try:
+        interval = float(os.environ.get("HONEYPOT_JANITOR_INTERVAL", "300"))
+        keep_tty = int(os.environ.get("HONEYPOT_MAX_TTY", "5000"))
+    except ValueError:
+        return
+    if interval <= 0:
+        return
+    threading.Thread(
+        target=_janitor_loop, args=(interval, keep_tty), name="artifact-janitor", daemon=True
+    ).start()
 
 
 # ── import hook ──────────────────────────────────────────────────────────────────────────────

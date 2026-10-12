@@ -323,6 +323,17 @@ class Settings(BaseSettings):
     flood_guard_per_minute: int = 600
     # Upper bound on tracked (source, event type) windows; the oldest quarter is evicted when full.
     flood_guard_max_sources: int = 50_000
+    # Cowrie keeps its session recordings and download records in RAM-backed tmpfs, and the
+    # container's memory cgroup counts every file's inode and dentry on top of the tmpfs size cap.
+    # With egress closed each failed wget/curl leaves a 0-byte file, and a telnet botnet makes tens
+    # of thousands: on the live droplet 54,000 files cost ~80 MiB of a 256 MiB limit and the telnet
+    # container was OOM-killed 246 times in 20 hours (losing everything in it each time). A thread
+    # inside the container (engines/cowrie_sitecustomize.py; the host's Docker guard refuses exec)
+    # runs every `cowrie_janitor_interval_seconds`: it deletes empty download leftovers older than
+    # five minutes and keeps only the newest `cowrie_max_tty_files` session recordings. 0 disables
+    # it. It applies to containers created after the setting changes.
+    cowrie_janitor_interval_seconds: float = 300.0
+    cowrie_max_tty_files: int = 5000
     # Comma-separated IPs/CIDRs that `blocklist_push_*` must never push (your
     # own gateway, monitoring, office egress). Link-local/private/loopback and
     # non-global addresses are never pushed regardless.
