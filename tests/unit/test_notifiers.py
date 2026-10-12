@@ -230,14 +230,55 @@ def test_repeat_events_are_coalesced():
         assert throttle.check(1, _event())[0] is False
 
 
-def test_critical_is_never_throttled():
-    """A triggered honeytoken or a container escape must reach someone even if
-    the same IP fired something a minute ago."""
+def test_a_critical_pages_immediately_even_if_the_same_ip_fired_something_a_minute_ago():
+    """A triggered honeytoken or a container escape must reach someone even if the same IP fired
+    something else a minute ago: the first CRITICAL of each kind from a source always goes out."""
     from honeypot_mcp.webhooks import _NotifyThrottle
 
     throttle = _NotifyThrottle(window_seconds=300)
+    assert throttle.check(1, _event("high"))[0] is True
+    assert throttle.check(1, _event("critical", "docker_api_container_escape"))[0] is True
+    assert throttle.check(1, _event("critical", "mongodb_ransom_note"))[0] is True
+    other = _event("critical", "mongodb_ransom_note", source_ip="198.51.100.9")
+    assert throttle.check(1, other)[0] is True, "a different source is a different incident"
+
+
+def test_identical_criticals_from_one_source_are_coalesced_and_counted():
+    """Found on the live droplet: one source sending ~700 SIP toll-fraud INVITEs an hour was a
+    Slack message every five seconds. The per-type cap (30 a minute) is far above any single
+    scanner's rate, so only a per-source window can stop it. Volume still rides along."""
+    from honeypot_mcp.webhooks import _NotifyThrottle
+
+    throttle = _NotifyThrottle(window_seconds=300, critical_repeat_window=0.1)
+    flood = _event("critical", "sip_toll_fraud_attempt")
+    assert throttle.check(1, flood) == (True, 0)
+    for _ in range(40):
+        assert throttle.check(1, flood)[0] is False
+    import time
+
+    time.sleep(0.15)
+    assert throttle.check(1, flood) == (True, 40), "the next page says how many it covers"
+
+
+def test_a_honeytoken_trigger_is_never_coalesced():
+    """The highest-fidelity signal the platform has: every use of a planted credential pages."""
+    from honeypot_mcp.webhooks import _NotifyThrottle
+
+    throttle = _NotifyThrottle(window_seconds=300, critical_repeat_window=300)
+    trip = _event("critical", "honeytoken_triggered_credential_via_ssh_login", honeytoken_id=7)
     for _ in range(10):
-        assert throttle.check(1, _event("critical"))[0] is True
+        assert throttle.check(1, trip)[0] is True
+
+
+def test_coalescing_is_per_subscription_and_can_be_turned_off():
+    from honeypot_mcp.webhooks import _NotifyThrottle
+
+    flood = _event("critical", "sip_toll_fraud_attempt")
+    throttle = _NotifyThrottle(critical_repeat_window=300)
+    assert throttle.check(1, flood)[0] is True
+    assert throttle.check(2, flood)[0] is True, "another channel has its own record"
+    off = _NotifyThrottle(critical_repeat_window=0)
+    assert all(off.check(1, flood)[0] for _ in range(5)), "0 restores one-to-one relaying"
 
 
 def test_suppressed_count_rides_on_the_next_message():

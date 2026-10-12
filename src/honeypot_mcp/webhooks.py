@@ -954,6 +954,7 @@ class _NotifyThrottle:
         max_keys: int = 4096,
         critical_cap: int = 30,
         critical_window: float = 60.0,
+        critical_repeat_window: float = 300.0,
     ) -> None:
         self._window = window_seconds
         self._max_keys = max_keys
@@ -966,12 +967,26 @@ class _NotifyThrottle:
         # the next message that does go out.
         self._critical_cap = critical_cap
         self._critical_window = critical_window
+        self._critical_repeat_window = critical_repeat_window
+        self._last_critical: dict[tuple[int, str, str], float] = {}
         self._critical_sent: dict[tuple[int, str], deque[float]] = {}
         self._critical_suppressed: dict[tuple[int, str], int] = {}
 
     def _check_critical(self, sub_id: int, event: PendingEvent) -> tuple[bool, int]:
         key = (sub_id, event.event_type)
         now = time.monotonic()
+        # The same CRITICAL from the same source, repeated: the first one pages, the rest ride
+        # along as a count. A honeytoken trigger is the highest-fidelity signal this platform has,
+        # so it is never coalesced. Found on the live droplet: one source sending ~700 SIP
+        # toll-fraud INVITEs an hour was a Slack message every five seconds, because the per-type
+        # cap below (30 a minute) is far above any single scanner's rate.
+        tripwire = event.honeytoken_id is not None
+        repeat_key = (sub_id, event.event_type, event.source_ip or "")
+        if not tripwire and self._critical_repeat_window > 0:
+            last = self._last_critical.get(repeat_key)
+            if last is not None and now - last < self._critical_repeat_window:
+                self._suppressed[repeat_key] = self._suppressed.get(repeat_key, 0) + 1
+                return False, 0
         sent = self._critical_sent.get(key)
         if sent is None:
             if len(self._critical_sent) >= self._max_keys:
@@ -992,7 +1007,20 @@ class _NotifyThrottle:
             self._critical_suppressed[key] = self._critical_suppressed.get(key, 0) + 1
             return False, 0
         sent.append(now)
-        return True, self._critical_suppressed.pop(key, 0)
+        carried = self._critical_suppressed.pop(key, 0)
+        if not tripwire and self._critical_repeat_window > 0:
+            # Spoofed sources rotate source_ip: bound the map like the others, and evict keys
+            # holding an unsent count last so volume is delayed, never discarded.
+            if len(self._last_critical) >= self._max_keys:
+                for old in sorted(
+                    self._last_critical,
+                    key=lambda k: (self._suppressed.get(k, 0) > 0, self._last_critical[k]),
+                )[: self._max_keys // 4]:
+                    self._last_critical.pop(old, None)
+                    self._suppressed.pop(old, None)
+            self._last_critical[repeat_key] = now
+            carried += self._suppressed.pop(repeat_key, 0)
+        return True, carried
 
     def check(self, sub_id: int, event: PendingEvent) -> tuple[bool, int]:
         """Returns (should_send, suppressed_since_last_send)."""
@@ -1472,6 +1500,8 @@ class WebhookDelivery:
         self._client: httpx.AsyncClient | None = None
         self._throttle = _NotifyThrottle(
             window_seconds=get_settings().notify_throttle_seconds,
+            critical_cap=get_settings().notify_critical_per_minute,
+            critical_repeat_window=get_settings().notify_critical_repeat_seconds,
         )
         self._sub_sems: dict[int, asyncio.Semaphore] = {}
         self._sub_backlog: dict[int, int] = {}

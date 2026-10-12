@@ -4,6 +4,30 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Public traffic can trip tokens; repeated CRITICALs no longer flood a channel
+
+Two findings from the live droplet, both fixed and proven from outside.
+
+**Honeytokens could not be tripped by the public.** The HTTP decoys (`/.env`, `/config.json`,
+`/wp-config.php`) were random, so no scanner could ever find a tracked credential, and the canary
+callback server binds loopback and is closed by the firewall, so a canary URL could never call
+back. Now a tracked MySQL credential token is served as the database login in those files
+(`credential_match.planted_credential`, lowest active token id, revoked tokens never served), and an
+active canary-URL token is embedded as an error-reporting webhook. The HTTP honeypot answers
+`/t/<token>` on its own public port (`canary.serve_if_token`; an unknown id is a plain 404 so `/t/`
+is not itself a fingerprint), with no new exposure. Proven from outside against the droplet: read
+`/.env` on port 80, replayed the pair on the public MySQL port, and followed the webhook URL; both
+tokens tripped with CRITICAL alerts.
+
+**One scanner could turn Slack into a firehose.** CRITICAL was exempt from the notification
+throttle on the assumption it is rare; one source sending ~700 SIP toll-fraud INVITEs an hour is a
+message every five seconds, and the only cap (30 a minute per event type) sat far above it. The
+first CRITICAL of each (event type, source) still pages immediately; identical repeats within
+`NOTIFY_CRITICAL_REPEAT_SECONDS` (300) are coalesced into a "+N suppressed" count, and honeytoken
+triggers are never coalesced. `NOTIFY_CRITICAL_PER_MINUTE` existed but was never passed to the
+throttle; it is wired now. Live: 24 messages in ten minutes against the real flood, about 12 a
+minute from SIP alone before.
+
 ## Field test: proving a live deployment, and what it found
 
 Two scripts that run from a machine other than the VPS, documented in

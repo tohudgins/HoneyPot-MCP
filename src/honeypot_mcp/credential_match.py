@@ -291,6 +291,24 @@ async def recover_ntlmv2_password(
     return None
 
 
+async def planted_credential(service: str) -> tuple[str, str] | None:
+    """A (username, password) pair from an active credential token for `service`, or None.
+
+    For decoy content a scanner reads and later replays (an exposed `.env` naming a MySQL user):
+    serving a *tracked* pair is what turns a scanner that tries it on one of our own services
+    into a CRITICAL alert. Tokens for `service` come first, then `any`-service ones, lowest token id
+    first so every decoy serves the same pair until that token is revoked. Revoked tokens are never
+    in the index; a token revoked in the last 30 s may still be served once, which is harmless.
+    """
+    await _load_index()
+    service = service.lower()
+    for pool in (_candidates.get(service, []), _candidates.get("any", [])):
+        for u, pw, _token_id in sorted(pool, key=lambda c: c[2]):
+            if u and pw:
+                return u, pw
+    return None
+
+
 async def match(event: PendingEvent) -> int | None:
     """Return the matching active CREDENTIAL honeytoken id, or None.
 

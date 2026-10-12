@@ -49,6 +49,9 @@ from aiohttp import web
 from aiohttp.web_request import FileField
 from sqlalchemy import update
 
+from honeypot_mcp.canary import planted_canary_url
+from honeypot_mcp.canary import serve_if_token as serve_canary_if_token
+from honeypot_mcp.credential_match import planted_credential
 from honeypot_mcp.engines import http_endpoints
 from honeypot_mcp.engines.base import HoneypotEngine
 from honeypot_mcp.engines.http_admin import (
@@ -475,18 +478,27 @@ def _rand_alnum(n: int, upper: bool = False) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
-def _generate_decoy(path: str) -> tuple[str, str]:
+def _generate_decoy(
+    path: str,
+    planted: tuple[str, str] | None = None,
+    canary_url: str | None = None,
+) -> tuple[str, str]:
     """Return `(body, content_type)` for a decoy response.
 
-    Each call mints fresh throwaway token-shaped strings. Nothing here is
-    a real honeytoken — they're decorative bait so the response *looks*
-    like what an attacker hopes to find. Real honeytokens fire via the
-    proper providers; mixing the two would risk leaking real tracker URLs
-    in scrape data.
+    Each call mints fresh throwaway token-shaped strings, so the cloud keys (AWS, Stripe, JWT) are
+    decorative bait. Two things are not decorative when the operator has planted them: `planted`,
+    a tracked MySQL credential used for the database user and password, and `canary_url`, a tracked
+    canary URL embedded as an error-reporting webhook. A scanner that replays either trips a
+    honeytoken; with neither planted the body is entirely throwaway, as before.
     """
     aws_key_id = "AKIA" + _rand_alnum(16, upper=True)
     aws_secret = _rand_alnum(40)
-    db_password = _rand_alnum(20)
+    # A planted pair (a tracked credential honeytoken for the MySQL this `.env` claims) is what a
+    # scanner that tries it against one of our services trips; otherwise a throwaway.
+    db_user, db_password = planted if planted else ("appuser", _rand_alnum(20))
+    wp_user = planted[0] if planted else "wpuser"
+    env_webhook = f"ERROR_WEBHOOK_URL={canary_url}\n" if canary_url else ""
+    json_webhook = f'  "error_webhook": "{canary_url}",\n' if canary_url else ""
     jwt_payload = (
         base64.urlsafe_b64encode(b'{"sub":"admin","role":"superuser","iat":1700000000}')
         .rstrip(b"=")
@@ -504,13 +516,14 @@ def _generate_decoy(path: str) -> tuple[str, str]:
             f"DB_HOST=127.0.0.1\n"
             f"DB_PORT=3306\n"
             f"DB_DATABASE=production\n"
-            f"DB_USERNAME=appuser\n"
+            f"DB_USERNAME={db_user}\n"
             f"DB_PASSWORD={db_password}\n"
             f"AWS_ACCESS_KEY_ID={aws_key_id}\n"
             f"AWS_SECRET_ACCESS_KEY={aws_secret}\n"
             f"AWS_DEFAULT_REGION=us-east-1\n"
             f"JWT_SECRET={_rand_alnum(48)}\n"
             f"STRIPE_SECRET=sk_live_{_rand_alnum(24)}\n"
+            f"{env_webhook}"
         )
         return body, "text/plain"
 
@@ -520,9 +533,10 @@ def _generate_decoy(path: str) -> tuple[str, str]:
             '  "version": "1.2.4",\n'
             '  "environment": "production",\n'
             f'  "api_token": "{fake_jwt}",\n'
+            f"{json_webhook}"
             f'  "database": {{\n'
             f'    "host": "db.internal",\n'
-            f'    "user": "appuser",\n'
+            f'    "user": "{db_user}",\n'
             f'    "password": "{db_password}"\n'
             "  },\n"
             f'  "aws": {{\n'
@@ -537,7 +551,7 @@ def _generate_decoy(path: str) -> tuple[str, str]:
         body = (
             "<?php\n"
             "define( 'DB_NAME', 'wordpress' );\n"
-            "define( 'DB_USER', 'wpuser' );\n"
+            f"define( 'DB_USER', '{wp_user}' );\n"
             f"define( 'DB_PASSWORD', '{db_password}' );\n"
             "define( 'DB_HOST', 'localhost' );\n"
             "define( 'DB_CHARSET', 'utf8mb4' );\n"
@@ -903,6 +917,12 @@ class HTTPEngine(HoneypotEngine):
             user_agent = request.headers.get("User-Agent", "")
             host_header = request.headers.get("Host", "localhost")
 
+            # A planted canary URL is only useful if the world can reach it: answer /t/<token> here,
+            # on the honeypot's own public port, instead of on the loopback-only callback server.
+            canary_response = await serve_canary_if_token(request)
+            if canary_response is not None:
+                return canary_response
+
             # Body parsing — content-type dispatch. Form/multipart goes through
             # request.post() so credential_match keeps seeing the parsed
             # `post_data` dict; non-form bodies (JSON, binary, raw exploit
@@ -1100,7 +1120,9 @@ class HTTPEngine(HoneypotEngine):
                 return resp
 
             if serve_decoy:
-                decoy_body, decoy_ct = _generate_decoy(path)
+                decoy_body, decoy_ct = _generate_decoy(
+                    path, await planted_credential("mysql"), await planted_canary_url()
+                )
                 resp = web.Response(
                     text=decoy_body,
                     content_type=decoy_ct,

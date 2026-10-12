@@ -342,7 +342,9 @@ async def test_one_slow_subscription_does_not_delay_the_others(monkeypatch):
 def test_critical_events_are_capped_per_event_type_and_the_count_rides_along():
     from honeypot_mcp.webhooks import _NotifyThrottle
 
-    throttle = _NotifyThrottle(critical_cap=3, critical_window=0.15)
+    # The per-source repeat window is off here: this pins the per-type cap on its own, the backstop
+    # for floods whose source address rotates (so no per-source window can see them).
+    throttle = _NotifyThrottle(critical_cap=3, critical_window=0.15, critical_repeat_window=0)
     # A spoofed-source flood rotates source_ip but not the event type.
     sent = [throttle.check(1, _event("critical", event_type="snmp_flood"))[0] for _ in range(8)]
     assert sent == [True, True, True, False, False, False, False, False]

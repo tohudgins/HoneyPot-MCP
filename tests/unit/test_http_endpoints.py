@@ -168,6 +168,125 @@ async def test_repeat_visits_escalate_severity(http_server):
     assert len(recon) >= 1, "expected http_active_recon after threshold hits"
 
 
+def test_decoy_files_carry_a_planted_credential_and_canary_url_only_when_planted():
+    from honeypot_mcp.engines.http import _generate_decoy
+
+    pair, url = ("svc_a1b2", "Planted-Pw-9x"), "http://203.0.113.5/t/abc"
+    for path in ("/.env", "/config.json", "/wp-config.php"):
+        body, _ = _generate_decoy(path, pair, url)
+        assert pair[1] in body, path
+        assert pair[0] in body, path
+    env, _ = _generate_decoy("/.env", pair, url)
+    assert f"DB_USERNAME={pair[0]}\n" in env and f"ERROR_WEBHOOK_URL={url}\n" in env
+    cfg, _ = _generate_decoy("/config.json", pair, url)
+    assert url in cfg and __import__("json").loads(cfg)["database"]["user"] == pair[0]
+    # Nothing planted: entirely throwaway, as before, and no webhook line at all.
+    plain, _ = _generate_decoy("/.env")
+    assert "DB_USERNAME=appuser" in plain and "ERROR_WEBHOOK_URL" not in plain
+    assert pair[1] not in plain
+    # The cloud keys stay decorative whatever is planted.
+    assert "AKIA" in env and pair[1] not in _generate_decoy("/.aws/credentials", pair, url)[0]
+
+
+@pytest.mark.asyncio
+async def test_an_exposed_env_file_serves_the_planted_mysql_pair_until_it_is_revoked(http_server):
+    """A scanner that reads /.env and replays the database login against one of our services is
+    only a CRITICAL alert if the pair it found is a tracked token. Found on the live droplet: the
+    decoy bodies were random, so no public scanner could ever trip a credential token."""
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
+    from honeypot_mcp.tokens.credential import CredentialProvider
+
+    value, meta = await CredentialProvider().create({"service": "mysql", "count": 1})
+    planted = meta["credentials"][0]
+    async with get_session() as session:
+        token = Honeytoken(
+            type=HoneytokenType.CREDENTIAL,
+            label="env-bait",
+            token_value=value,
+            status=HoneytokenStatus.ACTIVE,
+            token_meta=meta,
+        )
+        session.add(token)
+        await session.flush()
+        token_id = token.id
+    credential_match.invalidate_cache()
+
+    async with httpx.AsyncClient() as client:
+        body = (await client.get(f"http://127.0.0.1:{http_server}/.env")).text
+    assert f"DB_USERNAME={planted['username']}\n" in body
+    assert f"DB_PASSWORD={planted['password']}\n" in body
+
+    async with get_session() as session:
+        row = await session.get(Honeytoken, token_id)
+        row.status = HoneytokenStatus.REVOKED
+    credential_match.invalidate_cache()
+    async with httpx.AsyncClient() as client:
+        body = (await client.get(f"http://127.0.0.1:{http_server}/.env")).text
+    assert planted["password"] not in body, "a revoked token must never be served"
+    assert "DB_USERNAME=appuser" in body
+
+
+@pytest.mark.asyncio
+async def test_a_canary_url_planted_in_a_decoy_trips_when_followed_on_the_public_port(http_server):
+    """The callback server binds loopback and the host firewall closes it, so a canary URL could
+    never call back from the internet. The HTTP honeypot answers /t/<token> itself; an unknown id
+    is a plain 404 (not a generic 200 that would fingerprint every /t/ path)."""
+    from sqlalchemy import select
+
+    from honeypot_mcp import canary
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import (
+        Alert,
+        Honeytoken,
+        HoneytokenStatus,
+        HoneytokenType,
+    )
+    from honeypot_mcp.tokens.canary_url import CanaryURLProvider
+
+    value, meta = await CanaryURLProvider().create({})
+    async with get_session() as session:
+        token = Honeytoken(
+            type=HoneytokenType.CANARY_URL,
+            label="env-canary",
+            token_value=value,
+            status=HoneytokenStatus.ACTIVE,
+            token_meta=meta,
+        )
+        session.add(token)
+        await session.flush()
+        token_id = token.id
+    canary.invalidate_token_index()
+
+    buf = event_buffer.get_buffer()
+    await buf.start()
+    try:
+        async with httpx.AsyncClient() as client:
+            hit = await client.get(f"http://127.0.0.1:{http_server}{meta['path']}")
+            miss = await client.get(f"http://127.0.0.1:{http_server}/t/not-a-token")
+        await asyncio.sleep(1.2)
+    finally:
+        await buf.stop()
+    assert hit.status_code == 200 and hit.text == "OK"
+    assert miss.status_code == 404
+
+    async with get_session() as session:
+        status = (await session.get(Honeytoken, token_id)).status
+        alerts = (
+            (
+                await session.execute(
+                    select(Alert).where(Alert.event_type == "honeytoken_triggered_canary_url")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert status is HoneytokenStatus.TRIGGERED
+    assert len(alerts) == 1 and alerts[0].severity.value == "critical"
+
+
 @pytest.mark.asyncio
 async def test_a_login_attempt_after_crawling_is_still_a_credential_submission(http_server):
     """A scanner that maps the site first and then tries a login (the usual order, with a

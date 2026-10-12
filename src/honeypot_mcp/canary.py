@@ -494,6 +494,72 @@ async def _handle_token_tail(request: web.Request) -> web.Response:
     return response
 
 
+async def serve_if_token(request: web.Request) -> web.Response | None:
+    """For a web honeypot that is reachable from outside: answer `/t/<id>` if `<id>` is a planted
+    canary token, else None so the caller carries on as an ordinary web server.
+
+    The callback server binds loopback and the host firewall closes it, so a canary URL planted in
+    decoy content could never call back. Serving the same paths from the honeypot's own public port
+    needs no new exposure. Unlike the loopback server, an unknown id returns None (a 404 from the
+    caller) instead of a generic 200: on a public web server, every `/t/<anything>` answering 200
+    would be a fingerprint of its own, and ids are 128-bit so there is nothing to enumerate.
+    """
+    if not request.path.startswith("/t/"):
+        return None
+    raw, slash, tail = request.path[3:].partition("/")
+    token_pk = await _find_token_by_id(raw.split(".", 1)[0])
+    if token_pk is None:
+        return None
+    if not _over_limit(request.remote or "0.0.0.0") and not _global_rate_limit_check():
+        await _trigger(token_pk, request)
+    if slash:  # kubectl against a kubeconfig token: the path after /t/<id>
+        return _kubernetes_response(tail)
+    if raw.endswith(".png"):
+        return web.Response(body=_PIXEL, content_type="image/png")
+    return web.Response(text="OK", content_type="text/plain")
+
+
+_PLANTED_TTL_SECONDS = 30.0
+_planted_url: tuple[float, str | None] = (0.0, None)
+
+
+async def planted_canary_url() -> str | None:
+    """The URL of an active canary-URL token, for decoy content a scanner reads and may follow.
+
+    Cached for 30 s like the credential index, so a decoy hit costs no query; a token revoked in
+    the last 30 s may still be served once, which is harmless (a revoked token no longer fires).
+    """
+    global _planted_url
+    loaded, value = _planted_url
+    if loaded and time.monotonic() - loaded < _PLANTED_TTL_SECONDS:
+        return value
+    try:
+        async with get_session() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(Honeytoken)
+                        .where(
+                            Honeytoken.type == HoneytokenType.CANARY_URL,
+                            Honeytoken.status.in_(
+                                (HoneytokenStatus.ACTIVE, HoneytokenStatus.TRIGGERED)
+                            ),
+                        )
+                        .order_by(Honeytoken.id)
+                        .limit(1)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        value = (row.token_meta or {}).get("full_url") if row is not None else None
+    except Exception:  # noqa: BLE001 - decoy content must never fail a request
+        log.debug("planted canary lookup failed", exc_info=True)
+        return value
+    _planted_url = (time.monotonic(), value)
+    return value
+
+
 async def _handle_root(_request: web.Request) -> web.Response:
     return web.Response(text="OK", content_type="text/plain")
 

@@ -313,6 +313,10 @@ class Settings(BaseSettings):
     # coalescing, but spoofed-source UDP floods rotate source_ip, so without a
     # cap one flood turns the exemption into an unbounded stream.
     notify_critical_per_minute: int = 30
+    # The same CRITICAL (event type) from the same source is coalesced for this many seconds on the
+    # human channels: the first pages, repeats ride along as "+N suppressed". 0 disables it.
+    # Honeytoken triggers are never coalesced.
+    notify_critical_repeat_seconds: float = 300.0
     # Comma-separated IPs/CIDRs that `blocklist_push_*` must never push (your
     # own gateway, monitoring, office egress). Link-local/private/loopback and
     # non-global addresses are never pushed regardless.
