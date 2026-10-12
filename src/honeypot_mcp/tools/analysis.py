@@ -159,29 +159,62 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
     return profile
 
 
+# Most rollup rows the campaign tool will load. A row is one (hour, event type, source, sensor), so
+# this is far beyond any real run, but a bound that is reported beats one that is silent.
+_CAMPAIGN_ROW_CAP = 500_000
+
+
 @mcp.tool(**hints("analyze_campaign"))
 async def analyze_campaign(
     window_minutes: int = 60,
     min_sources: int = 3,
-) -> list[dict[str, Any]]:
-    """Detect coordinated attack campaigns: groups of IPs hitting similar targets
-    within the same time window.
+    since_hours: float | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Detect coordinated attack campaigns: several source IPs hitting the same event type in the
+    same time window, across the whole run (or the last `since_hours`).
+
+    Built from the exact hourly rollups, so it covers every alert however many there are. Time
+    resolution is therefore one hour: a window of `window_minutes` spans ceil(window/60) whole
+    hours, and `start_time`/`end_time` are hour boundaries. (It used to read only the latest
+    5,000 alerts, which on a flooded database is a few minutes of one source.)
 
     Args:
-        window_minutes: Time window to consider events correlated (default 60).
+        window_minutes: Time window to consider events correlated (default 60; hour resolution).
         min_sources: Minimum distinct source IPs to constitute a campaign (default 3).
+        since_hours: Only look at the last N hours. Omit for the whole run.
+        limit: Most campaigns returned, largest first; `campaigns_total` says how many there are.
     """
-    from honeypot_mcp.analysis.correlator import detect_campaigns
+    from datetime import timedelta
 
+    from honeypot_mcp.analysis.correlator import detect_campaigns, rolled_alerts
+
+    since = None
+    if since_hours is not None:
+        if since_hours <= 0:
+            return {"error": "since_hours must be greater than 0."}
+        since = datetime.now(UTC) - timedelta(hours=since_hours)
+    hours = max(1, -(-window_minutes // 60))
     async with get_session() as session:
-        alerts = await queries.get_recent_alerts(session, limit=5000)
+        rows = await rollups.campaign_rows(session, since, _CAMPAIGN_ROW_CAP + 1)
+    if len(rows) > _CAMPAIGN_ROW_CAP:
+        return {
+            "error": f"more than {_CAMPAIGN_ROW_CAP:,} (hour, event type, source) rows in the "
+            "window: narrow it with since_hours."
+        }
 
-    campaigns = await detect_campaigns(
-        alerts=alerts,
-        window_minutes=window_minutes,
+    found = await detect_campaigns(
+        alerts=rolled_alerts(rows),
+        window_minutes=(hours - 1) * 60,  # whole hours: items are hour-aligned
         min_sources=min_sources,
     )
-    return campaigns
+    return {
+        "window": f"last {since_hours}h" if since_hours is not None else "whole run",
+        "resolution": f"hourly: a window spans {hours} whole hour(s)",
+        "campaigns_total": len(found),
+        "count": min(len(found), limit),
+        "campaigns": found[:limit],
+    }
 
 
 @mcp.tool(**hints("map_ttps"))

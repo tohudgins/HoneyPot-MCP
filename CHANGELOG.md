@@ -4,6 +4,29 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Campaign analysis read 5,000 alerts; the DNS engine was UDP-only
+
+**`analyze_campaign` correlated only the newest 5,000 alerts.** On a database dominated by one flood that is
+a few minutes of one source: on the real run it reported 7 "campaigns", all from the last 16 minutes of a
+day-long run, and said nothing about being capped. The independent SQL oracle (a raw `GROUP BY` over the
+alert table) finds 274. It now correlates the exact hourly rollups for the whole run (or `since_hours`),
+states its hour resolution, and returns `{campaigns_total, count, campaigns}` so a limit is visible. Real data:
+274 campaigns, the same event types and source sets as the raw SQL, 457,839 events on both sides, and the
+new oracle checks fail when the loader is broken. `fingerprint_clusters` already reported its cap and
+matched SQL on all 22 fingerprints; both checks are now in `field_test_oracle.py` (73 checks).
+
+**Real `dig`, `nmap` and `smtplib` against the engines that are off on the VPS.** SMTP behaved like Postfix
+under all three. DNS did not: UDP only, so a TCP zone transfer was refused and unrecorded (and a nameserver
+with TCP/53 closed is a tell); `version.bind` answered with an SPF record; `ANY` returned NXDOMAIN for a name
+that answered `A`; every answer carried `aa ra ad`; and the SPF text was double-quoted and `ip4:0.0.0.0/0`.
+Now: TCP/53 with AXFR/IXFR recorded and REFUSED, BIND-style CHAOS answers, RFC 8482 `ANY`, resolver flags,
+one clean SPF. DNS is declared `both` for capture and firewalls but keeps a separate `spoofable_source` flag:
+the blocklist filter used the transport alone, so declaring DNS TCP-capable would have let sources seen only
+over forgeable UDP into a blocklist (the filter had no test; it does now).
+
+**Suppression presets replayed over every real source:** Shodan 18 alerts, Censys 7, RFC1918 4,489 (the
+Docker bridge's probes); nothing high-value on this traffic.
+
 ## Ready to leave running: analyse the data later without a sensor, and the ATT&CK numbers checked
 
 **Analysis mode.** A restored backup lists every sensor as RUNNING, so opening it with the normal server would

@@ -10,7 +10,7 @@ plain SQL straight over the `alerts` table. The tools read pre-aggregated rollup
 oracle never does, so agreement means the optimised path equals the definition.
 
 The oracles use real attackers, real windows (starting mid-hour, on the hour, and before any data)
-and real filters. Anything that cannot be checked this way (clusters, campaigns) is listed as NOT
+and real filters. Anything that cannot be checked this way is listed as NOT
 COVERED with the reason, never silently skipped. Nothing is written to the backup you name.
 """
 
@@ -385,11 +385,100 @@ async def run(args: argparse.Namespace) -> int:
         str(list(cov)[:6]),
     )
 
+    print("== analyze_campaign against a raw GROUP BY (hour, event type, source)")
+    camp = await N.analyze_campaign(window_minutes=60, min_sources=3, limit=100_000)
+    per: dict[tuple[str, str], list[Any]] = {}
+    for et, hour, ip, n in o.rows(
+        "SELECT event_type, strftime('%Y-%m-%d %H:00:00', timestamp), source_ip, count(*) "
+        "FROM alerts GROUP BY 1, 2, 3"
+    ):
+        group = per.setdefault((et, hour), [set(), 0])
+        group[0].add(ip)
+        group[1] += n
+    by_type: dict[str, list[tuple[set[str], int]]] = {}
+    for (et, _hour), (ips, n) in per.items():
+        if len(ips) >= 3:
+            by_type.setdefault(et, []).append((ips, n))
+    want: Counter = Counter()
+    want_events = 0
+    for et, groups in by_type.items():
+        kept: list[tuple[set[str], int]] = []
+        for ips, n in sorted(groups, key=lambda g: -len(g[0])):  # largest first, drop subsets
+            if not any(ips <= k[0] for k in kept):
+                kept.append((ips, n))
+        for ips, n in kept:
+            want[(et, frozenset(ips))] += 1
+            want_events += n
+    got = Counter((c["event_type"], frozenset(c["source_ips"])) for c in camp["campaigns"])
+    check(
+        "campaigns",
+        "the same campaigns (event type + sources) as the raw SQL",
+        got == want,
+        f"tool {sum(got.values())} vs sql {sum(want.values())}",
+    )
+    check(
+        "campaigns",
+        "the same number of events inside them",
+        sum(c["total_events"] for c in camp["campaigns"]) == want_events,
+        f"{sum(c['total_events'] for c in camp['campaigns'])} vs {want_events}",
+    )
+    check(
+        "campaigns",
+        "nothing truncated or hidden",
+        camp["campaigns_total"] == len(camp["campaigns"]),
+        str(camp["campaigns_total"]),
+    )
+
+    print("== fingerprint_clusters against json_extract over ssh_client_kex")
+    cutoff = stamp(datetime.now(UTC) - timedelta(hours=2160))
+    want_fp = {
+        r[0]: r
+        for r in o.rows(
+            "SELECT json_extract(payload,'$.hassh'), count(distinct source_ip), "
+            "count(distinct json_extract(payload,'$.session')), min(timestamp), max(timestamp) "
+            "FROM alerts WHERE event_type='ssh_client_kex' AND timestamp >= ? "
+            "AND json_extract(payload,'$.hassh') IS NOT NULL GROUP BY 1",
+            cutoff,
+        )
+    }
+    fp = await N.fingerprint_clusters(hours=2160, min_sources=1, limit=100)
+    check(
+        "clusters",
+        "fingerprint count and no truncation",
+        fp["fingerprints_seen"] == len(want_fp) and not fp["truncated"],
+        f"{fp['fingerprints_seen']} vs {len(want_fp)}, truncated={fp['truncated']}",
+    )
+    bad = [
+        c["hassh"]
+        for c in fp["clusters"]
+        if (r := want_fp.get(c["hassh"])) is None
+        or (c["distinct_ips"], c["sessions"]) != (r[1], r[2])
+        or c["first_seen"][:19].replace("T", " ") != r[3][:19]
+        or c["last_seen"][:19].replace("T", " ") != r[4][:19]
+    ]
+    check(
+        "clusters",
+        f"distinct IPs, sessions, first/last seen for {len(fp['clusters'])} clusters",
+        not bad,
+        str(bad[:3]),
+    )
+
+    print("== attack_summary against the alert table")
+    summary = await N.attack_summary()
+    check(
+        "attack",
+        "total alerts",
+        summary["total_alerts"] == total,
+        f"{summary['total_alerts']} vs {total}",
+    )
+    check(
+        "attack",
+        "event types seen",
+        summary["event_types_seen"] == o.one("SELECT count(DISTINCT event_type) FROM alerts"),
+        str(summary["event_types_seen"]),
+    )
+
     for what, why in (
-        (
-            "analyze_campaign / fingerprint_clusters",
-            "grouping heuristics with no independent closed-form definition; membership validity is checked in unit tests",
-        ),
         (
             "map_ttps",
             "a regex-to-ATT&CK table: correctness is the mapping table itself, covered by test_mitre_dashboard",

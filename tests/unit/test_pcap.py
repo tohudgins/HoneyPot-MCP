@@ -127,7 +127,7 @@ def test_transport_comes_from_the_capability_registry():
     which is the duplication that always drifts."""
     from honeypot_mcp.deception.capabilities import transport_for
 
-    assert transport_for("dns") == "udp"
+    assert transport_for("dns") == "both"  # UDP, and TCP for zone transfers
     assert transport_for("snmp") == "udp"
     assert transport_for("sip") == "both"
     assert transport_for("ssh") == "tcp"

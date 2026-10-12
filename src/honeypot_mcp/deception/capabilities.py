@@ -48,6 +48,8 @@ class EngineCapability:
     summary: str
     signature_events: tuple[str, ...]
     transport: Transport = "tcp"
+    # Sources seen only here may be forged (UDP reflection traffic), whatever the transports served.
+    spoofable_source: bool = False
     config_options: tuple[str, ...] = ()
     requires_docker: bool = False
     captures_credentials_as: str | None = None
@@ -165,7 +167,8 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         display_name="DNS",
         default_port=5353,
         real_world_port=53,
-        transport="udp",
+        transport="both",
+        spoofable_source=True,
         os_family="network",
         roles=("infrastructure",),
         summary=(
@@ -587,6 +590,16 @@ def transport_for(engine_type: str) -> Transport:
     """
     capability = BY_TYPE.get(engine_type.lower() if isinstance(engine_type, str) else engine_type)
     return capability.transport if capability else "tcp"
+
+
+def source_is_spoofable(engine_type: str) -> bool:
+    """Whether a source seen only on this sensor may be a forged address.
+
+    UDP reflection traffic (DNS, SNMP) carries whatever source its sender chose, so a blocklist
+    built from it would punish the victim. This is not the same as `transport`: DNS now listens on
+    TCP too (zone transfers), but most of what reaches it over UDP is still forgeable."""
+    capability = BY_TYPE.get(engine_type.lower() if isinstance(engine_type, str) else engine_type)
+    return bool(capability and (capability.transport == "udp" or capability.spoofable_source))
 
 
 @dataclass(frozen=True)

@@ -162,3 +162,109 @@ def test_dns_normal_query_is_low():
     et, sev = _classify_dns_query("www.example.com", "A", "IN")
     assert et == "dns_query"
     assert sev == AlertSeverity.LOW
+
+
+# ── Behaviour found by running real `dig` against the engine ─────────────────
+
+
+def _reply(name: str, qtype: str, qclass: str = "IN"):
+    import dnslib
+
+    from honeypot_mcp.engines.dns import _build_realistic_reply
+
+    q = dnslib.DNSRecord.question(name, qtype, qclass)
+    return _build_realistic_reply(q, name, qtype)
+
+
+def test_answers_are_a_recursive_resolvers_not_aa_ra_ad_together():
+    """dnslib defaults aa=1 and echoes the request's AD bit, so a plain `dig` saw `aa ra ad` on every
+    answer. That combination is never sent: AD means DNSSEC-validated, and nothing validates here."""
+    import dnslib
+
+    q = dnslib.DNSRecord.question("example.com", "A")
+    q.header.ad = 1  # `dig` sends this
+    from honeypot_mcp.engines.dns import _build_realistic_reply
+
+    reply = _build_realistic_reply(q, "example.com", "A")
+    assert (reply.header.aa, reply.header.ra, reply.header.ad) == (0, 1, 0)
+
+
+def test_chaos_version_probe_gets_a_bind_version_not_an_spf_record():
+    import dnslib
+
+    reply = _reply("version.bind", "TXT", "CH")
+    assert reply.header.rcode == dnslib.RCODE.NOERROR
+    rr = reply.rr[0]
+    assert rr.rclass == dnslib.CLASS.CH
+    assert "ubuntu" in str(rr.rdata).lower() and "spf" not in str(rr.rdata).lower()
+    assert _reply("bogus.bind", "TXT", "CH").header.rcode == dnslib.RCODE.REFUSED
+
+
+def test_any_is_answered_consistently_with_a_minimal_rfc8482_record():
+    """It used to be NXDOMAIN for a name that answered A, which contradicts itself."""
+    import dnslib
+
+    reply = _reply("example.com", "ANY")
+    assert reply.header.rcode == dnslib.RCODE.NOERROR and len(reply.rr) == 1
+    assert reply.rr[0].rtype == dnslib.QTYPE.HINFO and b"RFC8482" in reply.rr[0].rdata.cpu
+    assert len(reply.pack()) < 80, "a full ANY answer is an amplification vector"
+
+
+def test_zone_transfers_are_refused_and_the_txt_record_is_not_double_quoted():
+    import dnslib
+
+    assert _reply("example.com", "AXFR").header.rcode == dnslib.RCODE.REFUSED
+    assert _reply("example.com", "IXFR").header.rcode == dnslib.RCODE.REFUSED
+    text = str(_reply("example.com", "TXT").rr[0].rdata)
+    assert text.count('"') == 2, f"literal quotes inside the TXT string: {text}"
+    assert "0.0.0.0/0" not in text
+
+
+async def test_zone_transfers_arrive_over_tcp_and_are_recorded_and_refused():
+    """AXFR is TCP-only in practice. With UDP alone `dns_zone_transfer` could only fire on a rare
+    UDP attempt, and a real transfer got a refused connection and left no trace."""
+    import asyncio
+    import socket
+
+    import dnslib
+
+    from honeypot_mcp.engines.dns import DNSEngine
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
+
+    event_buffer.reset_for_tests()
+    await init_db()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    engine = DNSEngine()
+    recorded: list[tuple[str, str]] = []
+
+    from honeypot_mcp.engines import dns as dns_module
+
+    async def capture(self, src_ip, src_port, qname, qtype, qclass="IN"):
+        recorded.append((qtype, dns_module._classify_dns_query(qname, qtype, qclass)[0]))
+
+    original = dns_module._DNSProtocol._record
+    dns_module._DNSProtocol._record = capture  # type: ignore[method-assign]
+    cid = await engine.start("dns-tcp-test", port, {})
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        for qtype in ("AXFR", "A"):
+            wire = dnslib.DNSRecord.question("example.com", qtype).pack()
+            writer.write(len(wire).to_bytes(2, "big") + wire)
+            await writer.drain()
+            size = int.from_bytes(await reader.readexactly(2), "big")
+            answer = dnslib.DNSRecord.parse(await reader.readexactly(size))
+            if qtype == "AXFR":
+                assert answer.header.rcode == dnslib.RCODE.REFUSED
+            else:
+                assert answer.rr, "ordinary queries are answered over TCP as over UDP"
+        writer.close()
+    finally:
+        await engine.stop(cid)
+        dns_module._DNSProtocol._record = original  # type: ignore[method-assign]
+        await close_db()
+        event_buffer.reset_for_tests()
+
+    assert ("AXFR", "dns_zone_transfer") in recorded

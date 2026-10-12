@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from honeypot_mcp.storage.models import Alert
@@ -57,7 +58,7 @@ async def detect_campaigns(
                         "end_time": end_ts.isoformat(),
                         "duration_minutes": int((end_ts - start_ts).total_seconds() / 60),
                         "unique_source_ips": len(unique_ips),
-                        "total_events": len(window_alerts),
+                        "total_events": sum(_weight(a) for a in window_alerts),
                         "source_ips": sorted(unique_ips),
                         "targeted_honeypots": list(
                             {a.honeypot_id for a in window_alerts if a.honeypot_id}
@@ -99,3 +100,26 @@ def _deduplicate(campaigns: list[dict]) -> list[dict]:
         ):
             seen.append(c)
     return seen
+
+
+@dataclass(frozen=True, slots=True)
+class _RolledAlert:
+    """One rollup row, shaped like an alert for `detect_campaigns`: it stands for `weight` alerts."""
+
+    timestamp: datetime
+    event_type: str
+    source_ip: str
+    honeypot_id: int
+    weight: int
+
+
+def rolled_alerts(rows: list[tuple[datetime, str, str, int, int]]) -> list[Any]:
+    """Rollup rows `(hour, event type, source, sensor id, alerts)` as alert-shaped items, so the
+    same sliding-window correlation runs over a whole run instead of the latest few thousand."""
+    return [_RolledAlert(hour, etype, ip, hp, n) for hour, etype, ip, hp, n in rows]
+
+
+def _weight(alert: Any) -> int:
+    """How many alerts an item stands for: its `weight` if it is a rollup row, else one."""
+    weight = getattr(alert, "weight", 1)
+    return weight if isinstance(weight, int) else 1

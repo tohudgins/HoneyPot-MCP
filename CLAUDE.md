@@ -514,6 +514,19 @@ Four more surfaces, each chosen because its traffic means something specific.
 `nmap -sV` hard-matches all four: `Dovecot imapd`, `Asterisk PBX 18.10.0`
 (with `Device: PBX`), `rsync (protocol version 31)`, `rpcbind`.
 
+### DNS engine
+
+`engines/dns.py` answers as a **recursive resolver** (`ra`, never `aa` or `ad`; dnslib defaults `aa=1`
+and echoes the request's AD bit, so `dig` once saw `aa ra ad` together, which no real server sends). It
+serves **UDP and TCP/53** on one port: zone transfers are TCP-only, so with UDP alone the
+`dns_zone_transfer` detection could only fire on a rare UDP attempt, and a TCP/53 that refuses
+connections is itself a tell. AXFR/IXFR is recorded and REFUSED. CHAOS `version.bind` answers with a
+BIND version string (Ubuntu 22.04's, matching `_host_identity`), `ANY` with an RFC 8482 `HINFO`
+(consistent with the `A` answer and not an amplification vector). Its capability says
+`transport="both"` for capture, firewall and preflight, but `spoofable_source=True`: UDP reflection
+traffic carries forged sources, so `source_is_spoofable` (not `transport`) decides which sources a
+blocklist must not contain.
+
 ### POP3 / Kubernetes API engines
 
 The pair that takes the catalogue to 25.

@@ -210,6 +210,28 @@ async def event_type_counts(session: AsyncSession, since: datetime | None = None
     return {str(r[0]): int(r[1]) for r in rows.all()}
 
 
+async def campaign_rows(
+    session: AsyncSession, since: datetime | None = None, limit: int = 500_001
+) -> list[tuple[datetime, str, str, int, int]]:
+    """(hour, event type, source, sensor id, alerts), exact at hour resolution, oldest first.
+
+    A rollup row is written with every alert, so the current hour is included; `since` keeps the
+    whole hours that contain or follow it."""
+    q = select(
+        AlertRollup.bucket,
+        AlertRollup.event_type,
+        AlertRollup.source_ip,
+        AlertRollup.honeypot_id,
+        func.sum(AlertRollup.count),
+    ).group_by(
+        AlertRollup.bucket, AlertRollup.event_type, AlertRollup.source_ip, AlertRollup.honeypot_id
+    )
+    if since is not None:
+        q = q.where(AlertRollup.bucket >= hour_floor(since))
+    rows = await session.execute(q.order_by(AlertRollup.bucket).limit(limit))
+    return [(r[0], str(r[1]), str(r[2]), int(r[3]), int(r[4])) for r in rows.all()]
+
+
 async def hit_counts(
     session: AsyncSession, honeypot_ids: list[int] | None = None
 ) -> dict[int, int]:

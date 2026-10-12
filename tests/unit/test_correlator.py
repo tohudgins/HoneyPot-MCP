@@ -1,11 +1,14 @@
 """Unit tests for the attack campaign correlator."""
 
+import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
-from honeypot_mcp.analysis.correlator import detect_campaigns
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
+from honeypot_mcp.analysis.correlator import detect_campaigns  # noqa: E402
 
 
 def _make_alert(ip: str, event_type: str, minutes_offset: int) -> MagicMock:
@@ -91,3 +94,95 @@ async def test_earlier_smaller_window_deduplicated_against_later_superset():
     )
     assert ssh_campaigns[0]["unique_source_ips"] == 4
     assert set(ssh_campaigns[0]["source_ips"]) == {"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"}
+
+
+# ── analyze_campaign reads the whole run, not the latest alerts ──────────────
+
+
+@pytest.fixture
+async def db():
+    from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
+
+    event_buffer.reset_for_tests()
+    await init_db()
+    yield
+    event_buffer.reset_for_tests()
+    await close_db()
+
+
+async def _seed(rows: list[tuple[str, str, datetime, int]]) -> None:
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    async with get_session() as session:
+        for ip, event_type, at, count in rows:
+            for i in range(count):
+                session.add(
+                    Alert(
+                        source_ip=ip,
+                        event_type=event_type,
+                        severity=AlertSeverity.MEDIUM,
+                        timestamp=at + timedelta(seconds=i % 3000),
+                        payload={},
+                        honeypot_id=None,
+                    )
+                )
+
+
+def _hours_ago(n: int) -> datetime:
+    return datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(hours=n)
+
+
+async def test_a_campaign_is_found_even_after_a_flood_buries_it_in_the_latest_alerts(db):
+    """It used to correlate only the newest 5,000 alerts. On the real run one source's flood filled
+    that, so the only 'campaigns' reported were from the last few minutes of a day-long run."""
+    from honeypot_mcp.tools.analysis import analyze_campaign
+
+    rows = [(f"203.0.113.{n}", "redis_config_set", _hours_ago(6), 2) for n in range(1, 5)]
+    rows.append(("198.51.100.9", "sip_request", _hours_ago(1), 6000))  # the flood, newest
+    await _seed(rows)
+
+    out = await analyze_campaign()
+
+    redis = [c for c in out["campaigns"] if c["event_type"] == "redis_config_set"]
+    assert len(redis) == 1
+    assert redis[0]["unique_source_ips"] == 4 and redis[0]["total_events"] == 8
+    assert redis[0]["source_ips"] == [f"203.0.113.{n}" for n in range(1, 5)]
+    assert out["window"] == "whole run" and "hourly" in out["resolution"]
+
+
+async def test_the_window_spans_whole_hours_and_since_hours_narrows_the_run(db):
+    from honeypot_mcp.tools.analysis import analyze_campaign
+
+    rows = [
+        ("203.0.113.1", "ssh_login_failed", _hours_ago(6), 3),
+        ("203.0.113.2", "ssh_login_failed", _hours_ago(6), 3),
+        ("203.0.113.3", "ssh_login_failed", _hours_ago(5), 3),
+        ("203.0.113.4", "ssh_login_failed", _hours_ago(5), 3),
+    ]
+    await _seed(rows)
+
+    one_hour = await analyze_campaign(window_minutes=60, min_sources=3)
+    two_hours = await analyze_campaign(window_minutes=120, min_sources=3)
+    recent = await analyze_campaign(window_minutes=120, min_sources=3, since_hours=3)
+
+    assert one_hour["campaigns_total"] == 0, "two sources an hour is not a campaign at min 3"
+    assert two_hours["campaigns_total"] == 1 and two_hours["campaigns"][0]["unique_source_ips"] == 4
+    assert two_hours["campaigns"][0]["total_events"] == 12
+    assert recent["campaigns_total"] == 0, "the campaign is older than the window"
+
+
+async def test_the_result_says_when_it_returns_fewer_campaigns_than_exist(db):
+    from honeypot_mcp.tools.analysis import analyze_campaign
+
+    rows = []
+    for n in range(4):
+        for ip in range(3):
+            rows.append((f"203.0.113.{ip + 1}", f"event_{n}", _hours_ago(3), 1))
+    await _seed(rows)
+
+    out = await analyze_campaign(limit=2)
+
+    assert out["campaigns_total"] == 4 and out["count"] == 2 and len(out["campaigns"]) == 2
+    assert "error" in await analyze_campaign(since_hours=0)

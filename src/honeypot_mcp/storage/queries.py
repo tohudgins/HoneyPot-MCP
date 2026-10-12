@@ -407,7 +407,7 @@ async def get_top_offenders(
         offenders = [(ip, n) for ip, n in offenders if _is_global(ip)]
 
     if exclude_udp_only and offenders:
-        from honeypot_mcp.deception.capabilities import transport_for
+        from honeypot_mcp.deception.capabilities import source_is_spoofable
 
         candidates = {ip for ip, _ in offenders}
         w = rollups.window(since)
@@ -424,7 +424,7 @@ async def get_top_offenders(
             if ip not in candidates or ip in has_non_udp:
                 continue
             type_value = getattr(hp_type, "value", hp_type)
-            if type_value is None or transport_for(str(type_value)) != "udp":
+            if type_value is None or not source_is_spoofable(str(type_value)):
                 has_non_udp.add(ip)
         offenders = [(ip, n) for ip, n in offenders if ip in has_non_udp]
 

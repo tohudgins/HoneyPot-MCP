@@ -28,10 +28,18 @@ import logging
 import secrets
 from typing import Any
 
+import dnslib
+
 from honeypot_mcp import self_probe
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.engines._tasks import spawn
 from honeypot_mcp.engines.base import HoneypotEngine
-from honeypot_mcp.engines.conn_limit import UdpReplyLimiter
+from honeypot_mcp.engines.conn_limit import (
+    ConnectionLimiter,
+    UdpReplyLimiter,
+    limited_handler,
+    shutdown_server,
+)
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
@@ -96,6 +104,24 @@ def _classify_dns_query(qname: str, qtype: str, qclass: str) -> tuple[str, Alert
     return "dns_query", AlertSeverity.LOW
 
 
+def _parse_query(data: bytes) -> tuple[Any, str, str, str]:
+    """(request, qname, qtype, qclass) for a plain single-question query, else
+    (None, hex of the first bytes, "UNKNOWN", "IN"): recorded the way an unparseable packet always
+    was, never parsed or answered."""
+    if _is_plain_query(data):
+        try:
+            import dnslib
+
+            request = dnslib.DNSRecord.parse(data)
+            qclass = "IN"
+            with contextlib.suppress(Exception):
+                qclass = dnslib.CLASS[request.q.qclass]
+            return request, str(request.q.qname).rstrip("."), dnslib.QTYPE[request.q.qtype], qclass
+        except Exception:
+            pass
+    return None, data[:64].hex(), "UNKNOWN", "IN"
+
+
 class _DNSProtocol(asyncio.DatagramProtocol):
     """UDP DNS server that logs every query and returns NXDOMAIN."""
 
@@ -110,25 +136,7 @@ class _DNSProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         src_ip, src_port = addr
-        request = None
-        qclass = "IN"
-        qname = data[:64].hex()
-        qtype = "UNKNOWN"
-        # Anything that is not a plain single-question query is recorded the
-        # way an unparseable packet always was, but never parsed or answered.
-        if _is_plain_query(data):
-            try:
-                import dnslib
-
-                request = dnslib.DNSRecord.parse(data)
-                qname = str(request.q.qname).rstrip(".")
-                qtype = dnslib.QTYPE[request.q.qtype]
-                with contextlib.suppress(Exception):
-                    qclass = dnslib.CLASS[request.q.qclass]
-            except Exception:
-                request = None
-                qname = data[:64].hex()
-                qtype = "UNKNOWN"
+        request, qname, qtype, qclass = _parse_query(data)
 
         spawn(self._record(src_ip, src_port, qname, qtype, qclass), name="dns-record")
 
@@ -213,9 +221,50 @@ class _DNSProtocol(asyncio.DatagramProtocol):
         pass
 
 
+_MAX_TCP_QUERIES = 8  # per connection: a resolver reuses one for a few, a scanner for more
+_TCP_READ_TIMEOUT = 8.0
+_MAX_TCP_MESSAGE = 4096  # queries are tens of bytes; the 2-byte length allows 65,535
+_BIND_VERSION = "9.18.12-0ubuntu0.22.04.3-Ubuntu"  # bind9 on Ubuntu 22.04, as the host's kernel
+_SERVER_ID = "ns1"
+
+
+async def _serve_tcp(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, recorder: _DNSProtocol
+) -> None:
+    """DNS over TCP (RFC 1035 §4.2.2: each message has a 2-byte length prefix).
+
+    Zone transfers are TCP-only, so with UDP alone the `dns_zone_transfer` detection could only fire
+    on a rare UDP attempt, a real transfer got "connection refused" and left no trace, and a
+    nameserver with TCP/53 closed is itself a tell. Queries are answered as over UDP; AXFR/IXFR is
+    recorded and REFUSED."""
+    peer = writer.get_extra_info("peername") or ("0.0.0.0", 0)
+    src_ip, src_port = peer[0], peer[1]
+    for _ in range(_MAX_TCP_QUERIES):
+        try:
+            header = await asyncio.wait_for(reader.readexactly(2), _TCP_READ_TIMEOUT)
+            size = int.from_bytes(header, "big")
+            if not 12 <= size <= _MAX_TCP_MESSAGE:
+                return
+            data = await asyncio.wait_for(reader.readexactly(size), _TCP_READ_TIMEOUT)
+        except (asyncio.IncompleteReadError, TimeoutError, ConnectionError):
+            return
+        request, qname, qtype, qclass = _parse_query(data)
+        await recorder._record(src_ip, src_port, qname, qtype, qclass)
+        if request is None:
+            return
+        try:
+            packed = _build_realistic_reply(request, qname, qtype).pack()
+        except Exception:
+            return
+        writer.write(len(packed).to_bytes(2, "big") + packed)
+        await writer.drain()
+
+
 class DNSEngine(HoneypotEngine):
     def __init__(self) -> None:
         self._transports: dict[str, asyncio.DatagramTransport] = {}
+        self._servers: dict[str, asyncio.AbstractServer] = {}
+        self._limiter = ConnectionLimiter(get_settings().max_connections_per_ip)
 
     async def start(self, name: str, port: int, config: dict[str, Any]) -> str:
         hp_id: int | None = None
@@ -229,18 +278,39 @@ class DNSEngine(HoneypotEngine):
             lambda: _DNSProtocol(name, hp_id),
             local_addr=("0.0.0.0", port),
         )
+        recorder = _DNSProtocol(name, hp_id)
+
+        async def _tcp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                await _serve_tcp(reader, writer, recorder)
+            except Exception as e:
+                log.debug("DNS TCP handler error: %s", e)
+            finally:
+                writer.close()
+
+        try:
+            server = await asyncio.start_server(
+                limited_handler(_tcp, self._limiter), host="0.0.0.0", port=port
+            )
+        except OSError:
+            transport.close()  # no half-started sensor: UDP without TCP is itself a tell
+            raise
         cid = f"dns-{secrets.token_hex(8)}"
         self._transports[cid] = transport  # type: ignore[assignment]
-        log.info("DNS honeypot '%s' listening on UDP port %d", name, port)
+        self._servers[cid] = server
+        log.info("DNS honeypot '%s' listening on UDP and TCP port %d", name, port)
         return cid
 
     async def stop(self, container_id: str, remove: bool = False) -> None:
         transport = self._transports.pop(container_id, None)
         if transport:
             transport.close()
+        server = self._servers.pop(container_id, None)
+        if server:
+            await shutdown_server(server, self._limiter)
 
     async def status(self, container_id: str) -> dict[str, Any]:
-        return {"running": container_id in self._transports, "type": "asyncio_udp_dns"}
+        return {"running": container_id in self._transports, "type": "asyncio_udp_tcp_dns"}
 
     async def health_check(self, container_id: str, port: int) -> dict[str, Any]:
         """DNS is UDP — TCP probe doesn't work. Send a real DNS query and wait
@@ -328,6 +398,19 @@ def _deterministic_ipv6(qname: str) -> str:
     return ":".join(f"{g:x}" for g in groups)
 
 
+class _HINFO(dnslib.RD):
+    """HINFO rdata (RFC 1035 §3.3.2): dnslib ships no class for it. Two length-prefixed strings."""
+
+    attrs = ("cpu", "os")
+
+    def __init__(self, cpu: bytes, os: bytes) -> None:
+        self.cpu, self.os = cpu, os
+
+    def pack(self, buffer: Any) -> None:
+        for field in (self.cpu, self.os):
+            buffer.append(bytes([len(field)]) + field)
+
+
 def _build_realistic_reply(request, qname: str, qtype: str):  # type: ignore[no-untyped-def]
     """Synthesize a believable DNS response for common query types.
 
@@ -338,7 +421,39 @@ def _build_realistic_reply(request, qname: str, qtype: str):  # type: ignore[no-
 
     reply = request.reply()
     qn = dnslib.DNSLabel(qname or "localhost")
+    # A recursive resolver: not authoritative for what it answers, recursion available. dnslib
+    # echoes the request's AD bit and defaults aa=1, so a plain `dig` saw `aa ra ad` together, which
+    # no real server sends (AD means DNSSEC-validated, and nothing here validates anything).
+    reply.header.aa = 0
+    reply.header.ra = 1
+    reply.header.ad = 0
 
+    if qtype in ("AXFR", "IXFR"):
+        # What a hardened server says. The attempt itself is the finding and is recorded.
+        reply.header.rcode = dnslib.RCODE.REFUSED
+        return reply
+
+    if request.q.qclass == dnslib.CLASS.CH:
+        # CHAOS class is server fingerprinting. A real BIND answers with its version string (the
+        # TXT branch below used to answer these with an SPF record), and refuses anything else.
+        name = qname.lower()
+        if qtype == "TXT" and name in ("version.bind", "version.server"):
+            text = _BIND_VERSION
+        elif qtype == "TXT" and name in ("hostname.bind", "id.server"):
+            text = _SERVER_ID
+        else:
+            reply.header.rcode = dnslib.RCODE.REFUSED
+            return reply
+        reply.add_answer(
+            dnslib.RR(qn, dnslib.QTYPE.TXT, rclass=dnslib.CLASS.CH, rdata=dnslib.TXT(text), ttl=0)
+        )
+        return reply
+
+    if qtype == "ANY":
+        # RFC 8482: a minimal HINFO. NXDOMAIN here contradicted the A answer for the same name, and a
+        # full ANY response is an amplification vector.
+        reply.add_answer(dnslib.RR(qn, dnslib.QTYPE.HINFO, rdata=_HINFO(b"RFC8482", b""), ttl=3600))
+        return reply
     if qtype == "A":
         ip = _deterministic_ip(qname)
         reply.add_answer(dnslib.RR(qn, dnslib.QTYPE.A, rdata=dnslib.A(ip), ttl=300))
@@ -373,8 +488,9 @@ def _build_realistic_reply(request, qname: str, qtype: str):  # type: ignore[no-
         return reply
 
     if qtype == "TXT":
-        # Plausible SPF record — common on most real mail-bearing domains.
-        spf = '"v=spf1 ip4:0.0.0.0/0 ~all"'
+        # A plausible SPF record. (`ip4:0.0.0.0/0` passes the whole internet, which no real domain
+        # publishes.)
+        spf = "v=spf1 include:_spf.google.com ~all"
         reply.add_answer(dnslib.RR(qn, dnslib.QTYPE.TXT, rdata=dnslib.TXT(spf), ttl=300))
         return reply
 
