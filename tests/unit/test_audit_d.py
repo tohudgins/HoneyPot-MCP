@@ -161,7 +161,7 @@ async def test_health_check_flags_and_heals_a_dead_ingest_task(monkeypatch):
     engine._client.containers.get = MagicMock(return_value=container)
     engine._ingest_logs = AsyncMock(return_value=None)
 
-    async def _alive_probe(port, host="127.0.0.1", timeout=2.0):
+    async def _alive_probe(port, host="127.0.0.1", timeout=2.0, also_as=()):
         return {"alive": True, "detail": "ok"}
 
     monkeypatch.setattr("honeypot_mcp.engines.base.tcp_probe", _alive_probe)
