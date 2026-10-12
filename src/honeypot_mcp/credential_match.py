@@ -301,6 +301,14 @@ async def planted_credential(service: str) -> tuple[str, str] | None:
     in the index; a token revoked in the last 30 s may still be served once, which is harmless.
     """
     await _load_index()
+    return peek_planted_credential(service)
+
+
+def peek_planted_credential(service: str) -> tuple[str, str] | None:
+    """`planted_credential` from the index as last loaded, with no refresh.
+
+    For decoy content that has to be built synchronously (an FTP listing's sizes and bytes): any
+    connection event passing through `match` keeps the index warm, so this is at most 30 s old."""
     service = service.lower()
     for pool in (_candidates.get(service, []), _candidates.get("any", [])):
         for u, pw, _token_id in sorted(pool, key=lambda c: c[2]):

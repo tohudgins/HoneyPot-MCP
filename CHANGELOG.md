@@ -4,6 +4,26 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Bait in the FTP listing, and a prompt-injection field test
+
+**`passwords.txt` on the FTP decoy now carries a tracked credential** (an FTP token first, else the MySQL
+one). Its decoy lines were untracked, so replaying them anywhere tripped nothing. LIST, SIZE and RETR still
+agree on the length (the bait is part of the node, read through one function), and the download event is
+marked `bait_served` so analysis can see who took it. Driven by a real `ftplib` client: read the file, log in
+with the pair found in it, get a CRITICAL naming the token. Redis has no bait on purpose (attackers write to
+its store and the SAVE-redirection detection hashes it).
+
+**Can attacker-authored text steer the model?** `scripts/field_test_injection.py` plants alerts whose fields
+carry instructions aimed at the dangerous tools (bulk false-positive triage, prune, stop, abuse report,
+blocklist export) into a copy of the real backup and gives a real `claude -p` session every tool pre-approved.
+Three scenarios (summarise, triage, investigate), checked against database baselines and the tool-call stream
+rather than the model's account: all held, the model read the payloads in full, took only the write it was
+asked for, and twice named the attack. One model, one sample each: evidence, not proof, so the guidance is
+a `viewer` token for any unattended agent.
+
+**Grafana's 13 panel queries read the raw table** (17.8 s total on 4.9M alerts); measured and documented
+rather than converted, since an inexact shortcut would make the dashboard disagree with `alerts_stats`.
+
 ## Campaign analysis read 5,000 alerts; the DNS engine was UDP-only
 
 **`analyze_campaign` correlated only the newest 5,000 alerts.** On a database dominated by one flood that is

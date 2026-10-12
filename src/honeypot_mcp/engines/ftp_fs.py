@@ -23,7 +23,8 @@ import hashlib
 import io
 import random
 import tarfile
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 # Last-modified stamps are fixed strings in `ls -l` form so the output is stable.
 _MTIMES = {
@@ -100,7 +101,11 @@ class FakeFS:
     """The tree for one honeypot. Immutable apart from per-session overlays that
     the protocol layer manages itself."""
 
-    def __init__(self, seed: str) -> None:
+    def __init__(
+        self, seed: str, planted: Callable[[], tuple[str, str] | None] | None = None
+    ) -> None:
+        # `planted` returns a tracked (user, password) pair or None; see `_baited`.
+        self._planted = planted
         rng = random.Random(hashlib.sha256(seed.encode()).digest())
 
         def node(name: str, is_dir: bool = False, content: bytes = b"") -> Node:
@@ -145,7 +150,8 @@ class FakeFS:
         return path in self._tree
 
     def listdir(self, path: str) -> list[Node] | None:
-        return self._tree.get(path)
+        nodes = self._tree.get(path)
+        return None if nodes is None else [self._baited(n) for n in nodes]
 
     def lookup(self, path: str) -> Node | None:
         if path == "/":
@@ -153,8 +159,22 @@ class FakeFS:
         parent, _, name = path.rpartition("/")
         for entry in self._tree.get(parent or "/", []):
             if entry.name == name:
-                return entry
+                return self._baited(entry)
         return None
+
+    def bait_active(self) -> bool:
+        """Whether `passwords.txt` currently carries a tracked credential."""
+        return self._planted is not None and self._planted() is not None
+
+    def _baited(self, node: Node) -> Node:
+        """`passwords.txt` plus the tracked pair, when there is one. LIST, SIZE and RETR all go through
+        here, so the size an attacker sees is the length of the bytes they get."""
+        pair = (
+            self._planted() if self._planted is not None and node.name == "passwords.txt" else None
+        )
+        if pair is None:
+            return node
+        return replace(node, content=node.content + f"{pair[0]}:{pair[1]}\n".encode())
 
     def render_list(self, nodes: list[Node], extra: list[Node] | None = None) -> bytes:
         every = [*nodes, *(extra or [])]

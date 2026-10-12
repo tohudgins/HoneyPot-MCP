@@ -7,6 +7,7 @@ followed LIST with SIZE on a name it had just been shown got a refusal.
 """
 
 import asyncio
+import contextlib
 import ftplib
 import hashlib
 import os
@@ -227,3 +228,88 @@ async def test_downloads_are_recorded_with_a_hash_of_what_was_served(ftp_port):
     assert event.payload["sha256"] == hashlib.sha256(data).hexdigest()
     assert event.payload["size_bytes"] == len(data)
     assert event.payload["path"] == "/passwords.txt"
+
+
+# ── Bait: passwords.txt carries a tracked credential ─────────────────────────
+
+
+async def _plant(service: str, user: str, password: str) -> None:
+    from honeypot_mcp import credential_match
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
+
+    async with get_session() as session:
+        session.add(
+            Honeytoken(
+                type=HoneytokenType.CREDENTIAL,
+                label=f"bait-{service}",
+                token_value=f"cred:bait-{service}",
+                status=HoneytokenStatus.ACTIVE,
+                token_meta={
+                    "service": service,
+                    "credentials": [{"username": user, "password": password}],
+                },
+            )
+        )
+    credential_match.invalidate_cache()
+    await credential_match.planted_credential(
+        service
+    )  # warm the index, as any connection event does
+
+
+def test_the_bait_is_part_of_the_file_so_list_size_and_bytes_still_agree():
+    from honeypot_mcp.engines.ftp_fs import FakeFS
+
+    pair = {"value": ("svc-portal", "Zx9!kLm2#qq")}
+    fs = FakeFS("seed", planted=lambda: pair["value"])
+    plain = FakeFS("seed")
+
+    listed = next(n for n in fs.listdir("/") if n.name == "passwords.txt")
+    fetched = fs.lookup("/passwords.txt")
+    assert listed.content == fetched.content and listed.size == fetched.size == len(fetched.content)
+    assert fetched.content.startswith(plain.lookup("/passwords.txt").content), "decoy lines stay"
+    assert fetched.content.endswith(b"svc-portal:Zx9!kLm2#qq\n")
+    assert fs.bait_active() and not plain.bait_active()
+    pair["value"] = None  # the token was revoked
+    assert fs.lookup("/passwords.txt").content == plain.lookup("/passwords.txt").content
+    assert not fs.bait_active()
+
+
+async def test_a_scanner_that_takes_the_file_and_replays_the_credential_trips_it(ftp_port):
+    """The point of the bait, end to end with a real client: read passwords.txt over FTP, log in with
+    the pair found in it, and get a CRITICAL naming the token. The download is marked `bait_served`."""
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    await _plant("ftp", "svc-portal", "Zx9!kLm2#qq")
+
+    def run() -> str:
+        ftp = _session(ftp_port)
+        chunks: list[bytes] = []
+        ftp.retrbinary("RETR passwords.txt", chunks.append)
+        ftp.quit()
+        text = b"".join(chunks).decode()
+        user, _, password = text.strip().splitlines()[-1].partition(":")
+        again = ftplib.FTP()
+        again.connect("127.0.0.1", ftp_port, timeout=5)
+        with contextlib.suppress(ftplib.error_perm):
+            again.login(user, password)
+        again.close()
+        return text
+
+    text = await _in_thread(run)
+    assert "svc-portal:Zx9!kLm2#qq" in text
+    await asyncio.sleep(1.2)
+    async with get_session() as session:
+        alerts = (await session.execute(select(Alert))).scalars().all()
+    download = [a for a in alerts if a.event_type == "ftp_file_download"]
+    assert download and download[0].payload.get("bait_served") is True
+    tripped = [
+        a
+        for a in alerts
+        if a.severity == AlertSeverity.CRITICAL
+        and a.event_type.startswith("honeytoken_triggered_credential_via_ftp")
+    ]
+    assert tripped, [a.event_type for a in alerts]

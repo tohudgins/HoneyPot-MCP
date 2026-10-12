@@ -77,6 +77,14 @@ _MAX_EVENT_STRING = 256
 _MAX_WRITE_BACKLOG = 512 * 1024
 
 
+def _planted_pair() -> tuple[str, str] | None:
+    """The tracked credential `passwords.txt` should carry: an FTP token first (replaying it on this
+    sensor trips it), else the MySQL one (replaying it on the MySQL sensor does)."""
+    from honeypot_mcp.credential_match import peek_planted_credential
+
+    return peek_planted_credential("ftp") or peek_planted_credential("mysql")
+
+
 def _clip(value: str) -> str:
     return value[:_MAX_EVENT_STRING]
 
@@ -605,6 +613,12 @@ class _FTPProtocol(asyncio.Protocol):
                 "path": _clip(path),
                 "size_bytes": len(payload),
                 "sha256": hashlib.sha256(payload).hexdigest(),
+                # The attacker took a credential we can trace: watch for it on the other sensors.
+                **(
+                    {"bait_served": True}
+                    if path == "/passwords.txt" and self._fs.bait_active()
+                    else {}
+                ),
             },
         )
         # (The data listener was already torn down before the 226, above.)
@@ -730,7 +744,9 @@ class FTPEngine(HoneypotEngine):
                 hp_id = hp.id
 
         loop = asyncio.get_event_loop()
-        fs = FakeFS(name)  # one tree per honeypot: stable across connections
+        # One tree per honeypot, stable across connections. `passwords.txt` carries a tracked
+        # credential when the operator has planted one (an FTP token first, else the MySQL one).
+        fs = FakeFS(name, planted=_planted_pair)
         server = await loop.create_server(
             limited_factory(lambda: _FTPProtocol(name, hp_id, banner, fs), self._limiter),
             host="0.0.0.0",

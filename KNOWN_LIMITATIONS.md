@@ -291,6 +291,24 @@ there's no signal back to HoneyPot MCP. Worth it for trip-wire deception
 inside the honeypot stack; not a substitute for real credential canaries that
 hook into an identity provider's audit log.
 
+**Where tracked credentials are served as bait.** The HTTP decoys (`/.env`, `/config.json`,
+`/wp-config.php`) serve the tracked MySQL credential and a tracked canary URL, and the FTP decoy
+`passwords.txt` carries a tracked pair (an FTP token first, else the MySQL one; LIST, SIZE and RETR
+agree on its length and the download event is marked `bait_served`). Redis deliberately has no bait:
+its per-connection store is what attackers write to, and the SAVE-redirection detection hashes it, so
+seeded keys would pollute that evidence. No real public trip had been observed on the first run.
+
+**rsync stalls after the module is chosen.** The daemon lists modules, records anonymous access and the
+file request, but a real `rsync` client then waits for a file list, which needs protocol 31's
+compat flags, checksum negotiation and varint-encoded entries inside multiplexed framing. The detection
+(CRITICAL on the anonymous module request) is unaffected; the transfer itself is not emulated.
+
+**Grafana panels read the raw `alerts` table.** Thirteen panel queries took 17.8 s in total on 4.9M
+alerts (slowest 4.0 s, the tactic timeline), growing linearly with the table. That is fine for a run of
+days; at tens of millions of rows the aggregate panels (window totals, top attackers, top event types)
+should read the hourly rollups the way the MCP tools do, which needs the whole-hours-plus-raw-edges
+logic in SQL to stay exact. The tools, which analysis uses, are already independent of table size.
+
 **SMTP engine.** Speaks Postfix's dialect rather than accepting everything:
 commands out of sequence get the 503 Postfix gives (`RCPT` before `MAIL`, nested
 `MAIL`, `DATA` with no recipients), a mailbox the host does not have is
