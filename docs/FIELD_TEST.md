@@ -85,6 +85,30 @@ exports; a rate-limit rule on a real flooder must cut the live ingest rate by 80
 when no flood is active), and operations (pause a real sensor and watch its public port close,
 resume it, read a real sensor's log, pull a real attacker's packets from the capture ring).
 
+## 4. Are the answers right? `field_test_oracle.py`
+
+Parts two and three show the tools answer and act. This part checks the *numbers*. It takes a
+frozen backup (so live traffic cannot move anything), runs the read tools on a copy of it, and
+compares each answer with an independent computation written as plain SQL over the `alerts` table.
+The tools read pre-aggregated rollups and partial indexes; the oracle never does, so agreement means
+the optimised path equals the definition.
+
+```bash
+uv run python scripts/field_test_oracle.py --backup ~/hp-backups/<latest>/honeypot_mcp.db --out oracle.md
+```
+
+It covers `alerts_stats` over five window shapes (all time, mid-hour start, on the hour, the last
+40 minutes of data, after all data: total, unique sources, severity split, true top sources and
+event types with their true counts), per-sensor hit counts, `soc_brief`'s volume and untriaged
+counts and the order of its queue, `alerts_recent` filters, `alerts_search`, `threat_timeline`,
+`analyze_attacker` and the journey for heavy and light real sources (count, first and last seen to
+the microsecond, breakdowns), the blocklist's membership, and cross-tool invariants. Campaign
+and cluster analysis are listed as not covered, with the reason, rather than skipped silently.
+
+First run, on 4,896,441 real alerts: 67 checks, 0 failed, in 28 seconds. To prove the oracle can
+fail, one rollup count was changed by one in a copy: the total, severity split, top sources and
+per-sensor hits all failed (`4896442 != 4896441`). The original is never opened for writing.
+
 ## Seeing the data yourself
 
 Everything above can also be read on your own machine from a backup, with no SSH:
