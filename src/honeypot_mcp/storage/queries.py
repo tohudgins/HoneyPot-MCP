@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from sqlalchemy import String, cast, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from honeypot_mcp.storage import rollups
 from honeypot_mcp.storage.models import (
     Alert,
     AlertDisposition,
@@ -41,24 +42,15 @@ async def list_honeypots(
 
 
 async def get_honeypot_hit_count(session: AsyncSession, honeypot_id: int) -> int:
-    result = await session.execute(select(func.count()).where(Alert.honeypot_id == honeypot_id))
-    return result.scalar_one() or 0
+    return (await rollups.hit_counts(session, [honeypot_id])).get(honeypot_id, 0)
 
 
 async def get_hit_counts(
     session: AsyncSession, honeypot_ids: list[int] | None = None
 ) -> dict[int, int]:
-    """Bulk hit count by honeypot — single GROUP BY query instead of N round-trips.
+    """Bulk lifetime hit count by honeypot, from the rollups (one small query, no table scan).
     Returns {honeypot_id: count}. Honeypots with zero hits are absent."""
-    q = (
-        select(Alert.honeypot_id, func.count().label("c"))
-        .where(Alert.honeypot_id.is_not(None))
-        .group_by(Alert.honeypot_id)
-    )
-    if honeypot_ids is not None:
-        q = q.where(Alert.honeypot_id.in_(honeypot_ids))
-    result = await session.execute(q)
-    return {row[0]: row[1] for row in result.all()}
+    return await rollups.hit_counts(session, honeypot_ids)
 
 
 # ── Alert queries ─────────────────────────────────────────────────────────────
@@ -214,40 +206,14 @@ async def acknowledge_alert(session: AsyncSession, alert_id: int) -> bool:
 
 
 async def get_alert_stats(session: AsyncSession, since: datetime | None = None) -> dict:
-    def _scoped(q):  # type: ignore[no-untyped-def]
-        return q.where(Alert.timestamp >= since) if since is not None else q
+    """Totals, unique sources, severity split, top sources and event types for a window.
 
-    total = await session.execute(_scoped(select(func.count()).select_from(Alert)))
-    unique_ips = await session.execute(
-        _scoped(select(func.count(func.distinct(Alert.source_ip))).select_from(Alert))
-    )
-    # Severity breakdown is the first thing an analyst wants — "how bad is it"
-    # before "who and what".
-    severity_result = await session.execute(
-        _scoped(select(Alert.severity, func.count().label("cnt"))).group_by(Alert.severity)
-    )
-    top_ips_result = await session.execute(
-        _scoped(select(Alert.source_ip, func.count().label("cnt")))
-        .group_by(Alert.source_ip)
-        .order_by(desc("cnt"))
-        .limit(10)
-    )
-    top_types_result = await session.execute(
-        _scoped(select(Alert.event_type, func.count().label("cnt")))
-        .group_by(Alert.event_type)
-        .order_by(desc("cnt"))
-        .limit(10)
-    )
-    return {
-        "total_alerts": total.scalar_one(),
-        "unique_source_ips": unique_ips.scalar_one(),
-        "by_severity": {
-            (r[0].value if hasattr(r[0], "value") else str(r[0])): r[1]
-            for r in severity_result.all()
-        },
-        "top_source_ips": [{"ip": r[0], "count": r[1]} for r in top_ips_result.all()],
-        "top_event_types": [{"type": r[0], "count": r[1]} for r in top_types_result.all()],
-    }
+    Read from the hourly rollups (plus the alert rows for the window's partial edges), so the cost
+    follows the number of distinct (hour, kind, source, sensor) combinations, not the number of
+    alerts: on the live droplet the same five aggregates over the alert table took 27 s all-time
+    and over 100 s for one hour, at 4.9M rows.
+    """
+    return await rollups.stats(session, since)
 
 
 # ── Honeytoken queries ────────────────────────────────────────────────────────
@@ -337,18 +303,6 @@ async def get_or_create_profile(session: AsyncSession, ip: str) -> AttackerProfi
         session.add(profile)
         await session.flush()
     return profile
-
-
-async def get_events_for_ip(
-    session: AsyncSession, ip: str, limit: int = 200
-) -> list[AttackerEvent]:
-    result = await session.execute(
-        select(AttackerEvent)
-        .where(AttackerEvent.ip == ip)
-        .order_by(desc(AttackerEvent.timestamp))
-        .limit(limit)
-    )
-    return list(result.scalars().all())
 
 
 # ── Retention ─────────────────────────────────────────────────────────────────
@@ -448,14 +402,14 @@ async def get_top_offenders(
     from datetime import timedelta
 
     since = datetime.now(UTC) - timedelta(hours=hours)
+    w = rollups.window(since)
     result = await session.execute(
-        select(Alert.source_ip, func.count().label("c"))
-        .where(Alert.timestamp >= since)
-        .group_by(Alert.source_ip)
-        .having(func.count() >= min_hits)
+        select(w.c.source_ip, func.sum(w.c.n).label("c"))
+        .group_by(w.c.source_ip)
+        .having(func.sum(w.c.n) >= min_hits)
         .order_by(desc("c"))
     )
-    offenders = [(row[0], row[1]) for row in result.all()]
+    offenders = [(row[0], int(row[1])) for row in result.all()]
 
     if global_only:
         import ipaddress
@@ -472,13 +426,13 @@ async def get_top_offenders(
         from honeypot_mcp.deception.capabilities import transport_for
 
         candidates = {ip for ip, _ in offenders}
+        w = rollups.window(since)
         rows = (
             await session.execute(
-                select(Alert.source_ip, Honeypot.type)
-                .select_from(Alert)
-                .outerjoin(Honeypot, Alert.honeypot_id == Honeypot.id)
-                .where(Alert.timestamp >= since)
-                .group_by(Alert.source_ip, Honeypot.type)
+                select(w.c.source_ip, Honeypot.type)
+                .select_from(w)
+                .outerjoin(Honeypot, w.c.honeypot_id == Honeypot.id)
+                .group_by(w.c.source_ip, Honeypot.type)
             )
         ).all()
         has_non_udp: set[str] = set()

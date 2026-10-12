@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage import queries
+from honeypot_mcp.storage import queries, rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
@@ -108,6 +108,13 @@ async def report_ip_abuse(
     return result
 
 
+async def _exact_totals(session: Any, ip: str) -> tuple[dict[str, Any], Any, Any]:
+    """Exact all-time aggregates for one source (from the rollups) and its first/last seen."""
+    totals = await rollups.stats(session, None, ip=ip, top=100)
+    first_seen, last_seen = await rollups.first_last_seen(session, ip)
+    return totals, first_seen, last_seen
+
+
 @mcp.tool(**hints("analyze_attacker"))
 async def analyze_attacker(ip: str) -> dict[str, Any]:
     """Build a full attacker profile for an IP: all honeypot events, token triggers,
@@ -129,7 +136,7 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
 
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=200, source_ip=ip)
-        events = await queries.get_events_for_ip(session, ip, limit=200)
+        totals, first_seen, last_seen = await _exact_totals(session, ip)
 
     results: list[Any] = await asyncio.gather(
         lookup_geoip(ip),
@@ -142,7 +149,9 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
     profile = await build_profile(
         ip=ip,
         alerts=alerts,
-        events=events,
+        totals=totals,
+        first_seen=first_seen,
+        last_seen=last_seen,
         geoip=geo if not isinstance(geo, Exception) else {},
         vt=vt if not isinstance(vt, Exception) else {},
         abuse=abuse if not isinstance(abuse, Exception) else {},
@@ -262,7 +271,7 @@ async def generate_report(
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=limit, source_ip=ip, since=since)
         stats = await queries.get_alert_stats(session, since=since)
-        events = await queries.get_events_for_ip(session, ip) if ip else []
+        totals, first_seen, last_seen = await _exact_totals(session, ip) if ip else ({}, None, None)
 
     # For an IP-scoped report, attach the full intelligence picture (geo/ASN/
     # reverse-DNS + VT/AbuseIPDB reputation + risk score + recommendations) so
@@ -284,7 +293,14 @@ async def generate_report(
         )
         geo, vt, abuse = (r if not isinstance(r, Exception) else {} for r in results)
         intel = await build_profile(
-            ip=ip, alerts=alerts, events=events, geoip=geo, vt=vt, abuse=abuse
+            ip=ip,
+            alerts=alerts,
+            totals=totals,
+            first_seen=first_seen,
+            last_seen=last_seen,
+            geoip=geo,
+            vt=vt,
+            abuse=abuse,
         )
 
     content = await generate(
@@ -454,22 +470,31 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
     )
 
     async with get_session() as session:
-        total, first_ts, last_ts = (
+        # Exact totals come from the rollups and the edges from an index seek, so the cost does not
+        # grow with how many rows a heavy attacker left behind.
+        exact = await rollups.stats(session, since, ip=ip, top=100)
+        total = exact["total_alerts"]
+        first_ts, last_ts = (
             await session.execute(
-                select(func.count(), func.min(Alert.timestamp), func.max(Alert.timestamp)).where(
-                    *in_window
-                )
+                select(func.min(Alert.timestamp), func.max(Alert.timestamp)).where(*in_window)
             )
         ).one()
-        total_events = (
+        # Honeytoken-linked events are the only rows kept in attacker_events now; every other
+        # event is the alert itself, so `total_events` is the number of events recorded.
+        token_events = (
             await session.execute(
                 select(func.count())
                 .select_from(AttackerEvent)
-                .where(AttackerEvent.ip == ip, AttackerEvent.timestamp >= since)
+                .where(
+                    AttackerEvent.ip == ip,
+                    AttackerEvent.timestamp >= since,
+                    AttackerEvent.honeytoken_id.is_not(None),
+                )
             )
         ).scalar_one()
+        total_events = total
 
-        if not total and not total_events:
+        if not total and not token_events:
             return {
                 "ip": ip,
                 "total_alerts": 0,
@@ -487,10 +512,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         else:
             # Exact counts per event type for the whole window, then a bounded
             # sample: the earliest and latest alerts plus the most severe ones.
-            type_rows = await session.execute(
-                select(Alert.event_type, func.count()).where(*in_window).group_by(Alert.event_type)
-            )
-            type_counts = {row[0]: row[1] for row in type_rows.all()}
+            type_counts = {row["type"]: row["count"] for row in exact["top_event_types"]}
             picked: dict[int, Alert] = {}
             for query in (
                 select(Alert).where(*in_window).order_by(Alert.timestamp, Alert.id),
@@ -508,13 +530,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
             alerts = sorted(picked.values(), key=lambda a: (a.timestamp, a.id))
 
         # Which honeypots, and which tokens, over the WHOLE window (not just the sample).
-        hp_ids = {
-            row[0]
-            for row in (
-                await session.execute(select(Alert.honeypot_id).where(*in_window).distinct())
-            ).all()
-            if row[0] is not None
-        }
+        hp_ids = await rollups.honeypot_ids(session, since, ip)
         honeypot_names: dict[int, str] = {}
         if hp_ids:
             hp_result = await session.execute(
@@ -555,9 +571,9 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         return {
             "ip": ip,
             "total_alerts": 0,
-            "total_events": total_events,
+            "total_events": token_events,
             "tokens_triggered": tokens_triggered,
-            "summary": f"{total_events} token event(s) but no honeypot alerts for {ip} "
+            "summary": f"{token_events} token event(s) but no honeypot alerts for {ip} "
             f"in the last {hours}h.",
         }
 

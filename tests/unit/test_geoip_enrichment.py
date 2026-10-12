@@ -141,7 +141,15 @@ async def test_profile_passes_asn_through():
     profile = await build_profile(
         ip="1.2.3.4",
         alerts=[],
-        events=[],
+        totals={
+            "total_alerts": 0,
+            "unique_source_ips": 0,
+            "by_severity": {},
+            "top_source_ips": [],
+            "top_event_types": [],
+        },
+        first_seen=None,
+        last_seen=None,
         geoip=geoip_block,
         vt={"available": False},
         abuse={"available": False},

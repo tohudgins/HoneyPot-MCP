@@ -30,9 +30,9 @@ from aiohttp import web
 from sqlalchemy import func, select
 
 from honeypot_mcp.http_identity import identity_runner
+from honeypot_mcp.storage import rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
-    Alert,
     Honeypot,
     HoneypotStatus,
     Honeytoken,
@@ -105,35 +105,31 @@ async def _gather_metrics() -> str:
     out: list[str] = []
 
     async with get_session() as session:
+        # All three alert breakdowns come from the hourly rollups (storage/rollups.py): a scrape
+        # must not scan the alert table, which a flood grows by millions of rows an hour.
+        overall = await rollups.stats(session, None, top=50)
+
         # Alerts by severity
-        sev_rows = (
-            await session.execute(select(Alert.severity, func.count()).group_by(Alert.severity))
-        ).all()
         out.append("# HELP honeypot_alerts_total Total alerts grouped by severity.\n")
         out.append("# TYPE honeypot_alerts_total counter\n")
-        for severity, count in sev_rows:
-            sev_value = severity.value if hasattr(severity, "value") else str(severity)
+        for sev_value, count in overall["by_severity"].items():
             out.append(_line("honeypot_alerts_total", {"severity": sev_value}, count))
 
         # Alerts by event type (top 50 to keep cardinality bounded)
-        et_rows = (
-            await session.execute(
-                select(Alert.event_type, func.count())
-                .group_by(Alert.event_type)
-                .order_by(func.count().desc())
-                .limit(50)
-            )
-        ).all()
         out.append("# HELP honeypot_alerts_by_event_type_total Alerts by event_type (top 50).\n")
         out.append("# TYPE honeypot_alerts_by_event_type_total counter\n")
-        for et, count in et_rows:
-            out.append(_line("honeypot_alerts_by_event_type_total", {"type": et}, count))
+        for row in overall["top_event_types"]:
+            out.append(
+                _line("honeypot_alerts_by_event_type_total", {"type": row["type"]}, row["count"])
+            )
 
         # Alerts by honeypot (engine) — joined through honeypots.type
+        w = rollups.window(None)
         eng_rows = (
             await session.execute(
-                select(Honeypot.type, func.count(Alert.id))
-                .join(Honeypot, Alert.honeypot_id == Honeypot.id)
+                select(Honeypot.type, func.sum(w.c.n))
+                .select_from(w)
+                .join(Honeypot, w.c.honeypot_id == Honeypot.id)
                 .group_by(Honeypot.type)
             )
         ).all()
@@ -143,7 +139,9 @@ async def _gather_metrics() -> str:
         out.append("# TYPE honeypot_alerts_by_engine_total counter\n")
         for engine, count in eng_rows:
             engine_value = engine.value if hasattr(engine, "value") else str(engine)
-            out.append(_line("honeypot_alerts_by_engine_total", {"engine": engine_value}, count))
+            out.append(
+                _line("honeypot_alerts_by_engine_total", {"engine": engine_value}, int(count))
+            )
 
         # Active honeypots (gauge)
         active_hp = (

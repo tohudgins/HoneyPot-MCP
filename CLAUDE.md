@@ -46,6 +46,9 @@ Engine (any of the 25 — see deception/capabilities.py)
   → submit_event(PendingEvent)             # storage/event_buffer.py
   → suppression.should_suppress(event)     # in-memory rules, dropped here are gone
   → credential_match.match(event)          # planted creds → CRITICAL + honeytoken_id tag
+  → flood_guard.admit(event)               # per (source, event type) 600 stored/min; the rest
+                                           # are counted into one flood_summary per window.
+                                           # CRITICAL and honeytoken hits are never dropped
   → EventBuffer queue
   → flusher task (single async task, batches up to 50, max 1s wait)
   → DB transaction (Alert + AttackerEvent rows); credential-trigger events
@@ -108,6 +111,29 @@ and to the planner in `deception/planner.py` when a sensor pairs with one.
 ### Database layer
 
 `storage/database.py` exposes a single context manager `get_session()`. Auto-commits on clean exit, auto-rolls back on exception. Sessions aren't shared across blocks — each `async with` is its own transaction.
+
+**Statistics read rollups, never the alert table (`storage/rollups.py`, `alert_rollups`).** A public
+host's alert table grows by millions of rows a day (one SIP flood took it from 1.1M to 4.9M rows in
+nine hours, 3.8 GB, past the host's RAM) and every aggregate over it becomes a full scan:
+`honeypot_list` took 51 s and `alerts_stats`/`soc_brief` timed out. So the cost of a statistic must
+depend on the size of the answer. `alert_rollups` counts alerts per hour per (severity, event type,
+source, sensor). It is written by a `before_flush` hook on `Session` (`rollups.install()`, called
+when `database` is imported), so **every** Alert writer is counted in the same transaction as the
+row, a rolled-back transaction takes its counts with it, and nobody can forget to call a helper. A
+windowed query (`rollups.window`) takes whole hours from the rollups and the two partial edges from
+the alert rows, unioned and aggregated in the database, so it is exact to the second; pruning raw
+alerts does not change lifetime figures. `alerts_stats`, `soc_brief`, `honeypot_list`, the
+analyst's per-source profile and journey totals, the blocklist/campaign candidates and `/metrics` all
+read it. `ix_alerts_acked` and `ix_alerts_urgent` are small *partial* indexes (acknowledged rows;
+CRITICAL/HIGH rows) so the triage queue never touches the LOW/MEDIUM flood: untriaged = total minus
+acknowledged, and the "needs attention" list seeks `ix_alerts_urgent`. `attacker_events` now keeps
+only honeytoken-linked events (it used to copy every event, payload included). When adding a query
+over alerts, ask first whether it belongs on the rollups; `tests/unit/test_rollups.py` checks every
+windowed statistic against a brute-force count and `tests/unit/test_query_plans.py` pins plans.
+Two traps found the hard way: on PostgreSQL `coalesce(x, $3)` in SELECT and `coalesce(x, $5)` in
+GROUP BY are different expressions (use a literal), and the in-memory test database is one shared
+connection, whose pool reset rolled back other sessions' uncommitted writes (the engine disables
+reset-on-return for `:memory:`; see `test_database.py`).
 
 Default is SQLite (`honeypot_mcp.db`). For PostgreSQL, install the driver
 extra and swap the URL — no code changes:

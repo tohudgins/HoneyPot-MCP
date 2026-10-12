@@ -1,5 +1,6 @@
 """Unit tests for database layer."""
 
+import asyncio
 import os
 
 import pytest
@@ -109,3 +110,50 @@ async def test_acknowledge_alert():
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, source_ip="192.168.1.1")
         assert alerts[0].acknowledged is True
+
+
+@pytest.mark.asyncio
+async def test_one_session_finishing_does_not_undo_another_sessions_uncommitted_write():
+    """The in-memory test database is ONE connection shared by every session. The pool's
+    reset-on-return rolled that connection back whenever any session's connection was returned,
+    which silently undid a different session's uncommitted INSERT: the flusher's Alert row vanished
+    while the rows written after it survived, so honeytoken tests failed depending on interleaving.
+    Production gives each session its own connection; this pins the test database to behave the
+    same way.
+
+    The window is the one between another session's COMMIT and its connection being returned, so it
+    is reproduced with a raw engine connection."""
+    from sqlalchemy import func, select, text
+
+    from honeypot_mcp.storage import database
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    other_committed, writer_inserted = asyncio.Event(), asyncio.Event()
+
+    async def other() -> None:
+        async with database._get_engine().connect() as conn:
+            await conn.execute(text("SELECT 1"))
+            await conn.commit()
+            other_committed.set()
+            await writer_inserted.wait()
+        # leaving the block returns the connection to the pool
+
+    async def writer() -> None:
+        await other_committed.wait()
+        async with get_session() as session:
+            session.add(
+                Alert(
+                    source_ip="203.0.113.1",
+                    event_type="x",
+                    payload={},
+                    severity=AlertSeverity.LOW,
+                )
+            )
+            await session.flush()  # written, not yet committed
+            writer_inserted.set()
+            await asyncio.sleep(0.2)  # the other connection is returned while this is pending
+
+    await asyncio.gather(other(), writer())
+    async with get_session() as session:
+        assert (await session.execute(select(func.count()).select_from(Alert))).scalar_one() == 1

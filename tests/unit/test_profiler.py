@@ -19,13 +19,64 @@ def _alert(ip, event_type, severity="medium"):
     return a
 
 
+def _totals(alerts):
+    """The exact aggregate `rollups.stats(ip=...)` would give for `alerts`."""
+    from collections import Counter
+
+    types = Counter(a.event_type for a in alerts)
+    severities = Counter(a.severity.value for a in alerts)
+    return {
+        "total_alerts": len(alerts),
+        "unique_source_ips": 1,
+        "by_severity": dict(severities),
+        "top_source_ips": [],
+        "top_event_types": [{"type": t, "count": n} for t, n in types.most_common()],
+    }
+
+
+@pytest.mark.asyncio
+async def test_profile_totals_are_the_exact_aggregate_not_the_size_of_the_sample():
+    """analyze_attacker used to report `len(newest 200 alerts) + len(200 duplicate event rows)` as
+    total_events, its severity split and event breakdown from that sample, and first/last seen from
+    it too: an attacker with 39,916 hits was described by a capped, doubled number."""
+    sample = [_alert("1.2.3.4", "telnet_command_input", "high") for _ in range(200)]
+    exact = {
+        "total_alerts": 39_916,
+        "unique_source_ips": 1,
+        "by_severity": {"high": 30_000, "low": 9_900, "critical": 16},
+        "top_source_ips": [],
+        "top_event_types": [
+            {"type": "telnet_command_input", "count": 30_000},
+            {"type": "telnet_session_connect", "count": 9_900},
+        ],
+    }
+    first = datetime(2026, 10, 11, 19, 36, tzinfo=UTC)
+    last = datetime(2026, 10, 12, 13, 0, tzinfo=UTC)
+    profile = await build_profile(
+        ip="1.2.3.4",
+        alerts=sample,
+        totals=exact,
+        first_seen=first,
+        last_seen=last,
+        geoip={},
+        vt={},
+        abuse={},
+    )
+    assert profile["total_events"] == 39_916
+    assert profile["severity_breakdown"] == {"high": 30_000, "low": 9_900, "critical": 16}
+    assert profile["event_breakdown"]["telnet_session_connect"] == 9_900
+    assert profile["first_seen"] == first.isoformat() and profile["last_seen"] == last.isoformat()
+
+
 @pytest.mark.asyncio
 async def test_profile_contains_required_fields():
     alerts = [_alert("1.2.3.4", "ssh_login_failed", "high")]
     profile = await build_profile(
         ip="1.2.3.4",
         alerts=alerts,
-        events=[],
+        totals=_totals(alerts),
+        first_seen=None,
+        last_seen=None,
         geoip={"country": "Russia", "country_code": "RU"},
         vt={"available": False},
         abuse={"available": False},
@@ -96,7 +147,14 @@ async def _score(alerts, vt=None, abuse=None):
     from honeypot_mcp.analysis.profiler import build_profile
 
     profile = await build_profile(
-        ip="1.2.3.4", alerts=alerts, events=[], geoip={}, vt=vt or {}, abuse=abuse or {}
+        ip="1.2.3.4",
+        alerts=alerts,
+        totals=_totals(alerts),
+        first_seen=None,
+        last_seen=None,
+        geoip={},
+        vt=vt or {},
+        abuse=abuse or {},
     )
     return profile["risk_score"], profile["risk_level"]
 
@@ -175,7 +233,16 @@ async def test_compromise_plus_token_is_critical():
 async def _profile(alerts):
     from honeypot_mcp.analysis.profiler import build_profile
 
-    return await build_profile(ip="1.2.3.4", alerts=alerts, events=[], geoip={}, vt={}, abuse={})
+    return await build_profile(
+        ip="1.2.3.4",
+        alerts=alerts,
+        totals=_totals(alerts),
+        first_seen=None,
+        last_seen=None,
+        geoip={},
+        vt={},
+        abuse={},
+    )
 
 
 @pytest.mark.asyncio

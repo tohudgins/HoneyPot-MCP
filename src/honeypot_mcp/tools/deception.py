@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from honeypot_mcp import instance_lock
 from honeypot_mcp.deception.capabilities import BY_TYPE, all_capabilities, all_profiles
@@ -29,6 +29,7 @@ from honeypot_mcp.deception.coverage import build_coverage
 from honeypot_mcp.deception.planner import build_plan
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
+from honeypot_mcp.storage import rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import (
     Alert,
@@ -346,35 +347,34 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
     cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=since_hours)
 
     async with get_session() as session:
-        totals = (
-            await session.execute(
-                select(Alert.severity, func.count(Alert.id))
-                .where(Alert.timestamp >= cutoff)
-                .group_by(Alert.severity)
-            )
-        ).all()
-        unique_ips = (
-            await session.execute(
-                select(func.count(func.distinct(Alert.source_ip))).where(Alert.timestamp >= cutoff)
-            )
-        ).scalar() or 0
+        stats = await rollups.stats(session, cutoff, top=5)
+        totals = [(AlertSeverity(name), n) for name, n in stats["by_severity"].items()]
+        unique_ips = stats["unique_source_ips"]
 
-        urgent = (
-            (
-                await session.execute(
-                    select(Alert)
-                    .where(
-                        Alert.timestamp >= cutoff,
-                        Alert.severity.in_([AlertSeverity.CRITICAL, AlertSeverity.HIGH]),
-                        Alert.acknowledged.is_(False),
+        # Most severe first, newest first within a severity. Sorting on the stored severity text
+        # put "high" before "critical" (alphabetical), so the brief led with the lesser alerts. Each
+        # query is a seek into ix_alerts_urgent, a partial index holding only CRITICAL/HIGH rows.
+        urgent: list[Alert] = []
+        for severity in (AlertSeverity.CRITICAL, AlertSeverity.HIGH):
+            room = max_highlights - len(urgent)
+            if room <= 0:
+                break
+            urgent.extend(
+                (
+                    await session.execute(
+                        select(Alert)
+                        .where(
+                            Alert.severity == severity,
+                            Alert.acknowledged.is_(False),
+                            Alert.timestamp >= cutoff,
+                        )
+                        .order_by(Alert.timestamp.desc())
+                        .limit(room)
                     )
-                    .order_by(Alert.severity.desc(), Alert.timestamp.desc())
-                    .limit(max_highlights)
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
 
         token_trips = (
             (
@@ -389,44 +389,25 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
             .all()
         )
 
-        busiest = (
-            await session.execute(
-                select(Alert.source_ip, func.count(Alert.id).label("n"))
-                .where(Alert.timestamp >= cutoff)
-                .group_by(Alert.source_ip)
-                .order_by(func.count(Alert.id).desc())
-                .limit(5)
-            )
-        ).all()
+        busiest = [(row["ip"], row["count"]) for row in stats["top_source_ips"]]
 
         sensors = (
             await session.execute(select(Honeypot.name, Honeypot.type, Honeypot.status))
         ).all()
-        untriaged_total = (
-            await session.execute(
-                select(func.count(Alert.id)).where(
-                    Alert.timestamp >= cutoff, Alert.acknowledged.is_(False)
-                )
-            )
-        ).scalar() or 0
+        # Untriaged = everything in the window minus what a human acknowledged. Acknowledgement is
+        # a deliberate act and so is rare, which is what makes this cheap: the acknowledged rows are
+        # read from a tiny partial index instead of counting the (flood-sized) unacknowledged rest.
+        acked = await rollups.acknowledged_by_severity(session, cutoff)
+        untriaged_total = max(stats["total_alerts"] - sum(acked.values()), 0)
         # The true size of the queue `needs_attention` samples from. Counting
         # the returned list instead reports the `max_highlights` cap as if it
         # were the total — "8 untriaged high-severity alerts" when there are
         # 841 — which is the worst possible error in a shift handover.
-        urgent_counts: dict[AlertSeverity, int] = {
-            severity: count
-            for severity, count in (
-                await session.execute(
-                    select(Alert.severity, func.count(Alert.id))
-                    .where(
-                        Alert.timestamp >= cutoff,
-                        Alert.severity.in_([AlertSeverity.CRITICAL, AlertSeverity.HIGH]),
-                        Alert.acknowledged.is_(False),
-                    )
-                    .group_by(Alert.severity)
-                )
-            ).all()
-        }
+        urgent_counts: dict[AlertSeverity, int] = {}
+        for severity in (AlertSeverity.CRITICAL, AlertSeverity.HIGH):
+            open_count = stats["by_severity"].get(severity.value, 0) - acked.get(severity.value, 0)
+            if open_count > 0:
+                urgent_counts[severity] = open_count
 
     counts = {severity.value: n for severity, n in totals}
     total_events = sum(counts.values())

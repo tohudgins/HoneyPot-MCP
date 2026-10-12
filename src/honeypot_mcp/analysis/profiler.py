@@ -3,25 +3,37 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from honeypot_mcp.intel.mitre import map_to_attack
-from honeypot_mcp.storage.models import Alert, AttackerEvent
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from honeypot_mcp.storage.models import Alert
 
 
 async def build_profile(
     ip: str,
     alerts: list[Alert],
-    events: list[AttackerEvent],
+    totals: dict[str, Any],
+    first_seen: datetime | None,
+    last_seen: datetime | None,
     geoip: dict[str, Any],
     vt: dict[str, Any],
     abuse: dict[str, Any],
 ) -> dict[str, Any]:
-    """Merge all intelligence sources into a unified attacker profile."""
+    """Merge all intelligence sources into a unified attacker profile.
 
-    # Event type frequency
-    event_counts = Counter(a.event_type for a in alerts)
-    event_counts.update(e.event_type for e in events)
+    `totals` is the exact aggregate for this source (`rollups.stats(ip=...)`: total, severity split
+    and event-type counts). `alerts` is only a recent sample, read for payload text that maps to
+    ATT&CK techniques. The profile used to compute its counts, severity split and first/last seen
+    from that sample (the newest 200 alerts plus up to 200 duplicate event rows), so a heavy
+    attacker with 39,916 hits was reported with a capped, doubled number.
+    """
+
+    # Event type frequency, exact
+    event_counts = Counter({row["type"]: row["count"] for row in totals["top_event_types"]})
 
     # Collect all text for TTP mapping
     terms = list(event_counts.keys())
@@ -30,26 +42,22 @@ async def build_profile(
 
     ttps = await map_to_attack(terms)
 
-    # Severity breakdown
-    sev_counts: dict[str, int] = Counter(a.severity.value for a in alerts)  # type: ignore[assignment]
-
-    # Timeline
-    all_timestamps = [a.timestamp for a in alerts] + [e.timestamp for e in events]
-    first_seen = min(all_timestamps).isoformat() if all_timestamps else None
-    last_seen = max(all_timestamps).isoformat() if all_timestamps else None
+    # Severity breakdown, exact
+    sev_counts: dict[str, int] = dict(totals["by_severity"])
 
     # Risk score: 0-100
+    total_alerts = totals["total_alerts"]
     risk_score = _calculate_risk(
-        vt, abuse, ttps, sev_counts, len(alerts), event_types=dict(event_counts)
+        vt, abuse, ttps, sev_counts, total_alerts, event_types=dict(event_counts)
     )
 
     return {
         "ip": ip,
         "risk_score": risk_score,
         "risk_level": _risk_level(risk_score),
-        "first_seen": first_seen,
-        "last_seen": last_seen,
-        "total_events": len(alerts) + len(events),
+        "first_seen": first_seen.isoformat() if first_seen else None,
+        "last_seen": last_seen.isoformat() if last_seen else None,
+        "total_events": total_alerts,
         "event_breakdown": dict(event_counts.most_common(20)),
         "severity_breakdown": dict(sev_counts),
         "mitre_techniques": ttps,

@@ -471,15 +471,20 @@ class EventBuffer:
                     timestamp=ev.timestamp,
                 )
                 session.add(alert)
-                session.add(
-                    AttackerEvent(
-                        ip=ev.source_ip,
-                        event_type=ev.event_type,
-                        extra=ev.payload,
-                        honeytoken_id=ev.honeytoken_id,
-                        timestamp=ev.timestamp,
+                if ev.honeytoken_id is not None:
+                    # Only an event that carries a honeytoken link is kept here: it is the trail
+                    # `honeytoken_status` and the journey read. Every other event used to be copied
+                    # in full (payload included, with no alert_id), doubling the storage and the
+                    # write cost of the whole table for no reader.
+                    session.add(
+                        AttackerEvent(
+                            ip=ev.source_ip,
+                            event_type=ev.event_type,
+                            extra=ev.payload,
+                            honeytoken_id=ev.honeytoken_id,
+                            timestamp=ev.timestamp,
+                        )
                     )
-                )
                 if ev.severity == AlertSeverity.CRITICAL and _is_enrichable_ip(ev.source_ip):
                     to_enrich.append((alert, ev.source_ip))
                 if ev.honeytoken_id is not None and ev.event_type.startswith(
@@ -495,6 +500,8 @@ class EventBuffer:
                         "payload": ev.payload,
                     }
                     await queries.mark_honeytoken_triggered(session, ev.honeytoken_id, trigger_meta)
+            # The rollups are counted by the `before_flush` hook (storage/rollups.py), in this same
+            # transaction, so there is nothing to call here and nothing to forget.
             await session.flush()  # populate alert.id for the enrichment hook
             return [(alert.id, ip) for alert, ip in to_enrich]
 
@@ -553,7 +560,7 @@ async def submit_event(event: PendingEvent) -> None:
 
     Imports are lazy to avoid a cycle (event_buffer ⇄ suppression ⇄
     credential_match)."""
-    from honeypot_mcp import self_probe, suppression
+    from honeypot_mcp import flood_guard, self_probe, suppression
 
     _sanitise_identity(event)
 
@@ -574,6 +581,16 @@ async def submit_event(event: PendingEvent) -> None:
     if suppress and not tripped:
         if rule_id is not None:
             suppression.record_suppressed(rule_id)
+        return
+
+    # Last gate before storage: bound what one source can write (see flood_guard.py). A honeytoken
+    # hit and a CRITICAL event are never dropped; everything else from a source that exceeds its
+    # per-minute budget is counted and summarised instead. Summaries owed for windows that have
+    # ended are flushed here first, so a source that went quiet still gets its summary.
+    guard = flood_guard.get_guard()
+    for summary in guard.due_summaries():
+        await get_buffer().submit(summary)
+    if not tripped and event.severity is not AlertSeverity.CRITICAL and not guard.admit(event):
         return
 
     event.payload, event.size_hint = clamp_payload(event.payload)

@@ -317,6 +317,12 @@ class Settings(BaseSettings):
     # human channels: the first pages, repeats ride along as "+N suppressed". 0 disables it.
     # Honeytoken triggers are never coalesced.
     notify_critical_repeat_seconds: float = 300.0
+    # Per-(source address, event type) cap on events STORED each minute (see flood_guard.py). The
+    # rest are counted and summarised in one `flood_summary` event per window, so volume stays
+    # visible. CRITICAL events and honeytoken hits are never dropped. 0 disables the guard.
+    flood_guard_per_minute: int = 600
+    # Upper bound on tracked (source, event type) windows; the oldest quarter is evicted when full.
+    flood_guard_max_sources: int = 50_000
     # Comma-separated IPs/CIDRs that `blocklist_push_*` must never push (your
     # own gateway, monitoring, office egress). Link-local/private/loopback and
     # non-global addresses are never pushed regardless.

@@ -202,6 +202,55 @@ class Alert(Base):
     honeypot: Mapped[Honeypot | None] = relationship("Honeypot", back_populates="alerts")
 
 
+# Two small partial indexes that make the triage queue cheap on a table of millions of rows.
+# Acknowledgement is a deliberate human act, so acknowledged rows are few: the analyst-facing
+# "untriaged" counts are (total from the rollups) minus (acknowledged, from `ix_alerts_acked`), and
+# the "needs attention" list reads CRITICAL/HIGH from `ix_alerts_urgent`, which holds only the rare
+# severities. Neither index carries the flood of LOW/MEDIUM rows, so neither costs a write for them.
+Index(
+    "ix_alerts_acked",
+    Alert.timestamp,
+    sqlite_where=Alert.acknowledged.is_(True),
+    postgresql_where=Alert.acknowledged.is_(True),
+)
+Index(
+    "ix_alerts_urgent",
+    Alert.severity,
+    Alert.acknowledged,
+    Alert.timestamp,
+    sqlite_where=Alert.severity.in_([AlertSeverity.CRITICAL, AlertSeverity.HIGH]),
+    postgresql_where=Alert.severity.in_([AlertSeverity.CRITICAL, AlertSeverity.HIGH]),
+)
+
+
+class AlertRollup(Base):
+    """Alerts counted per hour, per (severity, event type, source, sensor).
+
+    The cost of a statistic should depend on the size of the answer, not the size of the table. On
+    the live droplet the alert table reached 4.9M rows in nine hours and `alerts_stats`,
+    `soc_brief` and `honeypot_list` took tens of seconds or timed out, because each aggregate read
+    every row. This table is written in the same transaction as the alerts, so it is never out of
+    step with them, and grows with the number of *distinct* (hour, kind, source, sensor)
+    combinations, which a flood does not change. It also survives `alerts_prune`: lifetime figures
+    stay correct after the raw rows are archived.
+
+    `honeypot_id` is 0 for events that belong to no sensor (canary and cloud-event triggers), so it
+    can be part of the primary key.
+    """
+
+    __tablename__ = "alert_rollups"
+    __table_args__ = (Index("ix_alert_rollups_source_ip_bucket", "source_ip", "bucket"),)
+
+    bucket: Mapped[datetime] = mapped_column(UTCDateTime, primary_key=True)
+    severity: Mapped[AlertSeverity] = mapped_column(
+        Enum(AlertSeverity, values_callable=_ev), primary_key=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_ip: Mapped[str] = mapped_column(String(45), primary_key=True)
+    honeypot_id: Mapped[int] = mapped_column(Integer, primary_key=True, default=0)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class Honeytoken(Base):
     __tablename__ = "honeytokens"
 

@@ -9,7 +9,11 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.storage import rollups
 from honeypot_mcp.storage.models import Base
+
+# Every Alert stored in any session is counted into the hourly rollups in the same transaction.
+rollups.install()
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +31,21 @@ def _get_engine():
     global _engine
     if _engine is None:
         settings = get_settings()
+        options: dict = {}
+        if ":memory:" in settings.database_url:
+            # An in-memory SQLite database lives on ONE connection (StaticPool) shared by every
+            # session. The pool's reset-on-return issues a ROLLBACK on that connection whenever any
+            # session closes, which also undoes another session's uncommitted writes: found when
+            # the flusher's Alert INSERT was rolled back by an unrelated session finishing, while
+            # the rows written after it survived. Sessions here always commit or roll back
+            # explicitly (`get_session`), so the reset is not needed; file and PostgreSQL databases
+            # give each session its own connection and are unaffected.
+            options["pool_reset_on_return"] = None
         _engine = create_async_engine(
             settings.database_url,
             echo=False,
             future=True,
+            **options,
         )
         _apply_sqlite_pragmas(_engine, settings.database_url)
     return _engine

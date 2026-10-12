@@ -4,6 +4,38 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Built for scale: statistics read rollups, one flood cannot fill the table, PostgreSQL parity
+
+The previous entry fixed one scan; the cause was the design. Every aggregate read the alert table,
+and a public host's table grows by millions of rows a day. Three changes, each proven on real data.
+
+**`alert_rollups` (migration 0017).** Alerts counted per hour per (severity, event type, source,
+sensor), written by a `before_flush` hook so every Alert writer is counted in its own transaction
+(a rollback takes its counts with it; nobody can forget a helper). `alerts_stats`, `soc_brief`,
+`honeypot_list`, `analyze_attacker` and journey totals, the blocklist/campaign candidates and
+`/metrics` read it; partial indexes `ix_alerts_acked` and `ix_alerts_urgent` keep the triage queue
+off the LOW/MEDIUM flood. On a copy of the real 1.1M-row database the migration takes 11 s and
+1,096,510 alerts become 1,311 rollup rows with the identical total; `alerts_stats`, `soc_brief` and
+`honeypot_list` went from 27 s, over 100 s and 51 s to 0.01 s or less. Windowed answers are exact to
+the second (whole hours from the rollups, the edges from the rows) and are tested against a brute
+force count for six window shapes; lifetime figures survive `alerts_prune`. `analyze_attacker` used
+to describe a source from its newest 200 alerts plus 200 duplicate event rows, so a 39,916-hit
+attacker was reported with a capped, doubled count and first/last seen from the sample; the totals
+are exact now. `attacker_events` keeps only honeytoken-linked events (it copied every event,
+payload included, doubling the table).
+
+**Flood guard (`flood_guard.py`, on by default).** A source keeps its first 600 events a minute per
+event type; the rest are counted into one `flood_summary` event per window, so volume stays visible
+while it stops being the storage mechanism. CRITICAL events and honeytoken hits are never dropped
+and different event types from one source are independent. `FLOOD_GUARD_PER_MINUTE=0` disables it.
+
+**Bugs the work surfaced.** On PostgreSQL `coalesce(x, $3)` in SELECT and `coalesce(x, $5)` in
+GROUP BY are different expressions and the query was rejected (SQLite accepted it): found only by
+running the new migration and queries against a real PostgreSQL 16, pinned by a compile-level test.
+The in-memory test database is one shared connection and the pool's reset-on-return rolled back
+other sessions' uncommitted writes, which made three honeytoken tests lose the flusher's Alert row
+depending on interleaving; reset-on-return is off for `:memory:` with a test that fails without it.
+
 ## Found at 5 million rows: the per-sensor count scanned the whole table
 
 Reading the data the morning after the first night: one SIP source sent about 190 events a second

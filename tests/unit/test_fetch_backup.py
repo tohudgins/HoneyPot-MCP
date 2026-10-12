@@ -497,30 +497,33 @@ def _sha256(path: Path) -> str:
 
 
 def test_a_wal_mode_backup_is_reported_without_side_files_or_changing_a_byte(rig):
-    """The server runs its database in WAL mode and `.backup` keeps that in the file header. A plain
-    read-only open of a WAL database needs its -shm/-wal side files ("unable to open database file"
-    otherwise), which a downloaded snapshot does not have: on the real droplet the transfer verified
-    and then every report query failed, because every test database before this one was in rollback
-    mode. The snapshot must be read as `immutable`: no side files, no writes, checksum intact."""
-    con = sqlite3.connect(rig.db)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.close()
+    """A snapshot in WAL mode must be read as `immutable`. A plain read-only open of a WAL database
+    needs its -shm/-wal side files ("unable to open database file" otherwise), which a downloaded
+    snapshot does not have: on the real droplet the transfer verified and then every report query
+    failed, because every test database before this one was in rollback mode. The backup script now
+    produces rollback-mode snapshots (`VACUUM INTO`), but one taken by an older version, by hand, or
+    by a different tool can still be WAL, so the reader must cope: no side files, no writes,
+    checksum intact."""
+    src = sqlite3.connect(rig.db)
+    src.execute("PRAGMA journal_mode=WAL")  # the server runs in WAL mode
+    src.close()
     rig.seed(*HEALTHY)
     done = rig.fetch()
     assert done.returncode == 0, done.stdout + done.stderr
-
     (backup,) = _backup_dirs(rig)
     db = backup / "honeypot_mcp.db"
-    assert db.read_bytes()[18:20] == b"\x02\x02", "the fixture is really a WAL-mode snapshot"
-    report = (backup / "report.txt").read_text()
-    assert "[PASS] database integrity_check is ok" in report, report
-    assert "[PASS] 4 attacker events from 3 source addresses" in report, report
-    assert "unable to open" not in report
-    assert not list(backup.glob("honeypot_mcp.db-*")), "no -shm/-wal files beside the evidence"
+    assert db.read_bytes()[18:20] == b"\x01\x01", "a fresh snapshot is rollback-mode: no side files"
 
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=WAL")  # a snapshot from an older version or taken by hand
+    con.close()
+    assert db.read_bytes()[18:20] == b"\x02\x02", "the fixture is really a WAL-mode snapshot"
     before = _sha256(db)
     again = rig.run("report", str(backup))
-    assert again.returncode == 0 and "[PASS] 4 attacker events" in again.stdout
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "[PASS] database integrity_check is ok" in again.stdout, again.stdout
+    assert "[PASS] 4 attacker events from 3 source addresses" in again.stdout, again.stdout
+    assert "unable to open" not in again.stdout
     assert _sha256(db) == before and not list(backup.glob("honeypot_mcp.db-*"))
 
 
