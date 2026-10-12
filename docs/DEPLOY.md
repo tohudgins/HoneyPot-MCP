@@ -286,6 +286,12 @@ its *listening* port in step 8 (HTTP on 8080, POP3 on 1110). Add `--admin-allow 
 to let only your own address reach admin SSH, and `--egress limited --dns <resolver>` to let
 Cowrie fetch malware samples (see HARDENING.md, "Malware sample capture").
 
+If you deploy the FTP honeypot, also pass `--ftp-pasv-ports 30000-30049` and set `FTP_PASV_PORT_MIN=30000`
+and `FTP_PASV_PORT_MAX=30049` in `.env`. FTP moves files over a second connection to a port the server
+names; without an opened range that connection is dropped, so a real client logs in and then every
+`LIST`, `RETR` and `STOR` times out. The first live run recorded 9 anonymous logins and not one listing,
+download or upload for exactly this reason. Nothing listens in the range except during a session.
+
 > **ufw does not protect Docker-published ports**, which is one reason this uses nftables
 > directly: Docker's published ports are forwarded, not input, so the firewall's `forward`
 > chain is where a container's outbound connections are refused (a hijacked Cowrie cannot scan,

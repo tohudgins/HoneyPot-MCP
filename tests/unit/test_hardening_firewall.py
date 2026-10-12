@@ -297,3 +297,36 @@ def test_a_single_source_cannot_hold_unlimited_sessions_open_to_a_container_port
 def test_no_container_ports_means_no_connection_cap_rule():
     text = render(_spec(docker_ports=()))
     assert "ct count" not in text and "conn_v4" not in text
+
+
+def test_the_ftp_passive_range_is_opened_so_data_connections_can_arrive():
+    """A default-drop input chain refused FTP's second (data) connection, so a real client logged in
+    and every LIST/RETR timed out. The range is rendered only when asked for, and only for new TCP."""
+    from honeypot_mcp.hardening.firewall import parse_port_range
+
+    with_range = _chain(render(_spec(ftp_pasv=parse_port_range("30000-30049"))), "input")
+    assert "tcp dport 30000-30049 ct state new accept" in with_range
+    assert "30000" not in _chain(render(_spec()), "input")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "why"),
+    [
+        ({"ftp_pasv": (30049, 30000)}, "ascending"),
+        ({"ftp_pasv": (1000, 3000)}, "at most"),
+        ({"ftp_pasv": (3380, 3399)}, "3389"),  # contains a listening honeypot port
+        ({"ftp_pasv": (2190, 2210)}, "2200"),  # contains the admin port
+        ({"ftp_pasv": (0, 100)}, "out of range"),
+    ],
+)
+def test_a_bad_ftp_passive_range_is_refused(kwargs, why):
+    with pytest.raises(FirewallError, match=why):
+        render(_spec(**kwargs))
+
+
+@pytest.mark.parametrize("bad", ["30000", "a-b", "30000-", "-30049", "30000:30049"])
+def test_unreadable_port_ranges_are_refused(bad):
+    from honeypot_mcp.hardening.firewall import parse_port_range
+
+    with pytest.raises(FirewallError):
+        parse_port_range(bad)

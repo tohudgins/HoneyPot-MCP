@@ -61,7 +61,8 @@ PMAP_NULL, PMAP_SET, PMAP_UNSET, PMAP_GETPORT, PMAP_DUMP = 0, 1, 2, 3, 4
 
 MSG_CALL, MSG_REPLY = 0, 1
 REPLY_ACCEPTED = 0
-ACCEPT_SUCCESS, ACCEPT_PROG_UNAVAIL, ACCEPT_PROC_UNAVAIL = 0, 1, 3
+ACCEPT_SUCCESS, ACCEPT_PROG_UNAVAIL, ACCEPT_PROG_MISMATCH, ACCEPT_PROC_UNAVAIL = 0, 1, 2, 3
+_PORTMAP_VERSIONS = (2, 3, 4)
 
 _NFS_PORT = 2049
 _MAX_RECORD = 256 * 1024
@@ -239,6 +240,15 @@ class _NFSProtocol(asyncio.Protocol):
             events, self._pending = self._pending, []
             spawn(self._flush_events(events), name="nfs-event")
 
+    def _local_ip(self) -> str:
+        """The address the client reached us on, for universal addresses (`h1.h2.h3.h4.p1.p2`)."""
+        name = self._transport.get_extra_info("sockname") if self._transport else None
+        host = name[0] if name else "0.0.0.0"
+        return host if host.count(".") == 3 else "0.0.0.0"
+
+    def _universal_address(self, port: int) -> str:
+        return f"{self._local_ip()}.{port >> 8}.{port & 0xFF}"
+
     def _dispatch(self, record: bytes) -> None:
         call = parse_rpc_call(record)
         if call is None:
@@ -296,11 +306,30 @@ class _NFSProtocol(asyncio.Protocol):
             return
 
         if program == PROG_PORTMAP:
+            version = call["version"]
+            if version not in _PORTMAP_VERSIONS:
+                # rpcbind speaks v2, v3 and v4. Anything else gets the mismatch a real one sends,
+                # with the supported range, which is how a client learns to fall back.
+                self._send(
+                    build_reply(
+                        xid,
+                        _u32(min(_PORTMAP_VERSIONS)) + _u32(max(_PORTMAP_VERSIONS)),
+                        ACCEPT_PROG_MISMATCH,
+                    )
+                )
+                return
+            # v2 asks for a port (GETPORT, procedure 3) and lists with ints (DUMP, 4). v3 and v4 ask
+            # for a universal address string (GETADDR, procedure 3) and list `rpcb` entries. nmap's
+            # RPC library and libtirpc (Linux `showmount`) ask for v3/v4 first, and a v2-shaped
+            # answer to those is unparseable: `rpcinfo` scripts failed with "data string too short".
             if procedure == PMAP_GETPORT:
-                # Always point at 2049 — this honeypot is one port, and a
-                # portmapper that advertises services on ports nothing is
-                # listening on is trivially detectable.
-                self._send(build_reply(xid, _u32(_NFS_PORT)))
+                # Always point at 2049: this honeypot is one port, and a portmapper that advertises
+                # services on ports nothing is listening on is trivially detectable.
+                if version == 2:
+                    results = _u32(_NFS_PORT)
+                else:
+                    results = xdr_string(self._universal_address(_NFS_PORT))
+                self._send(build_reply(xid, results))
                 self._emit(
                     "nfs_portmap_query",
                     AlertSeverity.MEDIUM,
@@ -308,7 +337,8 @@ class _NFSProtocol(asyncio.Protocol):
                 )
                 return
             if procedure == PMAP_DUMP:
-                self._send(build_reply(xid, _build_portmap_dump()))
+                dump = _build_portmap_dump() if version == 2 else _build_rpcb_dump(self._local_ip())
+                self._send(build_reply(xid, dump))
                 self._emit(
                     "nfs_portmap_dump",
                     AlertSeverity.MEDIUM,
@@ -372,6 +402,8 @@ def _build_portmap_dump() -> bytes:
     """`rpcinfo -p` output: the RPC services this host claims to run."""
     entries = (
         (PROG_PORTMAP, 2, 6, 111),
+        (PROG_PORTMAP, 3, 6, 111),
+        (PROG_PORTMAP, 4, 6, 111),
         (PROG_NFS, 3, 6, _NFS_PORT),
         (PROG_NFS, 4, 6, _NFS_PORT),
         (PROG_MOUNT, 3, 6, _NFS_PORT),
@@ -379,6 +411,26 @@ def _build_portmap_dump() -> bytes:
     out = b""
     for program, version, protocol, port in entries:
         out += _u32(1) + _u32(program) + _u32(version) + _u32(protocol) + _u32(port)
+    return out + _u32(0)
+
+
+def _build_rpcb_dump(ip: str) -> bytes:
+    """Portmapper v3/v4 DUMP: a list of `rpcb` entries (program, version, netid, universal address,
+    owner). The v2 list is ints; this one is strings, which is what nmap's RPC library parses."""
+
+    def uaddr(port: int) -> str:
+        return f"{ip}.{port >> 8}.{port & 0xFF}"
+
+    entries = (
+        *((PROG_PORTMAP, v, uaddr(111)) for v in _PORTMAP_VERSIONS),
+        (PROG_NFS, 3, uaddr(_NFS_PORT)),
+        (PROG_NFS, 4, uaddr(_NFS_PORT)),
+        (PROG_MOUNT, 3, uaddr(_NFS_PORT)),
+    )
+    out = b""
+    for program, version, addr in entries:
+        out += _u32(1) + _u32(program) + _u32(version) + xdr_string("tcp") + xdr_string(addr)
+        out += xdr_string("superuser")
     return out + _u32(0)
 
 

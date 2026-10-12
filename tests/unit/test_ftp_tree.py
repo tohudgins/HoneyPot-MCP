@@ -313,3 +313,58 @@ async def test_a_scanner_that_takes_the_file_and_replays_the_credential_trips_it
         and a.event_type.startswith("honeytoken_triggered_credential_via_ftp")
     ]
     assert tripped, [a.event_type for a in alerts]
+
+
+# ── Passive data ports: the range the firewall can open ──────────────────────
+
+
+def _free_range(size: int) -> tuple[int, int]:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        low = s.getsockname()[1]
+    return low, low + size - 1
+
+
+async def test_passive_listeners_open_only_inside_the_configured_range(ftp_port, monkeypatch):
+    """Behind a default-drop firewall only an opened range is reachable. An ephemeral port is not, so
+    every FTP session over the internet stalled after login (the live run recorded 9 anonymous logins
+    and not one listing, download or upload)."""
+    from honeypot_mcp.config import get_settings
+
+    low, high = _free_range(5)
+    monkeypatch.setattr(get_settings(), "ftp_pasv_port_min", low)
+    monkeypatch.setattr(get_settings(), "ftp_pasv_port_max", high)
+
+    def run() -> list[int]:
+        ports = []
+        for _ in range(6):
+            ftp = _session(ftp_port)
+            _host, port = ftp.makepasv()
+            ports.append(port)
+            ftp.quit()
+        return ports
+
+    ports = await _in_thread(run)
+    assert all(low <= p <= high for p in ports), (ports, low, high)
+
+
+async def test_an_exhausted_range_is_refused_cleanly_not_by_a_hang(ftp_port, monkeypatch):
+    import ftplib
+
+    from honeypot_mcp.config import get_settings
+
+    low, high = _free_range(1)
+    monkeypatch.setattr(get_settings(), "ftp_pasv_port_min", low)
+    monkeypatch.setattr(get_settings(), "ftp_pasv_port_max", high)
+
+    def run() -> str:
+        first = _session(ftp_port)
+        first.makepasv()  # holds the only port
+        second = _session(ftp_port)
+        try:
+            second.makepasv()
+        except ftplib.Error as exc:
+            return str(exc)
+        return "no error"
+
+    assert (await _in_thread(run)).startswith("425")

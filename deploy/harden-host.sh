@@ -26,6 +26,9 @@
 #   --ports SPEC                honeypot ports the engines listen on: "3389,80>8080,110>1110"
 #                               (A>B: the world connects to A, the engine listens on B)
 #   --docker-ports LIST         ports Docker publishes for Cowrie (default 22; add 23 for telnet)
+#   --ftp-pasv-ports MIN-MAX    passive data ports of the FTP honeypot, e.g. 30000-30049 (also set
+#                               FTP_PASV_PORT_MIN/MAX in .env). Without it every FTP session over the
+#                               internet stalls after login: the data connection is dropped.
 #   --egress closed|limited     closed (default): containers start no connections;
 #                               limited: public web servers only, rate limited (needs --dns)
 #   --dns IP[,IP]               resolver(s) the containers use (required for --egress limited)
@@ -42,6 +45,7 @@ ADMIN_PORT=2200
 ADMIN_ALLOW=""
 PORTS="80>8080,3389,110>1110"
 DOCKER_PORTS="22"
+FTP_PASV=""
 EGRESS=closed
 DNS=""
 ROLLBACK_SECONDS=120
@@ -69,6 +73,7 @@ while [ $# -gt 0 ]; do
     --admin-allow) ADMIN_ALLOW="${2:?}"; shift 2 ;;
     --ports) PORTS="${2:?}"; shift 2 ;;
     --docker-ports) DOCKER_PORTS="${2:?}"; shift 2 ;;
+    --ftp-pasv-ports) FTP_PASV="${2:?}"; shift 2 ;;
     --egress) EGRESS="${2:?}"; shift 2 ;;
     --dns) DNS="${2:?}"; shift 2 ;;
     --install-dir) INSTALL_DIR="${2:?}"; shift 2 ;;
@@ -131,6 +136,7 @@ fw_args() {
   local args=(--admin-port "$ADMIN_PORT" --ports "$PORTS" --docker-ports "$DOCKER_PORTS" --egress "$EGRESS")
   [ -n "$ADMIN_ALLOW" ] && args+=(--admin-allow "$ADMIN_ALLOW")
   [ -n "$DNS" ] && args+=(--dns "$DNS")
+  [ -n "$FTP_PASV" ] && args+=(--ftp-pasv-ports "$FTP_PASV")
   printf '%s\n' "${args[@]}"
 }
 

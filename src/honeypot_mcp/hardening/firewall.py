@@ -113,13 +113,29 @@ class FirewallSpec:
     # stub (systemd-resolved at 127.0.0.53 needs no rule).
     dns_servers: tuple[str, ...] = ()
     docker_bridges: bool = True
-    # Informational: ports Docker publishes (Cowrie). Checked for collisions, never rendered.
+    # Ports Docker publishes (Cowrie). Checked for collisions; the firewall also caps concurrent
+    # connections per source on them (see `render`).
     docker_ports: tuple[int, ...] = field(default=())
     # "closed": containers may not start connections. "limited": they may fetch from public web
     # servers only (malware-sample capture), rate limited, never to private space or the
     # metadata service. Pair with COWRIE_ALLOW_EGRESS=true in the service's environment.
     docker_egress: str = "closed"
     docker_egress_ports: tuple[int, ...] = (80, 443)
+    # Inclusive range the FTP honeypot opens passive data listeners in, or None.
+    ftp_pasv: tuple[int, int] | None = None
+
+
+# Most ports a passive range may span: each is closed unless a session is mid-transfer, but a range
+# that is far wider than the sessions the server will hold is a wide-open hole in a default-drop input.
+_MAX_PASV_RANGE = 1000
+
+
+def parse_port_range(spec: str) -> tuple[int, int]:
+    """`"30000-30049"` -> (30000, 30049). Raises `FirewallError` for anything else."""
+    low, sep, high = spec.strip().partition("-")
+    if not sep or not low.strip().isdigit() or not high.strip().isdigit():
+        raise FirewallError(f"port range {spec!r} must look like 30000-30049")
+    return int(low), int(high)
 
 
 def _valid_port(port: int, what: str) -> int:
@@ -214,6 +230,20 @@ def validate(spec: FirewallSpec) -> None:
         if key in seen:
             raise FirewallError(f"port {redirect.public}/{redirect.proto} is redirected twice")
         seen.add(key)
+    if spec.ftp_pasv is not None:
+        low, high = spec.ftp_pasv
+        _valid_port(low, "FTP passive range")
+        _valid_port(high, "FTP passive range")
+        if high < low or high - low >= _MAX_PASV_RANGE:
+            raise FirewallError(
+                f"FTP passive range {low}-{high} must be ascending and at most {_MAX_PASV_RANGE} ports"
+            )
+        taken = listening | set(spec.docker_ports) | {spec.admin_port}
+        collision = sorted(p for p in taken if low <= p <= high)
+        if collision:
+            raise FirewallError(
+                f"FTP passive range {low}-{high} contains the listening port(s) {collision}"
+            )
     clash = set(spec.docker_ports) & listening
     if clash:
         raise FirewallError(
@@ -317,6 +347,13 @@ def render(spec: FirewallSpec) -> str:
             lines.append(f"\t\t{proto} dport {{ {_set_list(direct)} }} accept")
         if redirected:
             lines.append(f"\t\t{proto} dport {{ {_set_list(redirected)} }} ct status dnat accept")
+    if spec.ftp_pasv is not None:
+        # The FTP honeypot's passive data connections. A real client LISTs and RETRs over a second
+        # connection to a port the server names; with the default-drop input chain that connection
+        # never arrived, so over the internet every FTP session stalled after login and no listing,
+        # download or upload was ever recorded. Nothing listens in the range except during a session.
+        low, high = spec.ftp_pasv
+        lines.append(f"\t\ttcp dport {low}-{high} ct state new accept")
     lines.append("\t}")
 
     if spec.redirects:
@@ -439,6 +476,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dns", default="", help="comma list of resolvers (needed for limited egress)"
     )
+    parser.add_argument(
+        "--ftp-pasv-ports",
+        default="",
+        help='passive data ports of the FTP honeypot, "30000-30049" (match FTP_PASV_PORT_MIN/MAX)',
+    )
     parser.add_argument("--out", help="write here instead of stdout")
     parser.add_argument(
         "--print-listen",
@@ -463,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
             docker_ports=tuple(int(p) for p in split(args.docker_ports)),
             docker_egress=args.egress,
             docker_egress_ports=tuple(int(p) for p in split(args.egress_ports)),
+            ftp_pasv=parse_port_range(args.ftp_pasv_ports) if args.ftp_pasv_ports else None,
         )
         text = render(spec)
         if args.print_listen:

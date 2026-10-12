@@ -4,6 +4,19 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## FTP over the internet never completed a transfer
+
+Testing the bait with a real FTP client against the droplet: login worked, then `LIST` timed out. FTP moves
+data over a **second connection to a port the server names**, the engine named an ephemeral one, and the
+host firewall (default drop) refused it. So from the internet every session stalled after login: the live
+run recorded 9 anonymous logins and 9 passive attempts and not one listing, download or upload, which also
+means `ftp_file_download`, malware-upload capture and the bait could never have fired in production. The
+engine now opens passive listeners only inside `FTP_PASV_PORT_MIN`/`MAX`, and the firewall renderer takes
+`--ftp-pasv-ports 30000-30049` (validated: ascending, at most 1,000 ports, never overlapping a listening or
+admin port; `harden-host.sh` passes it through). Nothing listens in the range except mid-session. Live, from
+outside: LIST, SIZE and RETR agree (158 bytes), the tracked credential is in the file, and the first FTP
+file transfer the deployment has recorded is `ftp_file_download`, HIGH, `bait_served`.
+
 ## Bait in the FTP listing, and a prompt-injection field test
 
 **`passwords.txt` on the FTP decoy now carries a tracked credential** (an FTP token first, else the MySQL

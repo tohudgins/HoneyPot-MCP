@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import random
 import secrets
 from typing import Any
 
@@ -75,6 +76,18 @@ _MAX_PASV_PER_SESSION = 64
 _MAX_EVENT_STRING = 256
 # Unread reply bytes tolerated before the connection is dropped.
 _MAX_WRITE_BACKLOG = 512 * 1024
+
+
+def _pasv_ports() -> list[int]:
+    """Ports to try for a passive listener, in random order: the configured range, or `[0]` (any
+    ephemeral port) when none is set. A range lets the firewall open exactly those ports."""
+    settings = get_settings()
+    low, high = settings.ftp_pasv_port_min, settings.ftp_pasv_port_max
+    if low <= 0 or high < low:
+        return [0]
+    ports = list(range(low, high + 1))
+    random.SystemRandom().shuffle(ports)
+    return ports
 
 
 def _planted_pair() -> tuple[str, str] | None:
@@ -461,6 +474,7 @@ class _FTPProtocol(asyncio.Protocol):
             )
             self._pasv_data_queue = queue
             control_ip = self._peer[0]
+            last_error: OSError | None = None
 
             async def _accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
                 # A data connection must come from the same host as the control
@@ -478,10 +492,14 @@ class _FTPProtocol(asyncio.Protocol):
                     with contextlib.suppress(Exception):
                         await writer.wait_closed()
 
-            try:
-                self._pasv_server = await asyncio.start_server(_accept, "0.0.0.0", 0)
-            except OSError as e:
-                log.warning("PASV listener could not bind: %s", e)
+            for port in _pasv_ports():
+                try:
+                    self._pasv_server = await asyncio.start_server(_accept, "0.0.0.0", port)
+                    break
+                except OSError as e:
+                    last_error = e
+            else:
+                log.warning("PASV listener could not bind: %s", last_error)
                 t.write(b"425 Cannot open passive data connection.\r\n")
                 self._pasv_data_queue = None
                 return

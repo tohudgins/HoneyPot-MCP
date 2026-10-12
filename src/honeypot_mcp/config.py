@@ -117,6 +117,13 @@ class Settings(BaseSettings):
     # Use this on a restored backup, where the recorded sensors must not be launched on your laptop.
     analysis_mode: bool = False
 
+    # Ports the FTP honeypot opens passive data listeners in (inclusive). 0 = any ephemeral port,
+    # which is fine on a laptop and silently useless behind a default-drop firewall: a client logs
+    # in, is told to open a data connection to a port the firewall refuses, and every LIST/RETR times
+    # out. On a VPS set both and load the same range with `harden-host.sh --ftp-pasv-ports`.
+    ftp_pasv_port_min: int = 0
+    ftp_pasv_port_max: int = 0
+
     # Alert (watchdog CRITICAL event, /readyz 503) when a volume the server writes to has
     # less than this many MB free. A full disk silently ends collection: the listeners
     # keep answering while events stop persisting. 0 disables the check.

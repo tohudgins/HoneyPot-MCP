@@ -408,6 +408,69 @@ async def test_nfs_mount_of_a_world_export_is_critical_and_granted():
     assert severities.get(False) == "high"
 
 
+def _u32(data: bytes, pos: int) -> int:
+    return struct.unpack_from(">I", data, pos)[0]
+
+
+def _xdr_read(data: bytes, pos: int) -> tuple[str, int]:
+    length = _u32(data, pos)
+    raw = data[pos + 4 : pos + 4 + length]
+    return raw.decode(), pos + 4 + length + (4 - length % 4) % 4
+
+
+async def _portmap(version: int, procedure: int, args: bytes = b"") -> bytes:
+    from honeypot_mcp.engines.nfs import NFSEngine
+    from honeypot_mcp.storage.models import HoneypotType
+
+    port = await _register(f"nfs-pm-{version}-{procedure}", HoneypotType.NFS)
+    engine = NFSEngine()
+    cid = await engine.start(f"nfs-pm-{version}-{procedure}", port, {})
+    try:
+        return await _talk(port, [(_rpc(100000, version, procedure, args), 0.5)])
+    finally:
+        await engine.stop(cid)
+
+
+async def test_portmapper_v3_dump_is_the_rpcb_list_nmap_parses():
+    """nmap's RPC library asks the portmapper for a v3 DUMP: entries of (program, version, netid,
+    universal address, owner). The engine answered with the v2 list of ints, so every nmap `rpcinfo`
+    and `nfs-*` script failed with "data string too short" while the lenient `rpcinfo` binary
+    accepted it. Decoded here with a strict parser, to the last byte."""
+    reply = await _portmap(3, 4)
+    assert _u32(reply, 24) == 0, "accepted"
+    pos, entries = 28, []
+    while _u32(reply, pos) == 1:
+        program, version = struct.unpack_from(">II", reply, pos + 4)
+        netid, after = _xdr_read(reply, pos + 12)
+        addr, after = _xdr_read(reply, after)
+        owner, pos = _xdr_read(reply, after)
+        entries.append((program, version, netid, addr, owner))
+    assert _u32(reply, pos) == 0 and pos + 4 == len(reply), "terminated, nothing left over"
+
+    seen = {(p, v) for p, v, *_ in entries}
+    assert {(100000, 2), (100000, 3), (100000, 4), (100003, 3), (100005, 3)} <= seen
+    assert {netid for _p, _v, netid, _a, _o in entries} == {"tcp"}
+    nfs_addr = next(a for p, v, _n, a, _o in entries if (p, v) == (100003, 3))
+    assert re.fullmatch(r"\d+\.\d+\.\d+\.\d+\.8\.1", nfs_addr), nfs_addr  # port 2049 = 8*256+1
+
+
+async def test_portmapper_v3_getaddr_returns_a_universal_address_and_v2_still_a_port():
+    rpcb = struct.pack(">II", 100005, 3) + _xdr("tcp") + _xdr("") + _xdr("")
+    v3 = await _portmap(3, 3, rpcb)
+    addr, end = _xdr_read(v3, 28)
+    assert addr.endswith(".8.1") and end == len(v3)
+
+    v2 = await _portmap(2, 3, struct.pack(">IIII", 100005, 3, 6, 0))
+    assert _u32(v2, 28) == 2049 and len(v2) == 32
+
+
+async def test_an_unsupported_portmapper_version_gets_a_mismatch_with_the_supported_range():
+    """What a real rpcbind sends, and how a client learns to fall back to a version it can use."""
+    reply = await _portmap(7, 4)
+    assert _u32(reply, 24) == 2, "PROG_MISMATCH"
+    assert (_u32(reply, 28), _u32(reply, 32)) == (2, 4)
+
+
 # ── Cross-cutting ───────────────────────────────────────────────────────────
 
 
