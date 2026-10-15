@@ -530,6 +530,7 @@ claude mcp add honeypot-analysis \
 | Which sources act together | `analyze_campaign`, `fingerprint_clusters` (SSH client fingerprints) |
 | Record a verdict | `alerts_acknowledge` (a source, an event type or ids; sets true/false positive) |
 | Hand it on | `generate_report` (markdown or html), `export_stix`, `export_blocklist`, `alerts_export` |
+| Ask a question none of the tools anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and 15 s). Prefer `alert_rollups` for anything over the whole run. Grafana has the same thing: the **Query** dashboard takes SQL in its `sql` box. |
 
 Measured on the first real run (4.9M alerts, 3.7 GB): opening it takes seconds and each of these
 calls returns in well under two seconds, because statistics read pre-aggregated rollups and not

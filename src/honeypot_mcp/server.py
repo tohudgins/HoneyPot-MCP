@@ -341,6 +341,7 @@ import honeypot_mcp.tools.honeypot  # noqa: E402, F401
 import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
 import honeypot_mcp.tools.integrations  # noqa: E402, F401
 import honeypot_mcp.tools.pcap  # noqa: E402, F401
+import honeypot_mcp.tools.sql  # noqa: E402, F401
 
 # ── Built-in diagnostic tools ─────────────────────────────────────────────────
 

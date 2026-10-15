@@ -303,11 +303,14 @@ file request, but a real `rsync` client then waits for a file list, which needs 
 compat flags, checksum negotiation and varint-encoded entries inside multiplexed framing. The detection
 (CRITICAL on the anonymous module request) is unaffected; the transfer itself is not emulated.
 
-**Grafana panels read the raw `alerts` table.** Thirteen panel queries took 17.8 s in total on 4.9M
-alerts (slowest 4.0 s, the tactic timeline), growing linearly with the table. That is fine for a run of
-days; at tens of millions of rows the aggregate panels (window totals, top attackers, top event types)
-should read the hourly rollups the way the MCP tools do, which needs the whole-hours-plus-raw-edges
-logic in SQL to stay exact. The tools, which analysis uses, are already independent of table size.
+**Grafana: aggregate panels read rollups, time series and geo panels still read raw alerts.** Six panels
+(window totals, unique sources, critical count, alerts by sensor, top attackers, top event types) read
+the hourly rollups for whole hours and the raw table only for the partial hours at each edge, so they are
+exact (identical to `alerts_stats` and to a raw `GROUP BY` on 14.9M real alerts) and answer in 0.00-0.03 s
+however large the run gets (`scripts/dashboard_rollups.py`, pinned by `test_dashboard_rollups.py`). The
+six that remain on `alerts` need sub-hour buckets (the time series, the tactic timeline) or a payload field
+the rollups do not hold (geo country, observed tactics), and take 5-14 s each at 14.9M alerts, growing
+with the run. The MCP tools and `sql_query`, which analysis uses, are independent of table size.
 
 **SMTP engine.** Speaks Postfix's dialect rather than accepting everything:
 commands out of sequence get the 503 Postfix gives (`RCPT` before `MAIL`, nested

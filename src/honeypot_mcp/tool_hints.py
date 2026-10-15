@@ -70,6 +70,7 @@ _FLAGS: dict[str, str] = {
     "honeytoken_status": "R",
     "map_ttps": "R",
     "attack_summary": "R",
+    "sql_query": "R",
     "pcap_files": "R",
     "pcap_status": "R",
     "ping": "R",
@@ -136,6 +137,7 @@ _TITLES = {
     "honeytoken_list": "List Honeytokens",
     "map_ttps": "Map to MITRE ATT&CK",
     "attack_summary": "ATT&CK Summary",
+    "sql_query": "Read-only SQL Query",
     "soc_brief": "SOC Shift Brief",
     "ping": "Ping",
 }

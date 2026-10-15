@@ -4,6 +4,31 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Ask your own questions: a read-only SQL tool and a Grafana query box; dashboards that stay fast
+
+**`sql_query`** (MCP, viewer role, works in analysis mode): one `SELECT` or `WITH ... SELECT` over `alerts`,
+`alert_rollups` and `honeypots`. Layered so a mistake cannot write: only one SELECT statement (keywords
+inside string literals and comments are fine), a subquery wrapper (a write is a syntax error inside one),
+a read-only transaction, the secret tables (`honeytokens`, `api_keys`, `subscriptions`, `audit_log`, schema
+catalogues) refused by name, at most 1,000 rows and 15 seconds, and a result that says when it was cut.
+Real data: an indexed query and a rollup query return in 0.0 s, a JSON search across 14.9M alerts in 5.9 s
+(414,048 `wget` payloads), a `DELETE` and a secret table are refused. The test found a real bug first: a
+trailing `-- comment` swallowed the wrapper's closing parenthesis.
+
+**Grafana.** A **Query** dashboard (`04-query.json`): type SQL into the `sql` box, the table runs it, with the
+tables, JSON tips and four example hunts beside it. (The provisioned datasource is `editable: false` and
+Grafana's default Viewer role cannot open Explore, which is why ad-hoc querying was not possible.) Six
+aggregate panels now read the hourly rollups for whole hours and raw alerts for the partial hours at each
+edge: identical to `alerts_stats` and to a raw `GROUP BY` on 14.9M real alerts (8,807,993 alerts, 2,131
+sources, 3,964 critical for a ragged window), in 0.01 s instead of 1-2 s, and independent of run size.
+`scripts/dashboard_rollups.py` rewrites them; `test_dashboard_rollups.py` runs the shipped SQL against a raw
+`GROUP BY` for mid-hour, on-the-hour and inside-one-hour windows, and fails if either edge is dropped.
+
+**Census of the 25 engines against real traffic** (5.27M real alerts, my own tests excluded): nine engines
+have every signature event triggered by real attackers; the rest are missing only post-login events
+(RDP session, IMAP/POP3 login success, SQL file reads, JNDI, SMB exploit) or are off on the VPS (SMTP, DNS).
+`ldap_jndi_lookup` was confirmed live from outside (CRITICAL).
+
 ## FTP over the internet never completed a transfer
 
 Testing the bait with a real FTP client against the droplet: login worked, then `LIST` timed out. FTP moves

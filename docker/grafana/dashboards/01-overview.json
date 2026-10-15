@@ -32,10 +32,10 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT COUNT(*) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')",
+          "queryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT COALESCE(SUM(n), 0) AS value FROM w",
           "queryType": "table",
           "timeColumns": [],
-          "rawQueryText": "SELECT COUNT(*) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')"
+          "rawQueryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT COALESCE(SUM(n), 0) AS value FROM w"
         }
       ],
       "options": {
@@ -93,10 +93,10 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT COUNT(DISTINCT source_ip) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')",
+          "queryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT COUNT(DISTINCT source_ip) AS value FROM w",
           "queryType": "table",
           "timeColumns": [],
-          "rawQueryText": "SELECT COUNT(DISTINCT source_ip) AS value FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')"
+          "rawQueryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT COUNT(DISTINCT source_ip) AS value FROM w"
         }
       ],
       "options": {
@@ -183,10 +183,10 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT COUNT(*) AS value FROM alerts WHERE severity = 'critical' AND timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')",
+          "queryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT COALESCE(SUM(n), 0) AS value FROM w WHERE severity = 'critical'",
           "queryType": "table",
           "timeColumns": [],
-          "rawQueryText": "SELECT COUNT(*) AS value FROM alerts WHERE severity = 'critical' AND timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch')"
+          "rawQueryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT COALESCE(SUM(n), 0) AS value FROM w WHERE severity = 'critical'"
         }
       ],
       "options": {
@@ -356,10 +356,10 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT h.type AS engine, COUNT(*) AS count FROM alerts a LEFT JOIN honeypots h ON a.honeypot_id = h.id WHERE a.timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY h.type ORDER BY count DESC",
+          "queryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT h.type AS engine, SUM(w.n) AS count FROM w LEFT JOIN honeypots h ON w.honeypot_id = h.id GROUP BY h.type ORDER BY count DESC",
           "queryType": "table",
           "timeColumns": [],
-          "rawQueryText": "SELECT h.type AS engine, COUNT(*) AS count FROM alerts a LEFT JOIN honeypots h ON a.honeypot_id = h.id WHERE a.timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY h.type ORDER BY count DESC"
+          "rawQueryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT h.type AS engine, SUM(w.n) AS count FROM w LEFT JOIN honeypots h ON w.honeypot_id = h.id GROUP BY h.type ORDER BY count DESC"
         }
       ],
       "options": {
@@ -404,12 +404,12 @@
       "targets": [
         {
           "refId": "A",
-          "queryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, strftime('%Y-%m-%dT%H:%M:%SZ', MAX(timestamp)) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10",
+          "queryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT source_ip AS ip, SUM(n) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity = 'critical' THEN n ELSE 0 END) AS critical_hits, strftime('%Y-%m-%dT%H:00:00Z', MAX(ts)) AS last_seen_hour FROM w GROUP BY source_ip ORDER BY hits DESC LIMIT 10",
           "queryType": "table",
           "timeColumns": [
-            "last_seen"
+            "last_seen_hour"
           ],
-          "rawQueryText": "SELECT source_ip AS ip, COUNT(*) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) AS critical_hits, strftime('%Y-%m-%dT%H:%M:%SZ', MAX(timestamp)) AS last_seen FROM alerts WHERE timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') GROUP BY source_ip ORDER BY hits DESC LIMIT 10"
+          "rawQueryText": "WITH b AS (SELECT $__from / 1000 AS f, $__to / 1000 AS t, ($__from / 1000 + 3599) / 3600 * 3600 AS lo, $__to / 1000 / 3600 * 3600 AS hi), w AS (SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0) AS honeypot_id, count AS n, bucket AS ts FROM alert_rollups, b WHERE lo < hi AND bucket >= datetime(lo, 'unixepoch') AND bucket < datetime(hi, 'unixepoch') UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE timestamp >= datetime(f, 'unixepoch') AND ((lo < hi AND timestamp < datetime(lo, 'unixepoch')) OR (lo >= hi AND timestamp <= datetime(t, 'unixepoch'))) UNION ALL SELECT severity, event_type, source_ip, COALESCE(honeypot_id, 0), 1, timestamp FROM alerts, b WHERE lo < hi AND timestamp >= datetime(hi, 'unixepoch') AND timestamp <= datetime(t, 'unixepoch')) SELECT source_ip AS ip, SUM(n) AS hits, COUNT(DISTINCT event_type) AS event_types, SUM(CASE WHEN severity = 'critical' THEN n ELSE 0 END) AS critical_hits, strftime('%Y-%m-%dT%H:00:00Z', MAX(ts)) AS last_seen_hour FROM w GROUP BY source_ip ORDER BY hits DESC LIMIT 10"
         }
       ],
       "fieldConfig": {

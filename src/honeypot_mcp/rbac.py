@@ -361,6 +361,7 @@ VIEWER_TOOLS: frozenset[str] = frozenset(
         "analyze_campaign",
         "map_ttps",
         "attack_summary",
+        "sql_query",
         "generate_report",
         "analyze_attacker_journey",
         "analyze_session",
