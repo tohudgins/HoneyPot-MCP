@@ -473,6 +473,11 @@ def _rewrite_home(
     node = _walk(root, f"{base}/.bash_history")
     if node is not None:
         node[A_CTIME] = _BASE_CTIME + rng.randint(0, 20_000_000)
+    # Most attackers log in as root (105k of the first run's ~220k successful logins; `admin` was next),
+    # not as the persona's own user, so the same bait must be in /root or they never see it.
+    _put(root, "/root/.bash_history", history, mode=0o100600, uid=0, gid=0)
+    for path, (data, mode) in bait_files("root", "/root", credential).items():
+        _put(root, path, data, mode=mode, uid=0, gid=0)
 
 
 def persona_tar(fs_pickle: bytes, sitecustomize: bytes | None = None) -> bytes:

@@ -1567,6 +1567,16 @@ to reduce alert latency.
   back without the patch and a warning says so. The compose values are literals pinned to
   `cowrie_env_vars` by `test_compose_sensor_carries_the_same_algorithm_environment_as_the_engine`;
   `tests/integration/test_cowrie_fingerprint.py` reads the wire of the real image.
+- **Cowrie behaves like coreutils where scripts lean on it.** `cowrie_sitecustomize` also patches
+  `head`/`tail` (legacy `-N` form to `-n N`, which stock Cowrie rejects with "invalid option -- '2'") and
+  `uptime`/`w`/`/proc/uptime` (a per-hostname boot offset of 3-27 days plus real elapsed time; stock Cowrie
+  counted from container start, so every restart read "up 11 min"). The persona filesystem carries a
+  **tracked credential** as bait: `~/.bash_history` has a `mysql -u USER '-pPASS' -h db1.internal` line and
+  `~/.my.cnf` the same pair (mode 600), resolved in `ssh.py:start` from `planted_credential("mysql")` (a
+  deterministic untracked decoy when no token exists). It is written to **both** `/root` and the persona's
+  own user: 105k of the first run's successful logins were `root` and 70k `admin`, and never the persona's
+  user, so bait only under `/home/<persona-user>` was never read. A Cowrie container only picks all of this up
+  when it is recreated (`honeypot_stop remove=True`, then deploy).
 - **Transient DB errors are retried, permanent ones are not.** `EventBuffer._write_retrying`.
 - `tls_dir` / `reports_dir` are settings; tests redirect both to `tmp_path` (conftest).
 

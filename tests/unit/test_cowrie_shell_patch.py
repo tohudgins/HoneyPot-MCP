@@ -43,6 +43,30 @@ def test_patched_head_start_sees_normalised_args():
     assert seen == [["-n", "2", "x"]]
 
 
+def test_patched_head_and_tail_each_keep_their_own_start():
+    """`tail -3` was rejected exactly like `head -2`; and wrapping both in one loop must not make
+    one command call the other's original (the classic late-binding closure mistake)."""
+    calls: list[tuple[str, list[str]]] = []
+
+    class Command_head:
+        def start(self):
+            calls.append(("head", list(self.args)))
+
+    class Command_tail:
+        def start(self):
+            calls.append(("tail", list(self.args)))
+
+    module = types.ModuleType("cowrie.commands.fs")
+    module.Command_head = Command_head  # type: ignore[attr-defined]
+    module.Command_tail = Command_tail  # type: ignore[attr-defined]
+    patch.patch_commands_fs(module)
+    for cls, args in ((Command_head, ["-2", "a"]), (Command_tail, ["-3", "b"])):
+        cmd = cls()
+        cmd.args = args
+        cmd.start()
+    assert calls == [("head", ["-n", "2", "a"]), ("tail", ["-n", "3", "b"])]
+
+
 def test_boot_offset_is_stable_per_host_and_several_days():
     offsets = {patch.boot_offset_seconds(f"host-{i}") for i in range(200)}
     assert len(offsets) > 100, "hosts must not all share one uptime"
@@ -154,3 +178,19 @@ def test_a_different_token_changes_the_bait():
     a, user = _build(("u1", "p1"))
     b, _ = _build(("u2", "p2"))
     assert cf._read(a, f"/home/{user}/.my.cnf") != cf._read(b, f"/home/{user}/.my.cnf")
+
+
+@pytest.mark.parametrize("persona", list(_PERSONAS))
+def test_the_bait_is_also_in_roots_home_because_that_is_who_attackers_log_in_as(persona):
+    """The first run had 105,066 successful logins as `root` and 70,460 as `admin`; the persona's own
+    user (`appuser`, `deploy`...) never appears. Bait only under /home/<user> was never read by anyone."""
+    pair = ("gitlab_f019", "26wJh#f$BgZiv56V")
+    root, user = _build(pair, persona=persona)
+
+    history = cf._read(root, "/root/.bash_history")
+    cnf = cf._read(root, "/root/.my.cnf")
+    assert "mysql -u gitlab_f019 '-p26wJh#f$BgZiv56V' -h db1.internal\n" in history
+    assert 'user=gitlab_f019\npassword="26wJh#f$BgZiv56V"\n' in cnf
+    node = cf._walk(root, "/root/.my.cnf")
+    assert node[cf.A_MODE] == 0o100600 and node[cf.A_UID] == 0, "root's own, mode 600"
+    assert node[cf.A_SIZE] == len(cnf.encode()), "ls -l and cat agree"

@@ -248,16 +248,20 @@ def normalise_head_args(args: list[str]) -> list[str]:
 
 
 def patch_commands_fs(module: ModuleType) -> None:
-    command = getattr(module, "Command_head", None)
-    if command is None:
-        return
-    original = command.start
+    """`head -2` and `tail -3` (the legacy `-N` form) are accepted by coreutils; Cowrie rejects both."""
+    for name in ("Command_head", "Command_tail"):
+        command = getattr(module, name, None)
+        if command is None:
+            continue
 
-    def start(self: Any) -> Any:
-        self.args = normalise_head_args(list(self.args))
-        return original(self)
+        def wrap(original: Any) -> Any:
+            def start(self: Any) -> Any:
+                self.args = normalise_head_args(list(self.args))
+                return original(self)
 
-    command.start = start
+            return start
+
+        command.start = wrap(command.start)
 
 
 # ── uptime ───────────────────────────────────────────────────────────────────────────────────
