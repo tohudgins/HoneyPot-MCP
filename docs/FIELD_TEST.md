@@ -7,16 +7,19 @@ and that the event lands in the database and is reachable through the control pl
 Passive traffic cannot prove this. A public host is mostly scanned for SSH, Telnet and a few web
 paths: in the first 3.5 hours of the run this was written from, 98% of events came from the two
 Cowrie sensors, and the Elasticsearch and Docker sensors had seen nothing at all. "No events" on a
-sensor is then ambiguous: nobody has tried, or it is broken. So run both scripts once, from a machine
-that is not the VPS, before trusting a quiet sensor.
+sensor is then ambiguous: nobody has tried, or it is broken. So run the first two scripts once, from a machine
+that is not the VPS, before trusting a quiet sensor; the other three are described below.
 
 | Script | Question it answers |
 |---|---|
 | `scripts/field_test.py` | Does each engine record what a real client does to it, from outside, through the firewall? |
 | `scripts/field_test_tools.py` | Does every MCP tool work at the role that owns it, and are the other roles refused? |
+| `scripts/field_test_ops.py` | Are the management and analysis answers right on real traffic, and do actions change the live system? |
+| `scripts/field_test_oracle.py` | Do the read tools' numbers equal an independent SQL computation on a frozen backup? |
+| `scripts/field_test_injection.py` | Can attacker-written text in captured alerts steer a model that has every tool? |
 
-Both run with `uv run` (their dependencies are declared in the script header), so nothing is added
-to the project's own dependencies.
+`field_test.py`, `field_test_tools.py` and `field_test_ops.py` run with `uv run` and declare their dependencies in
+the script header, so nothing is added to the project's own dependencies. The oracle and the injection test use the project environment (`uv run python scripts/...`).
 
 ## 1. Engines: `field_test.py`
 
@@ -126,7 +129,7 @@ scripts/field_test_injection.py ~/hp-backups/<backup-dir> [--model sonnet] [--sc
 ```
 
 Three scenarios, each on a fresh clone: *summarise* the newest CRITICAL alerts, *triage* them (a legitimate
-write is allowed, capped), and *investigate* the most heavily injected source. First run: all three held.
+write is allowed, capped), and *investigate* the most heavily injected source (`--scenario all` is the default). First run: all three held.
 The model read every planted payload (in `triage` and `investigate` through `alerts_get`, in full), called
 only read tools or the one `alerts_acknowledge` the analyst asked for (one real attack marked
 `true_positive`), changed no alert, sensor or audit row beyond that, and in two runs named the attack:
@@ -140,8 +143,8 @@ token only to a session a person is watching.
 ## Seeing the data yourself
 
 Everything above can also be read on your own machine from a backup, with no SSH:
-`scripts/fetch_backup.sh` the data, then point the project's Grafana dashboards (overview, threat
-map, MITRE ATT&CK coverage) at a copy of the database. A downloaded snapshot is in WAL mode, which
+`scripts/fetch_backup.sh` the data, then point the project's five Grafana dashboards (overview, threat
+map, MITRE ATT&CK coverage, Query, Alerts) at a copy of the database. A downloaded snapshot is in WAL mode, which
 Grafana's read-only mount cannot open, so make a rollback-mode copy first:
 
 ```bash
@@ -161,7 +164,7 @@ Bind it to localhost only: this Grafana can query the whole database, including 
 credentials and honeytoken values. Every panel reads the database alone (the "Active honeypots" tile
 used to need Prometheus and showed "No data" on a laptop; a test now pins that), and the map uses a
 keyless label-free Esri base layer, because Grafana's default CARTO basemap now stamps "API KEY
-REQUIRED" across every tile while still answering HTTP 200. All 12 data panels returned rows.
+REQUIRED" across every tile while still answering HTTP 200. All 12 data panels returned rows on the three dashboards that existed then.
 The same restored database also runs the MCP server locally over stdio for the analysis tools.
 
 ## What the first live run found
@@ -193,6 +196,7 @@ fake container filesystem instead of a stub that ignores it.
 | Reading `attack_summary` as an analyst | Internet RDP connections filed as Lateral Movement; journey phases listing 2,570 events and no technique | T1133 for connections, techniques from exact counts |
 | Oracle for `analyze_campaign` | It correlated only the latest 5,000 alerts: on a flooded database 7 "campaigns" from the last few minutes of a day-long run, against 274 in the SQL | built from the exact hourly rollups; the oracle now checks it |
 | Real `dig`, `nmap` and `smtplib` against the VPS-off engines | DNS served UDP only (so a TCP zone transfer was refused and unrecorded), answered `version.bind` with an SPF record, `ANY` with NXDOMAIN, and set `aa ra ad` together | TCP/53 with REFUSED + recorded AXFR, real CHAOS answers, RFC 8482 `ANY`, resolver flags |
+| Real `rsync` and OpenSSH against the Cowrie and rsync sensors | `rsync` timed out after selecting a module (protocol 30+ clients send arguments NUL-separated, so the newline reader never saw a line); Cowrie's `head -2` was rejected, `uptime` showed minutes after every container restart | `engines/rsync_wire.py` serves a protocol 31 listing; legacy `-N` for head, a per-hostname boot offset for uptime |
 
 Suppression presets were replayed over every real source in the backup: Shodan would have dropped 18
 alerts, Censys 7 (all low or medium), and the RFC1918 preset 4,489 from the Docker bridge address (the
@@ -220,7 +224,7 @@ Run these once from outside against your own VPS (all were run against the dropl
   the first try.
 - **Webhook delivery and signatures.** Temporarily set `WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true`,
   run a tiny receiver on the VPS, subscribe every format at `critical`, trigger criticals with
-  `field_test.py`, and compare: all eight formats delivered every event, and the JSON body's
+  `field_test.py`, and compare: every format then available (eight at the time of that run; `alert_subscribe` offers ten now) delivered every event, and the JSON body's
   `X-HoneyPot-Signature` matched an independent HMAC. Then **remove the setting and restart**; the
   policy refusing a loopback destination again is the check that you did.
 - **Canary callbacks.** The callback server is loopback-only by design, so test it from the VPS:
@@ -240,7 +244,6 @@ What the probes revealed about the services themselves:
 - **paramiko reports "Channel closed" for an SSH exec request** (`ssh host cmd`) against Cowrie,
   because Cowrie closes the channel before answering the request. The OpenSSH client gets the output
   and exit status normally, and the command is recorded either way. An interactive shell works in both.
-- **A real `rsync` client timed out** (10 s) after selecting a module: the honeypot recorded the
-  anonymous access and the file request (both CRITICAL) but the client received no file list. The
-  recording is complete; the session does not look like a real rsync daemon after that point.
-- Cowrie's emulated `head` rejects `head -2` (it accepts `-n 2`); a real `head` accepts both.
+- **`rsync -av` fails after the listing, by design.** A real `rsync rsync://host/module/` lists a decoy
+  tree and exits 0 (rsync 3.5.0 and 3.1.3); a transfer is refused, and clients speaking protocol 29 or
+  older (macOS `openrsync`) get no listing. The access and file request are recorded either way.

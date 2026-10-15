@@ -111,7 +111,7 @@ cd /opt/honeypot-mcp
 
 > **Architecture — read this once.** The MCP server is the *control plane*:
 > you talk to it in natural language and it deploys/monitors honeypots.
-> The in-process engines (HTTP/SMTP/FTP/DNS/RDP/VNC/Redis/MySQL/Elasticsearch)
+> The in-process engines (every engine except SSH and Telnet)
 > run *inside the server process* and bind host ports directly; the SSH engine
 > launches Cowrie as its own Docker container. Because the honeypots live in
 > the server process, **the server must run persistently** — not spawned per
@@ -186,6 +186,8 @@ CANARY_PUBLIC_URL=http://<your-vps-ip>
 # EMPTY otherwise: any non-empty placeholder is treated as a key.
 VIRUSTOTAL_API_KEY=
 ABUSEIPDB_API_KEY=
+# OPTIONAL extra providers, off unless set (enrich_ip and CRITICAL notifications; not yet run live with keys):
+# GREYNOISE_API_KEY=   ABUSECH_AUTH_KEY=   OTX_API_KEY=   SHODAN_INTERNETDB_ENABLED=true
 
 # OPTIONAL — drop GeoLite2 databases in config/ for geo + network enrichment
 GEOIP_DB_PATH=config/GeoLite2-City.mmdb
@@ -256,7 +258,7 @@ containers whose published ports (22, 23) Docker forwards itself.
 > **Why the guard.** Membership in the `docker` group is root-equivalent: anyone who can talk
 > to the daemon can start a privileged container that mounts `/`. This service parses
 > attacker-controlled bytes all day, so a bug in it must not reach that. The guard
-> (`honeypot-docker-guard.service`, `hardening/docker_guard.py`) forwards only the Cowrie
+> (`honeypot-docker-guard.service`, `src/honeypot_mcp/hardening/docker_guard.py`) forwards only the Cowrie
 > container operations the SSH engine makes, from the pinned image with the engine's own
 > security settings, and refuses everything else with 403: no privileged containers, no host
 > mounts, no exec, no other images. See HARDENING.md.
@@ -394,11 +396,11 @@ datasource can read the whole database (captured credentials, honeytoken
 values), so never publish it. For Prometheus (in a container) to scrape the
 host daemon, set `METRICS_HOST` to the Docker bridge gateway (e.g.
 `172.17.0.1`) rather than `0.0.0.0`. Dashboards: Overview, Threat Map, MITRE
-Coverage.
+Coverage, Query (read-only SQL box, see step 13) and Alerts (filterable alert browser).
 
 ### 10. Pre-flight, then go live
 
-Run the checks before you open the firewall to the world. They take seconds and find the
+Run the checks before you walk away from the host. They take seconds and find the
 mistakes that are cheap now and expensive once traffic arrives:
 
 ```bash

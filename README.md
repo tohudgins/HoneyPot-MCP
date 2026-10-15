@@ -3,7 +3,7 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-1448%20unit%20%2B%2011%20e2e-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2216%20unit%20%2B%2023%20integration-brightgreen)](tests/)
 
 **Deception infrastructure you drive by talking to it.** Deploy honeypots across 25
 protocols, plant honeytokens, and analyse what attackers actually do — from a chat
@@ -62,7 +62,7 @@ http://localhost:3000   ← Grafana, for historical dashboards
 ```
 
 That brings up the server, a live Cowrie SSH honeypot on `:2222`, an HTTP honeypot on
-`:8080`, Prometheus, and three provisioned Grafana dashboards. The honeypots are real —
+`:8080`, Prometheus, and five provisioned Grafana dashboards (overview, threat map, ATT&CK coverage, a **Query** box that runs read-only SQL, and an **Alerts** browser). The honeypots are real —
 SSH into `localhost:2222` with any password and watch your own session appear in the
 console within seconds.
 
@@ -150,7 +150,7 @@ Three design decisions worth calling out:
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-1448 unit tests plus 11 end-to-end pipeline tests cover the security-critical paths; ruff and mypy are blocking in CI
+2216 unit tests plus 23 integration tests (Docker- and network-gated ones skip without them) cover the security-critical paths; ruff and mypy are blocking in CI
 across Python 3.11–3.14.
 
 ---
@@ -197,6 +197,12 @@ cp .env.example .env         # optional — everything works without keys
 | `GEOIP_DB_PATH` | Country/city/coords on every alert (City DB) | free, registration |
 | `GEOIP_ASN_DB_PATH` | Origin AS number + org — spot hosting/VPN/botnet networks (ASN DB) | free, same account |
 | `CANARY_PUBLIC_URL` | Honeytokens that fire from the internet | ngrok / a domain |
+| `GREYNOISE_API_KEY` | GreyNoise: known mass scanner / benign crawler, in `enrich_ip` | free community tier |
+| `ABUSECH_AUTH_KEY` | abuse.ch (MalwareBazaar, URLhaus, ThreatFox) hash/URL lookups, `lookup_hash` | free |
+| `OTX_API_KEY` | AlienVault OTX pulses an address appears in | free |
+| `SHODAN_INTERNETDB_ENABLED=true` | Shodan InternetDB open ports/CPEs for an address (no key) | free |
+
+The last four are off unless set, cached, bounded by one 3 s fan-out deadline, and have been tested against stubs of the vendors' published contracts, not yet run live with keys (`scripts/intel_smoke.py` makes one live call per provider).
 
 ---
 
@@ -292,7 +298,7 @@ accept commands.
 
 Before exposing a VPS, run `scripts/preflight.sh` (see the go-live checklist in DEPLOY.md): it checks the control plane, bind addresses, disk, ports, backups, and probes every sensor end to end.
 To harden the host first (default-drop firewall, a validating Docker guard so the service never holds root-equivalent access, sandboxed units, key-only SSH, moved control ports), follow [docs/HARDENING.md](docs/HARDENING.md): the honeypots stay fully reachable, everything around them does not.
-After deploying, prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one, and `scripts/field_test_tools.py` exercises all 65 MCP tools at their roles ([docs/FIELD_TEST.md](docs/FIELD_TEST.md)). A quiet sensor on a real VPS is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
+After deploying, prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one, `scripts/field_test_tools.py` exercises all 70 MCP tools at their roles, and `scripts/field_test_ops.py`, `scripts/field_test_injection.py` and `scripts/field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([docs/FIELD_TEST.md](docs/FIELD_TEST.md)). A quiet sensor on a real VPS is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
 
 **Internal tripwire.** Put honeypots on ports nothing legitimate uses. Anything on your
 LAN that connects is by definition not supposed to be — a compromised laptop sweeping
@@ -328,9 +334,8 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 | `soc_brief` | Shift handover — what needs a human, separated from the background radiation |
 | `honeypot_deploy` | Deploy any of the 25 engine types |
 | `honeypot_stop` | Stop one, several by name, or every honeypot matching a type/status filter |
-| `honeytoken_rotate` | Replace a token's secret while keeping its identity and history |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
-| `honeypot_stop` / `honeypot_pause` / `honeypot_resume` | Lifecycle control |
+| `honeypot_pause` / `honeypot_resume` | Lifecycle control |
 | `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |
 | `honeypot_health` | Probe ports/containers — catches silent deaths |
 | `honeypot_self_test` | End-to-end pipeline check: synthetic probe → alert in DB |
@@ -346,6 +351,7 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 | `honeytoken_generate_aws` / `honeytoken_generate_credentials` | Fake AWS key pair / username-password sets |
 | `honeytoken_embed_file` | PDF/DOCX with an embedded canary tracker |
 | `honeytoken_list` / `honeytoken_status` / `honeytoken_revoke` / `honeytoken_export` | Manage and format for planting |
+| `honeytoken_rotate` | Replace a token's secret while keeping its identity and history |
 
 </details>
 
@@ -369,13 +375,17 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 
 | Tool | Description |
 |---|---|
-| `enrich_ip` | VirusTotal + AbuseIPDB + GeoIP, parallel and cached |
+| `enrich_ip` | VirusTotal + AbuseIPDB + GeoIP, plus GreyNoise / abuse.ch / OTX / Shodan InternetDB when configured; parallel and cached |
 | `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile + risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline (exact totals, bounded sample — safe on an attacker with 100k+ events) |
 | `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH) — the same tooling behind many IPs is one operator |
 | `analyze_campaign` / `map_ttps` / `threat_timeline` | Campaign correlation, MITRE mapping, chronological timeline |
 | `generate_report` | Write an XSS-safe HTML or Markdown report to disk |
 | `export_blocklist` / `export_stix` | Write iptables/fail2ban/CIDR list or a STIX 2.1 bundle to disk |
 | `report_ip_abuse` | Submit an attacker IP to AbuseIPDB |
+| `attack_summary` / `attack_navigator_layer` | Exact totals by tactic/technique for a window / an ATT&CK Navigator layer scored with the same counts |
+| `extract_iocs` / `lookup_hash` | Distinct URLs, hosts and file hashes from download and command payloads / MalwareBazaar lookup of a hash |
+| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, 15 s) — also the **Query** box on Grafana dashboard 04 |
+| `ping` | Server role (owner or read-only) and liveness |
 
 </details>
 
@@ -406,6 +416,8 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 **MCP resources:** `honeypot://active` · `alerts://stream` · `honeytoken://triggered` · `stats://dashboard`
 
 **MCP prompts:** `shift_handover` · `investigate_ip` · `honeytoken_tripped` · `hunt_campaigns` · `deploy_deception` · `weekly_report` — ready-made workflows for the common jobs. Each tells the model that captured text was written by an attacker and that destructive actions need confirmation.
+
+**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification (the recorded sensors must not launch on your laptop). `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and writes the headline numbers, ATT&CK techniques, top-source journeys, campaigns, fingerprint clusters and report/STIX/blocklist exports to `<workdir>/reports/` ([DEPLOY.md](docs/DEPLOY.md), step 13).
 
 Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool that is not in it cannot register.
 
@@ -506,7 +518,7 @@ Without a forwarder these are believable decoys with no callback. Said plainly i
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 1448 unit tests
+uv run pytest tests/unit/ -v     # 2216 unit tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
@@ -542,7 +554,7 @@ src/honeypot_mcp/
 ├── engines/             — Honeypot engines (plugin ABC: HoneypotEngine)
 ├── tokens/              — Honeytoken providers (plugin ABC: HoneytokenProvider)
 ├── storage/             — Models, async DB layer, batched event buffer
-├── intel/               — VirusTotal, AbuseIPDB, GeoIP, MITRE (TTL-cached)
+├── intel/               — VirusTotal, AbuseIPDB, GeoIP, MITRE, optional GreyNoise / abuse.ch / OTX / Shodan InternetDB (TTL-cached)
 ├── analysis/            — Correlator, profiler, Jinja2 reporter
 └── tools/               — MCP tool modules
 ```

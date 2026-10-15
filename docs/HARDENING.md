@@ -27,7 +27,7 @@ not protection. The protection is the loopback bind, the firewall and the tokens
 
 ## The layers
 
-**Network: `hardening/firewall.py` (nftables table `inet hp_fw`)**
+**Network: `src/honeypot_mcp/hardening/firewall.py` (nftables table `inet hp_fw`)**
 
 - `input` defaults to drop. It accepts loopback, established traffic, the ICMP a host needs, the
   admin port (rate limited per source, optionally allow-listed) and exactly the ports the engines
@@ -36,7 +36,12 @@ not protection. The protection is the loopback bind, the firewall and the tokens
   (8080, 1110), only for traffic addressed to the host. The service runs with no capabilities and
   never binds below 1024.
 - Docker-published ports (the Cowrie SSH/Telnet honeypots) are forwarded by Docker, not input, so
-  they need no rule; `userland-proxy` is off so no `docker-proxy` process listens either.
+  they need no rule; `userland-proxy` is off so no `docker-proxy` process listens either. The forward
+  chain does cap new connections per source on those ports at 128 concurrent (`ct count`): Cowrie has
+  no limit of its own, and one host opening ~2,400 sessions got the Telnet container OOM-killed.
+- Optional port sets: `--ftp-pasv-ports MIN-MAX` opens the FTP honeypot's passive data range (set
+  `FTP_PASV_PORT_MIN/MAX` to the same range), and the NFS honeypot is reached by redirecting both 111
+  and 2049 to its listening port (`--ports "...,2049>12049,111>12049"`, [DEPLOY.md](DEPLOY.md) step 6).
 - `forward`: containers cannot start connections (default), and may not open one to the host
   itself. A hijacked Cowrie cannot scan, relay, brute-force or reach the cloud metadata service.
 - `output`: the service user may only answer connections made to it, resolve names and open new
@@ -66,7 +71,7 @@ not protection. The protection is the loopback bind, the firewall and the tokens
 - `honeypot-docker-guard.service` is the only process that both parses a request from the service
   and holds Docker access. See below. It has no network at all (`PrivateNetwork`), scores 0.6.
 
-**Containers: the Docker guard (`hardening/docker_guard.py`)**
+**Containers: the Docker guard (`src/honeypot_mcp/hardening/docker_guard.py`)**
 
 Membership of the `docker` group is root: anyone who can ask the daemon can start a privileged
 container with `/` mounted. The service parses attacker-controlled bytes all day, so the service

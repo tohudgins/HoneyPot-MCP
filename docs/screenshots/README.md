@@ -39,4 +39,4 @@ docker compose -f docker/docker-compose.yml \
 - If a Grafana panel shows "No data" while the same SQL works through the API,
   check that every target carries `rawQueryText`. The SQLite plugin's frontend
   interpolates from that field, and without it the browser sends an empty
-  query — which is exactly how all three dashboards were silently broken.
+  query — which is exactly how all three dashboards that existed then were silently broken.
