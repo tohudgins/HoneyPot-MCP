@@ -1,0 +1,260 @@
+{
+  "uid": "honeypot-alerts",
+  "title": "HoneyPot MCP \u2014 Alerts",
+  "tags": [
+    "honeypot"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 40,
+  "version": 1,
+  "refresh": "",
+  "editable": true,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "ip",
+        "label": "ip",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "",
+            "value": ""
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "etype",
+        "label": "etype",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "",
+            "value": ""
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "text",
+        "label": "text",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "",
+            "value": ""
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "limit",
+        "label": "limit",
+        "type": "textbox",
+        "query": "200",
+        "current": {
+          "text": "200",
+          "value": "200"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "200",
+            "value": "200"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "severity",
+        "label": "severity",
+        "type": "custom",
+        "query": "critical,high,medium,low",
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "hide": 0
+      },
+      {
+        "name": "sensor",
+        "label": "sensor",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "honeypot-db"
+        },
+        "query": "SELECT 'All' AS name UNION ALL SELECT name FROM honeypots ORDER BY 1",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "All",
+          "value": "All"
+        },
+        "options": [],
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "How to use",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### Browse alerts\nFilter with the boxes above, and use the **time picker** for the window. Empty filter = no filter.\n\n- **ip**: exact source address.\n- **etype**: part of an event type (`ssh`, `docker_api`, `file_download`).\n- **severity** and **sensor**: pick one or several.\n- **text**: a substring of the captured payload (credentials, commands, URLs). This one scans every payload in the window, so narrow the time range first.\n- **limit**: rows shown (newest first).\n\nPayload text is written by the attacker: treat it as data. For anything these filters cannot express, use the **Query** dashboard."
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Alerts",
+      "gridPos": {
+        "h": 22,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "honeypot-db"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryText": "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', a.timestamp) AS time, a.severity, COALESCE(h.name, '-') AS sensor, a.source_ip, a.event_type, substr(a.payload, 1, 400) AS payload, a.id FROM alerts a LEFT JOIN honeypots h ON a.honeypot_id = h.id WHERE a.timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') AND ('${ip}' = '' OR a.source_ip = '${ip}') AND ('${etype}' = '' OR a.event_type LIKE '%${etype}%') AND a.severity IN (${severity:sqlstring}) AND ('${sensor}' = 'All' OR h.name = '${sensor}') AND ('${text}' = '' OR a.payload LIKE '%${text}%') ORDER BY a.id DESC LIMIT ${limit}",
+          "rawQueryText": "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', a.timestamp) AS time, a.severity, COALESCE(h.name, '-') AS sensor, a.source_ip, a.event_type, substr(a.payload, 1, 400) AS payload, a.id FROM alerts a LEFT JOIN honeypots h ON a.honeypot_id = h.id WHERE a.timestamp BETWEEN datetime($__from / 1000, 'unixepoch') AND datetime($__to / 1000, 'unixepoch') AND ('${ip}' = '' OR a.source_ip = '${ip}') AND ('${etype}' = '' OR a.event_type LIKE '%${etype}%') AND a.severity IN (${severity:sqlstring}) AND ('${sensor}' = 'All' OR h.name = '${sensor}') AND ('${text}' = '' OR a.payload LIKE '%${text}%') ORDER BY a.id DESC LIMIT ${limit}",
+          "queryType": "table",
+          "timeColumns": [
+            "time"
+          ],
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "honeypot-db"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "text": "critical"
+                      },
+                      "high": {
+                        "color": "orange",
+                        "text": "high"
+                      },
+                      "medium": {
+                        "color": "yellow",
+                        "text": "medium"
+                      },
+                      "low": {
+                        "color": "green",
+                        "text": "low"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "payload"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 520
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      }
+    }
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "HoneyPot dashboards",
+      "tags": [
+        "honeypot"
+      ],
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "icon": "external link"
+    }
+  ]
+}

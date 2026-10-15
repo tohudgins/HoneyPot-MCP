@@ -50,7 +50,13 @@ def _sitecustomize_source() -> bytes:
     )
 
 
-def _deliver_persona_fs(container: Any, persona: Any, hostname: str, seed: str) -> None:
+def _deliver_persona_fs(
+    container: Any,
+    persona: Any,
+    hostname: str,
+    seed: str,
+    credential: tuple[str, str] | None = None,
+) -> None:
     """Copy a persona-specific filesystem into a created (not yet started) container.
 
     Reads Cowrie's own bundled `fs.pickle` out of the container, rewrites it so
@@ -71,7 +77,7 @@ def _deliver_persona_fs(container: Any, persona: Any, hostname: str, seed: str) 
         if extracted is None or member is None or member.size > _MAX_BASE_PICKLE_BYTES:
             raise ValueError("no usable filesystem pickle in the Cowrie image")
         base = extracted.read()
-    built = build_persona_fs(base, persona, hostname, seed)
+    built = build_persona_fs(base, persona, hostname, seed, credential)
     if not container.put_archive(PERSONA_DIR, persona_tar(built, _sitecustomize_source())):
         raise RuntimeError("Docker refused the persona filesystem archive")
 
@@ -288,6 +294,15 @@ class SSHEngine(HoneypotEngine):
         # Artifact clean-up runs inside the container (see cowrie_sitecustomize.prune_artifacts).
         env["HONEYPOT_JANITOR_INTERVAL"] = str(get_settings().cowrie_janitor_interval_seconds)
         env["HONEYPOT_MAX_TTY"] = str(get_settings().cowrie_max_tty_files)
+        # A tracked MySQL credential (if a token exists) is planted in the home directory as
+        # bait; an attacker who replays it against our MySQL honeypot trips CRITICAL.
+        from honeypot_mcp.credential_match import planted_credential
+
+        try:
+            bait = await planted_credential("mysql")
+        except Exception:
+            log.warning("Could not look up a bait credential for '%s'", name, exc_info=True)
+            bait = None
 
         log.info(
             "SSH honeypot '%s' deploying as persona=%s hostname=%s",
@@ -379,7 +394,7 @@ class SSHEngine(HoneypotEngine):
             # while Cowrie itself can still not alter its own root.
             container = _create(env, persona_volume=True)
             try:
-                _deliver_persona_fs(container, persona, hostname, name)
+                _deliver_persona_fs(container, persona, hostname, name, bait)
             except Exception as e:
                 log.warning(
                     "Could not install the persona filesystem for SSH honeypot '%s' (%s). "

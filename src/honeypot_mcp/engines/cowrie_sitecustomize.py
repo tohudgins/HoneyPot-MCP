@@ -26,6 +26,10 @@ environment variables the engine sets from the persona:
     HONEYPOT_JANITOR_INTERVAL  seconds between artifact clean-ups (default 300; 0 turns it off)
     HONEYPOT_MAX_TTY        session recordings to keep, newest first (default 5000; -1 keeps all)
 
+It also fixes two shell tells: `head -2` (legacy `-N`, which Cowrie rejects) and `uptime` /
+`/proc/uptime` (which count from container start and so read minutes after every restart; they
+report a per-hostname boot offset of several days plus real elapsed time).
+
 Nothing runs when it is imported under any other name, so the host process and the tests can
 import it to exercise the patch functions.
 """
@@ -33,9 +37,11 @@ import it to exercise the patch functions.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.abc
 import importlib.util
 import os
+import posixpath
 import sys
 import threading
 import time
@@ -221,11 +227,109 @@ def start_janitor() -> None:
     ).start()
 
 
+# ── head -N ──────────────────────────────────────────────────────────────────────────────────
+
+
+def normalise_head_args(args: list[str]) -> list[str]:
+    """Rewrite the legacy `head -2 file` form to `head -n 2 file`. coreutils still accepts it
+    (scripts and muscle memory use it constantly); Cowrie's getopt only knows `-n`/`-c`, so it
+    answered "invalid option -- '2'" — a one-command tell. Stops at `--`; leaves everything else
+    untouched."""
+    out: list[str] = []
+    for i, arg in enumerate(args):
+        if arg == "--":
+            out.extend(args[i:])
+            break
+        if len(arg) > 1 and arg[0] == "-" and arg[1:].isdigit() and arg.isascii():
+            out.extend(["-n", arg[1:]])
+        else:
+            out.append(arg)
+    return out
+
+
+def patch_commands_fs(module: ModuleType) -> None:
+    command = getattr(module, "Command_head", None)
+    if command is None:
+        return
+    original = command.start
+
+    def start(self: Any) -> Any:
+        self.args = normalise_head_args(list(self.args))
+        return original(self)
+
+    command.start = start
+
+
+# ── uptime ───────────────────────────────────────────────────────────────────────────────────
+
+_PROCESS_START = time.time()
+_MIN_BOOT_DAYS = 3
+_BOOT_SPREAD_DAYS = 24  # 3 .. 27 days of uptime before this container started
+
+
+def boot_offset_seconds(hostname: str) -> int:
+    """How long the emulated host had been up before this process started: deterministic per
+    hostname (so a restart does not change the story), several days to about four weeks.
+    Cowrie counts from container start, so `uptime` read "11 min" after every restart."""
+    digest = hashlib.sha256(f"boot:{hostname}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (_BOOT_SPREAD_DAYS * 86400) + _MIN_BOOT_DAYS * 86400
+
+
+def uptime_seconds(hostname: str, now: float | None = None, start: float | None = None) -> float:
+    """Boot offset plus the real time this process has been running."""
+    now = time.time() if now is None else now
+    start = _PROCESS_START if start is None else start
+    return boot_offset_seconds(hostname) + max(0.0, now - start)
+
+
+def proc_uptime_text(up: float) -> bytes:
+    """`/proc/uptime`: seconds up and seconds idle summed over cores (a lightly loaded box is
+    ~95% idle; two cores, like the persona's cpuinfo)."""
+    return f"{up:.2f} {up * 2 * 0.95:.2f}\n".encode()
+
+
+def _hostname() -> str:
+    return os.environ.get("COWRIE_HONEYPOT_HOSTNAME") or os.environ.get("COWRIE_HOSTNAME") or "host"
+
+
+def patch_shell_protocol(module: ModuleType) -> None:
+    protocol = getattr(module, "HoneyPotBaseProtocol", None)
+    if protocol is None:
+        return
+
+    def uptime(self: Any) -> float:
+        return uptime_seconds(_hostname())
+
+    protocol.uptime = uptime
+
+
+def patch_shell_fs(module: ModuleType) -> None:
+    filesystem = getattr(module, "HoneyPotFilesystem", None)
+    if filesystem is None:
+        return
+    original = filesystem.file_contents
+
+    def file_contents(self: Any, target: str) -> bytes:
+        data = original(self, target)
+        try:
+            path = self.resolve_path(target, posixpath.dirname(target))
+        except Exception:
+            return data
+        if path == "/proc/uptime":
+            return proc_uptime_text(uptime_seconds(_hostname()))
+        return data
+
+    filesystem.file_contents = file_contents
+
+
 # ── import hook ──────────────────────────────────────────────────────────────────────────────
 
 _PATCHES = {
     "cowrie.ssh.factory": patch_ssh_factory,
     "cowrie.telnet.userauth": patch_telnet_userauth,
+    "cowrie.commands.fs": patch_commands_fs,
+    "cowrie.shell.protocol": patch_shell_protocol,
+    "cowrie.shell.fs": patch_shell_fs,
 }
 
 

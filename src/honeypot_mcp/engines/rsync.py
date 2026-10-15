@@ -24,6 +24,17 @@ spends time on.
 
 Wire format: the rsync daemon protocol — a `@RSYNCD:` version handshake, then
 newline-delimited text until a module is selected.
+
+After `@RSYNCD: OK` a client of protocol 30+ (every rsync 3.x) sends its server
+argument vector NUL-separated, ended by an empty word, and then waits for the
+daemon's setup bytes and file list; a daemon that goes quiet there is visibly
+not one. `rsync_wire.py` produces that listing (protocol 31, no incremental
+recursion) from a small decoy tree per module, the client's end-of-phase
+markers are answered, and the session closes cleanly. Pulls are refused by
+hanging up once the client asks for file data. Protocol 29 and older clients
+(openrsync, rsync 2.x) use a different list encoding and are closed after their
+arguments are recorded. Events are unchanged except that `rsync_file_request`
+carries `files_listed`.
 """
 
 from __future__ import annotations
@@ -32,7 +43,9 @@ import asyncio
 import base64
 import hashlib
 import logging
+import re
 import secrets
+import time
 from typing import Any
 
 from honeypot_mcp.config import get_settings
@@ -44,6 +57,16 @@ from honeypot_mcp.engines.conn_limit import (
     extract_lines,
     limited_factory,
     shutdown_server,
+)
+from honeypot_mcp.engines.rsync_wire import (
+    MAX_LISTED,
+    ClientStream,
+    ListEntry,
+    decoy_tree,
+    encode_session,
+    encode_stats,
+    parse_server_args,
+    resolve_request,
 )
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
@@ -80,6 +103,19 @@ _MAX_LINES_PER_CONNECTION = 128
 # Events recorded per connection once a module is open. Generous enough for a
 # real client's full option list plus its file requests.
 _MAX_TRANSFER_EVENTS = 64
+# A client speaking protocol 30+ separates its argument words with NUL, not LF,
+# and ends them with an empty word. Bounds for that phase:
+_MAX_ARG_BYTES = 16384
+# After the list is sent the client may still be writing (its filter list);
+# read and discard for a moment so closing never RSTs the list away.
+_DRAIN_SECONDS = 3.0
+_MAX_DRAIN_BYTES = 65536
+# The greeting version we speak; a newer client is held to it.
+_SPOKEN_PROTOCOL = 31
+# Oldest protocol whose file-list encoding the listing implements.
+_MIN_LIST_PROTOCOL = 30
+_STATS_READ = 140  # bytes a real sender reports having read for a listing
+_VERSION_RE = re.compile(r"@RSYNCD:\s*(\d+)")
 
 _STATE_HANDSHAKE = 0
 _STATE_MODULE = 1
@@ -104,6 +140,19 @@ class _RsyncProtocol(asyncio.Protocol):
         self._module = ""
         self._challenge = ""
         self._transfer_events = 0
+        self._client_proto = 0
+        # Argument phase after `@RSYNCD: OK` (NUL-separated for protocol >= 30).
+        self._args_mode = False
+        self._arg_buf = b""
+        self._post_args = False
+        self._drained = 0
+        self._drain_handle: asyncio.TimerHandle | None = None
+        self._argv: list[str] = []
+        self._client = ClientStream()
+        self._session_sent = False
+        self._post_buf = b""
+        self._entries: list[ListEntry] = []
+        self._missing: list[str] = []
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         assert isinstance(transport, asyncio.Transport)
@@ -123,6 +172,21 @@ class _RsyncProtocol(asyncio.Protocol):
             self._transport.close()
 
     def data_received(self, data: bytes) -> None:
+        if self._post_args:
+            # The list has been sent; whatever the client still writes is read
+            # and dropped (bounded) until it hangs up or the drain timer fires.
+            self._drained += len(data)
+            if self._drained > _MAX_DRAIN_BYTES:
+                self._close()
+                return
+            if self._session_sent:
+                self._feed_client(data)
+            else:
+                self._post_buf += data
+            return
+        if self._args_mode:
+            self._data_args(data)
+            return
         lines, self._buf, problem = extract_lines(
             self._buf + data, max_lines=_MAX_LINES_PER_READ, max_line=_MAX_LINE
         )
@@ -130,6 +194,29 @@ class _RsyncProtocol(asyncio.Protocol):
         if problem or not accepted:
             # Flood or oversized line: keep what was already queued (it is
             # evidence), refuse the rest and hang up.
+            self._send("@ERROR: protocol error\n")
+            if self._transport is not None:
+                self._transport.close()
+
+    def _data_args(self, data: bytes) -> None:
+        """Protocol 30+ argument words: NUL-terminated, ended by an empty word.
+        Each becomes one queued "line", so they are handled in order by the same
+        worker as the text phase."""
+        buf = self._arg_buf + data
+        words = buf.split(b"\0")
+        self._arg_buf = words.pop()
+        problem = len(self._arg_buf) > _MAX_LINE or len(buf) > _MAX_ARG_BYTES
+        done = b"" in words
+        if done:
+            # Later bytes are the client's own protocol data, not arguments.
+            self._post_args = True
+            # What follows the empty word is the client's own data, already in
+            # this read; keep it for when the list has gone out.
+            self._post_buf += b"\0".join(words[words.index(b"") + 1 :] + [self._arg_buf])
+            words = words[: words.index(b"") + 1]
+            self._arg_buf = b""
+        accepted = self._worker.submit(words[:_MAX_LINES_PER_READ])
+        if problem or not accepted or len(words) > _MAX_LINES_PER_READ:
             self._send("@ERROR: protocol error\n")
             if self._transport is not None:
                 self._transport.close()
@@ -146,6 +233,8 @@ class _RsyncProtocol(asyncio.Protocol):
                 self._send("@ERROR: protocol version mismatch\n")
                 self._close()
                 return
+            match = _VERSION_RE.match(line)
+            self._client_proto = min(int(match.group(1)), _SPOKEN_PROTOCOL) if match else 0
             self._state = _STATE_MODULE
             return
 
@@ -185,6 +274,7 @@ class _RsyncProtocol(asyncio.Protocol):
                 # copy files. That is the breach, not a probe.
                 self._send("@RSYNCD: OK\n")
                 self._state = _STATE_TRANSFER
+                self._args_mode = self._client_proto >= _MIN_LIST_PROTOCOL
                 await self._record(
                     "rsync_anonymous_access",
                     AlertSeverity.CRITICAL,
@@ -236,15 +326,26 @@ class _RsyncProtocol(asyncio.Protocol):
         if self._transfer_events > _MAX_TRANSFER_EVENTS:
             self._close()
             return
+        if line == "":
+            # End of the client's argument list.
+            await self._finish_args()
+            return
+        self._argv.append(line)
         if line.startswith("-") or line == ".":
             await self._record(
                 "rsync_transfer_options", AlertSeverity.MEDIUM, {"options": line[:200]}
             )
             return
+        files_listed = self._plan_listing(line)
         await self._record(
             "rsync_file_request",
             AlertSeverity.CRITICAL,
-            {"module": self._module[:64], "path": line[:200], "note": "attempted bulk file read"},
+            {
+                "module": self._module[:64],
+                "path": line[:200],
+                "note": "attempted bulk file read",
+                "files_listed": files_listed,
+            },
         )
 
     async def _record(self, event_type: str, severity: AlertSeverity, payload: dict) -> None:
@@ -262,6 +363,73 @@ class _RsyncProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._buf = b""
+        self._arg_buf = b""
+        if self._drain_handle is not None:
+            self._drain_handle.cancel()
+            self._drain_handle = None
+
+    def _plan_listing(self, request: str) -> int:
+        """Resolve one path argument against the decoy tree now, so the event
+        that records the request can carry how many entries the client will be
+        shown. Returns 0 when nothing can be listed."""
+        if self._client_proto < _MIN_LIST_PROTOCOL:
+            return 0
+        args = parse_server_args(self._argv)
+        tree = decoy_tree(self._module, self._name, time.time())
+        if not args.sender or args.unsupported or tree is None:
+            return 0
+        entries = resolve_request(tree, request, self._module, args)
+        if entries is None:
+            self._missing.append(
+                f'rsync: [sender] link_stat "/{request[:200]}" (in {self._module}) '
+                "failed: No such file or directory (2)\n"
+            )
+            return 0
+        room = max(MAX_LISTED - len(self._entries), 0)
+        self._entries.extend(entries[:room])
+        return min(len(entries), room)
+
+    async def _finish_args(self) -> None:
+        """The client sent its empty terminating argument: this is where a real
+        daemon starts the transfer. A listing is answered; anything else (an
+        upload, protocol 29 or older, options we cannot encode) ends the session,
+        having been recorded."""
+        self._args_mode = False
+        self._post_args = True
+        args = parse_server_args(self._argv)
+        if (
+            self._client_proto < _MIN_LIST_PROTOCOL
+            or not args.sender
+            or args.unsupported
+            or self._transport is None
+            or self._transport.is_closing()
+        ):
+            self._close()
+            return
+        self._transport.write(
+            encode_session(self._entries, args, secrets.randbits(32), self._missing)
+        )
+        # Keep reading for a moment: the client's filter list and end-of-phase
+        # markers may still be in flight, and closing on unread data would RST
+        # away the bytes just written.
+        self._worker.stop()
+        self._session_sent = True
+        self._client.stats = encode_stats(
+            _STATS_READ,
+            sum(len(e.name) for e in self._entries),
+            sum(e.node.size for e in self._entries),
+        )
+        pending, self._post_buf = self._post_buf, b""
+        if pending:
+            self._feed_client(pending)
+        self._drain_handle = asyncio.get_running_loop().call_later(_DRAIN_SECONDS, self._close)
+
+    def _feed_client(self, data: bytes) -> None:
+        for reply in self._client.feed(data):
+            if self._transport is not None and not self._transport.is_closing():
+                self._transport.write(reply)
+        if self._client.finished:
+            self._close()
 
 
 class RsyncEngine(HoneypotEngine):

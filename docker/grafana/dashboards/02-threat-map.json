@@ -2,8 +2,8 @@
   "uid": "honeypot-threat-map",
   "title": "HoneyPot MCP \u2014 Threat Map",
   "tags": [
-    "honeypot",
     "geo",
+    "honeypot",
     "soc"
   ],
   "timezone": "browser",
@@ -52,7 +52,7 @@
           "name": "Layer 0",
           "config": {
             "url": "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-            "attribution": "Tiles © Esri — Esri, DeLorme, NAVTEQ"
+            "attribution": "Tiles \u00a9 Esri \u2014 Esri, DeLorme, NAVTEQ"
           }
         },
         "controls": {
@@ -202,6 +202,19 @@
           "placement": "bottom"
         }
       }
+    }
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "HoneyPot dashboards",
+      "tags": [
+        "honeypot"
+      ],
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "icon": "external link"
     }
   ]
 }

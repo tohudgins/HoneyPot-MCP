@@ -4,6 +4,35 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Cowrie realism, a working rsync listing, four optional threat-intel providers, IOC tools
+
+**Cowrie** (checked through the OpenSSH client against a real 3.0.15 container): `head -2` works as well as
+`head -n 2`; `uptime`, `w` and `/proc/uptime` report a per-hostname boot offset of 3-27 days plus real
+elapsed time, instead of minutes after every container restart; and the persona home directory carries a
+tracked credential (`~/.bash_history` has a `mysql -u USER -pPASS -h db1.internal` line, `~/.my.cnf` the same
+pair, mode 600) when a MySQL credential token exists, deterministic decoys otherwise. Each patch is
+mutation-checked against the real client.
+
+**rsync listing.** A real `rsync rsync://host/module/` now lists a decoy tree and exits 0 (rsync 3.5.0 and
+3.1.3 in Docker). The cause of the old stall was not the file list: protocol 30+ clients send their
+arguments NUL-separated, so the newline-based reader never saw a complete line. `engines/rsync_wire.py`
+holds the protocol 31 setup and file-list encoder (varints, multiplexed frames, delta-encoded entries);
+trees are deterministic per sensor and UTC day (`db-dumps` has dated `.sql.gz` dumps, `backups` tarballs).
+`rsync -av` gets past the list and fails in 0.2 s without transferring anything, by design. Not served:
+protocol 29 and older (macOS openrsync) and options the encoder cannot produce. 70 tests decode the wire
+with an independent reader; 18 mutations killed.
+
+**Optional threat-intel providers** (off unless configured, cached, never called per event, bounded by one
+3 s fan-out deadline so a hung provider cannot cost the VirusTotal/AbuseIPDB lines): GreyNoise
+(`GREYNOISE_API_KEY`), abuse.ch for MalwareBazaar, URLhaus and ThreatFox (`ABUSECH_AUTH_KEY`), AlienVault
+OTX (`OTX_API_KEY`) and Shodan InternetDB (`SHODAN_INTERNETDB_ENABLED=true`, no key). They appear in
+`enrich_ip` and as one line each in Slack/Teams/email only when they have something to say; machine formats
+are not enriched. Each is tested through the real httpx client against a strict stub of the vendor's
+published contract. `scripts/intel_smoke.py` does an optional live call per provider.
+**`extract_iocs`** (distinct URLs, hosts and file hashes from download and command payloads, bounded and
+saying when capped), **`attack_navigator_layer`** (an ATT&CK Navigator 4.5 layer scored with the same counts
+as `attack_summary`) and **`lookup_hash`** (MalwareBazaar) are viewer-tier tools.
+
 ## Ask your own questions: a read-only SQL tool and a Grafana query box; dashboards that stay fast
 
 **`sql_query`** (MCP, viewer role, works in analysis mode): one `SELECT` or `WITH ... SELECT` over `alerts`,
@@ -23,6 +52,12 @@ edge: identical to `alerts_stats` and to a raw `GROUP BY` on 14.9M real alerts (
 sources, 3,964 critical for a ragged window), in 0.01 s instead of 1-2 s, and independent of run size.
 `scripts/dashboard_rollups.py` rewrites them; `test_dashboard_rollups.py` runs the shipped SQL against a raw
 `GROUP BY` for mid-hour, on-the-hour and inside-one-hour windows, and fails if either edge is dropped.
+
+An **Alerts** dashboard (`05-alerts.json`) is the Grafana counterpart of `alerts_recent` and `alerts_search`:
+filter by source IP, part of an event type, severity (several), sensor and a payload substring, over the time
+picker's window, newest first with severity coloured. Every dashboard also carries a **HoneyPot dashboards**
+menu (shared tag, time range kept) so the five pages are one click apart. Checked in a real browser against
+the 14.9M-alert backup: the filters and both dropdowns expand correctly and return the matching alerts.
 
 **Census of the 25 engines against real traffic** (5.27M real alerts, my own tests excluded): nine engines
 have every signature event triggered by real attackers; the rest are missing only post-login events

@@ -70,6 +70,12 @@ _FLAGS: dict[str, str] = {
     "honeytoken_status": "R",
     "map_ttps": "R",
     "attack_summary": "R",
+    # Writes one new ATT&CK Navigator layer file to the reports directory (never overwrites a
+    # named file), so it is additive rather than read-only.
+    "attack_navigator_layer": "",
+    "extract_iocs": "R",
+    # Sends the hash to abuse.ch MalwareBazaar.
+    "lookup_hash": "RW",
     "sql_query": "R",
     "pcap_files": "R",
     "pcap_status": "R",
@@ -137,6 +143,9 @@ _TITLES = {
     "honeytoken_list": "List Honeytokens",
     "map_ttps": "Map to MITRE ATT&CK",
     "attack_summary": "ATT&CK Summary",
+    "extract_iocs": "Extract IOCs",
+    "attack_navigator_layer": "ATT&CK Navigator Layer",
+    "lookup_hash": "Look Up File Hash",
     "sql_query": "Read-only SQL Query",
     "soc_brief": "SOC Shift Brief",
     "ping": "Ping",

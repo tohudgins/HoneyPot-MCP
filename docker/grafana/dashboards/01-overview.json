@@ -469,5 +469,18 @@
         }
       }
     }
+  ],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "HoneyPot dashboards",
+      "tags": [
+        "honeypot"
+      ],
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "icon": "external link"
+    }
   ]
 }

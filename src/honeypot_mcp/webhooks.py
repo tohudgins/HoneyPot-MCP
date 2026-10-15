@@ -1150,6 +1150,50 @@ def reputation_facts(enrichment: dict[str, Any] | None) -> list[tuple[str, str]]
                 f"{vt.get('malicious_votes', 0)} of {vt.get('total_engines', 0)} engines",
             )
         )
+    facts.extend(_optional_provider_facts(enrichment))
+    return facts
+
+
+def _optional_provider_facts(enrichment: dict[str, Any]) -> list[tuple[str, str]]:
+    """One short line each for GreyNoise, abuse.ch, OTX and Shodan InternetDB, and only when the
+    provider said something worth a person's attention: "never seen" and "not configured" are
+    left out. The values are third-party strings (already cleaned and clipped by the providers);
+    renderers escape them like every other fact."""
+    facts: list[tuple[str, str]] = []
+
+    gn = enrichment.get("greynoise") or {}
+    if gn.get("available") and (gn.get("noise") or gn.get("riot")):
+        kind = "known benign service" if gn.get("riot") else "internet-wide scanner"
+        verdict = gn.get("classification") or "unclassified"
+        name = f" · {gn['name']}" if gn.get("name") else ""
+        facts.append(("GreyNoise", f"{verdict} · {kind}{name}"))
+
+    ab = enrichment.get("abusech") or {}
+    if ab.get("available") and ab.get("listed"):
+        tf = ab.get("threatfox") or {}
+        uh = ab.get("urlhaus") or {}
+        parts: list[str] = []
+        if ab.get("malware"):
+            parts.append(", ".join(ab["malware"][:3]))
+        if tf.get("match_count"):
+            parts.append(f"{tf['match_count']} ThreatFox IOC(s)")
+        if uh.get("url_count"):
+            parts.append(f"{uh['url_count']} URLhaus URL(s)")
+        facts.append(("abuse.ch", " · ".join(parts) or "listed"))
+
+    otx = enrichment.get("otx") or {}
+    if otx.get("available") and otx.get("pulse_count"):
+        names = ", ".join(p["name"] for p in (otx.get("pulses") or [])[:2] if p.get("name"))
+        facts.append(("OTX", f"{otx['pulse_count']} pulse(s)" + (f": {names}" if names else "")))
+
+    db = enrichment.get("internetdb") or {}
+    if db.get("available") and db.get("ports"):
+        text = "ports " + ", ".join(str(p) for p in db["ports"][:8])
+        if len(db["ports"]) > 8:
+            text += f" (+{len(db['ports']) - 8})"
+        if db.get("vulns"):
+            text += f" · {len(db['vulns'])} CVE(s)"
+        facts.append(("InternetDB", text))
     return facts
 
 
@@ -1237,7 +1281,7 @@ def render_slack(
                 "type": "section",
                 "fields": [
                     {"type": "mrkdwn", "text": f"*{label}*\n{_slack_escape(value)}"}
-                    for label, value in reputation[:6]
+                    for label, value in reputation[:10]
                 ],
             }
         )

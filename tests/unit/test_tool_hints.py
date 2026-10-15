@@ -43,17 +43,19 @@ async def test_read_only_tools_do_not_claim_to_be_destructive_and_are_idempotent
             assert a.idempotentHint is True, name
 
 
-async def test_the_viewer_tier_is_read_only_apart_from_the_one_report_writer():
+async def test_the_viewer_tier_is_read_only_apart_from_the_two_file_writers():
     """A viewer token is the credential you hand to a triage agent. Everything it can
-    call must be safe to run unattended; `generate_report` is the deliberate
-    exception (it writes a new file and cannot overwrite one), so it is pinned by name
-    rather than allowed to creep."""
+    call must be safe to run unattended; `generate_report` and `attack_navigator_layer`
+    are the deliberate exceptions (each writes a new file inside the reports directory and a
+    caller-named one cannot overwrite an existing file), so they are pinned by name rather
+    than allowed to creep."""
     from honeypot_mcp import rbac
 
     tools = await _tools()
     not_read_only = {n for n in rbac.VIEWER_TOOLS if not tools[n].annotations.readOnlyHint}
-    assert not_read_only == {"generate_report"}
+    assert not_read_only == {"generate_report", "attack_navigator_layer"}
     assert tools["generate_report"].annotations.destructiveHint is False
+    assert tools["attack_navigator_layer"].annotations.destructiveHint is False
 
 
 async def test_everything_that_deletes_or_cannot_be_undone_is_marked_destructive():
@@ -73,7 +75,7 @@ async def test_tools_that_reach_outside_this_server_say_so():
     external = {
         "enrich_ip", "analyze_attacker", "generate_report", "report_ip_abuse",
         "alert_subscribe", "blocklist_push_aws_waf", "blocklist_push_cloudflare",
-        "blocklist_push_pfsense",
+        "blocklist_push_pfsense", "lookup_hash",
     }  # fmt: skip
     for name, tool in tools.items():
         assert tool.annotations.openWorldHint is (name in external), name

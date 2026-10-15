@@ -40,6 +40,19 @@ class Settings(BaseSettings):
     # Threat intel API keys
     virustotal_api_key: str = ""
     abuseipdb_api_key: str = ""
+    # Optional extra reputation providers. Each is OFF until configured and a missing key is
+    # reported as "not configured", never as an error. All are cached per IP/indicator and are
+    # called per CRITICAL alert, per sent notification or per tool call — never per event.
+    greynoise_api_key: str = ""  # community API: is this IP a known mass scanner / benign crawler
+    abusech_auth_key: str = ""  # ONE key for MalwareBazaar, URLhaus and ThreatFox
+    otx_api_key: str = ""  # AlienVault OTX: pulses an address appears in
+    # Shodan InternetDB needs no key; it is a free service for NON-COMMERCIAL use only, so it is
+    # opt-in (see https://internetdb.shodan.io).
+    shodan_internetdb_enabled: bool = False
+    # Per-request ceiling for the four providers above, and the deadline for the whole fan-out
+    # during alert enrichment. Kept below `notify_enrich_timeout_seconds` (4 s) so that adding
+    # them can never push a notification's reputation lookup past its own deadline.
+    intel_provider_timeout_seconds: float = 3.0
 
     # GeoIP
     geoip_db_path: Path = _PROJECT_ROOT / "config" / "GeoLite2-City.mmdb"

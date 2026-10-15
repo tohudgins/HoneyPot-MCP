@@ -24,6 +24,7 @@ import hashlib
 import io
 import pickle
 import random
+import shlex
 import tarfile
 from typing import TYPE_CHECKING, Any
 
@@ -305,8 +306,45 @@ def username_for(persona: SSHPersona, seed: str) -> str:
 # ── The build ───────────────────────────────────────────────────────────────
 
 
-def build_persona_fs(base: bytes, persona: SSHPersona, hostname: str, seed: str) -> bytes:
-    """Rewrite Cowrie's bundled filesystem so it describes `persona`."""
+def bait_credential(seed: str) -> tuple[str, str]:
+    """The untracked decoy MySQL pair used when no credential token exists: stable per
+    honeypot, shaped like a service account an admin would script with."""
+    digest = hashlib.sha256(f"bait:{seed}".encode()).hexdigest()
+    return f"app_{digest[:4]}", f"{digest[4:12]}{digest[12:16].upper()}!{digest[16:18]}"
+
+
+def bait_files(user: str, home: str, credential: tuple[str, str]) -> dict[str, tuple[str, int]]:
+    """The files in a home directory that carry the bait credential, as
+    `{path: (content, mode)}`. Pure: the same credential always yields the same bytes, so a
+    `cat` and an `ls -l` (or two reads) agree."""
+    db_user, db_pass = credential
+    host = "db1.internal"
+    # Quoted: an unquoted `#` in a my.cnf value starts a comment, and generated passwords
+    # contain one; a real admin's file would be quoted for exactly that reason.
+    quoted = db_pass.replace("\\", "\\\\").replace('"', '\\"')
+    cnf = f'[client]\nuser={db_user}\npassword="{quoted}"\nhost={host}\n'
+    return {
+        f"{home}/.my.cnf": (cnf, 0o100600),
+    }
+
+
+def bait_history_line(credential: tuple[str, str]) -> str:
+    """The `mysql` invocation an administrator left in shell history."""
+    db_user, db_pass = credential
+    return f"mysql -u {shlex.quote(db_user)} {shlex.quote('-p' + db_pass)} -h db1.internal\n"
+
+
+def build_persona_fs(
+    base: bytes,
+    persona: SSHPersona,
+    hostname: str,
+    seed: str,
+    credential: tuple[str, str] | None = None,
+) -> bytes:
+    """Rewrite Cowrie's bundled filesystem so it describes `persona`.
+
+    `credential` is a tracked (user, password) pair from a honeytoken, planted in the home
+    directory as bait; without one, a deterministic untracked decoy pair takes its place."""
     root = load_fs(base)
     rng = random.Random(hashlib.sha256(f"fs:{seed}".encode()).digest())
     pid = persona.id
@@ -346,7 +384,13 @@ def build_persona_fs(base: bytes, persona: SSHPersona, hostname: str, seed: str)
             _put(root, "/etc/motd", _DEBIAN_MOTD)
 
     _rewrite_accounts(root, rhel=rhel, user=user, rng=rng)
-    _rewrite_home(root, user=user, family=family, rng=rng)
+    _rewrite_home(
+        root,
+        user=user,
+        family=family,
+        rng=rng,
+        credential=credential or bait_credential(seed),
+    )
 
     # protocol 4 is readable by every Python Cowrie ships on.
     return pickle.dumps(root, protocol=4)
@@ -397,7 +441,9 @@ def _rewrite_accounts(root: Node, *, rhel: bool, user: str, rng: random.Random) 
     _put(root, "/etc/shadow", "\n".join(shadow_lines) + "\n", mode=_SECRET)
 
 
-def _rewrite_home(root: Node, *, user: str, family: str, rng: random.Random) -> None:
+def _rewrite_home(
+    root: Node, *, user: str, family: str, rng: random.Random, credential: tuple[str, str]
+) -> None:
     """Replace `/home/phil` with `/home/<user>`, with the files a used account has."""
     home = _mkdir(root, "/home")
     for old in [n for n in home[A_CONTENTS] if n[A_NAME] in ("phil", "richard")]:
@@ -406,6 +452,9 @@ def _rewrite_home(root: Node, *, user: str, family: str, rng: random.Random) -> 
     _mkdir(root, base, uid=1000, gid=1000, mode=_PRIVATE_DIR)
     _mkdir(root, f"{base}/.ssh", uid=1000, gid=1000, mode=_PRIVATE_DIR)
     history = _HISTORY[family]
+    lines = history.splitlines(keepends=True)
+    lines.insert(len(lines) - 2, bait_history_line(credential))  # before `cd ~` / `exit`
+    history = "".join(lines)
     bashrc = "# ~/.bashrc: executed by bash(1) for non-login shells.\n[ -z \"$PS1\" ] && return\nalias ll='ls -alF'\n"
     for name, data, mode in (
         (".bash_history", history, 0o100600),
@@ -418,6 +467,8 @@ def _rewrite_home(root: Node, *, user: str, family: str, rng: random.Random) -> 
         ),
     ):
         _put(root, f"{base}/{name}", data, mode=mode, uid=1000, gid=1000)
+    for path, (data, mode) in bait_files(user, base, credential).items():
+        _put(root, path, data, mode=mode, uid=1000, gid=1000)
     # Give the history a believable age that varies between honeypots.
     node = _walk(root, f"{base}/.bash_history")
     if node is not None:
