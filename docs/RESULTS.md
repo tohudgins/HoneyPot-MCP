@@ -185,6 +185,8 @@ SIP is 13,325,848 alerts (75.2%) from 207 sources, and most of it is a few sourc
 
 The `friendly-scanner` user agent, which the engine names, is 26.4% of probes (2,293,855) and 46.5% of REGISTERs (2,102,693); the rest do not announce a tool. Within toll fraud the two heaviest sources are 45.9% and 33.7% of the INVITEs; the user agents are `pplsip` (46%), `Linksys-SPA942` (39%) and `sipcli/v1.8` (8%). No call is ever connected: every INVITE is answered with a 407 digest challenge (`engines/sip.py`).
 
+What the toll-fraud sources were doing is visible in the dialled strings. Each of the five heaviest sources keeps to one or two destination numbers (country codes 1, 44, 421 and 972 between them) and sends them behind many dial prefixes: `00`, `000`, `0011`, `9011`, `#0`, `*0`, `00+`, `~00` and combinations. One source used 275 different strings for one number; another 3. The pattern fits probing which outbound-route prefix a PBX accepts toward a number the caller controls, as international revenue-share fraud does [inference]. The packet captures of three toll-fraud sources show the same INVITEs on the wire, with the `pplsip`, `Linksys-SPA942` and `VOIP` user agents. Their destination numbers are third-party phone numbers and are not published here.
+
 ### 2.3 Credentials
 
 The SSH and Telnet sensors (Cowrie) accepted almost every login: Telnet accepted 291,298 from 358 sources and refused 3,727, SSH accepted 19,971 from 102 sources and refused 49. The only pairs ever refused were `root/root` and `root/123456` (both protocols) and `root` with no password (SSH, 4). The cause in the Cowrie configuration was not checked.
