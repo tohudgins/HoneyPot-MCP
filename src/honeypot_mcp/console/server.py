@@ -43,9 +43,9 @@ def _bucket_size(hours: float) -> timedelta:
 
     The tiers are chosen for cost as well as looks. Sub-hour columns cannot come from the hourly
     rollups, so they scan raw alerts: that is bounded here to windows of two hours or less (about
-    300k rows at the heaviest rate seen, 1.3 s on the droplet). Everything longer reads the rollups,
+    300k rows at the heaviest rate seen, 1.3 s on the VPS). Everything longer reads the rollups,
     whose cost does not depend on how many alerts there are. A 30-minute tier for windows up to 12 h
-    used to sit in between and scanned about a million rows every 5 s (6.7 s per poll on the droplet)."""
+    used to sit in between and scanned about a million rows every 5 s (6.7 s per poll on the VPS)."""
     if hours <= 2:
         return timedelta(minutes=5)
     if hours <= 48:

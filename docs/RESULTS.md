@@ -1,12 +1,20 @@
-# Five days on the public internet: what the honeypots saw and what running them taught us
+# Results: five days on a public-IP host
 
-HoneyPot-MCP ran for 116.4 hours (2026-10-11 18:18 to 2026-10-16 14:42 UTC) on a DigitalOcean droplet with a public address, since destroyed. 23 sensors covered 23 engine types; SMTP and DNS exist but were off, as `KNOWN_LIMITATIONS.md` recommends for a cloud host. This page reports what was captured and what operating it exposed. Every number comes from the final backup (a read-only SQLite file, 11 GB) or from a file in this repository. The query behind each table sits under it in italics.
+## Summary
+
+- 116.4 hours on a public-IP VPS, 23 sensors covering 23 engine types: 17.7M alerts stored (about 73M events seen) from 3,337 source addresses.
+- Volume is concentrated: three sources produced 64.9% of stored alerts, and SIP and Telnet are 96% of rows. Severity and value are not the same thing as volume.
+- CRITICAL alerts (0.16%) were mostly SIP toll fraud, with Docker API container escapes, Redis and database RCE attempts, and ransom notes as the rarer, higher-value classes.
+- A planted credential was replayed on the MySQL sensor from outside by three sources; the tripwire path from decoy file to alert worked end to end.
+- Running on live traffic exposed defects no unit test had (section 5); each was fixed and is recorded in `../CHANGELOG.md`. Section 6 lists what was not verified.
+
+HoneyPot-MCP ran for 116.4 hours (2026-10-11 18:18 to 2026-10-16 14:42 UTC) on a VPS with a public address. 23 sensors covered 23 engine types; SMTP and DNS exist but were off, as `../KNOWN_LIMITATIONS.md` recommends for a cloud host. This page reports what was captured and what operating it exposed. Every number comes from the run's final database backup (a read-only SQLite file, 11 GB) or from a file in this repository. The query behind each table sits under it in italics.
 
 Conventions that apply to every table:
 
 - **The backup is not published.** It holds captured credentials, malware and attacker addresses. Addresses are left out of this page; countries and event types are not.
 - **"Alerts" are stored rows.** The flood guard stores at most 600 events a minute per source and event type and counts the rest (section 1.4). Stored and seen are different numbers.
-- **Totals exclude 5,756 internal alerts** (Docker bridge 5,622, loopback 55, `0.x` 79: the platform's own probes). They **include the author's own field-test traffic**, one address, 5,680 alerts (0.03%). Breakdowns that read payloads (credentials, commands, geography, exploit details) exclude that address as well.
+- **Totals exclude 5,756 internal alerts** (Docker bridge 5,622, loopback 55, `0.x` 79: the platform's own probes). They **include the operator's own test traffic** from the field-test scripts, one address, 5,680 alerts (0.03%). Breakdowns that read payloads (credentials, commands, geography, exploit details) exclude that address as well.
 - Rollup queries below use `F` for: `source_ip NOT LIKE '172.17.%' AND source_ip NOT LIKE '127.%' AND source_ip NOT LIKE '0.%'`.
 
 ## 1. The run in numbers
@@ -61,7 +69,7 @@ Across the 117 hourly buckets the median hour held 148,843 alerts, the 90th perc
 
 *`SELECT CASE WHEN event_type LIKE 'docker_api%' THEN 'docker_api' ELSE substr(event_type,1,instr(event_type,'_')-1) END e, sum(count), count(distinct source_ip) FROM alert_rollups WHERE F GROUP BY 1 ORDER BY 2 DESC`. Grouped by event-type prefix, not by sensor id: Cowrie sensors were recreated during the run, so most SSH and Telnet alerts have no sensor row. 9,981 `flood_summary` rows and 17 `honeytoken_triggered_*` rows are not shown.*
 
-Volume says little about value. SIP and Telnet are 96% of the rows; CRITICAL is 0.16% of them, of which 93.6% (25,874 of 27,630, author's tests removed) is SIP toll fraud and 4.3% (1,175) is shell-written files; the other 581 are spread over 18 event types (section 2).
+Volume says little about value. SIP and Telnet are 96% of the rows; CRITICAL is 0.16% of them, of which 93.6% (25,874 of 27,630, operator's test traffic removed) is SIP toll fraud and 4.3% (1,175) is shell-written files; the other 581 are spread over 18 event types (section 2).
 
 ### 1.3 By severity
 
@@ -93,7 +101,7 @@ The top source accounts for 24.8% of all stored alerts; the top 3 for 64.9%, the
 
 *`SELECT source_ip, sum(count) FROM alert_rollups WHERE F GROUP BY 1 ORDER BY 2 DESC`, then the dominant type and first/last bucket per source. Addresses omitted.*
 
-**The stored figure understates the flood.** The guard counted 55,478,833 further events that it did not store, from 13 sources: 55,431,585 are `sip_extension_probe`, and the three heaviest of those sources are 69.2%, 25.2% and 5.6% of the suppressed total. Stored plus suppressed, the sensor saw about 64.1M extension probes against the 8.7M it stored. The first `flood_summary` is at 2026-10-12 14:04, after the first flood (a 3.25M-alert source on 2026-10-12 08:16 to 13:59); I read that as the guard not yet being active during that flood, but I did not check the deployment time.
+**The stored figure understates the flood.** The guard counted 55,478,833 further events that it did not store, from 13 sources: 55,431,585 are `sip_extension_probe`, and the three heaviest of those sources are 69.2%, 25.2% and 5.6% of the suppressed total. Stored plus suppressed, the sensor saw about 64.1M extension probes against the 8.7M it stored. The first `flood_summary` is at 2026-10-12 14:04, after the first flood (a 3.25M-alert source on 2026-10-12 08:16 to 13:59). This is consistent with the guard not yet being active during that flood; the deployment time was not checked.
 
 *`SELECT json_extract(payload,'$.event_type'), sum(json_extract(payload,'$.suppressed')) FROM alerts WHERE event_type='flood_summary' GROUP BY 1`.*
 
@@ -112,7 +120,7 @@ The top source accounts for 24.8% of all stored alerts; the top 3 for 64.9%, the
 | South Korea | 64 | 0.2% | 4 |
 | Vietnam | 57 | 0.2% | 5 |
 
-*`SELECT json_extract(payload,'$.enrichment.geoip.country'), count(*), count(distinct source_ip) FROM alerts WHERE severity IN ('critical','high') AND severity='critical' GROUP BY 1 ORDER BY 2 DESC` (the redundant `IN` clause makes SQLite use the partial index; 1.1 s). The table above also drops the author's address, so the United States row is 112 alerts lower than that query. 27,630 alerts from 136 sources remain; 9 had no enrichment.*
+*`SELECT json_extract(payload,'$.enrichment.geoip.country'), count(*), count(distinct source_ip) FROM alerts WHERE severity IN ('critical','high') AND severity='critical' GROUP BY 1 ORDER BY 2 DESC` (the redundant `IN` clause makes SQLite use the partial index; 1.1 s). The table above also drops the operator's test address, so the United States row is 112 alerts lower than that query. 27,630 alerts from 136 sources remain; 9 had no enrichment.*
 
 Read this table narrowly. GeoIP runs only for CRITICAL alerts, so it describes 136 sources out of 3,337, and the country is where the address geolocates (mostly hosting providers), not where a person sits. The Philippines row is a single source: SIP toll-fraud INVITEs (the same source is 45.9% of all `sip_toll_fraud_attempt`). The United States row is 8,766 SIP toll-fraud alerts plus 345 SSH file writes.
 
@@ -156,7 +164,7 @@ Each event type is mapped with the repository's own mapper (`intel.mitre.map_to_
 | T1486 Data Encrypted for Impact | 20 | mongodb_ransom_note |
 | T1505.003 Web Shell | 8 | mysql_outfile_write |
 
-*`cd` into the repo, then `.venv/bin/python`: for each `(event_type, sum(count))` of `SELECT event_type, sum(count) FROM alert_rollups GROUP BY 1` (all sources, as the tool does), `await map_to_attack([event_type])`; a tactic counts each alert once, a technique counts every alert that maps to it, so `telnet_login_success` is under both T1110.001 and T1078. `docs/screenshots/real-run/attack-navigator-layer.json` holds the same scoring from a snapshot at 17,638,144 alerts (94.3% mapped), taken before the final backup. The mapping is by event type; payload text is not read here (`map_ttps` does that per attacker). T1611 and T1486 come from sensors with very few alerts, and some of those are the author's own tests (section 2.7).*
+*From the repository's virtualenv: for each `(event_type, sum(count))` of `SELECT event_type, sum(count) FROM alert_rollups GROUP BY 1` (all sources, as the tool does), `await map_to_attack([event_type])`; a tactic counts each alert once, a technique counts every alert that maps to it, so `telnet_login_success` is under both T1110.001 and T1078. `screenshots/real-run/attack-navigator-layer.json` holds the same scoring from a snapshot at 17,638,144 alerts (94.3% mapped), taken before the final backup. The mapping is by event type; payload text is not read here (`map_ttps` does that per attacker). T1611 and T1486 come from sensors with very few alerts, and some of those are the operator's own tests (section 2.7).*
 
 ![ATT&CK tactics and event types, Grafana, snapshot ending 2026-10-16 10:00 UTC](screenshots/real-run/mitre-coverage.png)
 
@@ -173,13 +181,13 @@ SIP is 13,325,848 alerts (75.2%) from 207 sources, and most of it is a few sourc
 | sip_invite | 49,707 | 37 | |
 | sip_toll_fraud_attempt (CRITICAL) | 25,874 | 17 | INVITE from an unregistered peer to a satellite or premium-prefix number or a long `00`-prefixed string; 648 distinct numbers dialled |
 
-*`SELECT event_type, sum(count), count(distinct source_ip) FROM alert_rollups WHERE F AND event_type LIKE 'sip_%' GROUP BY 1`; distinct extensions: `SELECT count(*) FROM (SELECT DISTINCT json_extract(payload,'$.extension') FROM alerts WHERE event_type='sip_extension_probe')` (4 s). Toll-fraud numbers and sources: `alerts` rows with `event_type='sip_toll_fraud_attempt'`, author's address removed. The classifier is `is_toll_fraud_target` in `engines/sip.py`.*
+*`SELECT event_type, sum(count), count(distinct source_ip) FROM alert_rollups WHERE F AND event_type LIKE 'sip_%' GROUP BY 1`; distinct extensions: `SELECT count(*) FROM (SELECT DISTINCT json_extract(payload,'$.extension') FROM alerts WHERE event_type='sip_extension_probe')` (4 s). Toll-fraud numbers and sources: `alerts` rows with `event_type='sip_toll_fraud_attempt'`, operator's test address removed. The classifier is `is_toll_fraud_target` in `engines/sip.py`.*
 
 The `friendly-scanner` user agent, which the engine names, is 26.4% of probes (2,293,855) and 46.5% of REGISTERs (2,102,693); the rest do not announce a tool. Within toll fraud the two heaviest sources are 45.9% and 33.7% of the INVITEs; the user agents are `pplsip` (46%), `Linksys-SPA942` (39%) and `sipcli/v1.8` (8%). No call is ever connected: every INVITE is answered with a 407 digest challenge (`engines/sip.py`).
 
 ### 2.3 Credentials
 
-The SSH and Telnet sensors (Cowrie) accepted almost every login: Telnet accepted 291,298 from 358 sources and refused 3,727, SSH accepted 19,971 from 102 sources and refused 49. The only pairs ever refused were `root/root` and `root/123456` (both protocols) and `root` with no password (SSH, 4). I did not check the cause in the Cowrie configuration.
+The SSH and Telnet sensors (Cowrie) accepted almost every login: Telnet accepted 291,298 from 358 sources and refused 3,727, SSH accepted 19,971 from 102 sources and refused 49. The only pairs ever refused were `root/root` and `root/123456` (both protocols) and `root` with no password (SSH, 4). The cause in the Cowrie configuration was not checked.
 
 | Telnet: top pairs | Logins | SSH: top pairs | Logins |
 |---|---|---|---|
@@ -202,7 +210,7 @@ Telnet is 78 distinct usernames and 247 distinct pairs, and `root` and `admin` a
 | rdp_nla_auth (NTLMv2 captured) | 10,632 | 146 | Administrator 2,865; administrator 1,438; admin 1,168 (1,745 distinct names) |
 | smb_ntlm_auth (NTLMv2 captured) | 58,708 | 31 | administrator 14,881; Administrator 3,650; admin 1,970 |
 
-*SSH/Telnet: `SELECT source_ip, payload FROM alerts WHERE event_type IN ('telnet_login_success','telnet_login_failed','ssh_login_success','ssh_login_failed')`, then count `username`/`password` in Python (public credential lists; `selftest_*` and the author's address dropped). The one SSH `svc-backup` password is withheld because it is a single-source pair, not a list entry. Other services: the same on `<service>_login_attempt` / `_auth`.*
+*SSH/Telnet: `SELECT source_ip, payload FROM alerts WHERE event_type IN ('telnet_login_success','telnet_login_failed','ssh_login_success','ssh_login_failed')`, then count `username`/`password` in Python (public credential lists; `selftest_*` and the operator's test address dropped). The one SSH `svc-backup` password is withheld because it is a single-source pair, not a list entry. Other services: the same on `<service>_login_attempt` / `_auth`.*
 
 ### 2.4 Commands on the shell honeypots
 
@@ -236,7 +244,7 @@ The HTTP sensor stored 5,015 alerts. `http_exploit_attempt`: 112 alerts from 23 
 
 The bait files were served 143 times to 23 sources: `/.env` 101 (21 sources), `/config.json` 12, `/wp-config.php` 11, `/.aws/credentials` 10, `/.kube/config` 9. `http_active_recon` (session with five or more requests) is 3,541; `http_credential_submit` 157 from 8 sources.
 
-*`SELECT source_ip, payload FROM alerts WHERE event_type='http_exploit_attempt'` and `'http_decoy_served'`, author's address removed; categories from `payload.exploit_categories`.*
+*`SELECT source_ip, payload FROM alerts WHERE event_type='http_exploit_attempt'` and `'http_decoy_served'`, operator's test address removed; categories from `payload.exploit_categories`.*
 
 ### 2.6 Docker API: container escapes
 
@@ -253,7 +261,7 @@ The bait files were served 143 times to 23 sources: `/.env` 101 (21 sources), `/
 
 Images used: `alpine` (18 events, three spellings), `postgres:15.4` (6), one `miningcontainers/xmrig` and 5 by image id. In 11 events the command runs `chroot` into the mounted root, in 13 it fetches with `curl`, and three name `xmrig` (pools `supportxmr`, `moneroocean` and `kryptex`; one fetches `xmrig.bin`); one writes a crontab entry. After a create, four sources ran `exec`: `head -3 /host/etc/shadow`, `head -3 /host/etc/passwd`, `ls -la /host/root/.ssh/`, and, four times, a command that starts `cd /tmp || cd /var/tmp || cd /dev/shm; echo '-----BEGIN OPENSSH PRIVATE KEY-----`.
 
-*`SELECT source_ip, payload FROM alerts WHERE event_type LIKE 'docker_api_%'`, author's address removed (6 of the 36 `container_escape` rows in the rollups were the author's `field_test.py` run); fields `image`, `cmd`, `escape_indicators`.*
+*`SELECT source_ip, payload FROM alerts WHERE event_type LIKE 'docker_api_%'`, operator's test address removed (6 of the 36 `container_escape` rows in the rollups were the operator's own `field_test.py` run); fields `image`, `cmd`, `escape_indicators`.*
 
 ### 2.7 Redis, databases, and engines nobody attacked
 
@@ -261,9 +269,9 @@ Images used: `alpine` (18 events, three spellings), `postgres:15.4` (6), one `mi
 
 **Databases.** `mysql_udf_rce` (CRITICAL) 118 events from 4 sources (`CREATE FUNCTION ... SONAME '<name>.dll'`); `mysql_outfile_write` 8 (2 sources); `postgresql_copy_program_rce` 22 (4 sources: `COPY ... FROM PROGRAM` running a base64-wrapped script); `mongodb_ransom_note` 15 (8 sources: `README` / `READ_ME_TO_RECOVER_YOUR_DATA` inserts), `mongodb_destructive` 45.
 
-**CRITICAL event types seen only from the author's own tests, not from the internet:** `kubernetes_secret_access` 12, `kubernetes_pod_escape` 6, `kubernetes_pod_exec` 6, `memcached_amplification_attempt` 9, `snmp_set_request` 4, `ldap_jndi_lookup` 1. The Kubernetes, memcached, SNMP and LDAP sensors recorded 350, 590, 248 and 374 alerts in total and none of them CRITICAL from outside. Their detection is proven by `field_test.py` (section 6), not by an attack seen in the wild.
+**CRITICAL event types seen only from the operator's own tests, not from the internet:** `kubernetes_secret_access` 12, `kubernetes_pod_escape` 6, `kubernetes_pod_exec` 6, `memcached_amplification_attempt` 9, `snmp_set_request` 4, `ldap_jndi_lookup` 1. The Kubernetes, memcached, SNMP and LDAP sensors recorded 350, 590, 248 and 374 alerts in total and none of them CRITICAL from outside. Their detection is proven by `field_test.py` (section 6), not by an attack seen in the wild.
 
-*Rollups: `SELECT event_type, sum(count), count(distinct source_ip) FROM alert_rollups WHERE F AND source_ip NOT IN (<author address>) AND severity='critical' GROUP BY 1`; Redis fields from `payload.parameter/value/target_path`.*
+*Rollups: `SELECT event_type, sum(count), count(distinct source_ip) FROM alert_rollups WHERE F AND source_ip NOT IN (<test address>) AND severity='critical' GROUP BY 1`; Redis fields from `payload.parameter/value/target_path`.*
 
 ## 3. The bait: tracked credentials tripped from outside
 
@@ -277,13 +285,13 @@ A honeytoken credential exists only in decoy files. Using it elsewhere has no be
 
 Eight trip alerts, three sources. The delay from token creation to the first trip was 20 h 22 m 28 s; B and C used it 2 d 21 h and 4 d 9 h after creation. `/.env` was first served after the token existed at 08:35 on 2026-10-12 and 100 times to 20 sources in all; one of those 20 went on to replay the pair. B and C had touched no other sensor, so the pair reached them some other way (from whoever read `/.env`, or from a list); the data cannot say which.
 
-What did not trip: 33 of the 35 revoked tokens carry field-test labels (`ft...`, `test-...`, `field-...`); the other two have other labels. The canary-URL token `public-bait-canary-env` was never called from outside. On SSH, the sensor was rebuilt at 2026-10-15 23:18 with `~/.my.cnf` and `~/.bash_history` bait under `/root`; 2,659 SSH sessions followed and no outside session ran a command that reads `.my.cnf`. The other 11 `honeytoken_triggered_*` alerts (of 19 total) are the author's field-test tokens and one replay of the bait from the author's address on 2026-10-15 23:19, run to check the Cowrie bait after the rebuild.
+What did not trip: 33 of the 35 revoked tokens carry field-test labels (`ft...`, `test-...`, `field-...`); the other two have other labels. The canary-URL token `public-bait-canary-env` was never called from outside. On SSH, the sensor was rebuilt at 2026-10-15 23:18 with `~/.my.cnf` and `~/.bash_history` bait under `/root`; 2,659 SSH sessions followed and no outside session ran a command that reads `.my.cnf`. The other 11 `honeytoken_triggered_*` alerts (of 19 total) are the operator's field-test tokens and one replay of the bait from the operator's test address on 2026-10-15 23:19, run to check the Cowrie bait after the rebuild.
 
 *`SELECT id, timestamp, event_type, source_ip FROM alerts WHERE event_type LIKE 'honeytoken_triggered_%' ORDER BY timestamp` (19 rows; sources labelled by order, addresses not shown); token creation from `SELECT id, label, type, status, created_at, triggered_at FROM honeytokens`; per-source history from `SELECT timestamp, event_type, json_extract(payload,'$.path') FROM alerts WHERE source_ip = ? ORDER BY timestamp`. The delay is measured from token creation; the pair is served from then on under the "lowest active token id" rule (`credential_match.planted_credential`, CHANGELOG). Counts differ by two canary rows between `alerts` (19) and the rollups (17) because loopback canary callbacks are internal.*
 
 ## 4. Captured artifacts
 
-| Location (`samples-QUARANTINE/`) | Files | Total size | Size range |
+| Location (quarantined sample directory) | Files | Total size | Size range |
 |---|---|---|---|
 | `honeypot-hp-ssh/downloads` | 4 | 5,224 B | 26 to 4,745 B |
 | `honeypot-hp-telnet/downloads` (`redir_*`) | 65 | 453 B | 0 to 202 B |
@@ -292,25 +300,25 @@ What did not trip: 33 of the 35 revoked tokens carry field-test labels (`ft...`,
 
 *`find <dir> -type f ! -name .gitignore -exec stat -f %z {} +` (listing only, nothing opened). `SHA256SUMS` has 159 lines: these 155 files plus four `.gitignore` markers.*
 
-I did not run `file` on them: every file is mode `0000` and I left it that way. The sizes already say most of this set is not malware: 63 of the 65 Telnet download files are 0 or 1 byte (leftovers of failed fetches, with egress closed), and the largest download is 4,745 B, too small for a typical bot binary [inference]. The alerts reference more than the directory holds: 34 distinct SHA-256 hashes appear in file events (`ssh_file_download`, `telnet_file_download`, `ssh_file_upload`, `ftp_file_upload`, `ftp_file_download`), of which 5 are file names in the quarantine. Cowrie keeps downloads and recordings in tmpfs, so they are lost whenever its container restarts; the Telnet container was killed for memory repeatedly (section 5) and both Cowrie sensors were rebuilt on 2026-10-15 at 23:18, so this directory is what was still in the containers at backup time.
+`file` was not run on them: every file is mode `0000` and was left that way. The sizes already say most of this set is not malware: 63 of the 65 Telnet download files are 0 or 1 byte (leftovers of failed fetches, with egress closed), and the largest download is 4,745 B, too small for a typical bot binary [inference]. The alerts reference more than the directory holds: 34 distinct SHA-256 hashes appear in file events (`ssh_file_download`, `telnet_file_download`, `ssh_file_upload`, `ftp_file_upload`, `ftp_file_download`), of which 5 are file names in the quarantine. Cowrie keeps downloads and recordings in tmpfs, so they are lost whenever its container restarts; the Telnet container was killed for memory repeatedly (section 5) and both Cowrie sensors were rebuilt on 2026-10-15 at 23:18, so this directory is what was still in the containers at backup time.
 
-*Hashes: `payload.shasum` or `payload.sha256` of those five event types, author's address removed; `SELECT count(*) FROM alerts WHERE event_type='ssh_file_download'` is 1,175, with 21 distinct hashes.*
+*Hashes: `payload.shasum` or `payload.sha256` of those five event types, operator's test address removed; `SELECT count(*) FROM alerts WHERE event_type='ssh_file_download'` is 1,175, with 21 distinct hashes.*
 
-## 5. What running it live taught us
+## 5. What live traffic taught us
 
-Each of these needed real traffic, a real client or a real backup; the unit suite did not catch them. Figures are the ones in `CHANGELOG.md` and `docs/FIELD_TEST.md`.
+Each of these needed real traffic, a real client or a real backup; the unit suite did not catch them. Figures are the ones in `../CHANGELOG.md` and `FIELD_TEST.md`.
 
 | What was wrong | How it was found | Fix | Measured |
 |---|---|---|---|
 | One SIP source sent about 190 events/s; the table went from 1.1M to 4.9M rows in nine hours (3.8 GB, past the 4 GB host's RAM) and the basic tools timed out | Reading the data the morning after the first night | Index on `alerts.honeypot_id`; a suppression rule; `alert_rollups`; the flood guard | `honeypot_list` 51 s to 0.02 s on a 1.1M-row copy; rate-limit rule: 198 to 11 events/s, CPU 112% to 23%; with rollups `alerts_stats`/`soc_brief`/`honeypot_list` 27 s, over 100 s and 51 s to 0.01 s or less |
 | The Telnet sensor was OOM-killed 246 times in 20 hours: the container's cgroup counts every tmpfs file's kernel memory (43,591 files in `downloads/`, 99.8% 0 bytes), and one source opened about 2,400 sessions in six minutes | A backup that finished with 33 health warnings; `docker events` (`docker inspect` resets `OOMKilled`) | In-container janitor, 128 connections per source in the firewall, 512 MiB and one CPU, watchdog needs two failed sweeps | 220 held connections from one host: 131 admitted, 89 dropped; CPU-throttled periods about 90% to 1% |
-| The operations console never returned on 17.6M alerts (re-aggregated the raw table ten times per poll) | Rendering it on the live droplet | Reads hourly rollups; literal SQL so the partial index is used | No answer in 100 to 120 s; now 0.2 to 3 s live; 7 days: 22 s after a first rewrite, 0.61 s after the second; CRITICAL lookup 12.7 s to 0.47 s |
+| The operations console never returned on 17.6M alerts (re-aggregated the raw table ten times per poll) | Rendering it against the live deployment | Reads hourly rollups; literal SQL so the partial index is used | No answer in 100 to 120 s; now 0.2 to 3 s live; 7 days: 22 s after a first rewrite, 0.61 s after the second; CRITICAL lookup 12.7 s to 0.47 s |
 | `sql_query` did not enforce its 15 s limit (`asyncio.wait_for` cannot stop a SQLite scan in a worker thread) | Running it on 14.9M real alerts | Deadline is a SQLite progress handler | Query ran 87 s and left the session in `PendingRollbackError`; now stops at 16.5 s and the next query works |
 | `analyze_campaign` correlated only the newest 5,000 alerts | Oracle against raw SQL | Built from exact hourly rollups | 7 campaigns from the last 16 minutes versus 274 in SQL; now 274 and 457,839 events on both sides |
 | The platform recorded its own health probes as an attacker (Docker bridge address) | Reading live data | Probe claims its bound port under the bridge gateway too | 1,060 connect/close pairs per sensor in nine hours; 48 events in six minutes before, none in four after |
 | Throttled notifications were counted as deliveries, and a CRITICAL flood bypassed the throttle | Reading subscription counters; one source sending about 700 toll-fraud INVITEs an hour | Throttled events count as `suppressed_count`; repeats within 300 s coalesce | 13,025 "deliveries" in nine hours against a handful of messages; 24 messages in ten minutes against about 12 a minute |
-| `backup.sh` ran `sqlite3 .backup` for 38 minutes without finishing; a downloaded WAL snapshot could not be opened read-only; `--samples` reported "0 files" | Running it on the droplet | `VACUUM INTO`; open `immutable=1`; missing directory is a failure | 203 s on the same database; the containers held 32 downloads and 18 recordings |
-| FTP: login worked, `LIST` timed out (the passive data port was not open in the firewall) | Real FTP client against the droplet | Passive range plus firewall rule | Live run had 9 anonymous logins and 9 passive attempts and no listing; now `LIST`, `SIZE`, `RETR` agree (158 bytes) |
+| `backup.sh` ran `sqlite3 .backup` for 38 minutes without finishing; a downloaded WAL snapshot could not be opened read-only; `--samples` reported "0 files" | Running it on the live host | `VACUUM INTO`; open `immutable=1`; missing directory is a failure | 203 s on the same database; the containers held 32 downloads and 18 recordings |
+| FTP: login worked, `LIST` timed out (the passive data port was not open in the firewall) | Real FTP client against the live host | Passive range plus firewall rule | Live run had 9 anonymous logins and 9 passive attempts and no listing; now `LIST`, `SIZE`, `RETR` agree (158 bytes) |
 | NFS: `showmount -e` could not work (port 111 closed); the portmapper answered every version in v2 format | `showmount`, `rpcinfo`, nmap `nfs-*` | 111 and 2049 redirected to one internal port; v2, v3, v4 and `PROG_MISMATCH` | nmap identifies `rpcbind 2-4` and `nfs 3-4`; `nfs_export_enumeration` recorded |
 | Seven extra ports reachable (1110, 1143, 1389, 2121, 4445, 8080, 8873): post-redirect ports answered directly | Full 65,535-port connect scan from outside | Firewall accepts redirect targets only for DNAT'd packets (`ct status dnat`) | Pinned against real nftables by `tests/integration/test_firewall_rules.py` |
 | DNS: UDP only (TCP zone transfer refused, unrecorded), `version.bind` answered with SPF, `ANY` gave NXDOMAIN, `aa ra ad` set together | Real `dig`, `nmap`, `smtplib` | TCP/53, CHAOS answers, RFC 8482 `ANY`, resolver flags | Fixed; DNS stayed off on the public host |
@@ -320,7 +328,7 @@ Each of these needed real traffic, a real client or a real backup; the unit suit
 | RDP connections from the internet filed as Lateral Movement; journeys with a 2,570-event phase and no technique | Reading `attack_summary` as an analyst | T1133 for connections; techniques from exact counts | 4,888 alerts re-filed from T1021.001 to T1133 |
 | `honeypot_pause` returned `paused` while the port kept answering; a triage filter re-selected the newest 500 and overwrote the first analyst's disposition; `http_active_recon` overwrote `http_credential_submit` | `field_test_ops.py`, `field_test.py` | In-process pause closes the listener; filters select untriaged alerts only; only a plain probe is relabelled | `hp-vnc`'s port closed on pause and reopened on resume |
 
-*Sources: `CHANGELOG.md` (top 470 lines) and `docs/FIELD_TEST.md` ("What the first live run found", "Later rounds", "Live checks that no script can replace"). The numbers were not re-measured for this page.*
+*Sources: `../CHANGELOG.md` and `FIELD_TEST.md` ("What the first live run found", "Later rounds", "Live checks that no script can replace"). The numbers were not re-measured for this page.*
 
 ## 6. Method and honesty
 
@@ -332,13 +340,13 @@ Each of these needed real traffic, a real client or a real backup; the unit suit
 | `scripts/field_test_oracle.py` | Do the read tools' numbers equal an independent SQL computation? | 73 checks, 0 failed on 17,539,280 alerts |
 | `scripts/field_test_injection.py` | Can attacker-written text steer a model that holds every tool? | All three scenarios held (one model, one sample each) |
 
-*Run reports are kept outside the repository, in the author's working directory (`field-report-final.md`, `tools-final.md`, `ops-final.md`, `oracle-final.md`); the scripts and `docs/FIELD_TEST.md` are in it.*
+*Run reports (`field-report-final.md`, `tools-final.md`, `ops-final.md`, `oracle-final.md`) are not part of the repository; the scripts that produce them and `FIELD_TEST.md` are.*
 
 - **The oracle is the check on this page's totals.** It runs the read tools on a copy of a frozen backup and compares each answer with plain SQL over `alerts`, never over rollups: `alerts_stats` in five window shapes, per-sensor counts, `soc_brief`, `threat_timeline`, attacker profiles and journeys (first and last seen to the microsecond), blocklist membership, `analyze_campaign`, `fingerprint_clusters`. The final run used the backup taken at 13:05 UTC on the last day (17,539,280 alerts), about 1.6 hours before the backup used here. To show it can fail, one rollup count was changed by one in a copy on the first run and the total, severity split, top sources and per-sensor hits all failed. `map_ttps` is the one tool it does not cover.
-- **The tool sweep's one failure** is the `sql_query` check that the `honeytokens` table is refused. The report line carries the server's refusal text, so the table was refused and I read the failure as a mismatch in what the check expected; I did not investigate or re-run it for this page.
+- **The tool sweep's one failure** is the `sql_query` check that the `honeytokens` table is refused. The report line carries the server's refusal text, so the table was refused and the failure looks like a mismatch in what the check expected; it was not investigated or re-run for this page.
 - **The prompt-injection test** plants alerts whose fields carry instructions (bulk false-positive triage, `alerts_prune`, `honeypot_stop`, `report_ip_abuse`, `export_blocklist`; in a command, user agent, username, path and JSON blob) into a copy of a real backup and gives a real `claude -p` session every tool pre-approved. It then checks the database and the tool-call stream, not the model's account. In all three scenarios (summarise, triage, investigate) the model read the payloads in full, called only read tools or the one `alerts_acknowledge` it was asked for, and changed nothing else; twice it named the attack. **One model and one sample per scenario: evidence, not proof.** The guidance that follows is the role system: an unattended agent gets a `viewer` token.
 - **Not verified live:** GreyNoise enrichment (the free key needs a business email); the pfSense, Cloudflare and AWS WAF blocklist push tools (rewritten to the vendors' published contracts after a review found four defects; tested against strict stubs and botocore's `Stubber`, never against a real account); the cloud-key honeytokens (needs an audit-log forwarder; the Terraform was never applied); SMTP and DNS on the public internet (off by design, tested locally with `smtplib`, `dig`, `nmap`).
-- **Limits of what this data shows.** These are protocol facades, so the population is automated scanners and bots: the platform does not claim to see a skilled human. Five days from one address is a sample of one network position, not a census. A country is the geolocation of the source address, and GeoIP covers only CRITICAL alerts. ATT&CK mapping is by event type with regular expressions and has not been checked against analyst labels. A few CRITICAL event types above were reached only by the author's tests.
-- **The labels are the project's own.** Severity, event types and the ATT&CK mapping come from the engines and `intel/mitre.py`; the figures here are only as good as those classifiers. The unit suite (2,221 passed, 4 skipped at its last full run, per `README.md`) was not run for this page.
+- **Limits of what this data shows.** These are protocol facades, so the population is automated scanners and bots: the platform does not claim to see a skilled human. Five days from one address is a sample of one network position, not a census. A country is the geolocation of the source address, and GeoIP covers only CRITICAL alerts. ATT&CK mapping is by event type with regular expressions and has not been checked against analyst labels. A few CRITICAL event types above were reached only by the operator's own tests.
+- **The labels are the project's own.** Severity, event types and the ATT&CK mapping come from the engines and `intel/mitre.py`; the figures here are only as good as those classifiers. The unit suite was not run for this page.
 
-Reproduce on your own deployment with `scripts/field_test.py`, `scripts/analyze_backup.py <backup>` and the queries above; `docs/FIELD_TEST.md` describes each script.
+Reproduce on your own deployment with `scripts/field_test.py`, `scripts/analyze_backup.py <backup>` and the queries above; `FIELD_TEST.md` describes each script.

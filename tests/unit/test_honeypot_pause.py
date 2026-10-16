@@ -1,6 +1,6 @@
 """`honeypot_pause` must do what its status says: a paused in-process sensor stops answering.
 
-Found on the live droplet: pausing `hp-vnc` returned `paused` while its port kept answering and
+Found on the live VPS: pausing `hp-vnc` returned `paused` while its port kept answering and
 recording, because the engine's `pause()` is a no-op for everything that is not a Docker container.
 """
 

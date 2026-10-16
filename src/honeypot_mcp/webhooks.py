@@ -982,7 +982,7 @@ class _NotifyThrottle:
         now = time.monotonic()
         # The same CRITICAL from the same source, repeated: the first one pages, the rest ride
         # along as a count. A honeytoken trigger is the highest-fidelity signal this platform has,
-        # so it is never coalesced. Found on the live droplet: one source sending ~700 SIP
+        # so it is never coalesced. Found on the live VPS: one source sending ~700 SIP
         # toll-fraud INVITEs an hour was a Slack message every five seconds, because the per-type
         # cap below (30 a minute) is far above any single scanner's rate.
         tripwire = event.honeytoken_id is not None

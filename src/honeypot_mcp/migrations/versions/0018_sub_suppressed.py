@@ -1,7 +1,7 @@
 """subscriptions.suppressed_count
 
 A notification the throttle declined to send was recorded as a successful delivery. On the live
-droplet the Slack subscription reported 13,025 "deliveries" in nine hours while it had received a
+VPS the Slack subscription reported 13,025 "deliveries" in nine hours while it had received a
 handful of messages, and each such "success" also reset `failure_count` and cleared `last_error`, so
 a broken webhook would have looked healthy. Suppressed events are now counted here instead.
 

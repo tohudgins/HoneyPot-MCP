@@ -72,7 +72,7 @@ def test_input_is_default_drop_and_opens_only_the_admin_port_and_the_engine_port
 
 
 def test_a_port_that_exists_only_as_a_redirect_target_is_not_reachable_directly():
-    """A scan of the whole port range against the live droplet found 8080, 1110, 1143, 1389, 2121,
+    """A scan of the whole port range against the live VPS found 8080, 1110, 1143, 1389, 2121,
     4445 and 8873 open beside 80, 110, 143, ...: the post-redirect ports were accepted for any
     packet. A real host does not answer POP3 on both 110 and 1110, so the decoy was fingerprintable
     by a port scan alone. The redirect targets are accepted only for redirected packets."""

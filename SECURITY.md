@@ -9,8 +9,8 @@ Use [GitHub's private vulnerability reporting](https://github.com/tohudgins/Hone
 observed, and a reproduction if you have one.
 
 Expect an acknowledgement within a few days. This is a personally maintained
-project, not a vendor with an on-call rota — please size your expectations
-accordingly, and say so in the report if you have a disclosure deadline.
+project without an on-call rota, so please size expectations accordingly, and
+say so in the report if you have a disclosure deadline.
 
 ## What this software is
 
@@ -87,9 +87,10 @@ if you change them deliberately.
   and move your admin SSH off port 22 before exposing honeypot ports. See
   [docs/DEPLOY.md](docs/DEPLOY.md).
 - **The MCP control plane can deploy honeypots and read every captured
-  attack.** On a networked transport it refuses to start without
-  `MCP_AUTH_TOKEN`. Do not open that port to the internet — reach it over an
-  SSH tunnel.
+  attack.** On a networked transport it refuses to start unless an auth token
+  (`MCP_AUTH_TOKEN` or `MCP_AUTH_TOKENS`) or an explicit
+  `MCP_ALLOW_UNAUTHENTICATED` is set. Do not open that port to the internet;
+  reach it over an SSH tunnel.
 - **The operations console has no authentication** and shows all captured
   attack data. It binds `127.0.0.1` by default; putting it on `0.0.0.0` should
   be a deliberate decision behind a reverse proxy or a VPN.

@@ -1,6 +1,6 @@
 """Queries that run on every `honeypot_list` must not scan the alerts table.
 
-Found on the live droplet: with 4.9M alerts `honeypot_list` took 51 s, because the per-sensor hit
+Found on the live VPS: with 4.9M alerts `honeypot_list` took 51 s, because the per-sensor hit
 count (`GROUP BY honeypot_id`) had no index and read every row. The alert table grows by gigabytes a
 day on a public host, so a plan regression is invisible in a small test database and fatal in
 production; the plan itself is what is pinned here.

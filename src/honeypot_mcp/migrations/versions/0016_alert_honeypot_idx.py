@@ -1,7 +1,7 @@
 """index alerts.honeypot_id
 
 `honeypot_list`, `honeypot_status` and the per-sensor counts group alerts by `honeypot_id`, and
-nothing indexed that column, so every call scanned the whole table. On the live droplet with 4.9M
+nothing indexed that column, so every call scanned the whole table. On the live VPS with 4.9M
 alerts `honeypot_list` took 51 seconds; with this covering index the same count is 0.02 seconds on a
 1.1M-row copy (a table scan became an index search).
 

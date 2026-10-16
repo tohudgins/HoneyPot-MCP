@@ -210,7 +210,7 @@ async def get_alert_stats(session: AsyncSession, since: datetime | None = None) 
 
     Read from the hourly rollups (plus the alert rows for the window's partial edges), so the cost
     follows the number of distinct (hour, kind, source, sensor) combinations, not the number of
-    alerts: on the live droplet the same five aggregates over the alert table took 27 s all-time
+    alerts: on the live VPS the same five aggregates over the alert table took 27 s all-time
     and over 100 s for one hour, at 4.9M rows.
     """
     return await rollups.stats(session, since)

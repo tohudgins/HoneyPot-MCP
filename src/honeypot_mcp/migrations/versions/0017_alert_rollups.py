@@ -1,6 +1,6 @@
 """alert_rollups: hourly alert counts, plus two small partial indexes for the triage queue
 
-On the live droplet the alert table reached 4.9M rows in nine hours (one SIP flood) and the basic
+On the live VPS the alert table reached 4.9M rows in nine hours (one SIP flood) and the basic
 analyst tools stopped working: `alerts_stats` took 27 s (and over 100 s over a one-hour window),
 `soc_brief` timed out, because each aggregate read every row. The remedy is to make the cost of a
 statistic depend on the size of the answer, not of the table:
@@ -15,7 +15,7 @@ statistic depend on the size of the answer, not of the table:
 
 Idempotent per the project convention: every step checks what exists first, so this is a no-op on
 a fresh database where 0001_baseline's create_all already built it all from models.py. Backfill
-runs only when this migration creates the table. On the 4.9M-row droplet table expect the backfill
+runs only when this migration creates the table. On the 4.9M-row table expect the backfill
 to take a minute or two, during which writers wait.
 
 Revision ID: 0017_alert_rollups

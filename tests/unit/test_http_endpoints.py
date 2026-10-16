@@ -191,7 +191,7 @@ def test_decoy_files_carry_a_planted_credential_and_canary_url_only_when_planted
 @pytest.mark.asyncio
 async def test_an_exposed_env_file_serves_the_planted_mysql_pair_until_it_is_revoked(http_server):
     """A scanner that reads /.env and replays the database login against one of our services is
-    only a CRITICAL alert if the pair it found is a tracked token. Found on the live droplet: the
+    only a CRITICAL alert if the pair it found is a tracked token. Found on the live VPS: the
     decoy bodies were random, so no public scanner could ever trip a credential token."""
     from honeypot_mcp import credential_match
     from honeypot_mcp.storage.database import get_session
@@ -292,7 +292,7 @@ async def test_a_login_attempt_after_crawling_is_still_a_credential_submission(h
     """A scanner that maps the site first and then tries a login (the usual order, with a
     cookie jar) crossed the recon threshold, and the escalation overwrote the event type: the
     attempt was filed as `http_active_recon`, so "which credentials were tried" came up short.
-    Found by a field test with a real httpx client against a live droplet."""
+    Found by a field test with a real httpx client against a live VPS."""
     from sqlalchemy import select
 
     from honeypot_mcp.storage import event_buffer

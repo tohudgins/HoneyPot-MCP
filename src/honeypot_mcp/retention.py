@@ -2,7 +2,7 @@
 
 Both paths must be safe on a table of millions of rows and must never destroy evidence they did not
 first write down. The manual tool used to build the whole archive as ONE string in memory and
-delete with one statement: on the live droplet's 4.9M-row, 3.8 GB table that is gigabytes of RAM on
+delete with one statement: on the live VPS's 4.9M-row, 3.8 GB table that is gigabytes of RAM on
 a 4 GB host and a write lock held for the length of the delete. So there is one implementation:
 
 * `archive_alerts` streams keyset-paginated chunks to a `.partial` file and renames it into place

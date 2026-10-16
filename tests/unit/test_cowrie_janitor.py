@@ -1,6 +1,6 @@
 """Cowrie's RAM-backed artifact directories must not grow until the container is OOM-killed.
 
-Found on the live droplet: the telnet container was OOM-killed 246 times in 20 hours. 43,591 empty
+Found on the live VPS: the telnet container was OOM-killed 246 times in 20 hours. 43,591 empty
 leftovers of failed downloads and 10,654 session recordings (~85 MB against a 64 MB tmpfs) cost
 ~80 MiB of kernel memory against a 256 MiB limit, and the full directory meant new recordings and
 real downloads were failing to write. Each kill discarded every session, recording and sample.
@@ -147,7 +147,7 @@ def test_only_importing_a_patched_cowrie_module_starts_the_janitor(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_of_a_docker_sensor_never_asks_the_docker_api_for_the_image():
-    """Found by calling `honeypot_status` on the live droplet: it failed with a 403 from the host's
+    """Found by calling `honeypot_status` on the live VPS: it failed with a 403 from the host's
     Docker guard because `container.image` makes the SDK fetch `GET /images/<id>/json`, which the
     guard (rightly) refuses. The tool worked on every in-process sensor and broke on every
     Docker-backed one in the hardened deployment. It also exposes the restart count, because a

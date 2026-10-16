@@ -1,6 +1,6 @@
 """Bound what one noisy source can write: store the first N events a minute, count the rest.
 
-Found on the live droplet: one address sent SIP probes at about 190 events a second and the database
+Found on the live VPS: one address sent SIP probes at about 190 events a second and the database
 went from 1.1M to 4.9M rows in nine hours (3.8 GB, past the host's RAM). From then on the basic
 analyst tools took tens of seconds or timed out, because every aggregate reads millions of rows that
 carry no information the first few thousand did not. A probe flood is volume, not intelligence.

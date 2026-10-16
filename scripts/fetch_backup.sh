@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch a backup from the honeypot VPS to this machine, verify it, and report whether the run worked.
 #
-#   scripts/fetch_backup.sh --host <droplet-ip> --key ~/.ssh/honeypot_deploy [options]
+#   scripts/fetch_backup.sh --host <vps-ip> --key ~/.ssh/honeypot_deploy [options]
 #   scripts/fetch_backup.sh report <backup-dir | honeypot_mcp.db>      # analyse a backup you already have
 #
 # What the first form does, over ONE ssh connection (the admin port allows 6 new connections a
@@ -23,7 +23,7 @@
 # stripped of every permission bit and kept in a quarantine folder; never run them.
 #
 # Options:
-#   --host IP             the droplet (required)           --user NAME     login user (default deploy)
+#   --host IP             the VPS (required)           --user NAME     login user (default deploy)
 #   --port N              admin SSH port (default 2200)    --key PATH      SSH private key
 #   --dest DIR            where to keep backups (default ./hp-backups)
 #   --install-dir DIR     project dir on the VPS (default /opt/honeypot-mcp)
@@ -323,7 +323,7 @@ Next:
   - The backup contains secrets (.env tokens, honeytoken values, TLS keys): keep it private.
   - Analyse it with the full tools: restore it into a local checkout (scripts/restore.sh $FINAL, with no
     server running), then run the server over stdio against that database.
-  - Before you destroy the droplet: harden-host.sh teardown --i-have-a-backup, then delete it in the
-    DigitalOcean console (a powered-off droplet is still billed).
+  - Before you destroy the VPS: harden-host.sh teardown --i-have-a-backup, then delete it in the
+    DigitalOcean console (a powered-off VPS is still billed).
 EOF
 [ "$FAILED" = 0 ] && [ "$RUN_FAILED" = 0 ]

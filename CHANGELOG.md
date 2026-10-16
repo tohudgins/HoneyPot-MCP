@@ -6,7 +6,7 @@ distinct iteration with a coherent goal.
 
 ## The operations console could not load on a real run; `sql_query` ignored its time limit
 
-**Rendering the console on the live droplet showed it never returned.** `/api/overview` did not answer in
+**Rendering the console on the live VPS showed it never returned.** `/api/overview` did not answer in
 120 s for the 24 h window, nor in 100 s for 1 h or 6 h, on 17.6M alerts. It re-aggregated the raw table ten
 times per 5-second poll (one pass with a 48-branch `CASE` per row, one extracting JSON from every row for
 geography), which was fine for thousands of alerts. The same defect the MCP tools had before the rollups,
@@ -15,7 +15,7 @@ left behind in the one component nobody had run at scale. It now reads the exact
 chart from rollups (clock-aligned hour and 6-hour columns; sub-hour columns only for windows of two hours
 or less, by integer arithmetic in SQL), and reads geography from CRITICAL alerts only, the only ones that
 carry enrichment. Measured on the 17.5M-alert backup: 1 h 0.19 s, 6 h 0.53 s, 24 h 0.16 s, 7 d 0.61 s (it
-was 22 s for 7 d even after the first rewrite); live on the droplet 0.2 to 3 s. Every number is checked
+was 22 s for 7 d even after the first rewrite); live on the VPS 0.2 to 3 s. Every number is checked
 against a plain computation (`test_console_rollups.py`; three mutations caught), the chart total equals the
 headline count in every window, and 7 d equals the database's 17,539,280.
 
@@ -44,7 +44,7 @@ handshake, and get a CRITICAL `honeytoken_triggered_credential_via_mysql_login_a
 **Providers verified live** (abuse.ch, OTX and Shodan InternetDB; GreyNoise's free key needs a business
 email, so it was not): `108.186.84.69`, the address that replayed the bait, is in 12 OTX pulses (one titled
 "Honeypot sg1 - SSH/Telnet/Web attackers and malware delivery") and InternetDB lists its open RDP port; a file
-hash captured on the droplet is a known MalwareBazaar sample. MalwareBazaar took 7-8 s for that known hash, so
+hash captured on the VPS is a known MalwareBazaar sample. MalwareBazaar took 7-8 s for that known hash, so
 the 3 s budget (right for notifications) reported a working service as timed out; `lookup_hash` now uses
 `INTEL_LOOKUP_TIMEOUT_SECONDS` (default 20), the notification fan-out keeps 3 s.
 
@@ -110,7 +110,7 @@ have every signature event triggered by real attackers; the rest are missing onl
 
 ## FTP over the internet never completed a transfer
 
-Testing the bait with a real FTP client against the droplet: login worked, then `LIST` timed out. FTP moves
+Testing the bait with a real FTP client against the VPS: login worked, then `LIST` timed out. FTP moves
 data over a **second connection to a port the server names**, the engine named an ephemeral one, and the
 host firewall (default drop) refused it. So from the internet every session stalled after login: the live
 run recorded 9 anonymous logins and 9 passive attempts and not one listing, download or upload, which also
@@ -251,7 +251,7 @@ previous code.
 ## Decoy tells found by stock nmap scripts: frozen clocks, constant ids, three kernels on one host
 
 Running the NSE scripts (`ldap-rootdse`, `mysql-info`, `mongodb-info`, `redis-info`, `docker-version`)
-against the live droplet showed what a scanner sees. The LDAP rootDSE `currentTime` was frozen six days in
+against the live VPS showed what a scanner sees. The LDAP rootDSE `currentTime` was frozen six days in
 the past; every MySQL connection reported thread id 12345; Redis and MongoDB uptime never advanced; and
 Redis, the Docker API and the Kubernetes node reported three different kernels although they share one
 IP. LDAP now reports the real clock (`directory_time`), MySQL ids count up from a random start, uptimes
@@ -308,7 +308,7 @@ returned success and was recorded as one. Worse, that "success" reset `failure_c
 event. Throttled events now increment `suppressed_count` (migration 0018, shown by
 `alert_subscriptions_list`) and touch nothing else.
 
-**The field-test sweep stopped packet capture on the live droplet.** It called `pcap_control stop`
+**The field-test sweep stopped packet capture on the live VPS.** It called `pcap_control stop`
 (written when capture was off) and ended capture on a deployment where it was on; it now starts
 capture (idempotent) and checks `pcap_extract` against the real state. Capture was restarted at once.
 
@@ -376,7 +376,7 @@ depending on interleaving; reset-on-return is off for `:memory:` with a test tha
 ## Found at 5 million rows: the per-sensor count scanned the whole table
 
 Reading the data the morning after the first night: one SIP source sent about 190 events a second
-and the database grew from 1.1M to 4.9M alerts (3.8 GB, past the 4 GB droplet's RAM). `honeypot_list`,
+and the database grew from 1.1M to 4.9M alerts (3.8 GB, past the 4 GB VPS's RAM). `honeypot_list`,
 the most basic tool, took 51 seconds because `alerts.honeypot_id` had no index and the per-sensor
 count read every row. Migration `0016_alert_honeypot_idx` adds it (a covering index, so no table
 read): 0.02 s on a 1.1M-row copy and 2.7 s live (1.5 s of that is connection overhead), 34 s to build
@@ -429,7 +429,7 @@ all 12 SQLite panels in the three Grafana dashboards return rows from a restored
 
 ## Public traffic can trip tokens; repeated CRITICALs no longer flood a channel
 
-Two findings from the live droplet, both fixed and proven from outside.
+Two findings from the live VPS, both fixed and proven from outside.
 
 **Honeytokens could not be tripped by the public.** The HTTP decoys (`/.env`, `/config.json`,
 `/wp-config.php`) were random, so no scanner could ever find a tracked credential, and the canary
@@ -438,7 +438,7 @@ back. Now a tracked MySQL credential token is served as the database login in th
 (`credential_match.planted_credential`, lowest active token id, revoked tokens never served), and an
 active canary-URL token is embedded as an error-reporting webhook. The HTTP honeypot answers
 `/t/<token>` on its own public port (`canary.serve_if_token`; an unknown id is a plain 404 so `/t/`
-is not itself a fingerprint), with no new exposure. Proven from outside against the droplet: read
+is not itself a fingerprint), with no new exposure. Proven from outside against the VPS: read
 `/.env` on port 80, replayed the pair on the public MySQL port, and followed the webhook URL; both
 tokens tripped with CRITICAL alerts.
 
@@ -463,7 +463,7 @@ live-provisioned API key that is refused the moment it is revoked, and a honeyto
 planted credential used through a real SSH login raises a CRITICAL alert and marks the token
 triggered). It fails if a registered tool is neither called nor explicitly skipped.
 
-Run against a real DigitalOcean droplet it found, besides the three bugs in the entry below:
+Run against a real DigitalOcean VPS it found, besides the three bugs in the entry below:
 `fetch_backup.sh --samples` reported "0 files" with a clean verdict while the Cowrie containers held
 32 downloads and 18 TTY recordings (it looked in `/cowrie/var/lib/cowrie`; the image keeps its state
 under `/cowrie/cowrie-git`; a missing directory is now a failure), and `http_active_recon`
@@ -472,7 +472,7 @@ scanner that had crawled first was filed as recon. The backup test rig's fake `d
 the script it was given, which is why the first could not fail a test; it now runs the real script
 against a fake container filesystem. New tests fail against the old code.
 
-## Getting the data off the droplet: `scripts/fetch_backup.sh`
+## Getting the data off the VPS: `scripts/fetch_backup.sh`
 
 A laptop-side script for the end of a run (and mid-run): it takes a consistent backup on the VPS,
 streams it back over one SSH connection (the admin port allows 6 new connections a minute),

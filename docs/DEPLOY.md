@@ -1,76 +1,105 @@
-# Deployment Guide — getting real attack data in under 30 minutes
+# Deployment guide
 
-This guide takes you from "code on your laptop" to "honeypot on the public
-internet logging real attack traffic" with a focus on the SSH honeypot
-because that's what catches traffic fastest. Expect your first events
-within minutes of the deploy on any public IP.
+How to run HoneyPot MCP on a public-IP VPS, collect real attack traffic, get the data off the
+host, and analyse it afterwards.
 
-Two paths:
+**Who it is for.** Someone comfortable with a Linux shell and `systemd` who wants the SSH-first
+deployment the project was exercised with. [HARDENING.md](HARDENING.md) explains what the host
+hardening does and what risk remains; this guide is the procedure.
 
-1. [Cheap VPS deploy](#cheap-vps-deploy) — DigitalOcean / Hetzner / Linode,
-   ~$5/month, ~15 minutes of work. **Recommended for real attack collection.**
-2. [Home lab deploy](#home-lab-deploy) — your own machine + a reverse tunnel
-   (ngrok / Cloudflare Tunnel). Good for testing the pipeline without renting
-   a VPS, but won't catch internet-scale traffic unless you're exposing real
-   ports.
+**What you will have at the end.** A dedicated Ubuntu 22.04 host running the MCP server as a
+sandboxed daemon, with a default-drop firewall that opens only the honeypot ports and your admin
+SSH port; the control plane reachable only through an SSH tunnel; an alert channel; backups; and a
+way to analyse a copy of the data offline.
+
+**Prerequisites.**
+
+- A disposable VPS with a public IPv4 address, root access and Ubuntu 22.04 LTS. 1 vCPU, 1 GB RAM
+  and 25 GB of disk is the practical minimum; plan disk around the growth rate in
+  [step 11](#step-11--leave-it-running).
+- A deploy-only SSH key pair, used for nothing else.
+- An MCP client that supports HTTP servers (Claude Code or Claude Desktop) on your own machine.
+- Optional: a Slack/Teams/email destination for alerts, free VirusTotal and AbuseIPDB keys,
+  MaxMind GeoLite2 databases.
+
+There are two paths: the [VPS deployment](#vps-deployment) (steps 1-13, recommended for real
+collection) and the [home lab](#home-lab-deployment) (pipeline testing only).
+
+## Contents
+
+- [Safety rules](#safety-rules)
+- [VPS deployment](#vps-deployment)
+  - [Step 1 — Provision the VPS](#step-1--provision-the-vps)
+  - [Step 2 — Create the admin user](#step-2--create-the-admin-user)
+  - [Step 3 — Install Docker and the code](#step-3--install-docker-and-the-code)
+  - [Step 4 — Configure](#step-4--configure)
+  - [Step 5 — Run the server as a daemon](#step-5--run-the-server-as-a-daemon)
+  - [Step 6 — Load the firewall](#step-6--load-the-firewall)
+  - [Step 7 — Connect your MCP client](#step-7--connect-your-mcp-client)
+  - [Step 8 — Deploy honeypots and an alert channel](#step-8--deploy-honeypots-and-an-alert-channel)
+  - [Step 9 — Grafana dashboards (optional)](#step-9--grafana-dashboards-optional)
+  - [Step 10 — Pre-flight and go-live checklist](#step-10--pre-flight-and-go-live-checklist)
+  - [Step 11 — Leave it running](#step-11--leave-it-running)
+  - [Step 12 — Get the data off the host](#step-12--get-the-data-off-the-host)
+  - [Step 13 — Analyse the data (analysis mode)](#step-13--analyse-the-data-analysis-mode)
+- [Home lab deployment](#home-lab-deployment)
+- [Ongoing operations](#ongoing-operations)
+- [Troubleshooting](#troubleshooting)
+- [What to expect](#what-to-expect)
+- [Running it in production](#running-it-in-production): health checks, backups, upgrades, file permissions
 
 ---
 
-## Before you start — a non-negotiable safety note
+## Safety rules
 
-A honeypot on the public internet **is the target**. Treat the host as
-compromised by design: assume the day you stop watching it, someone exploits
-something in your Docker image or your host configuration that you didn't
-anticipate. Concrete rules:
+A honeypot on the public internet **is the target**. Treat the host as compromised by design.
 
-- **One dedicated host per deployment**. Never run honeypots on a machine
-  that also holds anything you care about — your dev environment, your
-  password manager, your SSH keys to other servers.
-- **Never SSH into the honeypot host using the same keys you use for
-  production**. Generate a deploy-only key, store it on a single laptop.
-- **Move the real admin SSH port off 22** before you start the honeypot.
-  If you forget this step you're locking yourself out the moment the
-  honeypot starts.
-- **Set up alerts before traffic arrives**, not after. Slack, Teams and email
-  are first-class formats — `alert_subscribe(url=..., format="slack",
-  severity_threshold="high")`. Use `high` or `critical`; at `medium` a single
-  scanner will bury the channel. (Repeats are coalesced automatically per
-  `NOTIFY_THROTTLE_SECONDS`, and CRITICAL is never held back.)
+- **One dedicated host per deployment.** Never run honeypots on a machine that also holds anything
+  you care about: a development environment, a password manager, keys to other servers.
+- **Use a deploy-only SSH key** for this host, stored on a single machine, never one you use for
+  production.
+- **Move the real admin SSH port off 22 before the SSH honeypot starts.** Otherwise you lock
+  yourself out the moment it binds. `deploy/harden-host.sh` does this safely in two phases
+  (steps 5 and 6).
+- **Set up alerts before traffic arrives.** Slack, Teams and email are first-class formats:
+  `alert_subscribe(url=..., format="slack", severity_threshold="high")`. Use `high` or `critical`;
+  at `medium` a single scanner buries the channel. Repeats are coalesced per
+  `NOTIFY_THROTTLE_SECONDS`, and CRITICAL is never held back.
 - **Decide about packet capture before you need it.** `PCAP_ENABLED=true` plus
-  `sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)` gives you full
-  pcap for malware carving, Suricata/Zeek replay and evidence. It only records
-  from the moment you turn it on, so switching it on after an interesting
-  attack is too late. Check `PCAP_FILE_MB × PCAP_FILES` (default 1 GB) against
-  free disk — a full disk stops the database and ends collection entirely.
-  Capture is scoped to honeypot ports, so your own admin SSH is never recorded.
+  `sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)` records pcap for malware carving,
+  Suricata/Zeek replay and evidence. It records only from the moment it is on. Check
+  `PCAP_FILE_MB × PCAP_FILES` (default 100 MB × 10 = 1 GB) against free disk: a full disk stops
+  the database and ends collection. Capture is scoped to honeypot ports, so your admin SSH is
+  never recorded. Under the production systemd unit it also needs the drop-in described at the
+  bottom of `deploy/honeypot-mcp.service`.
 
 ---
 
-## Cheap VPS deploy
+## VPS deployment
 
-### 1. Provision the VPS (5 min)
+Architecture in one paragraph: the MCP server is the *control plane*; you talk to it in natural
+language and it deploys and monitors honeypots. The in-process engines (every engine except SSH
+and Telnet) run inside the server process and bind host ports directly; the SSH and Telnet engines
+launch Cowrie as a Docker container. Because the honeypots live in the server process, the server
+must run persistently, so on a VPS it runs as an HTTP daemon and your client connects over the
+network. (Locally, Claude Desktop/Code spawn it over stdio per chat, which is fine for testing and
+wrong for continuous collection.)
 
-Pick any provider. The cheapest tier is fine — 1 vCPU, 1 GB RAM, 25 GB disk.
+### Step 1 — Provision the VPS
 
-| Provider | Recommended size | Cost |
-|---|---|---|
-| Hetzner CX22 | 2 vCPU, 4 GB | €4.51/mo |
-| DigitalOcean Basic | 1 vCPU, 1 GB | $6/mo |
-| Linode Nanode | 1 vCPU, 1 GB | $5/mo |
-| Vultr Cloud Compute | 1 vCPU, 1 GB | $6/mo |
+Any provider works. Choose **Ubuntu 22.04 LTS** (the hardening scripts were exercised on it), note
+the public IPv4 address, and add your deploy-only public key if the provider offers it.
 
-Pick **Ubuntu 22.04 LTS** as the OS. Note the public IPv4 address.
-
-### 2. First SSH — create your admin user, then harden (the script moves the port)
+### Step 2 — Create the admin user
 
 ```bash
-ssh root@<your-ip>
+ssh root@<vps-ip>
 ```
 
-Create a non-root admin account with your **deploy-only** public key. Root login and password
-login are about to be disabled, so do this first. (The provider's browser console will stop
-working too, because it logs in as root: the safety net is the rollback timer plus the Recovery
-Console password in "Getting back in" below.)
+Create a non-root admin account with your deploy-only public key. Root login and password login are
+about to be disabled, so do this first. (A provider's browser console logs in as root and will stop
+working too; the safety nets are the rollback timer and the recovery-console password in
+[Getting back in](#getting-back-in).)
 
 ```bash
 adduser --disabled-password --gecos "" deploy
@@ -81,27 +110,24 @@ echo "<your deploy-only public key>" > /home/deploy/.ssh/authorized_keys
 chown deploy:deploy /home/deploy/.ssh/authorized_keys && chmod 600 /home/deploy/.ssh/authorized_keys
 ```
 
-From your laptop, confirm the key works **before** going on:
+From your own machine, confirm the key works **before** going on:
 
 ```bash
-ssh -i ~/.ssh/honeypot_deploy deploy@<your-ip>      # logged in as deploy: good
+ssh -i ~/.ssh/honeypot_deploy deploy@<vps-ip>
 ```
 
-Moving sshd off port 22 and turning off root/password login is done by
-`deploy/harden-host.sh` in step 5, in two phases so you cannot lock yourself out: first sshd
-listens on 22 *and* 2200 until you have logged in on 2200, then it moves to 2200 only. Do not
-edit `sshd_config` by hand.
+Moving sshd off port 22 and disabling root and password login is done by `deploy/harden-host.sh`
+in steps 5 and 6, in two phases: first sshd listens on 22 *and* 2200 until you have logged in on
+2200, then it moves to 2200 only. Do not edit `sshd_config` by hand.
 
-### 3. Install Docker + clone the repo (5 min)
+### Step 3 — Install Docker and the code
 
 ```bash
-# Docker — the SSH/Cowrie engine manages honeypot containers through it. Ubuntu's own
-# `docker.io` package is what the hardening was rehearsed and run with (Docker 29.1.3 on
-# 22.04); the get.docker.com script installs a different build that was not tested.
-sudo apt-get update && sudo apt-get install -y docker.io
+# Docker: the SSH/Telnet engines manage Cowrie containers through it. Ubuntu's own docker.io
+# package is what the hardening was tested with; other builds were not.
+sudo apt-get update && sudo apt-get install -y docker.io git
 
-# uv to build the Python environment (step 5 builds it)
-apt update && apt install -y git
+# uv builds the Python environment (step 5)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 
@@ -109,128 +135,118 @@ git clone https://github.com/tohudgins/HoneyPot-MCP.git /opt/honeypot-mcp
 cd /opt/honeypot-mcp
 ```
 
-> **Architecture — read this once.** The MCP server is the *control plane*:
-> you talk to it in natural language and it deploys/monitors honeypots.
-> The in-process engines (every engine except SSH and Telnet)
-> run *inside the server process* and bind host ports directly; the SSH engine
-> launches Cowrie as its own Docker container. Because the honeypots live in
-> the server process, **the server must run persistently** — not spawned per
-> chat. So on a VPS you run it as an HTTP daemon (this section) and connect
-> your MCP client to it over the network. (Locally, Claude Desktop/Code spawn
-> it over stdio per chat — fine for testing, wrong for 24/7 collection.)
+### Step 4 — Configure
 
-### 4. Configure (2 min)
-
-> **On the VPS, skip to step 5**: it installs `deploy/env.production.example`, the hardened
-> profile (loopback binds, moved ports, three role tokens, console off). What follows explains
-> every setting, for a laptop or for changing the profile.
+> **On the VPS, skip to step 5.** It installs `deploy/env.production.example`, the hardened
+> profile (loopback binds, moved ports, three role tokens, console off). This step explains every
+> setting, for a laptop or for changing the profile.
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and set:
+Settings that matter for a daemon:
 
 ```bash
 # Run as a persistent HTTP daemon so honeypots survive across chats.
 MCP_TRANSPORT=http
-MCP_HOST=127.0.0.1        # loopback only — reach it over the SSH tunnel (step 7)
+MCP_HOST=127.0.0.1        # loopback only; reach it over the SSH tunnel (step 7)
 MCP_PORT=8000
-# REQUIRED for http/sse — the daemon refuses to start without it. Clients must
-# present it as `Authorization: Bearer <token>`. Generate a fresh one:
-#   openssl rand -hex 32
-MCP_AUTH_TOKEN=<paste-openssl-rand-hex-32-here>   # min 16 chars; 64-hex recommended
+# Required for http/sse: the daemon refuses to start without it. Clients send it as
+# `Authorization: Bearer <token>`. Generate with `openssl rand -hex 32`.
+MCP_AUTH_TOKEN=<token>    # minimum 16 characters; 64 hex recommended
 
-# The systemd unit (step 5) can write ONLY data/, reports/, tls/ and pcap/, so
-# the SQLite database must live under data/:
+# The production systemd unit can write only data/, reports/, tls/ and pcap/, so the SQLite
+# database must live under data/:
 DATABASE_URL=sqlite+aiosqlite:///./data/honeypot_mcp.db
+```
 
-# ALTERNATIVE to the single token above: hand out multiple tokens with
-# different access levels instead of one shared full-access token. Takes
-# priority over MCP_AUTH_TOKEN when set. Format: "token:role,token:role",
-# role is one of viewer (read-only triage/analysis), operator (also
-# deploy/stop honeypots, manage honeytokens, acknowledge alerts — everything
-# reversible and contained to this system's own data), or admin (also prune
-# alerts, push to a real external firewall/WAF, read the audit log). See
-# src/honeypot_mcp/rbac.py for exactly which tool needs which role.
-#   openssl rand -hex 32   # once per token you hand out
-# MCP_AUTH_TOKENS=<viewer-token>:viewer,<operator-token>:operator,<admin-token>:admin
+**Scoped tokens instead of one shared token.** `MCP_AUTH_TOKENS` takes priority over
+`MCP_AUTH_TOKEN`. Format `token:role,token:role`, where role is one of:
 
-# For a TEAM: treat MCP_AUTH_TOKEN/MCP_AUTH_TOKENS above as a break-glass
-# bootstrap credential, not something you hand to every team member. Once
-# the server is up, use that admin token to mint real per-person keys —
-# these can be issued and revoked live, no restart, and each carries a real
-# name so audit_log_search can say who did what, not just what happened:
-#
-#   > create an operator API key for alice
-#   (admin-only tool api_key_create returns the plaintext token ONCE — copy
-#   it immediately, there is no way to retrieve it again)
-#
-#   > revoke alice's API key          (api_key_revoke, takes effect in ~30s)
-#   > list active API keys            (api_key_list)
+| Role | Can |
+|---|---|
+| `viewer` | Read-only triage and analysis |
+| `operator` | Also deploy/stop honeypots, manage honeytokens, acknowledge alerts: everything reversible and contained to this system's own data |
+| `admin` | Also prune alerts, push to external firewalls/WAFs, read the audit log |
 
-# Canary URLs and what a scanner can find. The callback server (port 18888) binds loopback and the
-# firewall closes it, so nothing is exposed by default. If an HTTP honeypot answers on port 80, point
-# the public URL at that instead: it serves /t/<token> itself (unknown ids are an ordinary 404), so
-# a canary URL embedded in a decoy can call back from the internet with no new open port.
-CANARY_PUBLIC_URL=http://<your-vps-ip>
-# Create the bait AFTER setting this and restarting, because the URL is baked into each token:
-#   > create a canary URL token labelled env-canary           (honeytoken_create, canary_url)
-#   > generate one mysql credential labelled env-mysql         (honeytoken_generate_credentials)
-# The HTTP honeypot then serves the credential as the database login, and the canary URL as an
-# error-reporting webhook, in /.env, /config.json and /wp-config.php. A scanner that replays the
-# login against your MySQL honeypot, or follows the URL, trips a CRITICAL alert. Revoke a token and
-# the decoys stop serving it within 30 seconds. Cloud keys in the decoys stay random on purpose.
+`src/honeypot_mcp/rbac.py` lists exactly which tool needs which role. Example:
+`MCP_AUTH_TOKENS=<viewer-token>:viewer,<operator-token>:operator,<admin-token>:admin`.
 
-# RECOMMENDED — sign up for the free tiers, paste real keys here. Leave them
-# EMPTY otherwise: any non-empty placeholder is treated as a key.
+**Teams.** Treat the static tokens as a break-glass bootstrap credential. Once the server is up,
+use the admin token to mint per-person keys that can be issued and revoked live, without a restart,
+and that carry a name so `audit_log_search` records who did what:
+
+```text
+> create an operator API key for alice     (api_key_create: the plaintext token is shown ONCE)
+> revoke alice's API key                   (api_key_revoke: takes effect within ~30 s)
+> list active API keys                     (api_key_list)
+```
+
+**Canary URLs.** The callback server (`CANARY_CALLBACK_PORT`) binds loopback and the firewall
+closes it, so nothing is exposed by default. If an HTTP honeypot answers on port 80, point the
+public URL at it instead: it serves `/t/<token>` itself (unknown ids are an ordinary 404), so a
+canary URL embedded in a decoy can call back from the internet with no new open port.
+
+```bash
+CANARY_PUBLIC_URL=http://<vps-ip>
+```
+
+Create tokens **after** setting this and restarting, because the URL is baked into each token:
+
+```text
+> create a canary URL token labelled env-canary          (honeytoken_create, canary_url)
+> generate one mysql credential labelled env-mysql       (honeytoken_generate_credentials)
+```
+
+The HTTP honeypot then serves the credential as the database login, and the canary URL as an
+error-reporting webhook, in `/.env`, `/config.json` and `/wp-config.php`. A scanner that replays
+the login against your MySQL honeypot, or follows the URL, trips a CRITICAL alert. A revoked token
+stops being served within 30 seconds. Cloud keys in the decoys stay random on purpose.
+
+**Threat intelligence** (optional, off unless a key is set; leave empty otherwise, because any
+non-empty placeholder counts as a key):
+
+```bash
 VIRUSTOTAL_API_KEY=
 ABUSEIPDB_API_KEY=
-# OPTIONAL extra providers, off unless set (enrich_ip and CRITICAL notifications). abuse.ch, OTX and
-# InternetDB are verified live; GreyNoise needs a business-email account for a free key.
-# GREYNOISE_API_KEY=   ABUSECH_AUTH_KEY=   OTX_API_KEY=   SHODAN_INTERNETDB_ENABLED=true
-
-# OPTIONAL — drop GeoLite2 databases in config/ for geo + network enrichment
+# Extra providers: GREYNOISE_API_KEY=  ABUSECH_AUTH_KEY=  OTX_API_KEY=  SHODAN_INTERNETDB_ENABLED=true
 GEOIP_DB_PATH=config/GeoLite2-City.mmdb
 GEOIP_ASN_DB_PATH=config/GeoLite2-ASN.mmdb
 ```
 
-If you want geographic and network data in alerts, register at
-[maxmind.com](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data)
-and download two databases: `GeoLite2-City.mmdb` (country/city/coords — feeds
-the threat map) and `GeoLite2-ASN.mmdb` (origin AS number + org — the
-highest-signal pivot for spotting hosting/VPN/botnet networks). Place both
-under `config/`. Each is independently optional; a missing one just leaves its
-fields out. MaxMind's license forbids redistribution, so neither is in the repo.
+For geographic and network data in alerts, register at
+[maxmind.com](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) and download
+`GeoLite2-City.mmdb` (country, city, coordinates; feeds the threat map) and `GeoLite2-ASN.mmdb`
+(origin AS number and organisation; the best pivot for spotting hosting, VPN and botnet networks).
+Place both under `config/`. Each is independently optional. MaxMind's license forbids
+redistribution, so neither is in the repository.
 
-> **Secure the control-plane port.** `MCP_PORT` can deploy honeypots and
-> read all captured data. It's bearer-token authenticated (`MCP_AUTH_TOKEN` or
-> `MCP_AUTH_TOKENS` — the daemon refuses to start without one), but treat the token as
-> defence-in-depth, not the only layer: keep `MCP_HOST=127.0.0.1`, let the firewall make the
-> port unreachable from outside, and reach it over an SSH tunnel (step 7). The production
-> profile also moves it off 8000 (to 18443); that only keeps a stray `localhost:8000` from
-> being this server, the protection is the loopback bind, the firewall and the tokens. If
-> several people need it, put a TLS reverse proxy (Caddy/nginx) in front on 443 rather than
-> binding it to `0.0.0.0` — the token travels in clear text over plain HTTP.
+> **Secure the control-plane port.** `MCP_PORT` can deploy honeypots and read all captured data.
+> It is bearer-token authenticated, but treat the token as defence in depth: keep
+> `MCP_HOST=127.0.0.1`, let the firewall make the port unreachable from outside, and reach it over
+> an SSH tunnel (step 7). The production profile moves it from 8000 to 18443; that only keeps a
+> stray `localhost:8000` from being this server. The protection is the loopback bind, the firewall
+> and the tokens. If several people need access, put a TLS reverse proxy (Caddy or nginx) in
+> front on 443 instead of binding to `0.0.0.0`: over plain HTTP the token travels in clear text.
 
-### 5. Run the server as a persistent daemon (5 min)
+### Step 5 — Run the server as a daemon
 
-Everything in this step and the next is scripted and explained in
-[HARDENING.md](HARDENING.md); this is the short version. The service runs as its own
-unprivileged user, in a systemd sandbox, **not** in the `docker` group (it reaches Docker only
-through a validating guard process), and it listens only on loopback.
+This step and the next are scripted and explained in [HARDENING.md](HARDENING.md). The service runs
+as its own unprivileged user in a systemd sandbox, is **not** in the `docker` group (it reaches
+Docker only through a validating guard process), and listens only on loopback.
 
 ```bash
 cd /opt/honeypot-mcp
 
 # 1. Build the venv with an interpreter the service user can execute. A plain `uv sync` as root
 #    puts Python under /root/.local/share/uv/python, which the service cannot reach (the unit
-#    dies with "Permission denied").
+#    fails with "Permission denied").
 sudo rm -rf .venv
 sudo UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12
 
 # 2. Users, sshd (listening on 22 AND 2200 for now), kernel hardening, Docker daemon settings,
-#    unattended security updates, and the systemd units. Touches no firewall rule.
+#    unattended security updates, systemd units. Touches no firewall rule.
 sudo deploy/harden-host.sh prepare --admin-user deploy
 #    -> from a NEW terminal confirm:  ssh -p 2200 deploy@<vps-ip>
 
@@ -247,32 +263,30 @@ sudo systemctl status honeypot-mcp honeypot-docker-guard   # both active (runnin
 journalctl -u honeypot-mcp -f                              # live logs
 ```
 
-The unit is sandboxed (`ProtectSystem=strict`, no capabilities, a syscall deny-list,
-`ProtectProc=invisible`, `MemoryMax=1G`, `TasksMax=512`, IP/Unix/netlink sockets only;
-`systemd-analyze security` scores it 1.4 and the guard 0.6). Tune `MemoryMax` to the machine.
-Packet capture (`PCAP_ENABLED=true`) needs the `CAP_NET_RAW`/`CAP_NET_ADMIN` + `AF_PACKET`
-drop-in documented at the bottom of the unit file. Honeypot ports below 1024 (80, 110, ...) are
-not bound directly (the unit has no `CAP_NET_BIND_SERVICE`): deploy the engine on a high port
-and let the firewall redirect (`80>8080`, step 6). The SSH/Telnet honeypots are Docker
-containers whose published ports (22, 23) Docker forwards itself.
+The unit is sandboxed: `ProtectSystem=strict`, no capabilities, a syscall deny-list,
+`ProtectProc=invisible`, `MemoryMax=1G`, `TasksMax=512`, and IP/Unix/netlink sockets only. Tune
+`MemoryMax` to the machine. Honeypot ports below 1024 are not bound directly (the unit has no
+`CAP_NET_BIND_SERVICE`): deploy those engines on a high port and let the firewall redirect
+(`80>8080`, step 6). The SSH and Telnet honeypots are Docker containers whose published ports
+(22, 23) Docker forwards itself.
 
-> **Why the guard.** Membership in the `docker` group is root-equivalent: anyone who can talk
-> to the daemon can start a privileged container that mounts `/`. This service parses
+> **Why the guard.** Membership of the `docker` group is root-equivalent: anyone who can talk to
+> the daemon can start a privileged container that mounts `/`. This service parses
 > attacker-controlled bytes all day, so a bug in it must not reach that. The guard
-> (`honeypot-docker-guard.service`, `src/honeypot_mcp/hardening/docker_guard.py`) forwards only the Cowrie
-> container operations the SSH engine makes, from the pinned image with the engine's own
+> (`honeypot-docker-guard.service`, `src/honeypot_mcp/hardening/docker_guard.py`) forwards only the
+> Cowrie container operations the SSH engine makes, from the pinned image with the engine's own
 > security settings, and refuses everything else with 403: no privileged containers, no host
-> mounts, no exec, no other images. See HARDENING.md.
+> mounts, no exec, no other images.
 
 The daemon serves the MCP endpoint at `http://127.0.0.1:18443/mcp` and Prometheus `/metrics` on
 `127.0.0.1:19090`; the console is disabled and the canary callback server is loopback-only.
 
-### 6. Load the firewall (3 min)
+### Step 6 — Load the firewall
 
 Open **only the honeypot ports and your admin SSH port**. Nothing else is reachable: not the
-control plane, not metrics, not a service somebody installs later. The honeypot ports are open
-to the whole internet with no rate limit, geo-block or ban: they exist to be attacked. The
-admin SSH port is rate-limited per source and can be restricted to your own address.
+control plane, not metrics, not a service installed later. The honeypot ports are open to the whole
+internet with no rate limit, geo-block or ban, because they exist to be attacked. The admin SSH
+port is rate-limited per source and can be restricted to your own address.
 
 ```bash
 # Moves sshd to 2200 ONLY (port 22 becomes the SSH honeypot), loads the nftables firewall, and
@@ -283,89 +297,87 @@ sudo deploy/harden-host.sh finalize --admin-user deploy --confirm-admin-port-tes
 sudo deploy/harden-host.sh confirm      # persists the firewall and the guard across reboots
 ```
 
-`--ports "80>8080,3389,110>1110"` means: the world connects to 80 and the HTTP engine listens
-on 8080; RDP listens on 3389; POP3 is reached on 110 and listens on 1110. Deploy each engine on
-its *listening* port in step 8 (HTTP on 8080, POP3 on 1110). Add `--admin-allow <your-ip>/32`
-to let only your own address reach admin SSH, and `--egress limited --dns <resolver>` to let
-Cowrie fetch malware samples (see HARDENING.md, "Malware sample capture").
+`--ports "80>8080,3389,110>1110"` means: the world connects to 80 and the HTTP engine listens on
+8080; RDP listens on 3389; POP3 is reached on 110 and listens on 1110. Deploy each engine on its
+*listening* port in step 8. Add `--admin-allow <your-ip>/32` to let only your own address reach
+admin SSH, and `--egress limited --dns <resolver>` to let Cowrie fetch malware samples (see
+[HARDENING.md](HARDENING.md#malware-sample-capture-optional)).
 
-If you deploy the FTP honeypot, also pass `--ftp-pasv-ports 30000-30049` and set `FTP_PASV_PORT_MIN=30000`
-and `FTP_PASV_PORT_MAX=30049` in `.env`. FTP moves files over a second connection to a port the server
-names; without an opened range that connection is dropped, so a real client logs in and then every
-`LIST`, `RETR` and `STOR` times out. The first live run recorded 9 anonymous logins and not one listing,
-download or upload for exactly this reason. Nothing listens in the range except during a session.
+**FTP.** If you deploy the FTP honeypot, also pass `--ftp-pasv-ports 30000-30049` and set
+`FTP_PASV_PORT_MIN=30000` and `FTP_PASV_PORT_MAX=30049` in `.env`. FTP moves files over a second
+connection to a port the server names; without an opened range that connection is dropped, so a
+real client logs in and then every `LIST`, `RETR` and `STOR` times out. Nothing listens in the
+range except during a session.
 
-If you deploy the NFS honeypot, run it on an internal port and redirect both NFS ports to it:
-`--ports "...,2049>12049,111>12049"` and deploy `nfs` on **12049**. NFS clients (`showmount`, nmap's
-`nfs-*` and `rpcinfo` scripts) ask the portmapper on 111 where mountd is before they ever touch 2049;
-with only 2049 open they got nothing, so the sensor's headline detection (`nfs_export_enumeration`) could
-not fire. The engine answers the portmapper in versions 2, 3 and 4 (libtirpc and nmap ask for 3/4 first)
-and always points clients back at 2049. TCP only: a client that insists on UDP (macOS `showmount`) is not
-served.
+**NFS.** If you deploy the NFS honeypot, run it on an internal port and redirect both NFS ports to
+it: `--ports "...,2049>12049,111>12049"`, and deploy `nfs` on **12049**. NFS clients (`showmount`,
+nmap's `nfs-*` and `rpcinfo` scripts) ask the portmapper on 111 where mountd is before they touch
+2049, so with only 2049 open the sensor's headline detection (`nfs_export_enumeration`) cannot
+fire. The engine answers the portmapper in versions 2, 3 and 4 and always points clients back at
+2049. TCP only: a client that insists on UDP (macOS `showmount`) is not served.
 
 > **ufw does not protect Docker-published ports**, which is one reason this uses nftables
-> directly: Docker's published ports are forwarded, not input, so the firewall's `forward`
-> chain is where a container's outbound connections are refused (a hijacked Cowrie cannot scan,
-> relay or reach the cloud metadata service).
+> directly: published ports are forwarded, not input, so the firewall's `forward` chain is where a
+> container's outbound connections are refused (a hijacked Cowrie cannot scan, relay or reach the
+> cloud metadata service).
 
-### 7. Connect your MCP client over an SSH tunnel (2 min)
+### Step 7 — Connect your MCP client
 
-From your laptop, tunnel the control port so you can drive the daemon without
-exposing it to the internet. Use a key that exists only for this host:
+From your own machine, tunnel the control port so you can drive the daemon without exposing it:
 
 ```bash
 ssh -i ~/.ssh/honeypot_deploy -p 2200 -N -L 18443:127.0.0.1:18443 deploy@<vps-ip> &
 ```
 
-Then register the daemon with Claude Code as a networked MCP server, passing
-a bearer token. **Use the `viewer` token for reading** and `operator` only while you deploy:
+Register the daemon with Claude Code as a networked MCP server with a bearer token. **Use the
+`viewer` token for reading** and `operator` only while you deploy:
 
 ```bash
 claude mcp add --transport http honeypot-mcp http://127.0.0.1:18443/mcp \
   --header "Authorization: Bearer <your-viewer-or-operator-token>"
 ```
 
-(Claude Desktop: add an `mcpServers` entry with `"url":
-"http://127.0.0.1:18443/mcp"` and a `"headers": {"Authorization": "Bearer
-<token>"}` — a URL, not a spawn command.) Without a valid token the server answers
-`401`. Every deploy you make now lands in the daemon on the VPS and keeps
-running after you disconnect. A `viewer` session cannot even see the deploy tools. The tunnel
-allows 6 new SSH connections a minute from one address; one long-lived tunnel is one connection.
+For Claude Desktop, add an `mcpServers` entry with `"url": "http://127.0.0.1:18443/mcp"` and
+`"headers": {"Authorization": "Bearer <token>"}`: a URL, not a spawn command. Without a valid
+token the server answers `401`. A `viewer` session cannot even see the deploy tools. Every deploy
+lands in the daemon on the VPS and keeps running after you disconnect. The admin port allows 6 new
+SSH connections a minute per address; one long-lived tunnel is one connection.
 
-### 8. Deploy honeypots and wire an alert channel (2 min)
+### Step 8 — Deploy honeypots and an alert channel
 
-Connect with the `operator` token for this step. In a chat with the connected client, deploy on
-the ports the engines **listen** on (the firewall maps the public ports to them, step 6):
+Connect with the `operator` token. Deploy on the ports the engines **listen** on (the firewall maps
+the public ports to them, step 6):
 
-```
+```text
 > Deploy an SSH honeypot on port 22.            (Cowrie in Docker; Docker publishes 22)
 > Deploy an HTTP honeypot on port 8080.         (the world reaches it on 80)
 > Deploy an RDP honeypot on port 3389.
 > Deploy a POP3 honeypot on port 1110.          (the world reaches it on 110)
 > alert_subscribe url=https://hooks.slack.com/services/... severity_threshold=high
-> honeypot_self_test <name>      # confirm the pipeline end-to-end
+> honeypot_self_test <name>                     (confirm the pipeline end to end)
 ```
 
-`honeypot_self_test` sends a synthetic probe and confirms it lands as an alert
-within ~1s (`alert_received: True`). Because the daemon is persistent, these
-honeypots keep collecting after your chat and your SSH tunnel close. Leave the SMTP and DNS
-honeypots out of a first run on a cloud provider: to an automated relay or resolver check they
-look like an open relay / open resolver, which several providers' acceptable-use policies
-prohibit (nothing is ever relayed or resolved, but the check cannot tell). When you are done
-deploying, switch the client to the `viewer` token.
+`honeypot_self_test` sends a synthetic probe and confirms it lands as an alert within about a
+second (`alert_received: True`). Because the daemon is persistent, the honeypots keep collecting
+after your chat and tunnel close.
 
-### 9. (Optional) Bring up the Grafana dashboards
+Leave the SMTP and DNS honeypots out of a first deployment on a cloud provider: to an automated
+relay or resolver check they look like an open relay or open resolver, which several providers'
+acceptable-use policies prohibit (nothing is ever relayed or resolved, but the check cannot tell).
+When you are done deploying, switch the client to the `viewer` token.
 
-The data directory is private (`0700`), which Grafana (a container, uid 472)
-cannot read. Rather than loosening it for everyone, give read access to one
-dedicated group and give that group only to the Grafana container:
+### Step 9 — Grafana dashboards (optional)
+
+The data directory is private (`0700`), which Grafana (a container, uid 472) cannot read. Rather
+than loosening it for everyone, give read access to one dedicated group and give that group only to
+the Grafana container. If you skip the dashboards, skip all of this.
 
 ```bash
 # A group that exists only to read the database.
 sudo groupadd --system honeypot-db
 
-# The directory belongs to the service user as before, but its group is the new one,
-# setgid so every file the daemon creates inherits it. 2750 = owner rwx, group r-x.
+# The directory stays owned by the service user, but its group is the new one, setgid so every
+# file the daemon creates inherits it. 2750 = owner rwx, group r-x.
 sudo chgrp honeypot-db /opt/honeypot-mcp/data
 sudo chmod 2750 /opt/honeypot-mcp/data
 
@@ -378,34 +390,31 @@ sudo chgrp honeypot-db /opt/honeypot-mcp/data/honeypot_mcp.db*
 sudo chmod 0640 /opt/honeypot-mcp/data/honeypot_mcp.db*
 
 cd /opt/honeypot-mcp/docker
-export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, no default — keep it
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required, no default: keep it
 HONEYPOT_DB_GID="$(getent group honeypot-db | cut -d: -f3)" \
 HONEYPOT_DB_DIR=/opt/honeypot-mcp/data \
   docker compose -f docker-compose.observability.yml up -d
 ```
 
-`HONEYPOT_DB_GID` is required and gives Grafana that one supplementary group. If
-you skip the dashboards entirely, skip all of this: the unit's `UMask=0077` and the
-`0700` directory stay as they are.
+`HONEYPOT_DB_GID` gives Grafana that one supplementary group. `HONEYPOT_DB_DIR` is required and
+must be a directory holding only the database, never the repository root, which contains `.env`
+and `tls/` keys.
 
-This starts Prometheus + Grafana pointed at the daemon's SQLite DB and
-`/metrics` endpoint (both read-only). `HONEYPOT_DB_DIR` is required and must be
-a directory holding only the database — never the repo root, which contains
-`.env` and `tls/` keys. Grafana binds `127.0.0.1:3000`, with anonymous access
-off; tunnel `-L 3000:127.0.0.1:3000` and log in as `admin`. Its SQLite
-datasource can read the whole database (captured credentials, honeytoken
-values), so never publish it. For Prometheus (in a container) to scrape the
-host daemon, set `METRICS_HOST` to the Docker bridge gateway (e.g.
-`172.17.0.1`) rather than `0.0.0.0`. Dashboards: Overview, Threat Map, MITRE
-Coverage, Query (read-only SQL box, see step 13) and Alerts (filterable alert browser).
+This starts Prometheus and Grafana against the daemon's SQLite database and `/metrics` endpoint
+(both read-only). Grafana binds `127.0.0.1:3000` with anonymous access off; tunnel
+`-L 3000:127.0.0.1:3000` and log in as `admin`. Its SQLite datasource can read the whole database
+(captured credentials, honeytoken values), so never publish it. For Prometheus (in a container) to
+scrape the host daemon, set `METRICS_HOST` to the Docker bridge gateway (for example `172.17.0.1`),
+not `0.0.0.0`. Dashboards: Overview, Threat Map, MITRE Coverage, Query (a read-only SQL box; see
+step 13) and Alerts (a filterable alert browser).
 
-### 10. Pre-flight, then go live
+### Step 10 — Pre-flight and go-live checklist
 
-Run the checks before you walk away from the host. They take seconds and find the
-mistakes that are cheap now and expensive once traffic arrives:
+Run the checks before you walk away. They take seconds and find the mistakes that are cheap now and
+expensive once traffic arrives:
 
 ```bash
-# harden-host.sh finalize prints this command with the right ports for your layout.
+# `deploy/harden-host.sh status` prints this command with the right ports for your layout.
 scripts/preflight.sh \
   --ports 80,3389,110,22 --listen-ports 1110,3389,8080,22 --admin-port 2200 \
   --metrics-url http://127.0.0.1:19090 \
@@ -413,221 +422,206 @@ scripts/preflight.sh \
   --backup-dir /var/backups/honeypot
 ```
 
-Run it as root on the VPS: the host checks read the firewall and the effective sshd
-configuration, and probe the Docker guard as the service user. It checks the control plane (a
-token, and a strong one), that the console and metrics are bound to loopback, `.env`
-permissions, a persistent database, free disk against `MIN_FREE_DISK_MB` (plus the
-packet-capture ring), Docker, that every port you plan to use is free, and that the port you
-are SSH'd in on is not one a honeypot is about to take (the lock-out). **On the host** it also
-checks that nothing listens on a public address except the ports you named (`--listen-ports`
-is what the engines bind after the firewall's redirects; `--ports` is what the world
-connects to), that the nftables firewall is loaded with a default-drop input chain, that the
-service is not in the `docker` group and its Docker socket is the guard (which refuses a
-daemon-wide call), that sshd is key-only and allow-listed, that the kernel hardening applied,
-and that security updates are on. Against the running server it asks `/readyz`, confirms this
-process owns the sensors, that each sensor answers, that a synthetic probe to **each** sensor
-becomes an alert (`honeypot_self_test`), and that someone is subscribed to alerts. It exits
-non-zero on any failure, so it can gate a script; `--strict` also fails on warnings. The
-self-test leaves a clearly marked probe alert behind, so run it before go-live (or pass
-`--no-self-test`).
+Run it as root on the VPS: the host checks read the firewall and the effective sshd configuration,
+and probe the Docker guard as the service user. `--ports` is what the world connects to;
+`--listen-ports` is what the engines bind after the firewall's redirects. It checks:
 
-Two things it will tell you that are not bugs: a port you have *already* deployed a honeypot
-on shows as "in use" (the port check is for before you deploy; the "public listeners" check is
-the one that covers the deployed state), and `--no-host-checks` skips the Linux checks when you
-run it from a laptop.
+- **Configuration:** a strong control-plane token; console and metrics bound to loopback; `.env`
+  permissions; a persistent database; free disk against `MIN_FREE_DISK_MB` (plus the packet-capture
+  ring); Docker; that every planned port is free and that the port you are SSH'd in on is not one a
+  honeypot is about to take.
+- **Host:** nothing listens on a public address except the ports you named; the nftables firewall
+  is loaded with a default-drop input chain; the service is not in the `docker` group and its
+  Docker socket is the guard; sshd is key-only and allow-listed; kernel hardening and security
+  updates are on.
+- **Running server:** `/readyz`; that this process owns the sensors; that each sensor answers; that
+  a synthetic probe to **each** sensor becomes an alert (`honeypot_self_test`); that someone is
+  subscribed to alerts.
 
-**A sensible first estate** is small, so a surprise is easy to attribute: SSH (Cowrie), HTTP,
-RDP, SMTP and POP3. `deception_plan` describes the rest.
+It exits non-zero on any failure, so it can gate a script; `--strict` also fails on warnings. The
+self-test leaves a clearly marked probe alert behind, so run it before go-live or pass
+`--no-self-test`. Two results that are not bugs: a port you have *already* deployed shows as "in
+use" (the "public listeners" check covers the deployed state), and `--no-host-checks` skips the
+Linux checks when you run it from a laptop.
 
-**Before you walk away**
+**A sensible first estate** is small, so a surprise is easy to attribute: SSH (Cowrie), HTTP, RDP
+and POP3 (SMTP only where your provider allows it). `deception_plan` describes the rest.
+
+**Go-live checklist**
 
 - [ ] Pre-flight is green (`0 failed`).
-- [ ] An alert channel is subscribed at `high`, and you have seen a test message arrive.
-- [ ] You know how you will notice a dead sensor without looking: alert on `/readyz` going
-      non-200, on `honeypot_sensor_up == 0`, and on the `disk_space_low` / `sensor_ownership_lost`
-      CRITICAL alerts.
-- [ ] A backup exists (`scripts/backup.sh`) and the database is not on the volume that
-      holds the packet-capture ring.
-- [ ] Your own SSH access is on a port the honeypots do not use, and you have a second way in:
-      the provider's **Recovery Console** (VNC, works without sshd) with a recovery password set
-      for `deploy` (see "Getting back in" below). The browser Droplet Console is **not** a way in
+- [ ] An alert channel is subscribed at `high` and you have seen a test message arrive.
+- [ ] You know how you will notice a dead sensor without looking: alert on `/readyz` going non-200,
+      on `honeypot_sensor_up == 0`, and on the `disk_space_low` / `sensor_ownership_lost` CRITICAL
+      alerts.
+- [ ] A backup exists (`scripts/backup.sh`) and the database is not on the volume that holds the
+      packet-capture ring.
+- [ ] Your own SSH access is on a port the honeypots do not use, and you have a second way in: the
+      provider's recovery console with a recovery password set for `deploy` (see
+      [Getting back in](#getting-back-in)). A browser console that logs in as root is not a way in
       once the host is hardened.
 
-**During the run: do not tune.** If something looks wrong, write it down and keep collecting.
-A changed configuration halfway through makes the data uninterpretable, and a honeypot that is
-reconfigured after the first contact teaches the scanners something.
+**During the run, do not tune.** If something looks wrong, write it down and keep collecting. A
+configuration changed halfway through makes the data hard to interpret, and a honeypot reconfigured
+after first contact teaches scanners something.
 
 **After 24 hours**
 
-```
-> soc_brief                      # what needs a human, separated from background radiation
-> deception_coverage             # what the estate could and could not have caught
-> fingerprint_clusters           # many addresses, one toolkit?
+```text
+> soc_brief                      (what needs a human, separated from background noise)
+> deception_coverage             (what the estate could and could not have caught)
+> fingerprint_clusters           (many addresses, one toolkit?)
 > alerts_recent severity=critical
 > generate_report format=markdown
 ```
 
-Then look for what real traffic did that the synthetic traffic did not: protocol quirks a
-scanner tripped on, event volumes, false CRITICALs. That is where the next round of fixes
-comes from.
+Then compare against what synthetic traffic did not exercise: protocol quirks a scanner tripped
+on, event volumes, false CRITICALs.
 
-### 11. Wait
+### Step 11 — Leave it running
 
-You'll see your first Mirai-family scanner usually within 5–10 minutes.
-Within an hour you'll have dozens of failed SSH logins. Within 24 hours
-you'll have a substantial dataset.
+On any public IP the first scanners usually arrive within minutes, and a substantial dataset builds
+over the first day.
 
-```
+```text
 > alerts_recent severity=high
 > analyze_attacker_journey ip=<top attacker>
 > generate_report format=markdown
 ```
 
-Leaving it unattended: the database grew about 4 GB a day on the first run (one source can be
-most of the traffic), so a 78 GB disk is a two-week runway, not a deployment. Set
-`MIN_FREE_DISK_MB` to about two days of growth (the first run used `10000`): below it the watchdog
-raises a CRITICAL alert, where the default `500` only fires when a full disk has already stopped
-collection. Copy the data off (step 12) at least every ten days. A sensor that fails one health
-probe and recovers is logged, not paged; three in an hour raises one HIGH `honeypot_unstable`.
+**Unattended runs: watch the disk.** Under heavy scanning the database grew by several GB a day
+(one source can be most of the traffic), so a typical VPS disk is a runway of days to a couple of
+weeks, not an open-ended deployment.
 
-### 12. Getting your data off the droplet (and checking the run worked)
+- Set `MIN_FREE_DISK_MB` to about two days of growth (for example `10000`). Below it the watchdog
+  raises a CRITICAL `disk_space_low` alert; the default `500` only fires when a full disk has
+  already stopped collection.
+- Copy the data off (step 12) regularly, at least every ten days at that growth rate, and after
+  the first night: a suspended account would otherwise take the data with it.
+- A sensor that fails one health probe and recovers is logged, not paged; three recoveries in an
+  hour raise one HIGH `honeypot_unstable` alert.
 
-From your laptop, any time (it is read-only on the honeypots and safe mid-run):
+### Step 12 — Get the data off the host
+
+Run this from your own machine, at any time. It is read-only on the honeypots and safe mid-run:
 
 ```bash
-scripts/fetch_backup.sh --host <droplet-ip> --key ~/.ssh/honeypot_deploy --dest ~/hp-backups --samples
+scripts/fetch_backup.sh --host <vps-ip> --key ~/.ssh/honeypot_deploy --dest ./backups --samples
 ```
 
-It pulls a consistent backup, verifies the transfer and the database, quarantines any malware
-samples, and prints a report: events per sensor, sensors that are dead or silent, outages,
-top sources and credentials, honeytoken trips, and a PASS/WARN/FAIL verdict. A sensor with no
-events early on is a warning, not a failure (some protocols are scanned rarely); *every* sensor
-silent means suspect the network path. Details, the `--delete-remote` and `--expect-types`
-options, and what is and is not in a backup: [HARDENING.md](HARDENING.md#end-of-the-run). Turning
-the droplet off does not save the data: copy it off first, then destroy the droplet.
+It takes a consistent backup, verifies the transfer and the database, quarantines malware samples,
+and prints a report: events per sensor, dead or silent sensors, outages, top sources and
+credentials, honeytoken trips, and a PASS/WARN/FAIL verdict. A sensor with no events early on is a
+warning, not a failure (some protocols are scanned rarely); *every* sensor silent means suspect the
+network path. Options (`--delete-remote`, `--expect-types`, what is and is not in a backup) are in
+[HARDENING.md](HARDENING.md#end-of-the-run) and `scripts/fetch_backup.sh --help`. Powering the VPS
+off does not save the data: copy it off first, then destroy the VPS.
 
-### 13. Analyse the data later (analysis mode)
+### Step 13 — Analyse the data (analysis mode)
 
-The server can open a backup for analysis without running any sensor. Set `ANALYSIS_MODE=true` and
-point `DATABASE_URL` at a **copy** of the database. Without it, a restored database lists every
-sensor as RUNNING and the server would try to launch all of them on your laptop (ports, Docker).
-In this mode nothing is started: no honeypots, packet capture, canary, watchdog, notifications or
-retention, and the sensor-changing tools answer that they are unavailable. Alerts, ATT&CK mapping,
-campaigns, triage, reports and exports work normally. Opening a database also upgrades its schema,
-so always work on a copy, never on the only copy of the evidence:
+The server can open a backup without running any sensor. Set `ANALYSIS_MODE=true` and point
+`DATABASE_URL` at a **copy** of the database. Without it, a restored database lists every sensor as
+RUNNING and the server would try to launch all of them on your machine (ports, Docker). In this
+mode nothing is started: no honeypots, packet capture, canary, watchdog, notifications or
+retention, and sensor-changing tools say they are unavailable. Alerts, ATT&CK mapping, campaigns,
+triage, reports and exports work normally. Opening a database also upgrades its schema, so always
+work on a copy:
 
 ```bash
-B=$(ls -dt ~/hp-backups/honeypot-* | head -1)
-mkdir -p ~/hp-analysis && cp -c "$B/honeypot_mcp.db" ~/hp-analysis/   # macOS clone; Linux: cp --reflink=auto
+B=$(ls -dt ./backups/honeypot-* | head -1)
+mkdir -p analysis && cp -c "$B/honeypot_mcp.db" analysis/   # macOS clone; Linux: cp --reflink=auto
 claude mcp add honeypot-analysis \
-  -e ANALYSIS_MODE=true -e MCP_TRANSPORT=stdio -e REPORTS_DIR=$HOME/hp-analysis/reports \
-  -e DATABASE_URL=sqlite+aiosqlite:///$HOME/hp-analysis/honeypot_mcp.db \
+  -e ANALYSIS_MODE=true -e MCP_TRANSPORT=stdio -e REPORTS_DIR="$PWD/analysis/reports" \
+  -e DATABASE_URL="sqlite+aiosqlite:///$PWD/analysis/honeypot_mcp.db" \
   -- /path/to/HoneyPot-MCP/.venv/bin/python -m honeypot_mcp.server
 ```
 
 | To answer | Tool |
 |---|---|
 | What happened, what needs triage | `soc_brief`, `alerts_stats`, `alerts_recent`, `alerts_search` |
-| Which ATT&CK techniques | `attack_summary` (the whole run, by tactic, exact counts), `map_ttps` (an IP, event types or text), `deception_coverage` |
+| Which ATT&CK techniques | `attack_summary` (whole run, by tactic, exact counts), `map_ttps` (an IP, event types or text), `deception_coverage` |
 | Who is this attacker, what did they do in order | `analyze_attacker`, `analyze_attacker_journey`, `analyze_session` |
 | Which sources act together | `analyze_campaign`, `fingerprint_clusters` (SSH client fingerprints) |
 | Record a verdict | `alerts_acknowledge` (a source, an event type or ids; sets true/false positive) |
 | Hand it on | `generate_report` (markdown or html), `export_stix`, `export_blocklist`, `alerts_export` |
-| Ask a question none of the tools anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and 15 s). Prefer `alert_rollups` for anything over the whole run. Grafana has the same thing: the **Query** dashboard takes SQL in its `sql` box. |
+| A question no tool anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and 15 s). Prefer `alert_rollups` for anything over the whole run. Grafana's **Query** dashboard takes SQL in its `sql` box. |
 
-Measured on the first real run (4.9M alerts, 3.7 GB): opening it takes seconds and each of these
-calls returns in well under two seconds, because statistics read pre-aggregated rollups and not
-the alerts table. Event types that are connection or session bookkeeping are deliberately not
-mapped to a technique, so the ATT&CK numbers count behaviour, not connections.
+Statistics read pre-aggregated rollups rather than the alerts table, so on a database with millions
+of alerts opening takes seconds and these calls return in about that time. Event types that are
+connection or session bookkeeping are deliberately not mapped to a technique, so the ATT&CK numbers
+count behaviour, not connections.
 
-For a first pass without a chat, one command does the lot (about ten seconds on that run):
+For a first pass without a chat, one command does the lot:
 
 ```bash
-scripts/analyze_backup.py ~/hp-backups/honeypot-<timestamp> --top 5 --hours 168
+scripts/analyze_backup.py ./backups/honeypot-<timestamp> --top 5 --hours 168 --workdir ./analysis
 ```
 
 It works on a copy, runs the server in analysis mode over real MCP stdio, and writes
-`~/hp-analysis/reports/analysis-summary.md` (headline numbers, the ATT&CK table by tactic, the
-busiest sources' journeys, campaigns and clusters) next to the HTML/Markdown reports, the STIX
-bundle and the blocklist. Triage and follow-up questions then go to the MCP client above.
+`analysis/reports/analysis-summary.md` (headline numbers, the ATT&CK table by tactic, the busiest
+sources' journeys, campaigns and clusters) next to the HTML/Markdown reports, the STIX bundle and
+the blocklist. Triage and follow-up questions then go to the MCP client above.
 
 ---
 
-## Home lab deploy
+## Home lab deployment
 
-For testing the pipeline without a public IP. Two options:
+For testing the pipeline without a public IP.
 
 ### Option A — Cloudflare Tunnel for canary callbacks only
 
-You don't need to expose your honeypots to the internet to test the system.
-Run them locally and just expose the canary callback so file/URL tokens can
-fire from anywhere.
+You do not need to expose honeypots to the internet to test the system. Run them locally and expose
+only the canary callback so file and URL tokens can fire from anywhere:
 
 ```bash
-# Install cloudflared from cloudflare.com/products/tunnel/
+# Install cloudflared from https://www.cloudflare.com/products/tunnel/
 cloudflared tunnel --url http://localhost:8888
 ```
 
-Cloudflare prints a URL like `https://random-words.trycloudflare.com`.
-Set `CANARY_PUBLIC_URL` to that. Canary tokens planted in documents will
-phone home to that URL from anywhere on the internet.
+Cloudflare prints a URL like `https://random-words.trycloudflare.com`. Set `CANARY_PUBLIC_URL` to
+it; canary tokens planted in documents then phone home to it from anywhere.
 
-### Option B — ngrok TCP for SSH brute-force collection
+### Option B — ngrok TCP for SSH collection
 
-This exposes your local SSH honeypot to the internet via ngrok, which lets
-you collect real attack traffic without a VPS. Note: ngrok's free tier
-gives a different hostname every time it restarts, so you can't use this
-for long-running collection.
+This exposes a local SSH honeypot to the internet, which collects real attack traffic without a
+VPS. ngrok's free tier gives a different hostname each restart, so this suits short tests, not
+long-running collection.
 
 ```bash
 ngrok tcp 22
 ```
 
-Note the public address ngrok prints — that's where attackers (will, very
-quickly) find your honeypot.
+The address ngrok prints is where attackers will find the honeypot.
 
 ---
 
 ## Ongoing operations
 
-### Daily
+**Daily**
 
-- Glance at the alert stream / dashboard
-- Acknowledge / dismiss low-severity noise
-- Check `alert_subscriptions_list` for any subscriptions that have started
-  failing — usually a stale Slack webhook
+- Glance at the alert stream or dashboard; acknowledge or dismiss low-severity noise.
+- Check `alert_subscriptions_list` for subscriptions that have started failing (usually a stale
+  Slack webhook).
 
-### Weekly
+**Weekly**
 
-- `alerts_prune older_than_days=30` (or whatever retention you want)
-- Update suppression rules for newly-discovered scanner traffic that doesn't
-  add signal (Censys, internal vuln scanners, your own monitoring)
-- Pull the repo, redeploy if there are updates
+- `alerts_prune older_than_days=30` (or your retention; it archives to JSON Lines first).
+- Update suppression rules for scanner traffic that adds no signal (Censys, internal vulnerability
+  scanners, your own monitoring).
+- Check for repository updates and redeploy using [Upgrades](#upgrades).
 
-### Monthly
+**Monthly**
 
-- Rotate the canary callback URL if you've shared it widely (so old
-  attackers can't keep hammering it)
-- Rebuild the host from scratch — assume drift / compromise over time
-- Export attack data: `export_stix` + `export_blocklist` for upstream
-  threat-intel feeds
+- Rotate the canary callback URL if you have shared it widely.
+- Rebuild the host from scratch: assume drift and compromise over time.
+- Export attack data (`export_stix`, `export_blocklist`) for upstream threat-intel feeds.
 
-### Updating the deployment
+If you run the Grafana stack, update it with:
 
 ```bash
-cd /opt/honeypot-mcp
-git pull
-uv sync --extra dev
-sudo systemctl restart honeypot-mcp        # reconcile re-establishes honeypots
-# If you run the Grafana stack too:
-cd docker && docker compose -f docker-compose.observability.yml pull \
+cd /opt/honeypot-mcp/docker && docker compose -f docker-compose.observability.yml pull \
   && docker compose -f docker-compose.observability.yml up -d
 ```
-
-Schema migrations are idempotent — Alembic upgrades on next server start, and
-the `reconcile` step brings the running honeypots back after the restart.
-If migrations fail, the server falls back to `create_all` (logged but
-non-fatal).
 
 ---
 
@@ -635,168 +629,151 @@ non-fatal).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| No events after 30 minutes | Firewall not open or port blocked upstream by provider | Test from your laptop: `nc -zv <your-ip> 22` |
-| `honeypot_self_test` returns `alert_received: False` | Engine is up but alert pipeline is broken | Check suppression rules; check DB connectivity; check the buffer flusher is running (it's a single asyncio task — usually fine) |
-| Canary URLs never fire | `CANARY_PUBLIC_URL` wrong or port 8888 not reachable | Test: `curl http://<canary-url>/t/test` — should return 200 OK |
-| Cowrie not catching anything but port is open | Cowrie image not pulled, or the container died | `docker logs honeypot-<name>` (the SSH engine names containers `honeypot-<honeypot-name>`); `honeypot_health <name>` |
-| Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on consumer side | `alert_subscriptions_list` shows `last_error` |
-| Out of disk space | Alert payloads accumulating | Run `alerts_prune` more aggressively, or set up a cron job |
-| Host SSH down (locked out) | The admin port was changed by hand, or the firewall blocks you | The browser **Droplet Console does not work** once hardened (it logs in as root). Use the **Recovery Console** with the `deploy` recovery password; see "Getting back in" below |
-| Client can't connect / tools don't appear | Daemon not running, tunnel down, or wrong/missing bearer token (401) | `systemctl status honeypot-mcp`; re-open `ssh -p 2200 -L 18443:127.0.0.1:18443 …`; confirm the `Authorization: Bearer` header matches a token in `MCP_AUTH_TOKENS`. A `viewer` token cannot see the deploy tools |
-| Daemon exits immediately on start with an auth message | `MCP_TRANSPORT=http` but `MCP_AUTH_TOKEN` is unset (fail-closed) | Set `MCP_AUTH_TOKEN` (`openssl rand -hex 32`), or `MCP_ALLOW_UNAUTHENTICATED=true` if you front it with your own auth |
-| SSH honeypots won't deploy (`403 ... honeypot docker guard`) | The Docker guard refused the request, or is not running. The service is deliberately **not** in the `docker` group; do not add it | `systemctl status honeypot-docker-guard`; `journalctl -u honeypot-docker-guard -n 30` names the refused rule |
-| Daemon won't start / crashes on boot | Config or DB error | `journalctl -u honeypot-mcp -e` — the last lines show the traceback |
-| Honeypots vanished after a reboot | Expected — they're re-established on daemon start | `reconcile` runs on startup; confirm with `honeypot_list`. If any show ERROR, check `journalctl` |
-| Need to read Prometheus metrics from another host | Metrics are bound to loopback (19090) for security | SSH-tunnel it: `ssh -p 2200 -L 19090:127.0.0.1:19090 deploy@<vps>` |
+| No events after 30 minutes | Firewall not open, or port blocked upstream by the provider | Test from another machine: `nc -zv <vps-ip> 22` |
+| `honeypot_self_test` returns `alert_received: False` | Engine is up but the alert pipeline is not | Check suppression rules, DB connectivity, and that the buffer flusher is running |
+| Canary URLs never fire | `CANARY_PUBLIC_URL` wrong, or the callback is not reachable | `curl http://<canary-url>/t/test` should return 200 OK. Under the production profile the callback is loopback-only (18888): point `CANARY_PUBLIC_URL` at an HTTP honeypot on port 80 (step 4) |
+| Cowrie catches nothing but the port is open | Image not pulled, or the container died | `docker logs honeypot-<name>` (containers are named `honeypot-<honeypot-name>`); `honeypot_health <name>` |
+| Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on the consumer | `alert_subscriptions_list` shows `last_error` |
+| Out of disk space | Alert payloads accumulating | `alerts_prune` more aggressively, or schedule it; see step 11 |
+| Host SSH down (locked out) | Admin port changed by hand, or the firewall blocks you | A browser console that logs in as root does not work once hardened. Use the recovery console; see [Getting back in](#getting-back-in) |
+| Client can't connect / tools don't appear | Daemon not running, tunnel down, or wrong or missing bearer token (401) | `systemctl status honeypot-mcp`; reopen the tunnel (`ssh -p 2200 -L 18443:127.0.0.1:18443 …`); check the `Authorization: Bearer` header matches a token in `MCP_AUTH_TOKENS`. A `viewer` token cannot see the deploy tools |
+| Daemon exits immediately with an auth message | `MCP_TRANSPORT=http` but no token set (fail-closed) | Set `MCP_AUTH_TOKEN` (`openssl rand -hex 32`), or `MCP_ALLOW_UNAUTHENTICATED=true` if you front it with your own auth |
+| SSH honeypots won't deploy (`403 ... honeypot docker guard`) | The guard refused the request, or is not running. The service is deliberately **not** in the `docker` group; do not add it | `systemctl status honeypot-docker-guard`; `journalctl -u honeypot-docker-guard -n 30` names the refused rule |
+| Daemon won't start / crashes on boot | Config or DB error | `journalctl -u honeypot-mcp -e` shows the traceback |
+| Honeypots vanished after a reboot | Expected: they are re-established on daemon start | `reconcile` runs on startup; confirm with `honeypot_list`; if any show ERROR, check `journalctl` |
+| Need Prometheus metrics from another host | Metrics are bound to loopback (19090) | Tunnel it: `ssh -p 2200 -L 19090:127.0.0.1:19090 deploy@<vps-ip>` |
 | Service dies with `status=203/EXEC ... Permission denied` | The venv's Python is under `/root/.local/share/uv/python`, which the service user cannot execute | `rm -rf .venv && UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12` (`harden-host.sh prepare` checks this) |
-| `finalize` says sshd is not listening on 2200 | sshd re-binds a moment after the reload, or the new config was rejected | It waits and, if sshd never comes up, restores port 22 for you. Check `journalctl -u ssh` and `sshd -t` |
-| Locked out after `finalize` | The firewall rules block your address | Do nothing: the rollback timer removes the firewall after `--rollback-seconds`. If you already ran `confirm`, see "Getting back in" below |
+| `finalize` says sshd is not listening on 2200 | sshd re-binds a moment after the reload, or the new config was rejected | It waits and, if sshd never comes up, restores port 22. Check `journalctl -u ssh` and `sshd -t` |
+| Locked out after `finalize` | The firewall rules block your address | Do nothing: the rollback timer removes the firewall after `--rollback-seconds`. If you already ran `confirm`, see [Getting back in](#getting-back-in) |
 
 ### Getting back in
 
-Hardening disables root login and password logins over SSH, so DigitalOcean's browser **Droplet
-Console** (which connects over the network as root with keys its agent fetches) fails with "all
-authentication methods failed". That is expected and not something to fix by loosening sshd. Two
-real ways back in if your SSH key or port stops working:
+Hardening disables root login and password login over SSH, so a provider's browser console that
+connects over the network as root (DigitalOcean's Droplet Console, for example) fails with "all
+authentication methods failed". That is expected; do not loosen sshd to fix it. Two real ways back
+in if your key or port stops working:
 
 1. **The rollback timer** undoes a bad firewall within `--rollback-seconds` of `finalize` (unless
    you ran `confirm`). It does not undo a wrong SSH port.
-2. **The Recovery Console** (Droplet page -> Access -> Recovery Console): a VNC session, like a
-   keyboard and monitor on the machine, available even if sshd or the network is broken. It needs
-   a local password, and the setup leaves every account password-less, so set one for `deploy`
-   *before you need it*:
+2. **The provider's recovery console**: a VNC session, like a keyboard and monitor on the machine,
+   available even if sshd or the network is broken (on DigitalOcean: Droplet page, Access,
+   Recovery Console). It needs a local password, and the setup leaves every account password-less,
+   so set one for `deploy` *before you need it*:
 
    ```bash
-   openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24 > ~/.ssh/honeypot_recovery_password
-   chmod 600 ~/.ssh/honeypot_recovery_password
-   printf 'deploy:%s\n' "$(tr -d '\n' < ~/.ssh/honeypot_recovery_password)" \
-     | ssh -p 2200 deploy@<ip> 'sudo chpasswd'
+   PW="$(openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24)"
+   echo "Recovery password for deploy (store it in your password manager): $PW"
+   printf 'deploy:%s\n' "$PW" | ssh -p 2200 deploy@<vps-ip> 'sudo chpasswd'
    ```
 
    sshd still refuses passwords (`PasswordAuthentication no`, `AuthenticationMethods publickey`),
    so the password only works at the console. From there `sudo nft delete table inet hp_fw`
    removes the firewall and `sudo systemctl restart ssh` restarts sshd. Pasting does not work in
-   the Recovery Console, so keep the password typeable (the command above drops `/+=`).
+   the recovery console, so keep the password typeable (the command above drops `/+=`).
 
-If both fail, the data is the only thing worth saving: rebuild the droplet and start over.
+If both fail, the data is the only thing worth saving: rebuild the VPS and start over.
 
 ---
 
-## What good looks like
+## What to expect
 
-After 7 days on a typical $5 VPS you should expect, roughly:
-
-- **5,000–50,000 SSH login attempts** (Mirai, Hydra, Patator, default-cred sweepers)
-- **A few hundred unique attacker IPs** spread across ~20 countries
-- **Dozens of unique commands** attempted — most are credential brute force,
-  some try `wget`/`curl` of dropper binaries, occasional manual probes
-- **HTTP**: hundreds-to-thousands of probes for `/admin`, `/.env`,
-  `/.git/config`, `/wp-login.php`, common JS framework env files
-- **RDP** (if enabled): often higher volume than SSH; many tools leak the
-  intended username in the `Cookie: mstshash=` field
-
-If you see substantially less, check the firewall and the self-test.
+Volume depends heavily on the provider's address range and on which engines you deploy. On a public
+IP expect, in roughly this order of volume: credential brute force against SSH, Telnet and RDP
+(many RDP tools leak the intended username in the `Cookie: mstshash=` field); HTTP probes for
+`/admin`, `/.env`, `/.git/config`, `/wp-login.php` and framework env files; a small number of
+commands in SSH sessions, mostly reconnaissance with occasional `wget`/`curl` of dropper binaries;
+and a long tail of exploit attempts. A real deployment's figures are in
+[RESULTS.md](RESULTS.md). If you see almost nothing, check the firewall and the self-test.
 
 ---
 
 ## Running it in production
 
-The sections above get a sensor collecting. These are the things that decide
-whether it keeps collecting, and whether you can prove what it collected.
+The sections above get a sensor collecting. These decide whether it keeps collecting, and whether
+you can prove what it collected.
 
 ### Health checks: liveness is not readiness
 
-Two endpoints on the metrics port (default `9090`, localhost-only):
+Two endpoints on the metrics port (`METRICS_PORT`, default `9090`, `19090` in the production
+profile, loopback-only):
 
 | Endpoint | Answers | Use for |
 |---|---|---|
-| `GET /healthz` | Is the process alive? | restart policy / liveness probe |
+| `GET /healthz` | Is the process alive? | restart policy, liveness probe |
 | `GET /readyz` | Is it actually *collecting*? | alerting, load-balancer readiness |
 
-The distinction is not academic. Every in-process engine keeps accepting
-connections and answering attackers whether or not the database is reachable —
-the listeners never touch it. Remove the database underneath a running server
-and the honeypots carry on perfectly while nothing is persisted; a liveness
-probe sees a healthy process the entire time. `/readyz` runs a real query
-against a real table and returns **503** when it cannot, which is the only
-signal that distinguishes "running" from "collecting".
+The distinction matters. Every in-process engine keeps accepting connections and answering
+attackers whether or not the database is reachable, because the listeners never touch it. Remove
+the database underneath a running server and the honeypots carry on while nothing is persisted; a
+liveness probe sees a healthy process the whole time. `/readyz` runs a real query against a real
+table and returns **503** when it cannot, which is the only signal that separates "running" from
+"collecting". It also fails on a runaway ingest backlog: the event queue is unbounded, so a
+database that cannot keep up becomes a memory problem before it becomes a data-loss one, and
+`honeypot_event_queue_depth` in `/metrics` shows the trend.
 
-It also fails on a runaway ingest backlog. The event queue is unbounded, so a
-database that cannot keep up becomes a memory problem before it becomes a
-data-loss one, and `honeypot_event_queue_depth` in `/metrics` shows the trend.
-
-**Alert on `/readyz`, not `/healthz`.** A honeypot that has silently stopped
-recording is worse than one that is obviously down.
+**Alert on `/readyz`, not `/healthz`.**
 
 ```bash
 curl -s localhost:19090/readyz | jq     # 9090 outside the production profile
 ```
 
-The compose stack already wires the container healthcheck to `/readyz`.
+The compose stack wires the container healthcheck to `/readyz`.
 
-### Backups — the database is the evidence
+### Backups: the database is the evidence
 
-Everything else can be rebuilt from the repo. Captured attack data cannot, and
-neither can honeytoken values: a token whose secret is lost can never be
-attributed if it fires later.
+Everything else can be rebuilt from the repository. Captured attack data cannot, and neither can
+honeytoken values: a token whose secret is lost can never be attributed if it fires later.
 
 ```bash
 ./scripts/backup.sh /var/backups/honeypot     # database + TLS certs + reports + .env
-./scripts/restore.sh /var/backups/honeypot/honeypot-20260730T013016Z
+./scripts/restore.sh /var/backups/honeypot/honeypot-<timestamp>
 ```
 
-Two details the script exists to get right:
+- **It uses SQLite's `VACUUM INTO`, never `cp`.** The server runs in WAL mode, so copying the
+  `.db` file while a write is in flight produces a file that opens cleanly and is quietly missing
+  recent transactions. `VACUUM INTO` takes a consistent snapshot in one read transaction without
+  blocking the server, and the copy is a compact rollback-mode file (no `-wal`/`-shm`). SQLite's
+  `.backup` was rejected because it restarts whenever the server writes between its copy steps and,
+  on a multi-GB database under constant writes, did not finish.
+- **The backup contains secrets** (`.env`, honeytoken values, captured credentials). It is written
+  mode 600; store it wherever you keep the `.env` itself.
 
-- **It uses SQLite's `VACUUM INTO`, never `cp`.** The server runs in WAL mode, so
-  copying the `.db` file while a write is in flight produces a file that opens
-  cleanly and is quietly missing recent transactions — the worst way for a
-  backup to fail. `VACUUM INTO` takes a consistent snapshot in one read
-  transaction without blocking the server, and the copy is a compact
-  rollback-mode file (no `-wal`/`-shm`). It replaced `.backup`, which copies in
-  small steps and restarts whenever the server writes between steps: on a
-  3.8 GB database taking ~190 events a second it ran 38 minutes and never
-  finished, where `VACUUM INTO` took 203 s.
-- **The backup contains secrets** — `.env`, honeytoken values, captured
-  credentials. It is written mode 600 and should be stored wherever you keep
-  the `.env` itself.
-
-`restore.sh` refuses to run while the server is up. Restoring underneath a
-running process leaves it holding an open handle to the replaced file: it keeps
-working, keeps reporting success, and writes into a database nobody will read
-again.
+`restore.sh` refuses to run while the server is up: restoring underneath a running process leaves
+it holding an open handle to the replaced file, still reporting success while writing into a
+database nobody will read.
 
 Schedule it:
 
-```
+```text
 0 3 * * *  cd /opt/honeypot-mcp && ./scripts/backup.sh /var/backups/honeypot
 ```
 
 ### Upgrades
 
-Migrations run automatically at startup, so the procedure is:
+Migrations run automatically at startup:
 
 ```bash
 ./scripts/backup.sh /var/backups/honeypot   # 1. always, before anything
-git pull                                    # 2. update (then rebuild the venv with the
-sudo UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12   # shared interpreter)
-sudo systemctl restart honeypot-docker-guard honeypot-mcp   # 3. restart (compose stack: docker compose up -d --build)
-curl -s localhost:19090/readyz              # 4. confirm it came back collecting (9090 outside the production profile)
+git pull                                    # 2. update, then rebuild the venv:
+sudo UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12
+sudo systemctl restart honeypot-docker-guard honeypot-mcp   # 3. restart; reconcile re-establishes the honeypots
+curl -s localhost:19090/readyz              # 4. confirm it came back collecting
 ```
 
-Step 4 matters: a failed migration falls back to `create_all()` so the server
-still starts, which means a broken upgrade can look like a successful one.
-`/readyz` and the startup logs are how you tell.
+For the all-in-one compose stack, use `docker compose up -d --build` instead of step 3. Step 4
+matters: a failed migration falls back to `create_all()` so the server still starts, which means a
+broken upgrade can look like a successful one. `/readyz` and the startup logs are how you tell.
 
 ### File permissions
 
-`.env` holds the MCP bearer token, threat-intel API keys and webhook HMAC
-secrets. A default umask produces mode 0644, so `cp .env.example .env` leaves
-it world-readable — on a shared host that hands the control plane to any local
-account, and the control plane can deploy honeypots and read every captured
-credential.
+`.env` holds the MCP bearer tokens, threat-intel API keys and webhook HMAC secrets. A default umask
+produces mode 0644, so `cp .env.example .env` leaves it world-readable; on a shared host that hands
+the control plane to any local account, and the control plane can deploy honeypots and read every
+captured credential.
 
 ```bash
-chmod 600 .env
+chmod 600 .env                                              # laptop or single-user host
+sudo chown root:honeypot .env && sudo chmod 0640 .env       # production profile (step 5)
 ```
 
-The server warns at startup if the mode is wrong.
+The server warns at startup if the mode is too open.

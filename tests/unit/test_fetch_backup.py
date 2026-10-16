@@ -1,6 +1,6 @@
 """`scripts/fetch_backup.sh`: pull a backup off the VPS, verify it, and say whether the run worked.
 
-The script is the laptop half of the "turn the droplet off but keep the data" procedure, so it has
+The script is the laptop half of the "turn the VPS off but keep the data" procedure, so it has
 to be right the one time it matters: it must refuse a hostile archive (the VPS is the machine
 attackers have been talking to), it must notice a bad transfer, and its verdict must not count the
 platform's own probes as attacker activity or call an empty run healthy.
@@ -499,7 +499,7 @@ def _sha256(path: Path) -> str:
 def test_a_wal_mode_backup_is_reported_without_side_files_or_changing_a_byte(rig):
     """A snapshot in WAL mode must be read as `immutable`. A plain read-only open of a WAL database
     needs its -shm/-wal side files ("unable to open database file" otherwise), which a downloaded
-    snapshot does not have: on the real droplet the transfer verified and then every report query
+    snapshot does not have: on the real VPS the transfer verified and then every report query
     failed, because every test database before this one was in rollback mode. The backup script now
     produces rollback-mode snapshots (`VACUUM INTO`), but one taken by an older version, by hand, or
     by a different tool can still be WAL, so the reader must cope: no side files, no writes,
@@ -541,7 +541,7 @@ def test_a_destination_with_uri_special_characters_still_opens_the_database(rig,
 def test_internal_sources_are_the_platforms_own_traffic_and_public_neighbours_of_those_ranges_are_not(
     rig,
 ):
-    """On the droplet the Docker bridge address (172.17.0.1) is the source Cowrie sees for the
+    """On the VPS the Docker bridge address (172.17.0.1) is the source Cowrie sees for the
     self-tests and the pre-flight probes, and only some of those events carry the self-test marker:
     the first real report counted it as an attacker with 28 events. Private ranges cannot be the
     internet, so they are reported on their own line; but an address just outside a private range is

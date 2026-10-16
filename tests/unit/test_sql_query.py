@@ -173,7 +173,7 @@ async def test_a_write_cannot_get_through_even_if_the_text_check_is_bypassed(mon
 
 
 async def test_a_runaway_query_is_stopped_inside_sqlite_and_leaves_a_working_session(monkeypatch):
-    """`asyncio.wait_for` cannot stop a SQLite scan: it runs in a worker thread. On the live droplet a
+    """`asyncio.wait_for` cannot stop a SQLite scan: it runs in a worker thread. On the live VPS a
     3-minute window over 11M rows ran 87 s against a 15 s limit and then returned PendingRollbackError.
     The deadline is now enforced by a progress handler inside SQLite."""
     import time

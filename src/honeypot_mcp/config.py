@@ -361,7 +361,7 @@ class Settings(BaseSettings):
     # Cowrie keeps its session recordings and download records in RAM-backed tmpfs, and the
     # container's memory cgroup counts every file's inode and dentry on top of the tmpfs size cap.
     # With egress closed each failed wget/curl leaves a 0-byte file, and a telnet botnet makes tens
-    # of thousands: on the live droplet 54,000 files cost ~80 MiB of a 256 MiB limit and the telnet
+    # of thousands: on the live VPS 54,000 files cost ~80 MiB of a 256 MiB limit and the telnet
     # container was OOM-killed 246 times in 20 hours (losing everything in it each time). A thread
     # inside the container (engines/cowrie_sitecustomize.py; the host's Docker guard refuses exec)
     # runs every `cowrie_janitor_interval_seconds`: it deletes empty download leftovers older than

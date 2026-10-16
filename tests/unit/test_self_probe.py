@@ -183,7 +183,7 @@ async def test_probe_to_a_non_loopback_local_address_is_also_claimed():
 
 
 async def test_a_probe_through_nat_is_claimed_under_the_gateway_address_too():
-    """Found on the live droplet: the watchdog probes each Cowrie container through its published
+    """Found on the live VPS: the watchdog probes each Cowrie container through its published
     port from 127.0.0.1, and the container sees that connection from the Docker bridge gateway with
     the port unchanged. Only the loopback tuple was registered, so every probe (1,060 connect/close
     pairs per sensor in nine hours) was recorded as an attacker called 172.17.0.1."""

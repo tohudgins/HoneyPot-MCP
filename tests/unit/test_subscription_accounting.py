@@ -1,6 +1,6 @@
 """A notification the throttle declined to send is not a delivery and not evidence of health.
 
-Found on the live droplet: the Slack subscription reported 13,025 deliveries in nine hours while its
+Found on the live VPS: the Slack subscription reported 13,025 deliveries in nine hours while its
 channel had received a handful of messages, because a throttled event returned success and was
 recorded as one. The same path reset `failure_count` and cleared `last_error`, so a broken webhook
 would have looked healthy as soon as the throttle swallowed the next event.

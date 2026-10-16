@@ -280,7 +280,7 @@ def _load_migration():
 
 @pytest.mark.asyncio
 async def test_the_migration_backfills_exactly_what_a_group_by_of_the_existing_alerts_gives():
-    """A database that already holds alerts when it upgrades (the live droplet: 4.9M rows) must get
+    """A database that already holds alerts when it upgrades (the live VPS: 4.9M rows) must get
     rollups equal to those alerts, not an empty table that makes every statistic read zero."""
     from alembic.migration import MigrationContext
     from alembic.operations import Operations

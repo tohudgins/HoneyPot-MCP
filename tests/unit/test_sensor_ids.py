@@ -1,6 +1,6 @@
 """A removed sensor's id is never handed to a new one, and removal keeps the rollups honest.
 
-Found on the live droplet: removing the newest sensor and deploying another gave the new one the old
+Found on the live VPS: removing the newest sensor and deploying another gave the new one the old
 id (SQLite reuses the highest rowid), so the old sensor's history was attributed to it. And removal
 NULLed the sensor on raw alerts but left the rollups pointing at the old id, so the rollups stopped
 agreeing with the alerts.

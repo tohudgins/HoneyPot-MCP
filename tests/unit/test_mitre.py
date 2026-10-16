@@ -137,7 +137,7 @@ async def test_unrecognised_input_maps_to_nothing():
 @pytest.mark.parametrize(
     ("event_type", "technique"),
     [
-        # Types that the live droplet recorded thousands of times and the mapper used to ignore.
+        # Types that the live VPS recorded thousands of times and the mapper used to ignore.
         ("redis_config_set", "T1190"),
         ("redis_key_set", "T1190"),
         ("redis_config_get", "T1082"),
@@ -151,7 +151,7 @@ async def test_unrecognised_input_maps_to_nothing():
         ("http_recon_probe", "T1595"),
     ],
 )
-async def test_attacker_behaviour_seen_on_the_live_droplet_is_mapped(event_type, technique):
+async def test_attacker_behaviour_seen_on_the_live_VPS_is_mapped(event_type, technique):
     from honeypot_mcp.intel.mitre import map_to_attack
 
     mapped = {m["technique_id"] for m in await map_to_attack([event_type])}

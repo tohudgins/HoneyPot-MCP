@@ -1,4 +1,4 @@
-"""Decoy tells found by running real nmap scripts against the live droplet.
+"""Decoy tells found by running real nmap scripts against the live VPS.
 
 Each of these was visible in the output of a stock NSE script: an LDAP rootDSE clock six days in the
 past (`ldap-rootdse`), a MySQL connection id that was always 12345 (`mysql-info`), uptimes that

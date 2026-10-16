@@ -176,7 +176,7 @@ class Alert(Base):
         Index("ix_alerts_timestamp_severity", "timestamp", "severity"),
         Index("ix_alerts_source_ip_timestamp", "source_ip", "timestamp"),
         # `honeypot_list`, `honeypot_status` and the sensor tables count alerts per sensor. With no
-        # index on this column that is a full scan: 51 s on 4.9M rows on the live droplet, 0.02 s
+        # index on this column that is a full scan: 51 s on 4.9M rows on the live VPS, 0.02 s
         # with it (a covering index, no table read).
         Index("ix_alerts_honeypot_id", "honeypot_id"),
     )
@@ -232,7 +232,7 @@ class AlertRollup(Base):
     """Alerts counted per hour, per (severity, event type, source, sensor).
 
     The cost of a statistic should depend on the size of the answer, not the size of the table. On
-    the live droplet the alert table reached 4.9M rows in nine hours and `alerts_stats`,
+    the live VPS the alert table reached 4.9M rows in nine hours and `alerts_stats`,
     `soc_brief` and `honeypot_list` took tens of seconds or timed out, because each aggregate read
     every row. This table is written in the same transaction as the alerts, so it is never out of
     step with them, and grows with the number of *distinct* (hour, kind, source, sensor)

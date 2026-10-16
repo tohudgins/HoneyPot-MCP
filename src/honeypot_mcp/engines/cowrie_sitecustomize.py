@@ -139,7 +139,7 @@ def patch_telnet_userauth(module: ModuleType) -> None:
 # `var/lib/cowrie`, which the container mounts as tmpfs. Two properties of that are fatal under a
 # botnet. The memory cgroup counts every file's inode and dentry on top of the tmpfs `size=` cap
 # (which does not limit the *number* of files), and with egress closed every failed `wget`/`curl`
-# leaves a 0-byte `tmp…`/`redir_…` file that nothing ever removes. On the live droplet that was
+# leaves a 0-byte `tmp…`/`redir_…` file that nothing ever removes. On the live VPS that was
 # 43,591 empty files plus 10,654 recordings (~85 MB against a 64 MB tmpfs): ~80 MiB of a 256 MiB
 # limit, the telnet container OOM-killed 246 times in 20 hours, and the directory full, so new
 # recordings and real downloads were failing to write. The cleanup runs here, inside the container,

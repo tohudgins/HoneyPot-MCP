@@ -398,7 +398,7 @@ async def run(a: argparse.Namespace) -> int:
     else:
         sw.record(o, "suppression_remove", "removes it", False, f"no rule id in {sup}")
     # Never stop a capture that is running: this sweep runs against live deployments, and the
-    # earlier version called action="stop" and silently ended packet capture on the droplet.
+    # earlier version called action="stop" and silently ended packet capture on the VPS.
     cap = await sw.call(v, "pcap_status", None)
     running = bool(cap[0] and isinstance(cap[1], dict) and cap[1].get("running"))
     await sw.expect(

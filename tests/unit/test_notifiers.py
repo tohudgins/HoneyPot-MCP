@@ -244,7 +244,7 @@ def test_a_critical_pages_immediately_even_if_the_same_ip_fired_something_a_minu
 
 
 def test_identical_criticals_from_one_source_are_coalesced_and_counted():
-    """Found on the live droplet: one source sending ~700 SIP toll-fraud INVITEs an hour was a
+    """Found on the live VPS: one source sending ~700 SIP toll-fraud INVITEs an hour was a
     Slack message every five seconds. The per-type cap (30 a minute) is far above any single
     scanner's rate, so only a per-source window can stop it. Volume still rides along."""
     from honeypot_mcp.webhooks import _NotifyThrottle

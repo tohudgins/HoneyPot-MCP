@@ -1,7 +1,8 @@
 # Contributing
 
-Thanks for looking. This document covers the things that are specific to this
-project — the general "fork, branch, PR" flow is what you'd expect.
+This document covers what is specific to this project; the general fork, branch and
+pull-request flow applies as usual. For an overview of all the documentation, see
+[docs/README.md](docs/README.md).
 
 ## Setup
 
@@ -22,13 +23,13 @@ uv run ruff format src/ tests/
 uv run mypy src/
 ```
 
-All four are blocking in CI, plus a job that runs the suite against a real
-PostgreSQL.
+Lint, format check, type check, the unit and integration suites and a job that
+runs the suite against a real PostgreSQL are all blocking in CI.
 
 ## The rules that aren't obvious
 
-Most of what follows exists because it was learned the hard way. Architecture
-details live in [CLAUDE.md](CLAUDE.md).
+Most of what follows exists because it was learned by running the system.
+Architecture and development notes live in [CLAUDE.md](CLAUDE.md).
 
 **Engines never write to the database.** Push events through
 `submit_event(PendingEvent(...))`. A direct `get_session()` write from an engine

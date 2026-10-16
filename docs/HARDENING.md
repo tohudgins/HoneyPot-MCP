@@ -38,7 +38,8 @@ not protection. The protection is the loopback bind, the firewall and the tokens
 - Docker-published ports (the Cowrie SSH/Telnet honeypots) are forwarded by Docker, not input, so
   they need no rule; `userland-proxy` is off so no `docker-proxy` process listens either. The forward
   chain does cap new connections per source on those ports at 128 concurrent (`ct count`): Cowrie has
-  no limit of its own, and one host opening ~2,400 sessions got the Telnet container OOM-killed.
+  no limit of its own, and a single host opening thousands of sessions got the Telnet container
+  OOM-killed.
 - Optional port sets: `--ftp-pasv-ports MIN-MAX` opens the FTP honeypot's passive data range (set
   `FTP_PASV_PORT_MIN/MAX` to the same range), and the NFS honeypot is reached by redirecting both 111
   and 2049 to its listening port (`--ports "...,2049>12049,111>12049"`, [DEPLOY.md](DEPLOY.md) step 6).
@@ -94,7 +95,7 @@ paths and commands are attacker-written strings that reach the model's context.
 
 ## Runbook
 
-[DEPLOY.md](DEPLOY.md) steps 2-7 are the short version. In order:
+[DEPLOY.md](DEPLOY.md) steps 2-6 are the short version. In order:
 
 ```bash
 sudo UV_PYTHON_INSTALL_DIR=/opt/uv-python uv sync --frozen --no-dev --python 3.12   # shared interpreter
@@ -135,11 +136,11 @@ limits make it a poor tool for harm, not an impossible one. Closed is the defaul
 
 ## End of the run
 
-Run this **from your laptop** (it needs `ssh`, `tar` and `sqlite3` there; macOS has all three):
+Run this **from your own machine** (it needs `ssh`, `tar` and `sqlite3` there; macOS has all three):
 
 ```bash
-scripts/fetch_backup.sh --host <droplet-ip> --key ~/.ssh/honeypot_deploy \
-    --dest ~/hp-backups --samples --expect-types ssh,telnet,http,ftp,rdp,smb
+scripts/fetch_backup.sh --host <vps-ip> --key ~/.ssh/honeypot_deploy \
+    --dest ./backups --samples --expect-types ssh,telnet,http,ftp,rdp,smb
 ```
 
 It takes a consistent backup on the VPS, streams it back over one SSH connection, **checks the
@@ -158,13 +159,13 @@ backup. Re-read a backup you already have with `scripts/fetch_backup.sh report <
 sudo deploy/harden-host.sh teardown --i-have-a-backup       # stop, remove containers and firewall
 ```
 
-Then **destroy the VPS** in the provider console (a powered-off droplet keeps its disk and is, as
-far as I know, still billed). Do not reuse it for anything else. The backup holds secrets
-(`.env` tokens, honeytoken values, TLS keys): store it where you would store the `.env`.
-Cowrie's downloads live in a tmpfs, which `docker cp` cannot read, so the script runs Python
-inside the container to copy them; they exist only while the container does, so fetch before
-teardown. Packet capture is a bounded ring (100 MB x 10 by default): use `pcap_extract` for the
-attackers you care about during the run.
+Then **destroy the VPS** in the provider console: a powered-off VPS typically keeps its disk and
+may still be billed. Do not reuse it for anything else. The backup holds secrets (`.env` tokens,
+honeytoken values, TLS keys): store it where you would store the `.env`. Cowrie's downloads live in
+a tmpfs, which `docker cp` cannot read, so the script runs Python inside the container to copy
+them; they exist only while the container does, so fetch before teardown. Packet capture is a
+bounded ring (100 MB × 10 by default): use `pcap_extract` for the attackers you care about during
+the run.
 
 ## What was verified, and how
 
@@ -188,11 +189,10 @@ plane through an SSH tunnel), not just in unit tests:
 - unit tests, and Docker-gated integration tests that load the ruleset into a real kernel and run the
   real SSH engine through the real guard.
 
-Bugs this found and fixed, which unit tests had passed: the documented `uv sync` as root leaves the
-service unable to execute its own interpreter; re-running `prepare` reopened port 22; the guard
-tried to `chown` its socket, which the unit's syscall filter forbids; the pre-flight rejected the
-documented `root:honeypot 0640` `.env` and probed the guard as root, which it refuses; sshd was
-checked for its new port before it had re-bound.
+Testing on a real host also found ordering problems that unit tests had passed (the interpreter
+location when `uv sync` runs as root, re-running `prepare` reopening port 22, the guard's socket
+ownership, pre-flight handling of the `root:honeypot 0640` `.env`); the scripts now handle each of
+them. See the [CHANGELOG](../CHANGELOG.md).
 
 ## Residual risks
 
@@ -209,7 +209,7 @@ Hardening reduces risk; it does not remove it. Know what is left:
 - **HTTPS egress** from the service is open (alert webhooks, threat intel): a hijacked process could
   exfiltrate to any HTTPS host. Pin or remove the integrations you do not use.
 - **Provider policy.** Check your provider's acceptable-use policy; some prohibit open mail relays or
-  resolvers (leave SMTP and DNS out of a first run) or "security research" on their platform.
+  resolvers (leave SMTP and DNS out of a first deployment) or "security research" on their platform.
 - **Denial of service.** A flood can fill disk or exhaust connections. Per-IP connection caps, a disk
   floor alert and `MemoryMax` bound it; they do not prevent it.
 - **Your own mistakes.** The viewer token in your client config, your deploy key, the data you copy

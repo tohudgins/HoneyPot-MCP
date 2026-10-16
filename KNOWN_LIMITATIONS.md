@@ -1,7 +1,8 @@
 # Known Limitations
 
 What will not work, and why. Fixed items live in [CHANGELOG.md](CHANGELOG.md), not here; the
-first-run measurements are in [docs/FIELD_TEST.md](docs/FIELD_TEST.md).
+results of the live run are in [docs/RESULTS.md](docs/RESULTS.md) and the test guide in
+[docs/FIELD_TEST.md](docs/FIELD_TEST.md).
 
 ## Scope
 
@@ -74,7 +75,7 @@ Smaller edges, one line each (all still record the attack):
 - **How detection survives partial emulation.** The alert fires on the first discriminating step (rsync module request, NFS export listing, SMB negotiate, NTLM AUTHENTICATE, `COPY ... FROM PROGRAM`), before the point where the emulation stops.
 - **FTP needs a passive port range** on the internet: set `FTP_PASV_PORT_MIN`/`MAX` and pass the firewall renderer `--ftp-pasv-ports` (`docs/DEPLOY.md`). **NFS** sits on an internal port with 111 and 2049 redirected to it (firewall `2049>12049,111>12049`), because clients ask the portmapper first.
 - **Unattended agents:** use a `viewer` token. The prompt-injection field test (`scripts/field_test_injection.py`) held for one model with one sample per scenario: evidence, not proof.
-- **`scripts/fetch_backup.sh`** reports on SQLite backups only, and only from containers still running: Cowrie downloads and TTY recordings live in a tmpfs and are gone after a restart, so fetch before `teardown`. A sensor that is up but unreachable looks the same as a quiet one, hence every-sensor-silent is called out separately. Exercised over a real sshd, not a real DigitalOcean droplet.
+- **`scripts/fetch_backup.sh`** reports on SQLite backups only, and only from containers still running: Cowrie downloads and TTY recordings live in a tmpfs and are gone after a restart, so fetch before `teardown`. A sensor that is up but unreachable looks the same as a quiet one, hence every-sensor-silent is called out separately. Exercised over a real sshd and on a live VPS.
 - **One server owns the sensors.** A second process on the same database starts read-only (deploy/stop/pause/clone/configure/`pcap_control` refuse) and takes over when the owner exits (`OWNER_CHECK_SECONDS`, default 10). SQLite ownership is an `flock`; PostgreSQL uses a session advisory lock. If the PostgreSQL lock is lost the owner re-takes it or raises CRITICAL `sensor_ownership_lost` (it does not stop its own sensors, so the new owner fails to bind until it is stopped). Read-only mode does not probe in-process sensors, since a probe from a second process looks like an attacker.
 - **Disk watch** covers the database directory, `reports_dir` and the pcap ring, alerts below `MIN_FREE_DISK_MB` (500) and does not prevent a full disk. A remote PostgreSQL volume is not visible; alert on `honeypot_database_size_bytes`.
 - **Grafana against a host daemon** needs the `honeypot-db` group (`docs/DEPLOY.md` step 9, `HONEYPOT_DB_GID`, `deploy/grafana-readable.conf`); the all-in-one compose stack needs none of it.

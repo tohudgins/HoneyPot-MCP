@@ -125,7 +125,7 @@ async def test_triage_caps_and_says_so():
 
 @pytest.mark.asyncio
 async def test_a_second_bulk_triage_does_not_overwrite_the_first_analysts_work():
-    """Found by triaging a real flooder twice on the live droplet: a filter re-selected the 500
+    """Found by triaging a real flooder twice on the live VPS: a filter re-selected the 500
     newest matches, which were the already-triaged ones, and rewrote their disposition, note and
     analyst. With the cap it also never reached the older untriaged alerts."""
     from honeypot_mcp.tools.alerts import alerts_acknowledge, alerts_get
