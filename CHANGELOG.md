@@ -4,6 +4,23 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Found by running it live: bait in the wrong home, `tail`, and a slow MalwareBazaar
+
+**The Cowrie bait was never visible to anyone.** It was written under the persona's own user
+(`/home/appuser`), but real attackers log in as `root` (105,066 successful logins in the first run) or
+`admin` (70,460); the persona user never appears. A real SSH session to the live sensor listed `/root`
+without it. The bait now lives in `/root` as well. `tail -3` was rejected exactly like `head -2` and is fixed
+the same way. The whole chain was then run as an attacker would: read the tracked credential out of the live
+sensor's `/root/.my.cnf` over SSH, replay it against the live MySQL honeypot with a real native-password
+handshake, and get a CRITICAL `honeytoken_triggered_credential_via_mysql_login_attempt`.
+
+**Providers verified live** (abuse.ch, OTX and Shodan InternetDB; GreyNoise's free key needs a business
+email, so it was not): `108.186.84.69`, the address that replayed the bait, is in 12 OTX pulses (one titled
+"Honeypot sg1 - SSH/Telnet/Web attackers and malware delivery") and InternetDB lists its open RDP port; a file
+hash captured on the droplet is a known MalwareBazaar sample. MalwareBazaar took 7-8 s for that known hash, so
+the 3 s budget (right for notifications) reported a working service as timed out; `lookup_hash` now uses
+`INTEL_LOOKUP_TIMEOUT_SECONDS` (default 20), the notification fan-out keeps 3 s.
+
 ## Cowrie realism, a working rsync listing, four optional threat-intel providers, IOC tools
 
 **Cowrie** (checked through the OpenSSH client against a real 3.0.15 container): `head -2` works as well as

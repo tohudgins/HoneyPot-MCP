@@ -202,7 +202,7 @@ cp .env.example .env         # optional — everything works without keys
 | `OTX_API_KEY` | AlienVault OTX pulses an address appears in | free |
 | `SHODAN_INTERNETDB_ENABLED=true` | Shodan InternetDB open ports/CPEs for an address (no key) | free |
 
-The last four are off unless set, cached, bounded by one 3 s fan-out deadline, and have been tested against stubs of the vendors' published contracts, not yet run live with keys (`scripts/intel_smoke.py` makes one live call per provider).
+The last four are off unless set, cached and bounded by one 3 s fan-out deadline. They are tested against stubs of the vendors' published contracts, and abuse.ch (MalwareBazaar, URLhaus, ThreatFox), OTX and InternetDB were also run live against real attacker IPs and a captured malware hash; GreyNoise was not (its free key requires a business email). `scripts/intel_smoke.py` makes one live call per provider.
 
 ---
 

@@ -186,7 +186,8 @@ CANARY_PUBLIC_URL=http://<your-vps-ip>
 # EMPTY otherwise: any non-empty placeholder is treated as a key.
 VIRUSTOTAL_API_KEY=
 ABUSEIPDB_API_KEY=
-# OPTIONAL extra providers, off unless set (enrich_ip and CRITICAL notifications; not yet run live with keys):
+# OPTIONAL extra providers, off unless set (enrich_ip and CRITICAL notifications). abuse.ch, OTX and
+# InternetDB are verified live; GreyNoise needs a business-email account for a free key.
 # GREYNOISE_API_KEY=   ABUSECH_AUTH_KEY=   OTX_API_KEY=   SHODAN_INTERNETDB_ENABLED=true
 
 # OPTIONAL — drop GeoLite2 databases in config/ for geo + network enrichment
