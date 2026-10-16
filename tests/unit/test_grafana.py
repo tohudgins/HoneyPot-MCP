@@ -144,10 +144,15 @@ def _foreign(client: FakeClient, name: str, labels: dict[str, str] | None = None
 @pytest.fixture(autouse=True)
 async def setup_db():
     from honeypot_mcp.storage import event_buffer
-    from honeypot_mcp.storage.database import close_db, init_db
+    from honeypot_mcp.storage.database import close_db, get_session, init_db
 
     event_buffer.reset_for_tests()
     await init_db()
+    # A persistent database creates its engine on first use, not in init_db. Several tests then point
+    # `database_url` at another database to exercise the tool, and an engine first created after that
+    # would bind to the wrong one (and its audit write would hit a database with no tables).
+    async with get_session():
+        pass
     yield
     await asyncio.sleep(0.05)
     event_buffer.reset_for_tests()

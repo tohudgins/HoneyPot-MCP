@@ -389,6 +389,7 @@ async def test_backup_refuses_an_in_memory_database(tmp_path, monkeypatch):
     from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools.workflows import database_backup
 
+    monkeypatch.setattr(get_settings(), "database_url", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(get_settings(), "backup_dir", tmp_path / "backups")
     out = await database_backup()
     assert "in memory" in out["error"]
