@@ -13,6 +13,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -44,9 +45,11 @@ def _spawn(work: Path, tag: str, mcp_port: int):
         "OWNER_CHECK_SECONDS": "1",
     }
     return subprocess.Popen(
-        ["uv", "run", "--project", str(ROOT), "python", "-m", "honeypot_mcp.server"],
+        # The interpreter that is running this test, so it needs neither `uv` nor a project lookup:
+        # CI installs with pip and has no `uv` on PATH.
+        [sys.executable, "-m", "honeypot_mcp.server"],
         cwd=work, env=env, stdout=open(work / f"{tag}.log", "w"), stderr=subprocess.STDOUT,
-        start_new_session=True,  # `uv run` spawns the server; signal the whole group
+        start_new_session=True,  # signal the whole process group on shutdown
     )  # fmt: skip
 
 

@@ -110,10 +110,12 @@ async def stored(monkeypatch):
     from honeypot_mcp import flood_guard
     from honeypot_mcp.config import get_settings
     from honeypot_mcp.storage import event_buffer
+    from honeypot_mcp.storage.database import close_db, init_db
 
     monkeypatch.setattr(get_settings(), "flood_guard_per_minute", 5, raising=False)
     flood_guard.reset_for_tests()
     event_buffer.reset_for_tests()
+    await init_db()
     kept: list = []
 
     class _Capture:
@@ -128,6 +130,10 @@ async def stored(monkeypatch):
     monkeypatch.setattr(event_buffer, "_match_honeytokens", _no_match)
     yield kept
     flood_guard.reset_for_tests()
+    # submit_event consults the suppression rules, which are read from the database. On PostgreSQL that
+    # opens a pooled connection bound to THIS test's event loop; left open it poisoned the next test
+    # ("Future attached to a different loop"). SQLite's in-memory database hid it.
+    await close_db()
 
 
 @pytest.mark.asyncio
