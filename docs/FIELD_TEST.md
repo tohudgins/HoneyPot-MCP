@@ -241,7 +241,14 @@ What the probes revealed about the services themselves:
 ## Reading the data on your own machine
 
 Everything above can also be read locally from a backup, with no SSH: `scripts/fetch_backup.sh` the
-data, then point the project's five Grafana dashboards (overview, threat map, MITRE ATT&CK coverage,
+data, then open it in analysis mode (`ANALYSIS_MODE=true`, [DEPLOY.md](DEPLOY.md) step 13) and ask
+your MCP client. The tools cover the whole workflow on your own data: `run_analysis` (headline numbers,
+ATT&CK by tactic, busiest sources, campaigns, exports), `attack_patterns` (credentials, commands, files,
+SSH clients, SIP dialling, concentration), `bait_trips` (who used a planted credential and what they
+did first), `pcap_analyze` (the capture extracts) and `grafana_start` (the five dashboards on the same
+database, on `127.0.0.1` only; the admin password is written to a file, never returned).
+
+To run Grafana by hand instead, point the five dashboards (overview, threat map, MITRE ATT&CK coverage,
 Query, Alerts) at a copy of the database. A downloaded snapshot is in WAL mode, which Grafana's
 read-only mount cannot open, so make a rollback-mode copy first:
 
@@ -251,8 +258,8 @@ sqlite3 grafana-data/honeypot_mcp.db "PRAGMA journal_mode=DELETE;"
 docker run -d --name hp-grafana -p 127.0.0.1:3000:3000 \
   -e GF_SECURITY_ADMIN_PASSWORD=<choose one> -e GF_INSTALL_PLUGINS=frser-sqlite-datasource \
   -e GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=frser-sqlite-datasource \
-  -v "$PWD/docker/grafana/provisioning:/etc/grafana/provisioning:ro" \
-  -v "$PWD/docker/grafana/dashboards:/etc/grafana/dashboards:ro" \
+  -v "$PWD/src/honeypot_mcp/grafana_assets/provisioning:/etc/grafana/provisioning:ro" \
+  -v "$PWD/src/honeypot_mcp/grafana_assets/dashboards:/etc/grafana/dashboards:ro" \
   -v "$PWD/grafana-data:/mcp-data:ro" grafana/grafana:11.3.0
 ```
 
@@ -261,5 +268,4 @@ default to the last 24 hours, so a backup older than that shows empty panels unt
 Bind it to localhost only: this Grafana can query the whole database, including captured
 credentials and honeytoken values. Every panel reads the database alone, and the map uses a keyless
 label-free Esri base layer, because Grafana's default CARTO basemap now stamps "API KEY REQUIRED"
-across every tile while still answering HTTP 200. The same restored database also runs the MCP
-server locally over stdio for the analysis tools.
+across every tile while still answering HTTP 200.

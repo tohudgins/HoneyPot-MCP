@@ -35,7 +35,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-DASHBOARD = ROOT / "docker" / "grafana" / "dashboards" / "03-mitre-coverage.json"
+DASHBOARD = (
+    ROOT / "src" / "honeypot_mcp" / "grafana_assets" / "dashboards" / "03-mitre-coverage.json"
+)
 
 _WINDOW = (
     "timestamp BETWEEN datetime($__from / 1000, 'unixepoch') "

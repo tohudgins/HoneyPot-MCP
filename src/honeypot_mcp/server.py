@@ -337,12 +337,15 @@ import honeypot_mcp.tools.analysis  # noqa: E402, F401
 import honeypot_mcp.tools.api_keys  # noqa: E402, F401
 import honeypot_mcp.tools.blocklist_push  # noqa: E402, F401
 import honeypot_mcp.tools.deception  # noqa: E402, F401
+import honeypot_mcp.tools.grafana  # noqa: E402, F401
 import honeypot_mcp.tools.honeypot  # noqa: E402, F401
 import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
 import honeypot_mcp.tools.integrations  # noqa: E402, F401
 import honeypot_mcp.tools.ioc  # noqa: E402, F401
+import honeypot_mcp.tools.patterns  # noqa: E402, F401
 import honeypot_mcp.tools.pcap  # noqa: E402, F401
 import honeypot_mcp.tools.sql  # noqa: E402, F401
+import honeypot_mcp.tools.workflows  # noqa: E402, F401
 
 # ── Built-in diagnostic tools ─────────────────────────────────────────────────
 

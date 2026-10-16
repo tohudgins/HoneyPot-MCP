@@ -73,9 +73,9 @@ async def test_everything_that_deletes_or_cannot_be_undone_is_marked_destructive
 async def test_tools_that_reach_outside_this_server_say_so():
     tools = await _tools()
     external = {
-        "enrich_ip", "analyze_attacker", "generate_report", "report_ip_abuse",
+        "enrich_ip", "analyze_attacker", "generate_report", "report_ip_abuse", "run_analysis",
         "alert_subscribe", "blocklist_push_aws_waf", "blocklist_push_cloudflare",
-        "blocklist_push_pfsense", "lookup_hash",
+        "blocklist_push_pfsense", "lookup_hash", "grafana_start",
     }  # fmt: skip
     for name, tool in tools.items():
         assert tool.annotations.openWorldHint is (name in external), name

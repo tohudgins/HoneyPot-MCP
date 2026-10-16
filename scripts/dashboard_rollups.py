@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Point the dashboards' window-aggregate panels at the hourly rollups.
 
-    python scripts/dashboard_rollups.py          # rewrites docker/grafana/dashboards/*.json in place
+    python scripts/dashboard_rollups.py          # rewrites src/honeypot_mcp/grafana_assets/dashboards/*.json in place
 
 The panels used to scan the raw `alerts` table, so their cost grew with the whole run (13 queries took
 17.8 s on 4.9M alerts). They now read the same pieces `storage/rollups.py` does:
@@ -22,7 +22,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-DASHBOARDS = Path(__file__).resolve().parent.parent / "docker" / "grafana" / "dashboards"
+DASHBOARDS = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "honeypot_mcp"
+    / "grafana_assets"
+    / "dashboards"
+)
 
 # `w`: (severity, event_type, source_ip, honeypot_id, n, ts) covering [from, to] exactly.
 WINDOW = (

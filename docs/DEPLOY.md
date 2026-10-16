@@ -544,7 +544,13 @@ claude mcp add honeypot-analysis \
 | Which sources act together | `analyze_campaign`, `fingerprint_clusters` (SSH client fingerprints) |
 | Record a verdict | `alerts_acknowledge` (a source, an event type or ids; sets true/false positive) |
 | Hand it on | `generate_report` (markdown or html), `export_stix`, `export_blocklist`, `alerts_export` |
-| A question no tool anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and 15 s). Prefer `alert_rollups` for anything over the whole run. Grafana's **Query** dashboard takes SQL in its `sql` box. |
+| A question no tool anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300). Prefer `alert_rollups` for anything over the whole run. Grafana's **Query** dashboard takes SQL in its `sql` box. |
+| What attackers did, without SQL | `attack_patterns` with `kind` = `credentials`, `commands`, `files`, `clients`, `sip_dialling`, `http` or `concentration` (top logins, command shapes, dropped files, SSH client families, dial-prefix cycling, how concentrated the volume is) |
+| Who used a planted credential and what they did first | `bait_trips` |
+| What is in a packet capture | `pcap_analyze` (extracts in `REPORTS_DIR`; protocol and conversation digest, SIP/HTTP/DNS/SSH/TLS decoding, credentials), `pcap_files` |
+| The whole post-run workflow in one call | `run_analysis` (headline, ATT&CK table, busiest sources, campaigns, clusters, exports, `analysis-summary.md`) |
+| Dashboards on this database | `grafana_start` (loopback only, read-only datasource; the admin password goes to a file whose path is returned), `grafana_status`, `grafana_stop` |
+| A verified copy of the database | `database_backup` (online backup, integrity check, manifest, inside `BACKUP_DIR`; SQLite only) |
 
 Statistics read pre-aggregated rollups rather than the alerts table, so on a database with millions
 of alerts opening takes seconds and these calls return in about that time. Event types that are
@@ -560,7 +566,9 @@ scripts/analyze_backup.py ./backups/honeypot-<timestamp> --top 5 --hours 168 --w
 It works on a copy, runs the server in analysis mode over real MCP stdio, and writes
 `analysis/reports/analysis-summary.md` (headline numbers, the ATT&CK table by tactic, the busiest
 sources' journeys, campaigns and clusters) next to the HTML/Markdown reports, the STIX bundle and
-the blocklist. Triage and follow-up questions then go to the MCP client above.
+the blocklist. Triage and follow-up questions then go to the MCP client above. The script is a thin
+client: the work is the `run_analysis` tool, so asking your MCP client to "analyse this run" does the
+same thing without the script.
 
 ---
 

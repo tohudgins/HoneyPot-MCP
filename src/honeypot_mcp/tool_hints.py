@@ -77,9 +77,13 @@ _FLAGS: dict[str, str] = {
     # Sends the hash to abuse.ch MalwareBazaar.
     "lookup_hash": "RW",
     "sql_query": "R",
+    "attack_patterns": "R",
+    "bait_trips": "R",
     "pcap_files": "R",
+    "pcap_analyze": "R",
     "pcap_status": "R",
     "ping": "R",
+    "grafana_status": "R",
     "soc_brief": "R",
     "suppression_list": "R",
     "suppression_list_presets": "R",
@@ -106,6 +110,9 @@ _FLAGS: dict[str, str] = {
     "honeytoken_rotate": "D",
     "pcap_control": "",
     "pcap_extract": "",
+    # Writes new files into the reports directory (a fixed-name summary that is regenerated each
+    # run, plus timestamped exports); calls threat-intel lookups for the busiest sources.
+    "run_analysis": "W",
     "report_ip_abuse": "DW",
     "suppression_add": "D",
     "suppression_load_preset": "I",
@@ -118,9 +125,15 @@ _FLAGS: dict[str, str] = {
     "api_key_list": "R",
     "api_key_revoke": "DI",
     "audit_log_search": "R",
+    # Writes a new directory under the backups directory and never replaces an existing one.
+    "database_backup": "",
     "blocklist_push_aws_waf": "IW",
     "blocklist_push_cloudflare": "IW",
     "blocklist_push_pfsense": "IW",
+    # Pulls the Grafana image and the SQLite plugin from the internet; replaces (not deletes)
+    # its own previous container.
+    "grafana_start": "W",
+    "grafana_stop": "DI",
 }
 
 _ACRONYMS = {
@@ -147,6 +160,8 @@ _TITLES = {
     "attack_navigator_layer": "ATT&CK Navigator Layer",
     "lookup_hash": "Look Up File Hash",
     "sql_query": "Read-only SQL Query",
+    "attack_patterns": "Attack Patterns",
+    "bait_trips": "Honeytoken Bait Trips",
     "soc_brief": "SOC Shift Brief",
     "ping": "Ping",
 }

@@ -354,3 +354,27 @@ Each of these needed real traffic, a real client or a real backup; the unit suit
 - **The labels are the project's own.** Severity, event types and the ATT&CK mapping come from the engines and `intel/mitre.py`; the figures here are only as good as those classifiers. The unit suite was not run for this page.
 
 Reproduce on your own deployment with `scripts/field_test.py`, `scripts/analyze_backup.py <backup>` and the queries above; `FIELD_TEST.md` describes each script.
+
+## 7. Reproducing this analysis with the MCP tools
+
+Everything on this page was first done by hand (SQL, `tcpdump`, a Grafana container). The tools below do it on your own data, in `ANALYSIS_MODE=true` against a backup or on a live server ([DEPLOY.md](DEPLOY.md), step 13).
+
+| This page | Ask for | Tool |
+|---|---|---|
+| 1. Run in numbers, severity, engines | "Summarise the run" | `run_analysis`, `alerts_stats`, `soc_brief` |
+| 1.4 A few sources dominate | "How concentrated is the volume?" | `attack_patterns` `kind=concentration` |
+| 2.1 ATT&CK by tactic | "What techniques did we see?" | `attack_summary`, `attack_navigator_layer`, `deception_coverage` |
+| 2.2 SIP volume and toll fraud | "What were the toll-fraud sources dialling?" | `attack_patterns` `kind=sip_dialling` (destination numbers masked), `pcap_analyze` on an extract |
+| 2.3 Credentials | "Top passwords tried over Telnet, and which were accepted?" | `attack_patterns` `kind=credentials` |
+| 2.4 Commands, SSH clients, dropped files | "What commands ran, which SSH tools connected, what files were written?" | `attack_patterns` `kind=commands`, `clients`, `files` |
+| 2.5 HTTP | "What did the web scanners ask for?" | `attack_patterns` `kind=http` |
+| 2.6 to 2.7 Container APIs, databases | "Show Docker API escape attempts" | `alerts_search`, `analyze_attacker_journey`, `sql_query` |
+| 3. Who used the bait | "Who used the planted credential and what did they do first?" | `bait_trips`, `honeytoken_list` |
+| 4. Captured artifacts | "Which hashes were captured? Is this one known malware?" | `attack_patterns` `kind=files`, `extract_iocs`, `lookup_hash` |
+| Packet captures | "Decode this capture" | `pcap_extract` (live ring), `pcap_files`, `pcap_analyze` |
+| Dashboards | "Put the dashboards on this database" | `grafana_start`, `grafana_status`, `grafana_stop` |
+| Backup | "Back the database up and verify it" | `database_backup` |
+
+These were checked against the database behind this page: `attack_patterns` returns 30,491 successful Telnet logins for the top pair, 1,152 executions of the `filter` script from 15 sources, 17,972 events for the top SSH fingerprint from 37 sources, and the top four sources' 70.41% share; `pcap_analyze` decodes the 12 MB SIP extracts in under a second and its packet counts equal `tcpdump`'s.
+
+Still outside the server, by design: deploying and hardening the host, fetching a backup from a remote machine over SSH (`scripts/fetch_backup.sh`), and the captured malware samples and terminal recordings, which live in the sensors' containers and are copied by that script into a quarantine directory. The field-test scripts attack the engines from outside, so they cannot be a tool.

@@ -23,9 +23,9 @@ HoneyPot MCP is a single server that runs decoy services and decoy credentials, 
 |---|---|
 | **25 protocol engines** | Remote access (SSH, Telnet, RDP, VNC), databases (MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch, Memcached), web and APIs (HTTP/S, Docker API, Kubernetes API), mail (SMTP, IMAP, POP3), file sharing (SMB, FTP, NFS, rsync), VoIP and directory (SIP, LDAP, SNMP, DNS), tested against real clients and scanners |
 | **Honeytokens and canary files** | Cloud keys, credential pairs, canary URLs, document trackers and more; a planted credential used on any honeypot escalates straight to CRITICAL |
-| **70 MCP tools in three roles** | Viewer, operator and admin, with live-provisioned per-person API keys and an audit log of every control-plane action |
-| **Analysis** | MITRE ATT&CK mapping, attacker profiles and risk scores, cross-honeypot timelines, campaign correlation, reports and STIX export |
-| **Dashboards** | Five provisioned Grafana dashboards and a built-in read-only operations console |
+| **78 MCP tools in three roles** | Viewer, operator and admin, with live-provisioned per-person API keys and an audit log of every control-plane action |
+| **Analysis** | MITRE ATT&CK mapping, attacker profiles and risk scores, cross-honeypot timelines, campaign correlation, what attackers did (credentials, commands, dropped files, SSH clients, SIP dialling), who used the bait, packet-capture analysis, reports and STIX export, all as tools |
+| **Dashboards** | Five provisioned Grafana dashboards (started by one tool call, on loopback only) and a built-in read-only operations console |
 | **Alerts** | Slack, Teams, email and SIEM delivery (Splunk, Elastic, CEF, syslog, Loki, Datadog) |
 | **Threat intelligence** | Optional VirusTotal, AbuseIPDB, GeoIP, GreyNoise, abuse.ch, OTX and Shodan InternetDB enrichment |
 

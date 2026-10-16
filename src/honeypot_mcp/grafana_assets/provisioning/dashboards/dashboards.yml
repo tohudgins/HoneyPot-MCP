@@ -1,7 +1,7 @@
 # Grafana dashboard provisioning.
 #
 # Auto-loads every JSON file in /etc/grafana/dashboards on startup, and
-# polls for changes every 30s — drop a new JSON into docker/grafana/dashboards/
+# polls for changes every 30s — drop a new JSON into src/honeypot_mcp/grafana_assets/dashboards/
 # and it appears in Grafana without a restart.
 
 apiVersion: 1

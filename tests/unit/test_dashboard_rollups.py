@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-DASHBOARDS = Path(__file__).resolve().parents[2] / "docker" / "grafana" / "dashboards"
+DASHBOARDS = (
+    Path(__file__).resolve().parents[2] / "src" / "honeypot_mcp" / "grafana_assets" / "dashboards"
+)
 BASE = datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC)
 SEVERITIES = ["low", "medium", "high", "critical"]
 TYPES = ["ssh_login_failed", "telnet_command_input", "sip_register_attempt", "http_probe"]

@@ -358,7 +358,7 @@ services:
 
   # ── Grafana (provisioned dashboards) ───────────────────────────────────────
   # The visual front door. Provisions Prometheus + SQLite datasources and
-  # auto-loads dashboards from grafana/dashboards/. Mounts the MCP data
+  # auto-loads dashboards from the package's grafana_assets/dashboards/. Mounts the MCP data
   # volume read-only so SQLite-backed panels (geo map, top attackers) can
   # query the live alerts table. WAL mode (database.py) means these reads
   # don't lock the MCP writer.
@@ -385,8 +385,8 @@ services:
       GF_USERS_DEFAULT_THEME: dark
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - ../src/honeypot_mcp/grafana_assets/provisioning:/etc/grafana/provisioning:ro
+      - ../src/honeypot_mcp/grafana_assets/dashboards:/etc/grafana/dashboards:ro
       # Read-only access to the MCP SQLite DB. WAL mode lets us read while
       # MCP writes; mount is :ro because dashboards should never mutate.
       - mcp-data:/mcp-data:ro

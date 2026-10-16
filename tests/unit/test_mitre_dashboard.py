@@ -23,7 +23,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-DASHBOARD = ROOT / "docker" / "grafana" / "dashboards" / "03-mitre-coverage.json"
+DASHBOARDS = ROOT / "src" / "honeypot_mcp" / "grafana_assets" / "dashboards"
+DASHBOARD = DASHBOARDS / "03-mitre-coverage.json"
 
 
 def _generator():
@@ -134,7 +135,7 @@ def test_every_declared_signature_event_exists_in_an_engine():
 
 @pytest.mark.parametrize(
     "dashboard_file",
-    sorted(p.name for p in (ROOT / "docker" / "grafana" / "dashboards").glob("*.json")),
+    sorted(p.name for p in (DASHBOARDS).glob("*.json")),
 )
 def test_dashboard_query_fields_agree(dashboard_file: str):
     """`queryText` is what frser-sqlite-datasource executes; `rawQueryText` is
@@ -146,9 +147,7 @@ def test_dashboard_query_fields_agree(dashboard_file: str):
     dashboard kept executing the buggy one — a fix that reads as applied and
     isn't.
     """
-    dashboard = json.loads(
-        (ROOT / "docker" / "grafana" / "dashboards" / dashboard_file).read_text()
-    )
+    dashboard = json.loads((DASHBOARDS / dashboard_file).read_text())
     for panel in dashboard.get("panels", []):
         for target in panel.get("targets", []):
             present = {f: target[f] for f in ("queryText", "rawQueryText", "rawSql") if f in target}
@@ -167,7 +166,7 @@ def _timeseries_queries() -> list[tuple[str, str, str]]:
     """(dashboard, panel title, SQL) for every timeseries panel."""
     found = []
     for name in ("01-overview.json", "02-threat-map.json", "03-mitre-coverage.json"):
-        dashboard = json.loads((ROOT / "docker" / "grafana" / "dashboards" / name).read_text())
+        dashboard = json.loads((DASHBOARDS / name).read_text())
         for panel in dashboard.get("panels", []):
             if panel.get("type") != "timeseries":
                 continue
@@ -213,9 +212,7 @@ def test_table_panels_format_timestamps_rather_than_returning_raw_columns():
     `2026-07-30 20:22:10.632767`: no T, no offset, microsecond noise. It renders
     as an ambiguous string in a table whose every other time is formatted, and
     cannot be shown in the viewer's timezone."""
-    dashboard = json.loads(
-        (ROOT / "docker" / "grafana" / "dashboards" / "01-overview.json").read_text()
-    )
+    dashboard = json.loads((DASHBOARDS / "01-overview.json").read_text())
     for panel in dashboard.get("panels", []):
         for target in panel.get("targets", []):
             sql = target.get("queryText") or ""
@@ -282,7 +279,7 @@ def test_threat_map_basemap_needs_no_api_key_and_has_no_labels():
     so nothing looked broken until a person opened the map. The basemap is now an explicit,
     keyless, label-free layer (Esri's Dark Gray *Base*; the labels are a separate layer we do not
     add). The 'Top countries' table beside it carries the place names."""
-    path = ROOT / "docker" / "grafana" / "dashboards" / "02-threat-map.json"
+    path = DASHBOARDS / "02-threat-map.json"
     dashboard = json.loads(path.read_text())
     geomap_panels = [p for p in dashboard["panels"] if p.get("type") == "geomap"]
     assert geomap_panels, "no geomap panel found in the threat map dashboard"
@@ -299,7 +296,7 @@ def test_dashboards_need_nothing_but_the_database():
     stack. A panel on the Prometheus datasource ('Active honeypots') showed 'No data' there, because
     there is no Prometheus; the honeypots table is the source of truth and is always present."""
     for name in ("01-overview.json", "02-threat-map.json", "03-mitre-coverage.json"):
-        dashboard = json.loads((ROOT / "docker" / "grafana" / "dashboards" / name).read_text())
+        dashboard = json.loads((DASHBOARDS / name).read_text())
 
         def walk(panels):
             for panel in panels:

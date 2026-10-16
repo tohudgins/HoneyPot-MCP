@@ -82,3 +82,5 @@ def _isolated_data_dirs(tmp_path, monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "tls_dir", tmp_path / "tls")
     monkeypatch.setattr(settings, "reports_dir", tmp_path / "reports")
+    monkeypatch.setattr(settings, "backup_dir", tmp_path / "backups")
+    monkeypatch.setattr(settings, "grafana_dir", tmp_path / "grafana")

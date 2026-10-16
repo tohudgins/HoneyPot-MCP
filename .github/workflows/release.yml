@@ -83,6 +83,12 @@ jobs:
               page = await _handle_index(None)
               assert page.status == 200 and "HoneyPot MCP" in page.text
 
+              from honeypot_mcp import grafana
+              dashboards = grafana.list_dashboards()
+              assert len(dashboards) == 5 and all(d.uid for d in dashboards), dashboards
+              datasources = grafana.assets_root() / "provisioning" / "datasources" / "datasources.yml"
+              assert datasources.is_file()
+
               await close_db()
               print("wheel is complete:", presets)
 

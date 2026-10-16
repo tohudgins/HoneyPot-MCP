@@ -178,9 +178,10 @@ async def test_a_runaway_query_is_stopped_inside_sqlite_and_leaves_a_working_ses
     The deadline is now enforced by a progress handler inside SQLite."""
     import time
 
+    from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools import sql
 
-    monkeypatch.setattr(sql, "_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr(get_settings(), "sql_query_timeout_seconds", 1)
     forever = (
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000000000) "
         "SELECT count(*) FROM c"
@@ -191,7 +192,23 @@ async def test_a_runaway_query_is_stopped_inside_sqlite_and_leaves_a_working_ses
     elapsed = time.monotonic() - started
 
     assert "did not finish" in out["error"], out
-    assert elapsed < 5, f"a 0.4 s limit took {elapsed:.1f}s"
+    assert "sql_query_timeout_seconds" in out["error"], "the message must name the setting"
+    assert "attack_patterns" in out["error"] and "alert_rollups" in out["error"], out
+    assert 0.9 < elapsed < 6, f"a 1 s limit took {elapsed:.1f}s"
     assert (await sql.sql_query("SELECT 1 AS ok"))["rows"] == [[1]], "the next query must just work"
     await _seed(2)
     assert (await sql.sql_query("SELECT count(*) FROM alerts"))["rows"] == [[2]]
+
+
+def test_the_timeout_setting_defaults_to_15_and_is_validated_to_1_300():
+    """The limit became a setting: the default must stay 15 s, and a value outside 1-300 must be
+    refused at load (0 would mean 'no limit' to a careless reader, 10 000 would hold a worker)."""
+    from pydantic import ValidationError
+
+    from honeypot_mcp.config import Settings
+
+    assert Settings().sql_query_timeout_seconds == 15
+    assert Settings(sql_query_timeout_seconds=300).sql_query_timeout_seconds == 300
+    for bad in (0, -1, 301, 100_000):
+        with pytest.raises(ValidationError):
+            Settings(sql_query_timeout_seconds=bad)

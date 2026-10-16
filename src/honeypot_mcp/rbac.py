@@ -365,6 +365,8 @@ VIEWER_TOOLS: frozenset[str] = frozenset(
         "attack_navigator_layer",
         "lookup_hash",
         "sql_query",
+        "attack_patterns",
+        "bait_trips",
         "generate_report",
         "analyze_attacker_journey",
         "analyze_session",
@@ -385,7 +387,9 @@ VIEWER_TOOLS: frozenset[str] = frozenset(
         "suppression_list_presets",
         "pcap_status",
         "pcap_files",
+        "pcap_analyze",
         "ping",
+        "grafana_status",
     }
 )
 
@@ -413,6 +417,7 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
         "deception_deploy_plan",
         "pcap_control",
         "pcap_extract",
+        "run_analysis",
         "export_blocklist",
         "export_stix",
         "report_ip_abuse",
@@ -428,8 +433,11 @@ ADMIN_TOOLS: frozenset[str] = frozenset(
         "blocklist_push_pfsense",
         "blocklist_push_aws_waf",
         "audit_log_search",
+        "database_backup",
         "api_key_create",
         "api_key_revoke",
         "api_key_list",
+        "grafana_start",
+        "grafana_stop",
     }
 )

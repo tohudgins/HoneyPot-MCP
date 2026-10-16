@@ -4,6 +4,45 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Every manual analysis step is now an MCP tool
+
+**Analysing the final run took a shell, `sqlite3`, `tcpdump` and a Grafana container; an MCP user could
+not have repeated any of it.** The tools existed for the questions the engines were built around, but
+five things we did by hand had no tool, and the project's point is that a user can do the same on their
+own data through the MCP interface. Eight tools (70 to 78) close that:
+
+- **`pcap_analyze`** reads a capture back. Only the live ring could be touched before (`pcap_extract`
+  wrote a file nothing could read). It is pure Python, accepts pcap and pcapng with Ethernet, Linux
+  cooked, raw and loopback framing, and decodes SIP, HTTP, DNS, SSH (HASSH), TLS (SNI, JA3) and
+  cleartext Telnet/FTP/POP3/IMAP/SMTP/Redis, with every length bounded and the file path confined.
+  On a 12 MB SIP capture it takes 0.3 s and its packet count equals `tcpdump`'s (18,050).
+  `pcap_files` now lists extracts as well as ring files.
+- **`attack_patterns`** answers what attackers did (credentials, commands, files, SSH clients, SIP
+  dialling, HTTP, concentration) without SQL. These took 10 to 40 s as hand-written queries on 17.7M
+  alerts and `sql_query` stopped at 15 s, so they could not be reproduced through it; the tool takes
+  0.0 to 5.6 s on the same database and reproduces the figures from the analysis exactly (30,491
+  successful logins for the top Telnet pair; 1,152 `filter` script executions from 15 sources; 17,972
+  events for the top SSH fingerprint from 37 sources). It separates a file the session wrote itself from
+  one fetched from the network, the distinction that made the top "sample" turn out to be a 26-byte
+  script, and masks planted-token passwords and the destination numbers of toll-fraud calls.
+- **`bait_trips`** shows who used a planted credential and what they did before: delay from creation,
+  the decoy fetch and how many seconds earlier, replays on other services, and the sources that reached
+  the bait with no earlier contact at all.
+- **`grafana_start` / `grafana_status` / `grafana_stop`** put the dashboards on the database. Loopback
+  only, admin role, a read-only datasource over a private directory containing only the database files,
+  the password in a 0600 file and never in a response. A WAL database cannot be opened on a read-only
+  mount without its `-shm` file, which was reproduced; the tool falls back to an immutable read-only
+  datasource and says so. The dashboards moved into the package (`grafana_assets/`) so an installed
+  server can use them.
+- **`run_analysis`** is the post-run workflow as a tool; `scripts/analyze_backup.py` is now a thin
+  client of it. The script's campaign count was always 0 (it treated a dict as a list); fixed.
+  **`database_backup`** is the verified SQLite backup (online backup API, integrity check, free-space
+  check, manifest).
+- **`sql_query`'s limit is now `SQL_QUERY_TIMEOUT_SECONDS`** (default 15, up to 300).
+
+Still outside the server: deploying and hardening the host, fetching a backup over SSH, and the
+captured malware samples and terminal recordings that live in the sensors' containers.
+
 ## The operations console could not load on a real run; `sql_query` ignored its time limit
 
 **Rendering the console on the live VPS showed it never returned.** `/api/overview` did not answer in

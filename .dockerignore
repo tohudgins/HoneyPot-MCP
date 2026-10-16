@@ -40,6 +40,8 @@ node_modules/
 *.db
 honeypot_mcp.db*
 tls/
+backups/
+grafana/
 
 # Documentation + tests — the runtime image doesn't need them
 docs/

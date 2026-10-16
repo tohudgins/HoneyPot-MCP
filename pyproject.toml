@@ -131,6 +131,10 @@ packages = ["src/honeypot_mcp"]
 artifacts = [
     "src/honeypot_mcp/console/static/*",
     "src/honeypot_mcp/presets/*.yaml",
+    # Grafana provisioning + dashboards: `grafana_start` materialises them from the installed
+    # package (importlib.resources), and both compose files mount them from here too.
+    "src/honeypot_mcp/grafana_assets/provisioning/**/*.yml",
+    "src/honeypot_mcp/grafana_assets/dashboards/*.json",
 ]
 
 [tool.pytest.ini_options]

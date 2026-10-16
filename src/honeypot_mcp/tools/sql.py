@@ -22,12 +22,12 @@ from typing import Any
 
 from sqlalchemy import text
 
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.tool_hints import hints
 
 _MAX_ROWS = 1000
-_TIMEOUT_SECONDS = 15.0
 _MAX_CELL_CHARS = 2000
 _MAX_QUERY_CHARS = 8000
 _PROGRESS_OPS = 20_000  # SQLite VM instructions between deadline checks (a few milliseconds)
@@ -98,7 +98,11 @@ async def sql_query(query: str, limit: int = 200) -> dict[str, Any]:
     Tables: `alerts` (id, honeypot_id, source_ip, source_port, event_type, payload JSON, severity,
     acknowledged, disposition, timestamp), `alert_rollups` (hourly counts by source, type, severity and
     sensor: use it for anything over the whole run, it is far faster), `honeypots` (id, name, type, port).
-    Tables holding secrets are refused. At most 1,000 rows and 15 seconds; the result says when it was cut.
+    Tables holding secrets are refused. At most 1,000 rows, and a time limit (15 seconds unless the
+    operator raised `sql_query_timeout_seconds`); the result says when it was cut. The raw `alerts`
+    table can hold millions of rows, so a whole-run question that has to read payloads (what were the
+    top passwords, which commands ran) belongs in `attack_patterns` (purpose-built, indexed, with a
+    coverage note) and anything countable by source/type/hour in `alert_rollups`, not here.
 
     Args:
         query: A single SELECT or WITH ... SELECT statement.
@@ -109,9 +113,12 @@ async def sql_query(query: str, limit: int = 200) -> dict[str, Any]:
     limit = max(1, min(limit, _MAX_ROWS))
     # The newline ends a trailing `-- comment`, which would otherwise swallow the closing parenthesis.
     wrapped = text(f"SELECT * FROM ({query.strip().rstrip(';')}\n) AS _q LIMIT :n")
+    timeout = float(get_settings().sql_query_timeout_seconds)
     timeout_message = (
-        f"query did not finish in {_TIMEOUT_SECONDS:g}s: narrow the time window, filter on an indexed "
-        "column, or use alert_rollups."
+        f"query did not finish in {timeout:g}s (setting sql_query_timeout_seconds): narrow the time "
+        "window, filter on an indexed column (event_type, source_ip, timestamp), query alert_rollups "
+        "for counts, or use attack_patterns for credentials, commands, files, SSH clients, SIP "
+        "dialling, HTTP and source concentration."
     )
     try:
         async with get_session() as session:
@@ -121,19 +128,17 @@ async def sql_query(query: str, limit: int = 200) -> dict[str, Any]:
             if dialect == "sqlite":
                 await session.execute(text("PRAGMA query_only = ON"))
                 # `asyncio.wait_for` cannot stop a SQLite scan: the query runs in a worker thread, so
-                # a cancelled wait left the 15 s limit unenforced (a 3-minute window over 11M rows
+                # a cancelled wait left the time limit unenforced (a 3-minute window over 11M rows
                 # held the thread 87 s) and the session in PendingRollbackError. A progress handler
                 # runs inside SQLite and aborts the statement itself once the deadline passes.
                 driver = (await connection.get_raw_connection()).driver_connection
-                deadline = time.monotonic() + _TIMEOUT_SECONDS
+                deadline = time.monotonic() + timeout
                 await driver.set_progress_handler(
                     lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS
                 )
             else:
                 await session.execute(text("SET TRANSACTION READ ONLY"))
-                await session.execute(
-                    text(f"SET LOCAL statement_timeout = {int(_TIMEOUT_SECONDS * 1000)}")
-                )
+                await session.execute(text(f"SET LOCAL statement_timeout = {int(timeout * 1000)}"))
             try:
                 result = await session.execute(wrapped, {"n": limit + 1})
                 rows = result.fetchall()

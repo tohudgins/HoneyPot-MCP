@@ -174,13 +174,13 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 **Public internet.** Use a dedicated throwaway host, move your admin SSH off port 22 first, and never reuse production keys. Scanners arrive within minutes.
 
-**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification. `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and writes headline numbers, ATT&CK techniques, top-source journeys, campaigns, fingerprint clusters and report, STIX and blocklist exports to `<workdir>/reports/` ([DEPLOY.md](DEPLOY.md), step 13). For a live database, `scripts/attack_report.py --days 30 --format markdown` writes campaign statistics.
+**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification. Everything done in the [results](RESULTS.md) is available as MCP tools there: `run_analysis` for the whole post-run workflow, `attack_patterns` and `bait_trips` for what attackers did, `pcap_analyze` for capture files, `sql_query` for anything else, and `grafana_start` for dashboards. `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and calls `run_analysis` ([DEPLOY.md](DEPLOY.md), step 13). For a live database, `scripts/attack_report.py --days 30 --format markdown` writes campaign statistics.
 
 ---
 
 ## MCP tools
 
-70 tools in three roles (35 viewer, 25 operator, 10 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
+78 tools in three roles (39 viewer, 26 operator, 13 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
 
 ### Honeypots and deception planning
 
@@ -234,7 +234,9 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `report_ip_abuse` | Submit an attacker IP to AbuseIPDB |
 | `attack_summary` / `attack_navigator_layer` | Exact totals by tactic and technique for a window / an ATT&CK Navigator layer scored with the same counts |
 | `extract_iocs` / `lookup_hash` | Distinct URLs, hosts and file hashes from payloads / MalwareBazaar lookup of a hash |
-| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, 15 s); also the **Query** box on Grafana dashboard 04 |
+| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300); also the **Query** box on Grafana dashboard 04. Whole-run questions over millions of rows belong in `attack_patterns` or `alert_rollups` |
+| `attack_patterns` | **What attackers actually did, without SQL.** `kind` = `credentials` (top pairs, usernames, passwords, accepted vs refused, per service), `commands` (classified by shape: shell-menu words, writable-directory probes, download chains with staging hosts, fingerprint checks, execution-capability probes), `files` (by hash, with *written by the session* separated from *fetched from the network*), `clients` (SSH versions and HASSH families, shared-fingerprint clusters), `sip_dialling` (dial-prefix cycling toward each destination, number masked), `http`, `concentration` (share held by the busiest sources, the long tail, per-day volume). Planted honeytoken passwords are masked, including inside commands |
+| `bait_trips` | **Who used the bait, and what they did first.** For each tripped honeytoken: creation time, delay to the first trip, each source's earlier contact, decoy fetches and how many seconds before the trip, user-agent rotation, commands, replays on other services, and the sources that reached the bait with no earlier contact. Never returns token secrets |
 | `ping` | Server role (owner or read-only) and liveness |
 
 ### Integrations, suppression and access
@@ -253,8 +255,18 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 |---|---|
 | `pcap_extract` | **One attacker's packets as a single file** for Wireshark, or replay through Suricata or Zeek |
 | `pcap_status` | Running? Disk used? If not running, the actual reason plus the fix |
-| `pcap_files` | Ring contents and how far back the capture reaches |
+| `pcap_files` | Ring files and written extracts (`kind`), sizes, and how far back the ring reaches |
+| `pcap_analyze` | **Read a capture back**: protocol and conversation digest, SIP/HTTP/DNS/SSH/TLS decoding, credentials, payload samples; works on extracts in `REPORTS_DIR` with capture off |
 | `pcap_control` | Start, stop or restart (deploy and stop refresh the filter automatically) |
+
+### Dashboards and backups
+
+| Tool | Description |
+|---|---|
+| `grafana_start` | **Put the dashboards on your data.** Runs a pinned Grafana container on `127.0.0.1` only, with the five dashboards and a read-only SQLite datasource over the server's database (a private directory holding only the database files, hardlinked, not copied). Returns the URL, the path of a generated admin-password file (never the password) and whether the datasource answers. Admin role: Grafana can read every table. Works on a live server and in analysis mode |
+| `grafana_status` / `grafana_stop` | Is it running, where, serving which database / stop and remove only the container this server started, plus its private files |
+| `database_backup` | Verified SQLite backup: online backup API (safe under WAL), integrity check, free-space check, 0600 file plus `MANIFEST.json` with alert count, sources, window and checksum, inside `BACKUP_DIR`. Admin role. PostgreSQL: use `pg_dump` |
+| `run_analysis` | The post-run workflow as one call: headline numbers, ATT&CK by tactic, the busiest sources' journeys, campaigns, SSH-client clusters, coverage and the report, STIX and blocklist exports, with `analysis-summary.md` written to `REPORTS_DIR`. A failing part is reported and the rest still lands |
 
 **MCP resources:** `honeypot://active` · `alerts://stream` · `honeytoken://triggered` · `stats://dashboard`
 
@@ -310,10 +322,13 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # or run as root
 ```
 > pcap_status                                  # running? why not? disk used?
 > pcap_extract source_ip=203.0.113.44          # that attacker's packets, as one file
-> pcap_files                                   # how far back the ring reaches
+> pcap_files                                   # ring files and the extracts already written, with sizes
+> pcap_analyze path=pcap-203.0.113.44-<stamp>.pcap   # decode an extract: protocols, SIP/HTTP/DNS/SSH detail, credentials
 ```
 
 The capture filter is built from the deployed honeypot ports (your own admin SSH is never recorded) and refreshes on deploy and stop. Disk is bounded: `PCAP_FILE_MB × PCAP_FILES` is a ceiling tcpdump enforces itself.
+
+`pcap_analyze` reads a capture file back as a bounded digest, in pure Python with no Wireshark dependency. It accepts classic pcap and pcapng (Ethernet, Linux cooked, raw IP and loopback framing; IPv4 and IPv6) and reports the capture window, per-port and per-conversation totals, TCP scan indicators, and what each protocol said: SIP methods, user agents and dialled numbers grouped by dial prefix, HTTP requests, DNS names, cleartext Telnet/FTP/POP3/IMAP/SMTP/Redis commands and credentials, SSH identification strings with HASSH, TLS ClientHello with SNI and JA3, plus a few clipped payload samples. It only opens files inside `REPORTS_DIR` or `PCAP_DIR` (no `..`, no symlink escapes), refuses files above `PCAP_ANALYZE_MAX_FILE_MB` (512), stops at `PCAP_ANALYZE_MAX_PACKETS` (2,000,000) and says so when it truncates. It works on a backup with `ANALYSIS_MODE=true`: put the extracts you want analysed in `REPORTS_DIR`.
 
 ---
 

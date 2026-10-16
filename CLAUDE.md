@@ -76,8 +76,15 @@ Current tool modules:
 - `tools/blocklist_push.py` — push blocked IPs to Cloudflare / AWS WAF / pfSense
 - `tools/deception.py` — the intent-level tools: `deception_plan`,
   `deception_deploy_plan`, `deception_coverage`, `soc_brief`, `deception_profiles`
-- `tools/pcap.py` — `pcap_status`, `pcap_extract`, `pcap_files`, `pcap_control`
+- `tools/pcap.py` — `pcap_status`, `pcap_extract`, `pcap_files`, `pcap_control`, `pcap_analyze` (reads a capture file back; the parser is `pcap_analysis.py`, pure Python, bounded, confined to `reports_dir`/`pcap_dir`)
+- `tools/patterns.py` — `attack_patterns` (credentials, commands, files, clients, sip_dialling, http, concentration) and `bait_trips`. Purpose-built, indexed, time-budgeted queries for the questions that otherwise need hand-written SQL over millions of rows; planted-token passwords are masked
+- `tools/grafana.py` — `grafana_start`, `grafana_stop`, `grafana_status` (lifecycle in `grafana.py`): a pinned container on loopback with a read-only SQLite datasource over a private directory that holds only the database files (hardlink, then reflink, then a size-capped copy); the password goes to a 0600 file and is never returned or audited
+- `tools/workflows.py` — `run_analysis` (the post-run workflow as one call, composing the existing tools in-process) and `database_backup` (SQLite online backup into `backup_dir`, verified, with a manifest)
 - `tools/api_keys.py` — `api_key_create`, `api_key_revoke`, `api_key_list` (live-provisioned, per-person credentials — see "Role-based access control" below)
+
+**Rule: anything an analyst does by hand with the data must exist as a tool.** The project's point is that a
+user can reproduce an analysis on their own traffic through the MCP interface. Before doing an analysis
+step in a shell, check whether a tool does it; if none does, the step is a missing tool, not a one-off.
 
 The `@mcp.tool` decorator returns the original function unchanged, so tools are directly callable in tests (no `.fn` accessor needed).
 
@@ -1431,7 +1438,7 @@ requests until `CLOUD_EVENT_HMAC_SECRET` is set.
 
 Non-Python assets must be declared in `pyproject.toml`'s
 `tool.hatch.build.targets.wheel.artifacts` **and** loaded through
-`importlib.resources`, never by walking up from `__file__`. Two things live
+`importlib.resources`, never by walking up from `__file__`. Three things live
 inside the package for this reason:
 
 - `console/static/index.html` — the console 500s without it.
@@ -1440,6 +1447,9 @@ inside the package for this reason:
   resolved to a path inside site-packages that never exists, so a pip-installed
   user saw an empty preset list for a feature the README advertises. Nothing
   failed loudly; the list was just empty.
+- `grafana_assets/{provisioning,dashboards}` — the Grafana provisioning and the five dashboards. They
+  used to sit in `docker/grafana/`, outside the package, so a pip-installed server could not start
+  Grafana. The compose files, the dashboard generators and `grafana.py` all read this one copy.
 
 The failure mode is identical in both cases: the wheel builds, installs and
 imports cleanly, then misbehaves at runtime. `tests/unit/test_operational.py`

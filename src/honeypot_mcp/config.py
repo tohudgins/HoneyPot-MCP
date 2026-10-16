@@ -302,6 +302,24 @@ class Settings(BaseSettings):
     # carving and Suricata replay; lower it to headers-only if disk is tight.
     pcap_snaplen: int = 0
     pcap_dir: Path = _PROJECT_ROOT / "pcap"
+    # Reading a capture back (`pcap_analyze`). The file must live in `reports_dir` or
+    # `pcap_dir`; these bound what one call may read. The packet cap is what bounds the CPU
+    # and memory a single analysis can spend (≈ 20-60k packets/s), the size cap refuses a
+    # whole ring file that was never meant to be analysed in one go.
+    pcap_analyze_max_file_mb: int = 512
+    pcap_analyze_max_packets: int = 2_000_000
+
+    # ── Query limits ────────────────────────────────────────────────────────
+    # How long `sql_query` may run before the statement is stopped. 15 s suits the interactive
+    # path; a whole-run aggregate over the raw alerts table of a multi-million-row database can
+    # need longer, so an operator who wants that raises it here (the row cap and the refusal of
+    # secret-bearing tables are not affected). Prefer `attack_patterns` / `alert_rollups`.
+    sql_query_timeout_seconds: int = Field(default=15, ge=1, le=300)
+    # Wall-clock budget `attack_patterns` spends scanning raw alerts for one question. A scan
+    # works through the newest events first and reports how much of the run it covered when this
+    # runs out, so a huge table gives a bounded answer instead of a hung call. Raise it for an
+    # exact whole-run answer on a very large database.
+    attack_patterns_time_budget_seconds: float = Field(default=12.0, ge=1, le=300)
 
     # Live operations console — a read-only wall display served by the server
     # itself (see console/). Bound to localhost by default: it exposes every
@@ -323,6 +341,23 @@ class Settings(BaseSettings):
     # server from another directory does not mint a second certificate per sensor —
     # a scanner pinning the certificate would see the identity change.
     tls_dir: Path = _PROJECT_ROOT / "tls"
+
+    # Where `database_backup` writes verified database snapshots (one timestamped directory per
+    # backup). Confined like `reports_dir`: the tool's `destination` can only name a
+    # sub-directory of this one. A backup holds secret-bearing tables (honeytoken values, API-key
+    # digests, captured credentials), so the directory is created owner-only.
+    backup_dir: Path = _PROJECT_ROOT / "backups"
+
+    # Where `grafana_start` keeps its private working files: the generated admin password (0600),
+    # the provisioning/dashboards copied out of the package, and a directory holding ONLY the
+    # database files Grafana is allowed to see (a hardlink to the live file when this directory is
+    # on the same filesystem as the database; a snapshot otherwise). Created owner-only. Put it on
+    # the database's filesystem when the database is large: a snapshot of a big database is refused
+    # above `grafana_max_copy_mb`.
+    grafana_dir: Path = _PROJECT_ROOT / "grafana"
+    # Largest database `grafana_start` will duplicate when it can neither hardlink nor reflink it.
+    # 0 forbids copying altogether.
+    grafana_max_copy_mb: int = 2048
 
     # ── Control plane / delivery hardening (slice C1) ───────────────────────
     # Webhook/syslog/SMTP destinations are validated at subscribe AND delivery
@@ -424,6 +459,8 @@ class Settings(BaseSettings):
         "mitre_data_path",
         "reports_dir",
         "tls_dir",
+        "backup_dir",
+        "grafana_dir",
         mode="after",
     )
     @classmethod
