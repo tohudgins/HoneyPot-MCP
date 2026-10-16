@@ -41,6 +41,7 @@ from typing import Any
 import httpx
 
 from honeypot_mcp._loop_bound import LoopBound
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.intel import _cache
 from honeypot_mcp.intel._common import (
     as_int,
@@ -55,6 +56,8 @@ from honeypot_mcp.intel._common import (
 log = logging.getLogger(__name__)
 
 _MB_URL = "https://mb-api.abuse.ch/api/v1/"
+# MalwareBazaar is slow for a known hash (7-8 s). Only the explicit `lookup_hash` tool calls it, never
+# the notification fan-out, so it uses `intel_lookup_timeout_seconds` instead of the 3 s provider budget.
 _URLHAUS_BASE = "https://urlhaus-api.abuse.ch/v1"
 _THREATFOX_URL = "https://threatfox-api.abuse.ch/api/v1/"
 
@@ -72,13 +75,11 @@ _client: LoopBound[httpx.AsyncClient] = LoopBound(new_client)
 
 
 def configured() -> bool:
-    from honeypot_mcp.config import get_settings
 
     return bool(get_settings().abusech_auth_key)
 
 
 def _key() -> str:
-    from honeypot_mcp.config import get_settings
 
     return get_settings().abusech_auth_key
 
@@ -99,6 +100,7 @@ async def _post(
     *,
     form: dict[str, str] | None = None,
     body: dict[str, Any] | None = None,
+    timeout: float | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """`(json, None)` on an HTTP-level success or `(None, failure result)`. Honours and writes the
     negative cache; the success cache is written by the caller once it has shaped the result."""
@@ -106,7 +108,8 @@ async def _post(
         return None, failed
     headers = {"Auth-Key": _key(), "Accept": "application/json"}
     try:
-        resp = await _client.get().post(url, headers=headers, data=form, json=body)
+        wait = timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT
+        resp = await _client.get().post(url, headers=headers, data=form, json=body, timeout=wait)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
@@ -114,7 +117,10 @@ async def _post(
         return data, None
     except Exception as e:  # noqa: BLE001 - a reputation source must never break its caller
         out = failure(provider, e)
-        if not isinstance(e, httpx.TimeoutException):
+        if isinstance(e, httpx.TimeoutException):
+            if timeout is not None:
+                out["error"] = f"{provider} timed out after {timeout:g}s."
+        else:
             log.warning("%s lookup failed: %s", provider, out["error"])
         _cache.set_negative(cache_key, out)
         return None, out
@@ -136,11 +142,13 @@ async def lookup_malwarebazaar(file_hash: str) -> dict[str, Any]:
     cache_key = f"abusech:mb:{file_hash}"
     if (cached := _cache.get(cache_key)) is not None:
         return cached
+
     data, bad = await _post(
         cache_key,
         "MalwareBazaar",
         _MB_URL,
         form={"query": "get_info", "hash": file_hash},
+        timeout=get_settings().intel_lookup_timeout_seconds,
     )
     if data is None:
         return bad or {"available": False, "error": "MalwareBazaar lookup failed"}

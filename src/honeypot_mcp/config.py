@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     # during alert enrichment. Kept below `notify_enrich_timeout_seconds` (4 s) so that adding
     # them can never push a notification's reputation lookup past its own deadline.
     intel_provider_timeout_seconds: float = 3.0
+    # Ceiling for an EXPLICIT lookup (the `lookup_hash` tool), which never runs inside a notification.
+    # MalwareBazaar answers a known hash in 7-8 s, so the 3 s budget above reports a working service as
+    # timed out.
+    intel_lookup_timeout_seconds: float = 20.0
 
     # GeoIP
     geoip_db_path: Path = _PROJECT_ROOT / "config" / "GeoLite2-City.mmdb"

@@ -513,6 +513,21 @@ async def test_malwarebazaar_rejects_a_non_hash_before_any_request(monkeypatch):
     assert result["available"] is False and "valid" in result["note"] and stub.requests == []
 
 
+async def test_only_malwarebazaar_gets_the_longer_timeout(monkeypatch):
+    """MalwareBazaar took 7-8 s on a documented example hash, so the 3 s budget reported a working
+    service as 'timed out'. It is reached only by the explicit `lookup_hash` tool; the lookups that
+    can run inside a notification keep the short budget."""
+    configure(monkeypatch, abusech_auth_key=ABUSECH_KEY)
+    stub = Stub(abusech_stub).install(monkeypatch, abusech)
+
+    await abusech.lookup_malwarebazaar(KNOWN_HASH)
+    await abusech.lookup_urlhaus_host("198.51.100.7")
+
+    waits = [request.extensions["timeout"]["read"] for request in stub.requests]
+    assert waits[0] == 20.0, "the explicit-lookup setting's default"
+    assert waits[1] == 3.0, "URLhaus keeps the provider budget"
+
+
 async def test_urlhaus_host_summarises_urls_and_counts_online_ones(monkeypatch):
     configure(monkeypatch, abusech_auth_key=ABUSECH_KEY)
     stub = Stub(abusech_stub).install(monkeypatch, abusech)
@@ -829,7 +844,12 @@ async def test_a_hung_vendor_times_out_quickly_and_the_failure_is_remembered(
     monkeypatch, silent_server, _name, module, attr, settings, func, arg
 ):
     base, connections = silent_server
-    configure(monkeypatch, intel_provider_timeout_seconds=0.3, **settings)
+    configure(
+        monkeypatch,
+        intel_provider_timeout_seconds=0.3,
+        intel_lookup_timeout_seconds=0.3,
+        **settings,
+    )
     monkeypatch.setattr(module, attr, base + ("/api/v1/" if attr == "_MB_URL" else ""))
     monkeypatch.setattr(module, "_client", LoopBound(module.new_client))
 
