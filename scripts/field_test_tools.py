@@ -181,9 +181,18 @@ async def run(a: argparse.Namespace) -> int:
         "campaigns",
         lambda d: d is not None,
     )
-    sess = None
-    for al in (recent or {}).get("alerts", []):
-        sess = (al.get("payload") or {}).get("session") or sess
+    picked = await sw.expect(
+        v,
+        "sql_query",
+        {
+            "query": "SELECT json_extract(payload, '$.session') AS s FROM alerts "
+            "WHERE event_type = 'telnet_command_input' AND json_extract(payload, '$.session') IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        },
+        "a recent shell session id (also exercises sql_query)",
+        lambda d: d["row_count"] == 1,
+    )
+    sess = ((picked or {}).get("rows") or [[None]])[0][0]
     await sw.expect(
         v,
         "analyze_session",
@@ -216,6 +225,46 @@ async def run(a: argparse.Namespace) -> int:
         lambda d: d,
     )
     await sw.expect(v, "map_ttps", {"ip": me}, "ATT&CK mapping", lambda d: d)
+    await sw.expect(
+        v,
+        "attack_summary",
+        None,
+        "ATT&CK by tactic from the rollups",
+        lambda d: d["total_alerts"] > 0 and d["tactics"] and d["mapped_share"] > 0.5,
+    )
+    await sw.expect(
+        v,
+        "attack_navigator_layer",
+        {"since_hours": 24},
+        "Navigator layer written",
+        lambda d: d["techniques"] > 0 and str(d["path"]).endswith(".json"),
+    )
+    await sw.expect(
+        v,
+        "extract_iocs",
+        {"since_hours": 6, "limit": 5},
+        "distinct URLs, hosts and hashes",
+        lambda d: "urls" in d and "scan_capped" in d,
+    )
+    await sw.expect(
+        v,
+        "sql_query",
+        {
+            "query": "SELECT event_type, SUM(count) AS n FROM alert_rollups GROUP BY 1 ORDER BY n DESC LIMIT 3"
+        },
+        "read-only SQL",
+        lambda d: d["row_count"] == 3,
+    )
+    await sw.refused(
+        v, "sql_query", "secret tables refused", {"query": "SELECT * FROM honeytokens"}
+    )
+    await sw.expect(
+        v,
+        "lookup_hash",
+        {"sha256": "0" * 64},
+        "no key: a note; with a key: an answer",
+        lambda d: d.get("available") is False or d.get("known") is False,
+    )
     await sw.expect(
         v, "threat_timeline", {"hours": 24, "limit": 10}, "timeline", lambda d: d["count"] >= 1
     )

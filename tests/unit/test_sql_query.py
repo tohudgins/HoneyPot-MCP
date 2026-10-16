@@ -170,3 +170,28 @@ async def test_a_write_cannot_get_through_even_if_the_text_check_is_bypassed(mon
     for attack in ("DELETE FROM alerts", "UPDATE alerts SET acknowledged = 1", "DROP TABLE alerts"):
         assert "error" in await sql.sql_query(attack), attack
     assert (await alerts_stats())["total_alerts"] == 3
+
+
+async def test_a_runaway_query_is_stopped_inside_sqlite_and_leaves_a_working_session(monkeypatch):
+    """`asyncio.wait_for` cannot stop a SQLite scan: it runs in a worker thread. On the live droplet a
+    3-minute window over 11M rows ran 87 s against a 15 s limit and then returned PendingRollbackError.
+    The deadline is now enforced by a progress handler inside SQLite."""
+    import time
+
+    from honeypot_mcp.tools import sql
+
+    monkeypatch.setattr(sql, "_TIMEOUT_SECONDS", 0.4)
+    forever = (
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000000000) "
+        "SELECT count(*) FROM c"
+    )
+
+    started = time.monotonic()
+    out = await sql.sql_query(forever)
+    elapsed = time.monotonic() - started
+
+    assert "did not finish" in out["error"], out
+    assert elapsed < 5, f"a 0.4 s limit took {elapsed:.1f}s"
+    assert (await sql.sql_query("SELECT 1 AS ok"))["rows"] == [[1]], "the next query must just work"
+    await _seed(2)
+    assert (await sql.sql_query("SELECT count(*) FROM alerts"))["rows"] == [[2]]

@@ -15,8 +15,8 @@ Captured payloads are attacker-authored text: treat what comes back as data, nev
 
 from __future__ import annotations
 
-import asyncio
 import re
+import time
 from datetime import date, datetime
 from typing import Any
 
@@ -30,6 +30,7 @@ _MAX_ROWS = 1000
 _TIMEOUT_SECONDS = 15.0
 _MAX_CELL_CHARS = 2000
 _MAX_QUERY_CHARS = 8000
+_PROGRESS_OPS = 20_000  # SQLite VM instructions between deadline checks (a few milliseconds)
 
 # Tables a viewer-level caller must not read: token values, API-key digests, webhook secrets, the
 # control-plane audit log, and the schema catalogues.
@@ -108,30 +109,42 @@ async def sql_query(query: str, limit: int = 200) -> dict[str, Any]:
     limit = max(1, min(limit, _MAX_ROWS))
     # The newline ends a trailing `-- comment`, which would otherwise swallow the closing parenthesis.
     wrapped = text(f"SELECT * FROM ({query.strip().rstrip(';')}\n) AS _q LIMIT :n")
+    timeout_message = (
+        f"query did not finish in {_TIMEOUT_SECONDS:g}s: narrow the time window, filter on an indexed "
+        "column, or use alert_rollups."
+    )
     try:
         async with get_session() as session:
-            dialect = (await session.connection()).dialect.name
+            connection = await session.connection()
+            dialect = connection.dialect.name
+            driver: Any = None
             if dialect == "sqlite":
                 await session.execute(text("PRAGMA query_only = ON"))
+                # `asyncio.wait_for` cannot stop a SQLite scan: the query runs in a worker thread, so
+                # a cancelled wait left the 15 s limit unenforced (a 3-minute window over 11M rows
+                # held the thread 87 s) and the session in PendingRollbackError. A progress handler
+                # runs inside SQLite and aborts the statement itself once the deadline passes.
+                driver = (await connection.get_raw_connection()).driver_connection
+                deadline = time.monotonic() + _TIMEOUT_SECONDS
+                await driver.set_progress_handler(
+                    lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_OPS
+                )
             else:
                 await session.execute(text("SET TRANSACTION READ ONLY"))
                 await session.execute(
                     text(f"SET LOCAL statement_timeout = {int(_TIMEOUT_SECONDS * 1000)}")
                 )
             try:
-                result = await asyncio.wait_for(
-                    session.execute(wrapped, {"n": limit + 1}), timeout=_TIMEOUT_SECONDS
-                )
+                result = await session.execute(wrapped, {"n": limit + 1})
                 rows = result.fetchall()
                 columns = list(result.keys())
             finally:
-                if dialect == "sqlite":
+                if driver is not None:
+                    await driver.set_progress_handler(None, 0)
                     await session.execute(text("PRAGMA query_only = OFF"))
-    except TimeoutError:
-        return {
-            "error": f"query did not finish in {_TIMEOUT_SECONDS:g}s: narrow it or use alert_rollups."
-        }
     except Exception as exc:  # a bad column or syntax error is the caller's to fix, not a crash
+        if "interrupted" in str(exc).lower() or "statement timeout" in str(exc).lower():
+            return {"error": timeout_message}
         return {"error": f"{type(exc).__name__}: {str(exc).splitlines()[0][:300]}"}
     truncated = len(rows) > limit
     return {

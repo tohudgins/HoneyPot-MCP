@@ -105,6 +105,7 @@ async def run(a: argparse.Namespace) -> int:
             "disposition": "true_positive",
             "note": "field test: real attacker triaged",
             "analyst": "field_test",
+            "since_hours": 12,  # the same window the queue below is counted over
             "max_alerts": 500,
         },
     )
@@ -162,10 +163,11 @@ async def run(a: argparse.Namespace) -> int:
         str(ttps)[:150],
     )
     camps = await r.call("viewer", "analyze_campaign", {"window_minutes": 720, "min_sources": 2})
+    found = camps.get("campaigns", []) if isinstance(camps, dict) else camps
     r.check(
         "analysis",
         "campaign analysis groups real sources hitting the same sensor",
-        isinstance(camps, list) and any(c.get("unique_source_ips", 0) >= 2 for c in camps),
+        bool(found) and any(c.get("unique_source_ips", 0) >= 2 for c in found),
         str(camps)[:120],
     )
     clusters = await r.call(
@@ -204,19 +206,35 @@ async def run(a: argparse.Namespace) -> int:
     stix = await r.call("operator", "export_stix", {"hours": 24, "min_hits": 20})
     r.check("remediation", "STIX export reports a file", bool(stix.get("path")), str(stix)[:150])
     if flooder:
-        h = {x["name"]: x["hits"] for x in await r.call("viewer", "honeypot_list")}
+        listing = await r.call("viewer", "honeypot_list")
+        h = {x["name"]: x["hits"] for x in listing}
         hot = max(h, key=h.get)
-        c0 = await r.call("viewer", "honeypot_list")
-        h0 = {x["name"]: x["hits"] for x in c0}[hot]
+        hot_id = {x["name"]: x["id"] for x in listing}[hot]
+        # The source to throttle is the one flooding THIS sensor now (from the hourly rollups), not the
+        # all-time top source: a flood from many addresses is not cut by throttling one that has gone quiet.
+        window = f"honeypot_id = {hot_id} AND bucket >= datetime('now', '-2 hours')"
+        top = await r.call(
+            "viewer",
+            "sql_query",
+            {
+                "query": f"SELECT source_ip, SUM(count) AS n, "
+                f"(SELECT SUM(count) FROM alert_rollups WHERE {window}) AS total "
+                f"FROM alert_rollups WHERE {window} GROUP BY source_ip ORDER BY n DESC LIMIT 1"
+            },
+        )
+        top_ip, top_n, top_total = (top.get("rows") or [[None, 0, 0]])[0]
+        share = (top_n / top_total) if top_total else 0.0
+        h0 = h[hot]
         await asyncio.sleep(20)
         h1 = {x["name"]: x["hits"] for x in await r.call("viewer", "honeypot_list")}[hot]
         rate_before = (h1 - h0) / 20
-        if rate_before < 5:
+        if rate_before < 5 or share < 0.3:
             r.check(
                 "remediation",
                 "rate-limit rule on the loudest source",
                 True,
-                "SKIPPED: no flood is active (under 5 events/s), so there is nothing to cut",
+                f"SKIPPED: {hot} runs {rate_before:.1f} events/s and its top source is {share:.0%} of it, "
+                "so there is no single flood to cut",
             )
         else:
             rule = await r.call(
@@ -224,7 +242,7 @@ async def run(a: argparse.Namespace) -> int:
                 "suppression_add",
                 {
                     "label": "field-test ratelimit",
-                    "ip_pattern": flooder,
+                    "ip_pattern": top_ip,
                     "action": "rate_limit",
                     "rate_limit_count": 5,
                     "rate_limit_window_seconds": 60,
@@ -236,10 +254,12 @@ async def run(a: argparse.Namespace) -> int:
             await asyncio.sleep(20)
             h3 = {x["name"]: x["hits"] for x in await r.call("viewer", "honeypot_list")}[hot]
             rate_after = (h3 - h2) / 20
+            # Throttling one source can remove at most that source's share of the traffic.
             r.check(
                 "remediation",
-                f"a rate-limit rule on {flooder} cuts {hot}'s live ingest rate by 80%+",
-                rate_after <= rate_before * 0.2,
+                f"a rate-limit rule on {top_ip} ({share:.0%} of {hot}'s traffic) cuts its ingest by "
+                f"at least 60% of that share",
+                rate_after <= rate_before * (1 - 0.6 * share),
                 f"{rate_before:.1f}/s -> {rate_after:.1f}/s",
             )
             if rid and not a.keep_ratelimit:

@@ -512,17 +512,25 @@ async def _start(name: str):
 
 async def _alerts(event_type: str) -> list:
     from sqlalchemy import select
+    from sqlalchemy.exc import OperationalError
 
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert
 
-    for _ in range(40):
-        async with get_session() as session:
-            rows = [
-                a
-                for a in (await session.execute(select(Alert))).scalars().all()
-                if a.event_type == event_type
-            ]
+    for _ in range(80):
+        try:
+            async with get_session() as session:
+                rows = [
+                    a
+                    for a in (await session.execute(select(Alert))).scalars().all()
+                    if a.event_type == event_type
+                ]
+        except OperationalError:
+            # The in-memory test database is ONE connection shared with the event flusher; a commit
+            # that lands while the flusher is mid-statement fails ("SQL statements in progress") and
+            # succeeds on the next poll. Production uses a pooled file database.
+            await asyncio.sleep(0.05)
+            continue
         if rows:
             return rows
         await asyncio.sleep(0.05)
