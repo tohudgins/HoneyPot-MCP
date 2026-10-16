@@ -647,7 +647,14 @@ async def test_a_connection_from_an_unlisted_user_is_dropped(monkeypatch):
         listen, os.path.join(directory, "none.sock"), allowed_uids={os.getuid() + 1}
     )
     try:
-        assert await _roundtrip(listen, b"GET /_ping HTTP/1.1\r\n\r\n") == b""
+        # Dropped means: nothing is relayed. The guard closes without reading the request, so on Linux
+        # the client sees either a clean EOF (empty read) or a reset, depending on timing; both are the
+        # same outcome and the test must not depend on which one the kernel picks.
+        try:
+            reply = await _roundtrip(listen, b"GET /_ping HTTP/1.1\r\n\r\n")
+        except (ConnectionResetError, BrokenPipeError):
+            reply = b""
+        assert reply == b""
         assert server.guard.denied == 1  # type: ignore[attr-defined]
     finally:
         server.close()

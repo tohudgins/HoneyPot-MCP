@@ -57,7 +57,7 @@ async def test_json_payload_fields_and_ctes_work():
 
     await _seed(3)
     out = await sql_query(
-        "WITH w AS (SELECT source_ip, json_extract(payload, '$.input') AS cmd FROM alerts) "
+        "WITH w AS (SELECT source_ip, payload ->> 'input' AS cmd FROM alerts) "
         "SELECT source_ip FROM w WHERE cmd LIKE '%wget%' ORDER BY source_ip"
     )
 
@@ -121,7 +121,7 @@ async def test_a_keyword_inside_a_string_or_comment_is_not_a_write():
 
     await _seed(2)
     out = await sql_query(
-        "SELECT count(*) FROM alerts WHERE json_extract(payload,'$.input') LIKE '%delete%' -- DROP TABLE x"
+        "SELECT count(*) FROM alerts WHERE payload ->> 'input' LIKE '%delete%' -- DROP TABLE x"
     )
 
     assert out["rows"] == [[2]]

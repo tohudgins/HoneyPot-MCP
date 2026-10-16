@@ -79,6 +79,7 @@ dependencies = [
     # including plain `pip install` — cannot pick a release with known CVEs.
     "pyjwt>=2.15.0",
     "urllib3>=2.8.0",
+    "mcp>=1.30.0",  # CVE-2026-59951 (fixed in 1.30.0); imported directly, pinned here as a floor too
 ]
 
 [project.optional-dependencies]
