@@ -162,7 +162,7 @@ def test_top_attackers_event_types_and_engines_equal_the_raw_table(db, name):
         r[0]: r[1]
         for r in _run(con, _panel_sql("01-overview.json", "Alerts by honeypot engine"), window)
     }
-    names = {1: "ssh", 2: "sip", 3: "http", None: None, 0: None}
+    names = {1: "ssh", 2: "sip", 3: "http", None: "(removed sensors)", 0: "(removed sensors)"}
     expected_engines: dict[str | None, int] = {}
     for r in mine:
         key = names[r[0]]

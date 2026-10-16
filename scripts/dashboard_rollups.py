@@ -48,7 +48,8 @@ PANELS: dict[tuple[str, str], str] = {
         "SELECT COALESCE(SUM(n), 0) AS value FROM w WHERE severity = 'critical'"
     ),
     ("01-overview.json", "Alerts by honeypot engine"): (
-        "SELECT h.type AS engine, SUM(w.n) AS count FROM w LEFT JOIN honeypots h ON w.honeypot_id = h.id "
+        "SELECT COALESCE(h.type, '(removed sensors)') AS engine, SUM(w.n) AS count FROM w "
+        "LEFT JOIN honeypots h ON w.honeypot_id = h.id "
         "GROUP BY h.type ORDER BY count DESC"
     ),
     ("01-overview.json", "Top 10 attackers (window)"): (
