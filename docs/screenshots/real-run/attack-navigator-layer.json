@@ -1,0 +1,344 @@
+{
+  "name": "HoneyPot-MCP detections (all time)",
+  "versions": {
+    "attack": "18",
+    "navigator": "5.3.2",
+    "layer": "4.5"
+  },
+  "domain": "enterprise-attack",
+  "description": "ATT&CK techniques HoneyPot-MCP sensors observed, all time. Score = alerts whose event type maps to the technique (an alert counts under every technique it maps to). 16,625,899 of 17,638,144 alerts mapped; the rest are connection bookkeeping.",
+  "sorting": 3,
+  "layout": {
+    "layout": "side",
+    "aggregateFunction": "max",
+    "showID": true,
+    "showName": true,
+    "showAggregateScores": false,
+    "countUnscored": false,
+    "expandedSubtechniques": "annotated"
+  },
+  "hideDisabled": false,
+  "techniques": [
+    {
+      "techniqueID": "T1005",
+      "tactic": "collection",
+      "score": 13,
+      "comment": "13 alert(s): postgresql_file_access (13)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1039",
+      "tactic": "collection",
+      "score": 99,
+      "comment": "99 alert(s): rsync_anonymous_access (67), rsync_file_request (21), nfs_mount_attempt (10), imap_mailbox_access (1)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1213",
+      "tactic": "collection",
+      "score": 739,
+      "comment": "739 alert(s): elasticsearch_query_probe (381), elasticsearch_recon_probe (273), elasticsearch_data_access (52), nfs_portmap_dump (29), elasticsearch_health_probe (4)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1602",
+      "tactic": "collection",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1602.001",
+      "tactic": "collection",
+      "score": 126,
+      "comment": "126 alert(s): snmp_default_community (121), snmp_community_attempt (5)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1071",
+      "tactic": "command-and-control",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1071.001",
+      "tactic": "command-and-control",
+      "score": 3,
+      "comment": "3 alert(s): honeytoken_triggered_canary_url (3)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1090",
+      "tactic": "command-and-control",
+      "score": 992,
+      "comment": "992 alert(s): ssh_port_forward (440), ssh_port_forward_data (276), ssh_port_forward_ja4h (276)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1105",
+      "tactic": "command-and-control",
+      "score": 1206,
+      "comment": "1,206 alert(s): ssh_file_download (1,175), ftp_file_upload (13), telnet_file_download (10), ssh_file_upload (7), ldap_jndi_lookup (1)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1110",
+      "tactic": "credential-access",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1110.001",
+      "tactic": "credential-access",
+      "score": 4952569,
+      "comment": "4,952,569 alert(s): sip_register_attempt (4,483,280), telnet_login_success (290,645), vnc_auth_attempt (66,111), smb_ntlm_auth (58,712), ssh_login_success (19,793)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1528",
+      "tactic": "credential-access",
+      "score": 12,
+      "comment": "12 alert(s): kubernetes_secret_access (12)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1552",
+      "tactic": "credential-access",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1552.007",
+      "tactic": "credential-access",
+      "score": 12,
+      "comment": "12 alert(s): kubernetes_secret_access (12)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1555",
+      "tactic": "credential-access",
+      "score": 176,
+      "comment": "176 alert(s): http_credential_submit (160), honeytoken_triggered_credential_via_mysql_login_attempt (10), honeytoken_triggered_credential_via_ssh_login_success (6)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1046",
+      "tactic": "discovery",
+      "score": 8803439,
+      "comment": "8,803,439 alert(s): sip_extension_probe (8,637,755), smb_negotiate (59,390), sip_request (53,346), sip_invite (49,305), nfs_unknown_program (2,223)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1069",
+      "tactic": "discovery",
+      "score": 6,
+      "comment": "6 alert(s): kubernetes_rbac_enumerate (6)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1082",
+      "tactic": "discovery",
+      "score": 298,
+      "comment": "298 alert(s): mysql_recon_query (97), redis_info_probe (76), postgresql_recon_query (68), redis_config_get (42), memcached_version_probe (11)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1087",
+      "tactic": "discovery",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1087.002",
+      "tactic": "discovery",
+      "score": 94,
+      "comment": "94 alert(s): ldap_search (50), ldap_anonymous_bind (44)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1135",
+      "tactic": "discovery",
+      "score": 118,
+      "comment": "118 alert(s): rsync_module_access (40), rsync_module_enumeration (30), nfs_portmap_dump (29), nfs_export_enumeration (8), nfs_mount_probe (6)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1613",
+      "tactic": "discovery",
+      "score": 1312,
+      "comment": "1,312 alert(s): docker_api_probe (884), kubernetes_probe (212), docker_api_enumerate (111), kubernetes_recon (54), kubernetes_enumerate (51)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1059",
+      "tactic": "execution",
+      "score": 222,
+      "comment": "222 alert(s): mysql_udf_rce (118), redis_eval (34), redis_rogue_replica (23), postgresql_copy_program_rce (21), redis_module_load (18)",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1059.004",
+      "tactic": "execution",
+      "score": 2806626,
+      "comment": "2,806,626 alert(s): telnet_command_input (2,784,853), ssh_command_input (21,773)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1609",
+      "tactic": "execution",
+      "score": 63,
+      "comment": "63 alert(s): docker_api_exec (32), docker_api_exec_start (25), kubernetes_pod_exec (6)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1610",
+      "tactic": "execution",
+      "score": 100,
+      "comment": "100 alert(s): docker_api_container_start (52), docker_api_container_create (32), docker_api_image_pull (16)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1485",
+      "tactic": "impact",
+      "score": 59,
+      "comment": "59 alert(s): mongodb_destructive (50), memcached_flush_all (9)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1486",
+      "tactic": "impact",
+      "score": 20,
+      "comment": "20 alert(s): mongodb_ransom_note (20)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1496",
+      "tactic": "impact",
+      "score": 25817,
+      "comment": "25,817 alert(s): sip_toll_fraud_attempt (25,817)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1498",
+      "tactic": "impact",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1498.002",
+      "tactic": "impact",
+      "score": 118,
+      "comment": "118 alert(s): snmp_bulk_request (70), memcached_stats_probe (30), memcached_amplification_attempt (9), memcached_large_set (9)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1565",
+      "tactic": "impact",
+      "score": 4,
+      "comment": "4 alert(s): snmp_set_request (4)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1078",
+      "tactic": "initial-access",
+      "score": 310457,
+      "comment": "310,457 alert(s): telnet_login_success (290,645), ssh_login_success (19,793), honeytoken_triggered_credential_via_mysql_login_attempt (10), honeytoken_triggered_credential_via_ssh_login_success (6), honeytoken_triggered_canary_url (3)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1133",
+      "tactic": "initial-access",
+      "score": 26517,
+      "comment": "26,517 alert(s): rdp_connection (13,378), rdp_handshake (13,041), rdp_nla_negotiate (53), rdp_nla_probe (36), rdp_mcs_handshake (9)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1190",
+      "tactic": "initial-access",
+      "score": 267,
+      "comment": "267 alert(s): http_exploit_attempt (124), redis_config_set (102), redis_key_set (40), ldap_jndi_lookup (1)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1021",
+      "tactic": "lateral-movement",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1021.001",
+      "tactic": "lateral-movement",
+      "score": 15,
+      "comment": "15 alert(s): rdp_session (15)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1505",
+      "tactic": "persistence",
+      "score": 0,
+      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1505.003",
+      "tactic": "persistence",
+      "score": 8,
+      "comment": "8 alert(s): mysql_outfile_write (8)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1611",
+      "tactic": "privilege-escalation",
+      "score": 42,
+      "comment": "42 alert(s): docker_api_container_escape (36), kubernetes_pod_escape (6)",
+      "enabled": true
+    },
+    {
+      "techniqueID": "T1595",
+      "tactic": "reconnaissance",
+      "score": 1420,
+      "comment": "1,420 alert(s): http_probe (926), rdp_invalid_probe (196), http_recon_probe (92), ldap_invalid_probe (80), sip_invalid_probe (65)",
+      "enabled": true,
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1595.003",
+      "tactic": "reconnaissance",
+      "score": 3559,
+      "comment": "3,559 alert(s): http_active_recon (3,559)",
+      "enabled": true
+    }
+  ],
+  "gradient": {
+    "colors": [
+      "#fee5d9",
+      "#fb6a4a",
+      "#a50f15"
+    ],
+    "minValue": 0,
+    "maxValue": 8803439
+  },
+  "legendItems": [],
+  "metadata": [],
+  "links": [],
+  "showTacticRowBackground": false,
+  "tacticRowBackground": "#dddddd",
+  "selectTechniquesAcrossTactics": true,
+  "selectSubtechniquesWithParent": false,
+  "selectVisibleTechniques": false
+}

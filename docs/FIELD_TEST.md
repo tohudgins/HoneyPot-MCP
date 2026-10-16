@@ -140,6 +140,26 @@ can be steered on another day), and a deployment's real defence is the role syst
 unattended should hold a `viewer` token (it cannot triage, prune, stop or push); give an operator or admin
 token only to a session a person is watching.
 
+## The final run, before the droplet was destroyed
+
+Every script was run once more against the finished deployment (23 sensors, 17.6M alerts) and the data was
+then backed up and checked offline:
+
+| Check | Result |
+|---|---|
+| `field_test.py attack` then `verify` against the backup | 23 of 23 engines proven end to end; 0 probes failed |
+| `field_test_tools.py` | 86 checks over all 70 registered tools: 85 passed, 1 failed. The failure was the check's own expectation (it required an error message back, and `sql_query` correctly refused the secret table); the check now asserts the refusal and was not re-run, because the droplet was destroyed afterwards |
+| `field_test_ops.py` | 20 of 20 (after three of its own checks were corrected: the campaign result shape, the triage window, and throttling the sensor's *current* top source) |
+| `field_test_oracle.py` on the final backup | 73 checks, 0 failed, on 17.5M alerts (6 min 25 s on SQLite) |
+| `field_test_injection.py` | 3 of 3 scenarios held (summarise, triage, investigate); one model and one sample each |
+| Backup (`fetch_backup.sh`) | integrity check ok, 17,726,494 alerts from 3,337 sources over 116.4 h |
+
+Running the console, the Navigator layer and `sql_query` on the live host in that last pass found three more
+defects that nothing before it had: the operations console did not return in 100 s on 17.6M alerts, a
+SQLite scan outran `sql_query`'s 15 s limit by 72 s, and a partial index was being ignored because
+SQLAlchemy bound its predicate as a parameter. All three are fixed, measured and recorded in
+[CHANGELOG.md](../CHANGELOG.md).
+
 ## Seeing the data yourself
 
 Everything above can also be read on your own machine from a backup, with no SSH:

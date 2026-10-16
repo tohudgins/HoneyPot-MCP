@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (1448 unit tests covering security-critical paths)
+# Tests (2,200+ unit tests covering security-critical paths; about 6 minutes on 4 workers: `-n 4`)
 uv run pytest tests/unit/ -v
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format

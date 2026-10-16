@@ -95,3 +95,6 @@ desktop.ini
 # Claude Code per-developer settings — keep .claude/settings.json shared,
 # .claude/settings.local.json is your personal grants/preferences.
 .claude/settings.local.json
+
+# Serena (MCP code-intelligence tool) per-developer cache
+.serena/

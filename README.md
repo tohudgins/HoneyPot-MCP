@@ -3,45 +3,118 @@
 [![CI](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tohudgins/HoneyPot-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%E2%80%933.14-blue)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-2216%20unit%20%2B%2023%20integration-brightgreen)](tests/)
 
-**Deception infrastructure you drive by talking to it.** Deploy honeypots across 25
-protocols, plant honeytokens, and analyse what attackers actually do — from a chat
-window, a terminal, or a systemd unit.
+**An MCP server that deploys 25 honeypot protocol engines and honeytokens, and turns what attackers do into telemetry you analyse by talking to an AI client.**
 
 ```
 > Deploy an SSH honeypot on port 2222 and an HTTP one on 8080.
 > Anything critical in the last hour?
-> Reconstruct what 45.148.10.72 did across all my honeypots.
+> Reconstruct what <ip> did across all my honeypots.
 > Export an iptables blocklist for anyone with 10+ hits.
 ```
 
-![HoneyPot MCP operations console](docs/screenshots/console.png)
-<p align="center"><em>The built-in operations console — live attack feed, sensor health,
-volume by severity. No login, no query language, no Grafana required.</em></p>
+## Results
+
+Run on a public-IP DigitalOcean droplet for 116 hours (since destroyed); the full database backup is kept.
+
+| Measured | Value | Source |
+|---|---|---|
+| Alerts captured | 17.7M stored (17,726,494 rows); the flood guard counted a further 55.5M sip probes from 13 sources without storing them, so the sensors saw about 73M events | `alerts` table of the backup; [docs/RESULTS.md](docs/RESULTS.md) section 1.4 |
+| Distinct source addresses | 3,337 | attacker-event report over the backup (`report.txt`) |
+| Duration | 116.4 h (2026-10-11 18:18 to 2026-10-16 14:42 UTC) | first and last alert timestamps |
+| Sensors / engine types | 23 sensors, 23 types (SMTP and DNS exist but were off on the public host) | `honeypots` table |
+| MCP tools | 70 | [docs/FIELD_TEST.md](docs/FIELD_TEST.md) |
+| Unit tests | 2,221 passed, 4 skipped (the last full run, before the final docs) | `pytest tests/unit` |
+| Independent oracle | 73 raw-SQL checks, 0 failed (first run: 4.9M alerts, in 31 s; the final run was on 17.5M) | `scripts/field_test_oracle.py`, [docs/FIELD_TEST.md](docs/FIELD_TEST.md) |
+| End-to-end engine proof | 23 of 23 deployed engines attacked from outside with real clients and recorded | `scripts/field_test.py` |
+| Console load on 17.6M alerts | over 100 s, now 0.2 to 3 s live | [CHANGELOG.md](CHANGELOG.md) |
+
+Not verified: GreyNoise enrichment and the pfSense / Cloudflare / AWS WAF push tools were never run against real services (tests drive strict stubs of the vendors' published contracts).
+
+## What it is
+
+Most honeypot stacks are a single-protocol toy or a 30-container distribution you read as raw JSON. This is one process on one box: in-process asyncio engines for 23 protocols plus Cowrie (Docker) for SSH and Telnet, honeytokens that trip on use, and an analysis layer exposed over [Model Context Protocol](https://modelcontextprotocol.io), so Claude Desktop, Claude Code or any MCP client is the console. Engines capture artifacts (the SSH key from a Redis dropper chain, the ransom note from a MongoDB wipe, NetNTLMv2 responses from RDP/SMB) and the tools answer questions about them (ATT&CK mapping, campaigns, triage, reports, blocklists). [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) states plainly what it will and will not catch: internet-scale automated traffic yes, a skilled human probing by hand no.
+
+## How data flows
+
+Engines never touch the database. Everything passes one ingestion path ([CLAUDE.md](CLAUDE.md) has the detail):
+
+```mermaid
+flowchart LR
+    ENG["25 engine types<br/>Cowrie SSH/Telnet + in-process asyncio"] --> SUB["submit_event()"]
+    subgraph BUF["Event buffer"]
+        direction TB
+        SUP{"Suppression<br/>CIDR / glob / rate limit"} -->|passes| CM{"Credential match<br/>planted creds -> CRITICAL"}
+        CM --> FG{"Flood guard<br/>600 stored/min per source+type<br/>CRITICAL never dropped"}
+        FG --> Q["Queue -> flusher<br/>batches of 50, max 1 s"]
+    end
+    SUB --> SUP
+    SUP -->|dropped| X["discarded"]
+    Q --> DB[("alerts + alert_rollups<br/>SQLite / PostgreSQL<br/>rollups written in the same transaction")]
+    DB --> MCP["MCP tools<br/>+ operations console"]
+    DB --> GF["Grafana"]
+    DB --> WH["Webhook worker<br/>SIEM, Slack, Teams, email"]
+    DB -.->|CRITICAL| ENR["Enrichment<br/>VT, AbuseIPDB, GeoIP"] -.-> DB
+```
+
+Design points:
+
+- **Batched writes carry their own timestamps**, so a batch of 50 does not share one `func.now()` and session reconstruction stays chronological.
+- **Statistics read hourly rollups, never the alert table.** The cost of a figure depends on the size of the answer, not of the database; this is what kept the tools usable at 17.7M rows.
+- **The webhook worker is decoupled from the flusher**; a SIEM that takes 30 s cannot back-pressure ingestion.
+- **Enrichment is fire-and-forget and TTL-cached**; repeat CRITICALs from one IP cost no external calls.
+- **Tool responses are shaped for a context window.** List tools return digests, `alerts_get` expands one alert, bulk output goes to disk.
+
+## Screenshots
+
+Real run (the 116-hour droplet; the Grafana captures stop at 2026-10-16 10:00 UTC, about four hours before the end):
+
+![Threat map, real run](docs/screenshots/real-run/threat-map.png)
+<p align="center"><em>Real run: Grafana threat map of attacker origins.</em></p>
+
+![MITRE ATT&CK coverage, real run](docs/screenshots/real-run/mitre-coverage.png)
+<p align="center"><em>Real run: ATT&CK tactic coverage from the same database.</em></p>
+
+![ATT&CK Navigator layer, real run](docs/screenshots/real-run/attack-navigator.png)
+<p align="center"><em>Real run: Navigator layer from <code>attack_navigator_layer</code>, scored with the same exact counts (<a href="docs/screenshots/real-run/attack-navigator-layer.json">layer JSON</a>).</em></p>
+
+Demo stack (seeded synthetic events, regenerated by [`scripts/capture_screenshots.sh`](scripts/capture_screenshots.sh)):
+
+<table>
+<tr>
+<td width="50%"><a href="docs/screenshots/console.png"><img src="docs/screenshots/console.png" alt="Operations console"></a><br><em>Demo stack: built-in operations console (live feed, sensor health, severity volume).</em></td>
+<td width="50%"><a href="docs/screenshots/overview.png"><img src="docs/screenshots/overview.png" alt="Grafana overview"></a><br><em>Demo stack: Grafana overview.</em></td>
+</tr>
+</table>
+
+## What running it on the real internet taught us
+
+Defects and measurements that unit tests and the demo stack did not surface. Detail in [CHANGELOG.md](CHANGELOG.md), [docs/FIELD_TEST.md](docs/FIELD_TEST.md) and [docs/RESULTS.md](docs/RESULTS.md).
+
+- **Passive FTP and NFS were unreachable behind a default-drop firewall.** FTP data ports were random, so every session stalled after login: 9 anonymous logins, 9 passive attempts, no listing or download. NFS clients ask the portmapper on 111 before 2049, so `showmount -e` got nothing; its portmapper also answered every version in the v2 format and broke nmap's RPC library. Fixed with a bounded passive range and a 111/2049 redirect.
+- **`analyze_campaign` read only the newest 5,000 alerts.** On a flood-dominated database it reported 7 campaigns from the last 16 minutes; the raw-SQL oracle found 274. It now reads the exact hourly rollups.
+- **The console did not load on 17.6M alerts.** `/api/overview` did not answer in 100 to 120 s, re-aggregating the raw table ten times per poll; it now reads rollups and answers in 0.2 to 3 s.
+- **The SSH bait credential sat in the wrong home directory.** It was under the persona user, but attackers log in as `root` (105,066 logins in the first run) or `admin` (70,460), so nobody could see it. It now also lives in `/root`; replaying it against the MySQL sensor produced a CRITICAL token trip.
+- **`asyncio.wait_for` cannot stop a SQLite scan in aiosqlite's worker thread.** `sql_query` ran 87 s past its 15 s limit and left the session in `PendingRollbackError`; the deadline is now a SQLite progress handler.
+- **The three blocklist-push tools were wrong against the vendors' real contracts.** pfSense: wrong auth header, lookup and HTTP verb; Cloudflare: asynchronous operation reported done; AWS WAF: the operator's description blanked each push. They had only been tested against mocks of themselves.
+
+## Documentation map
+
+| Document | What it covers |
+|---|---|
+| [docs/RESULTS.md](docs/RESULTS.md) | What the 116-hour run captured and found |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Step-by-step VPS deployment, go-live checklist, backups, offline analysis |
+| [docs/HARDENING.md](docs/HARDENING.md) | Host hardening: default-drop firewall, Docker guard, sandboxed units |
+| [docs/FIELD_TEST.md](docs/FIELD_TEST.md) | The scripts that attack every engine and check the answers, and what they found |
+| [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) | What works, what does not, and why |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, including live-run findings |
+| [CLAUDE.md](CLAUDE.md) | Architecture and plugin patterns |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Setup and the non-obvious rules |
+| [SECURITY.md](SECURITY.md) | Private vulnerability reporting |
 
 ---
 
-## Why this exists
-
-Most honeypot stacks make you choose: a single-protocol toy you outgrow in a week,
-or a 30-container distribution that takes a weekend to stand up and a spreadsheet to
-operate. Both leave you reading raw JSON to answer "did anything interesting happen?"
-
-HoneyPot MCP is the middle path. The engines capture real attack artifacts — the
-attacker's SSH key from a Redis RCE dropper chain, the webshell body from a MySQL
-`INTO OUTFILE`, the ransom note from a MongoDB wipe — and the analysis layer answers
-questions in the language you'd actually ask them in. It runs on one box, installs in
-two minutes, and speaks [Model Context Protocol](https://modelcontextprotocol.io) so
-any MCP client (Claude Desktop, Claude Code, your own) becomes the console.
-
-> **Before you rely on it:** [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) is a frank
-> account of what works and what doesn't. It will catch internet-scale automated
-> attack traffic. It will not fool a skilled human probing by hand.
-
----
-
-## See it in 2 minutes
+## Try it in 2 minutes
 
 No API keys, no config, no MCP client required:
 
@@ -50,121 +123,49 @@ git clone https://github.com/tohudgins/HoneyPot-MCP.git
 cd HoneyPot-MCP/docker
 docker compose up -d --build
 
-# Seed ~5,000 realistic attack events across the last 24h
+# Seed ~5,000 synthetic attack events across the last 24h
 docker compose exec honeypot-mcp python scripts/seed_demo_data.py
 
-open http://localhost:3000        # Grafana — admin / honeypot
+open http://localhost:8090   # operations console
+open http://localhost:3000   # Grafana, admin / honeypot
 ```
 
-```
-http://localhost:8090   ← the operations console (above)
-http://localhost:3000   ← Grafana, for historical dashboards
-```
-
-That brings up the server, a live Cowrie SSH honeypot on `:2222`, an HTTP honeypot on
-`:8080`, Prometheus, and five provisioned Grafana dashboards (overview, threat map, ATT&CK coverage, a **Query** box that runs read-only SQL, and an **Alerts** browser). The honeypots are real —
-SSH into `localhost:2222` with any password and watch your own session appear in the
-console within seconds.
-
-<table>
-<tr>
-<td width="50%"><a href="docs/screenshots/threat-map.png"><img src="docs/screenshots/threat-map.png" alt="Threat map dashboard"></a><br><em>Threat Map — geo-located attacker origins</em></td>
-<td width="50%"><a href="docs/screenshots/mitre.png"><img src="docs/screenshots/mitre.png" alt="MITRE ATT&CK dashboard"></a><br><em>MITRE ATT&CK coverage by tactic</em></td>
-</tr>
-</table>
-
-Screenshots are regenerated from the live stack by
-[`scripts/capture_screenshots.sh`](scripts/capture_screenshots.sh) — not hand-captured,
-so they can't drift from what the dashboards actually render.
-
----
-
-## How it works
-
-Engines never touch the database. Everything funnels through one ingestion path, which
-is what makes suppression, honeytoken correlation, and SIEM fan-out uniform across all
-25 protocols:
-
-```mermaid
-flowchart TD
-    subgraph E["Honeypot engines"]
-        direction LR
-        E1["SSH · Telnet<br/><i>Cowrie, Docker</i>"]
-        E2["HTTP/S · SMB · RDP<br/>FTP · SMTP · DNS · VNC"]
-        E3["MySQL · PostgreSQL · MSSQL<br/>MongoDB · Redis · Elasticsearch"]
-        E4["Docker API · Kubernetes · LDAP · SNMP<br/>Memcached · IMAP · POP3 · SIP · rsync · NFS"]
-    end
-
-    E --> SUB["submit_event()"]
-    SUB --> SUP{"Suppression<br/><i>CIDR · glob · rate limit</i>"}
-    SUP -->|dropped| X["discarded"]
-    SUP -->|passes| CM{"Honeytoken<br/>cross-reference"}
-    CM -->|planted creds matched| CRIT["severity → CRITICAL<br/>token → TRIGGERED"]
-    CM --> BUF["Event buffer<br/><i>batches ≤50, ≤1s</i>"]
-    CRIT --> BUF
-    BUF --> DB[("Alerts + AttackerEvents<br/>SQLite / PostgreSQL")]
-    DB --> ENR["Auto-enrichment<br/><i>VirusTotal · AbuseIPDB · GeoIP</i>"]
-    ENR --> DB
-    DB --> WH["Webhook worker"]
-    WH --> SIEM["Splunk · Elastic · Loki · Datadog<br/>CEF · syslog · Slack · Teams · email"]
-    DB --> MCP["MCP tools + resources"]
-    MCP --> CLIENT["Claude / any MCP client"]
-
-    style CRIT fill:#c0392b,color:#fff
-    style DB fill:#2c3e50,color:#fff
-    style SUB fill:#16a085,color:#fff
-```
-
-Three design decisions worth calling out:
-
-- **Batched writes carry their own timestamps.** Every `PendingEvent` records when it
-  happened, not when it was flushed. Without that, a batch of 50 events would share one
-  `func.now()` and session reconstruction would be meaningless.
-- **The webhook worker is decoupled from the flusher.** A SIEM endpoint that takes 30s
-  to respond cannot back-pressure honeypot ingestion.
-- **Enrichment is fire-and-forget and TTL-cached.** A CRITICAL alert triggers parallel
-  VT/AbuseIPDB/GeoIP lookups that merge into the payload when they land. Repeat hits
-  from the same IP cost zero external calls.
-- **Tool responses are shaped for a context window.** A single HTTP alert can carry
-  64 KB of captured body, so list tools return a digest of the fields you triage on,
-  `alerts_get` expands one alert in full, and exports go to disk. Getting this wrong
-  is how an MCP server becomes unusable on real traffic volume.
+This brings up the server, a live Cowrie SSH honeypot on `:2222`, an HTTP honeypot on `:8080`, Prometheus, and five provisioned Grafana dashboards (overview, threat map, ATT&CK coverage, a **Query** box that runs read-only SQL, and an **Alerts** browser). SSH into `localhost:2222` with any password and your session appears in the console within seconds.
 
 ---
 
 ## Capabilities
 
 <table>
-<tr><td><b>25 protocols</b></td><td>SSH, Telnet (Cowrie), HTTP/S, SMB, RDP, FTP, SMTP, DNS, VNC, MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch, Docker API, <b>Kubernetes API</b>, LDAP, SNMP, Memcached, IMAP, <b>POP3</b>, SIP/VoIP, rsync, NFS</td></tr>
-<tr><td><b>Past the login</b></td><td>RDP lets a planted credential (or one weak pair) into a desktop session over NLA or plain TLS with a working-looking console (cmd/PowerShell answered by a fake shell that executes nothing and has no route out; every command, keystroke, click and pasted text is recorded); POP3 and IMAP serve the mailbox the SMTP honeypot filled, bounces and all; HTTP has an admin console. What an intruder does <i>after</i> getting in is captured, not just that they got in. Nothing is ever sent onward</td></tr>
-<tr><td><b>Anti-fingerprinting</b></td><td>Per-deploy SSH + HTTP personas (coherent banner/kernel/header bundles), response jitter, per-honeypot self-signed TLS, realistic <code>robots.txt</code>/<code>favicon.ico</code>/<code>security.txt</code></td></tr>
+<tr><td><b>25 protocols</b></td><td>SSH, Telnet (Cowrie), HTTP/S, SMB, RDP, FTP, SMTP, DNS, VNC, MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch, Docker API, Kubernetes API, LDAP, SNMP, Memcached, IMAP, POP3, SIP/VoIP, rsync, NFS</td></tr>
+<tr><td><b>Past the login</b></td><td>RDP lets a planted credential (or one weak pair) into a desktop session over NLA or plain TLS, with a fake <code>cmd</code>/PowerShell that executes nothing and has no route out; every command, keystroke, click and pasted text is recorded. POP3 and IMAP serve the mailbox the SMTP honeypot filled; HTTP has an admin console. Nothing is ever sent onward</td></tr>
+<tr><td><b>Anti-fingerprinting</b></td><td>Per-deploy SSH + HTTP personas (coherent banner/kernel/header bundles), response jitter, per-honeypot self-signed TLS shaped per service, realistic <code>robots.txt</code>/<code>favicon.ico</code>/<code>security.txt</code></td></tr>
 <tr><td><b>Honeytokens</b></td><td>AWS/Azure/GCP keys, canary URLs, credential pairs, PDF/DOCX trackers, SSH keys, JWTs, DB rows, kubeconfigs, Slack webhooks</td></tr>
-<tr><td><b>Credential correlation</b></td><td>Planted creds auto-match on any honeypot login and escalate to CRITICAL — including MySQL and VNC, where the plaintext never crosses the wire (the engine recomputes the scramble/DES response)</td></tr>
+<tr><td><b>Credential correlation</b></td><td>Planted creds auto-match on any honeypot login and escalate to CRITICAL, including MySQL and VNC, where the plaintext never crosses the wire (the engine recomputes the scramble/DES response)</td></tr>
 <tr><td><b>Analysis</b></td><td>MITRE ATT&CK mapping, attacker profiling + risk score, SSH session reconstruction, cross-honeypot kill-chain timelines, campaign correlation, XSS-safe HTML/Markdown reports</td></tr>
-<tr><td><b>SIEM delivery</b></td><td>JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, RFC 5424 syslog, Grafana Loki, Datadog — per-subscription severity thresholds and delivery health stats</td></tr>
-<tr><td><b>Human notifications</b></td><td>Slack (Block Kit), Microsoft Teams (MessageCard), email (SMTP/STARTTLS) — severity-coloured with captured credentials up front, and coalesced so one scanner can't bury the channel. CRITICAL is never held back</td></tr>
-<tr><td><b>Packet capture</b></td><td>Optional tcpdump ring buffer scoped to the deployed honeypot ports, with <code>pcap_extract</code> pulling a single attacker's packets out for Wireshark, Suricata or Zeek. Disk bounded by construction</td></tr>
+<tr><td><b>SIEM delivery</b></td><td>JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, RFC 5424 syslog, Grafana Loki, Datadog; per-subscription severity thresholds and delivery health</td></tr>
+<tr><td><b>Human notifications</b></td><td>Slack, Microsoft Teams, email; severity-coloured, credentials up front, coalesced so one scanner cannot bury the channel. CRITICAL is never held back</td></tr>
+<tr><td><b>Packet capture</b></td><td>Optional tcpdump ring buffer scoped to the deployed ports; <code>pcap_extract</code> pulls one attacker's packets for Wireshark, Suricata or Zeek. Disk bounded by construction</td></tr>
 <tr><td><b>Response</b></td><td>Blocklist push to Cloudflare / pfSense / AWS WAFv2, iptables/fail2ban/CIDR export, STIX 2.1 bundles, AbuseIPDB reporting</td></tr>
-<tr><td><b>Console</b></td><td>Built-in read-only web dashboard on <code>:8090</code> — live attack feed with captured credentials and paths, sensor health, volume by severity, top attackers and origins. Served by the server itself; no extra container</td></tr>
-<tr><td><b>Triage</b></td><td>Bulk acknowledge by filter with a disposition (true/false positive, benign, duplicate), note and analyst; append-only audit log of every control-plane action</td></tr>
+<tr><td><b>Console</b></td><td>Read-only web dashboard on <code>:8090</code> served by the server itself: live feed, sensor health, severity volume, top attackers and origins</td></tr>
+<tr><td><b>Triage</b></td><td>Bulk acknowledge by filter with a disposition, note and analyst; append-only audit log of every control-plane action</td></tr>
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
 </table>
 
-2216 unit tests plus 23 integration tests (Docker- and network-gated ones skip without them) cover the security-critical paths; ruff and mypy are blocking in CI
-across Python 3.11–3.14.
+Ruff and mypy are blocking in CI across Python 3.11 to 3.14; a CI job also runs the whole suite on PostgreSQL. Docker- and network-gated integration tests skip without them.
 
 ---
 
 ## Install
 
-**Prerequisites:** Python 3.11+. Docker only if you want the Cowrie SSH honeypot.
+**Prerequisites:** Python 3.11+. Docker only for the Cowrie SSH/Telnet honeypot.
 
 ```bash
 pipx install honeypot-mcp          # or: pip install honeypot-mcp
 honeypot-mcp                        # starts the server
 ```
 
-Add PostgreSQL support with `pip install "honeypot-mcp[postgres]"`.
+PostgreSQL: `pip install "honeypot-mcp[postgres]"`.
 
 **Container:**
 
@@ -176,39 +177,36 @@ docker run -d --name honeypot-mcp \
   ghcr.io/tohudgins/honeypot-mcp:latest
 ```
 
-**From source**, for development or to change the engines:
+**From source:**
 
 ```bash
 git clone https://github.com/tohudgins/HoneyPot-MCP.git
 cd HoneyPot-MCP
 uv sync --extra dev          # or: pip install -e ".[dev]"
-cp .env.example .env         # optional — everything works without keys
+cp .env.example .env         # optional; everything works without keys
 ```
 
-> `--extra dev` pulls in pytest/ruff/mypy. With a pip install, drop the `uv run` prefix
-> from every command below.
+> `--extra dev` pulls in pytest/ruff/mypy. With a pip install, drop the `uv run` prefix from the commands below.
 
-**Optional integrations** — each degrades gracefully to `{"available": false}`:
+**Optional integrations** each degrade to `{"available": false}`:
 
 | Variable | Gets you | Cost |
 |---|---|---|
 | `VIRUSTOTAL_API_KEY` | IP reputation | free |
 | `ABUSEIPDB_API_KEY` | Abuse reports + outbound reporting | free, 1k/day |
 | `GEOIP_DB_PATH` | Country/city/coords on every alert (City DB) | free, registration |
-| `GEOIP_ASN_DB_PATH` | Origin AS number + org — spot hosting/VPN/botnet networks (ASN DB) | free, same account |
+| `GEOIP_ASN_DB_PATH` | Origin AS number + org (ASN DB) | free, same account |
 | `CANARY_PUBLIC_URL` | Honeytokens that fire from the internet | ngrok / a domain |
-| `GREYNOISE_API_KEY` | GreyNoise: known mass scanner / benign crawler, in `enrich_ip` | free community tier |
-| `ABUSECH_AUTH_KEY` | abuse.ch (MalwareBazaar, URLhaus, ThreatFox) hash/URL lookups, `lookup_hash` | free |
+| `GREYNOISE_API_KEY` | GreyNoise scanner/crawler classification in `enrich_ip` | free community tier |
+| `ABUSECH_AUTH_KEY` | abuse.ch (MalwareBazaar, URLhaus, ThreatFox), `lookup_hash` | free |
 | `OTX_API_KEY` | AlienVault OTX pulses an address appears in | free |
-| `SHODAN_INTERNETDB_ENABLED=true` | Shodan InternetDB open ports/CPEs for an address (no key) | free |
+| `SHODAN_INTERNETDB_ENABLED=true` | Shodan InternetDB open ports/CPEs (no key) | free |
 
-The last four are off unless set, cached and bounded by one 3 s fan-out deadline. They are tested against stubs of the vendors' published contracts, and abuse.ch (MalwareBazaar, URLhaus, ThreatFox), OTX and InternetDB were also run live against real attacker IPs and a captured malware hash; GreyNoise was not (its free key requires a business email). `scripts/intel_smoke.py` makes one live call per provider.
+The last four are off unless set, cached and bounded by one 3 s fan-out deadline. All are tested against stubs of the vendors' published contracts; abuse.ch, OTX and InternetDB were also run live against real attacker addresses and a captured malware hash. **GreyNoise was never run live** (its free key requires a business email). `scripts/intel_smoke.py` makes one live call per provider.
 
 ---
 
 ## Run it
-
-There are three modes, and picking the right one is most of the setup:
 
 | Mode | `MCP_TRANSPORT` | Lives as long as | Use for |
 |---|---|---|---|
@@ -218,9 +216,7 @@ There are three modes, and picking the right one is most of the setup:
 
 ### Local (stdio)
 
-Claude Code users: the repo ships `.claude/settings.json`, so the tools appear as soon
-as you open it. For Claude Desktop, add to `claude_desktop_config.json` (macOS
-`~/Library/Application Support/Claude/`, Windows `%APPDATA%\Claude\`):
+Claude Code users: the repo ships `.claude/settings.json`, so the tools appear when you open it. For Claude Desktop, add to `claude_desktop_config.json` (macOS `~/Library/Application Support/Claude/`, Windows `%APPDATA%\Claude\`):
 
 ```json
 {
@@ -234,116 +230,86 @@ as you open it. For Claude Desktop, add to `claude_desktop_config.json` (macOS
 }
 ```
 
-Fully quit and relaunch Claude Desktop (tray → Quit, not just close-window), then:
+Fully quit and relaunch Claude Desktop, then:
 
 ```
 Deploy an HTTP honeypot on port 8080, then run honeypot_self_test on it.
 ```
 
-`alert_received: true` confirms the whole pipeline end to end — probe → engine →
-suppression → buffer → database.
+`alert_received: true` confirms probe, engine, suppression, buffer and database end to end.
 
 ### Daemon (http)
 
-Honeypots outlive any chat. This is the mode for anything real:
+Honeypots outlive any chat:
 
 ```bash
 # In .env:  MCP_TRANSPORT=http   MCP_AUTH_TOKEN=$(openssl rand -hex 32)
 sudo cp deploy/honeypot-mcp.service /etc/systemd/system/   # edit paths inside
 sudo systemctl enable --now honeypot-mcp
 
-# From your laptop — tunnel the control port, never firewall-expose it:
+# From your laptop: tunnel the control port, never firewall-expose it
 ssh -N -L 8000:127.0.0.1:8000 you@host &
 claude mcp add --transport http honeypot-mcp http://127.0.0.1:8000/mcp \
   --header "Authorization: Bearer <your-MCP_AUTH_TOKEN>"
 ```
 
-The networked control plane can deploy honeypots and read everything they capture, so
-it is **fail-closed**: the server refuses to start on a networked transport unless
-`MCP_AUTH_TOKEN` is set (or you explicitly opt out with `MCP_ALLOW_UNAUTHENTICATED`).
+The networked control plane can deploy honeypots and read everything they capture, so it is **fail-closed**: the server refuses to start on a networked transport unless `MCP_AUTH_TOKEN` is set (or you opt out with `MCP_ALLOW_UNAUTHENTICATED`).
 
-**Role-based access.** `MCP_AUTH_TOKENS` hands out separately-scoped tokens instead of
-one shared full-access one: `viewer` (read-only triage/analysis/reports), `operator`
-(also deploy/stop honeypots, manage honeytokens, acknowledge alerts — everything
-reversible and contained to this system's own data), or `admin` (also prune alerts,
-push to a real external firewall/WAF, read the audit log, manage other people's
-access). See [`src/honeypot_mcp/rbac.py`](src/honeypot_mcp/rbac.py) for exactly which
-tool needs which role, and [`docs/DEPLOY.md`](docs/DEPLOY.md) for the format.
+**Role-based access.** `MCP_AUTH_TOKENS` hands out scoped tokens: `viewer` (read-only triage, analysis, reports), `operator` (also deploy/stop honeypots, manage honeytokens, acknowledge alerts: everything reversible and contained to this system's data), `admin` (also prune alerts, push to an external firewall/WAF, read the audit log, manage access). [`rbac.py`](src/honeypot_mcp/rbac.py) lists which tool needs which role; [docs/DEPLOY.md](docs/DEPLOY.md) has the format.
 
-**Per-person access for a team.** Env-var tokens need a restart to add or revoke and
-carry no identity beyond a role — fine to bootstrap with, not what you hand to five
-teammates. Once the server is up, an admin token can mint real per-person API keys
-live (`api_key_create`/`api_key_revoke`/`api_key_list`) — each with its own name, so
-`audit_log_search` can say *who* deployed a honeypot or pruned alerts, not just that
-someone did. Keys take effect within 30 seconds, no restart; the plaintext is shown
-exactly once, at creation.
+**Per-person access.** Env-var tokens need a restart to change and carry no identity beyond a role. An admin token can mint per-person API keys live (`api_key_create` / `api_key_revoke` / `api_key_list`), so `audit_log_search` says *who* deployed a honeypot or pruned alerts. Keys take effect within 30 s; the plaintext is shown once.
 
 ### Collector (none)
 
-Runs the capture plane — engines, canary callbacks, watchdog, webhook delivery,
-`/metrics` — with **no control plane at all**. Nothing can be deployed or queried
-remotely; events flow to the database and onward to your SIEM. This is what the Docker
-stack runs, and the right choice for a host that should collect attacks but never
-accept commands.
+Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `/metrics`) with **no control plane**. Nothing can be deployed or queried remotely; events flow to the database and your SIEM. This is what the Docker stack runs.
+
+**Two processes, one database.** The first server to start owns the sensors (an OS file lock beside the SQLite file). A second, such as another chat session, starts read-only: it can query, triage and report, and refuses to deploy or stop. `ping` reports the role.
 
 ---
 
-## Deploy — catching real traffic
+## Deploy: catching real traffic
 
 | Goal | Run it on | Effort |
 |---|---|---|
 | See the dashboards | your laptop | ~2 min (above) |
 | Catch attacks on **your own network** | a spare box/VM | ~15 min |
-| Catch **real internet attack traffic** | a $5 throwaway VPS | ~30 min ([docs/DEPLOY.md](docs/DEPLOY.md)) |
+| Catch **real internet attack traffic** | a throwaway VPS | ~30 min ([docs/DEPLOY.md](docs/DEPLOY.md)) |
 
-Before exposing a VPS, run `scripts/preflight.sh` (see the go-live checklist in DEPLOY.md): it checks the control plane, bind addresses, disk, ports, backups, and probes every sensor end to end.
-To harden the host first (default-drop firewall, a validating Docker guard so the service never holds root-equivalent access, sandboxed units, key-only SSH, moved control ports), follow [docs/HARDENING.md](docs/HARDENING.md): the honeypots stay fully reachable, everything around them does not.
-After deploying, prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one, `scripts/field_test_tools.py` exercises all 70 MCP tools at their roles, and `scripts/field_test_ops.py`, `scripts/field_test_injection.py` and `scripts/field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([docs/FIELD_TEST.md](docs/FIELD_TEST.md)). A quiet sensor on a real VPS is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
+- Before exposing a VPS, run `scripts/preflight.sh`: it checks the control plane, bind addresses, disk, ports, backups, and probes every sensor end to end.
+- Harden the host first with [docs/HARDENING.md](docs/HARDENING.md) (default-drop firewall, validating Docker guard, sandboxed units, key-only SSH, moved control ports). The honeypots stay reachable; everything around them does not.
+- Prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one; `field_test_tools.py` exercises all 70 tools at their roles; `field_test_ops.py`, `field_test_injection.py` and `field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([docs/FIELD_TEST.md](docs/FIELD_TEST.md)). A quiet sensor is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
 
-**Internal tripwire.** Put honeypots on ports nothing legitimate uses. Anything on your
-LAN that connects is by definition not supposed to be — a compromised laptop sweeping
-for open SSH/SMB/Redis, or someone poking around. **Every hit is high-signal.** Plant
-credential tokens and canary URLs on real file shares so lateral movement trips them
-too. Nothing needs to face the internet.
+**Internal tripwire.** Put honeypots on ports nothing legitimate uses; anything on your LAN that connects is by definition unexpected. Plant credential tokens and canary URLs on real file shares so lateral movement trips them too.
 
-**Public internet.** Run the daemon on a VPS you don't care about and open 22, 80, 443,
-445, 3389. Mirai SSH brute force, RDP/SMB exploit scanners, and web exploit probes
-arrive within minutes. **Use a dedicated throwaway host, move your admin SSH off port 22
-first, and never reuse production keys.** The guarded walkthrough — firewall rules,
-alerting, ongoing ops — is in [docs/DEPLOY.md](docs/DEPLOY.md).
+**Public internet.** Use a dedicated throwaway host, move your admin SSH off port 22 first, and never reuse production keys. Scanners arrive within minutes.
 
-Already collecting? [`scripts/attack_report.py`](scripts/attack_report.py) turns a live
-database into publishable campaign statistics:
-
-```bash
-uv run python scripts/attack_report.py --days 30 --format markdown
-```
+**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification. `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and writes headline numbers, ATT&CK techniques, top-source journeys, campaigns, fingerprint clusters and report/STIX/blocklist exports to `<workdir>/reports/` ([DEPLOY.md](docs/DEPLOY.md), step 13). For a live database, `scripts/attack_report.py --days 30 --format markdown` writes campaign statistics.
 
 ---
 
 ## MCP tools
 
 <details>
-<summary><b>Honeypots</b> — deploy, lifecycle, health</summary>
+<summary><b>Honeypots</b>: deploy, lifecycle, health</summary>
 
 | Tool | Description |
 |---|---|
-| `deception_plan` | **Describe an environment, get a coherent deployment plan** — conflict-free ports, consistent identities, tokens tied to sensors that can detect them |
+| `deception_plan` | **Describe an environment, get a coherent deployment plan**: conflict-free ports, consistent identities, tokens tied to sensors that can detect them |
 | `deception_deploy_plan` | Bring a plan up atomically, rolling back everything on failure |
 | `deception_coverage` | What the live deployment detects per ATT&CK tactic, and the ranked blind spots |
-| `soc_brief` | Shift handover — what needs a human, separated from the background radiation |
+| `soc_brief` | Shift handover: what needs a human, separated from the background radiation |
 | `honeypot_deploy` | Deploy any of the 25 engine types |
 | `honeypot_stop` | Stop one, several by name, or every honeypot matching a type/status filter |
 | `honeypot_list` / `honeypot_status` | List all / detail + recent events for one |
 | `honeypot_pause` / `honeypot_resume` | Lifecycle control |
 | `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |
-| `honeypot_health` | Probe ports/containers — catches silent deaths |
-| `honeypot_self_test` | End-to-end pipeline check: synthetic probe → alert in DB |
+| `honeypot_health` | Probe ports/containers; catches silent deaths |
+| `honeypot_self_test` | End-to-end pipeline check: synthetic probe, alert in DB |
 
 </details>
 
 <details>
-<summary><b>Honeytokens</b> — generate, plant, track</summary>
+<summary><b>Honeytokens</b>: generate, plant, track</summary>
 
 | Tool | Description |
 |---|---|
@@ -356,13 +322,13 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 </details>
 
 <details>
-<summary><b>Alerts</b> — triage, search, export</summary>
+<summary><b>Alerts</b>: triage, search, export</summary>
 
 | Tool | Description |
 |---|---|
-| `alerts_recent` | Triage by time window, severity, IP, or honeypot — returns a compact digest per alert |
-| `alerts_get` | Full captured payload for one alert (headers, decoded bodies, enrichment) |
-| `alerts_search` | Find alerts by payload content — a command, username, path, User-Agent, or hash |
+| `alerts_recent` | Triage by time window, severity, IP, or honeypot; a compact digest per alert |
+| `alerts_get` | Full captured payload for one alert |
+| `alerts_search` | Find alerts by payload content: a command, username, path, User-Agent, or hash |
 | `alerts_stats` | Totals by severity, top attacker IPs, top event types, optionally windowed |
 | `alerts_acknowledge` | Triage in bulk with a disposition (true/false positive, benign), note and analyst |
 | `alerts_export` / `alerts_prune` | Write JSON/CSV to disk, retention |
@@ -371,43 +337,43 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 </details>
 
 <details>
-<summary><b>Analysis</b> — enrichment, profiling, reporting</summary>
+<summary><b>Analysis</b>: enrichment, profiling, reporting</summary>
 
 | Tool | Description |
 |---|---|
 | `enrich_ip` | VirusTotal + AbuseIPDB + GeoIP, plus GreyNoise / abuse.ch / OTX / Shodan InternetDB when configured; parallel and cached |
-| `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile + risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline (exact totals, bounded sample — safe on an attacker with 100k+ events) |
-| `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH) — the same tooling behind many IPs is one operator |
+| `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile + risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline (exact totals, bounded sample; safe on an attacker with 100k+ events) |
+| `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH); the same tooling behind many IPs is one operator |
 | `analyze_campaign` / `map_ttps` / `threat_timeline` | Campaign correlation, MITRE mapping, chronological timeline |
 | `generate_report` | Write an XSS-safe HTML or Markdown report to disk |
 | `export_blocklist` / `export_stix` | Write iptables/fail2ban/CIDR list or a STIX 2.1 bundle to disk |
 | `report_ip_abuse` | Submit an attacker IP to AbuseIPDB |
 | `attack_summary` / `attack_navigator_layer` | Exact totals by tactic/technique for a window / an ATT&CK Navigator layer scored with the same counts |
-| `extract_iocs` / `lookup_hash` | Distinct URLs, hosts and file hashes from download and command payloads / MalwareBazaar lookup of a hash |
-| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, 15 s) — also the **Query** box on Grafana dashboard 04 |
+| `extract_iocs` / `lookup_hash` | Distinct URLs, hosts and file hashes from payloads / MalwareBazaar lookup of a hash |
+| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, 15 s); also the **Query** box on Grafana dashboard 04 |
 | `ping` | Server role (owner or read-only) and liveness |
 
 </details>
 
 <details>
-<summary><b>Integrations</b> — SIEM, suppression, blocklist push</summary>
+<summary><b>Integrations</b>: SIEM, suppression, blocklist push</summary>
 
 | Tool | Description |
 |---|---|
 | `alert_subscribe` / `alert_unsubscribe` / `alert_subscriptions_list` | SIEM, Slack, Teams and email delivery with health stats |
 | `suppression_add` / `suppression_remove` / `suppression_list` | Drop or rate-limit noise (exact IP / CIDR / event-type glob) |
 | `suppression_load_preset` / `suppression_list_presets` | Bundled presets: shodan, censys, internal-rfc1918 |
-| `blocklist_push_cloudflare` / `blocklist_push_pfsense` / `blocklist_push_aws_waf` | Push offenders to live appliances (idempotent, `dry_run`) |
+| `blocklist_push_cloudflare` / `blocklist_push_pfsense` / `blocklist_push_aws_waf` | Push offenders to live appliances (idempotent, `dry_run`); never run against a real service |
 
 </details>
 
 <details>
-<summary><b>Packet capture</b> — optional, off by default</summary>
+<summary><b>Packet capture</b>: optional, off by default</summary>
 
 | Tool | Description |
 |---|---|
-| `pcap_extract` | **One attacker's packets as a single file** — for Wireshark, or replay through Suricata/Zeek |
-| `pcap_status` | Running? Disk used? And if it isn't running, the actual reason plus the fix |
+| `pcap_extract` | **One attacker's packets as a single file** for Wireshark, or replay through Suricata/Zeek |
+| `pcap_status` | Running? Disk used? If not running, the actual reason plus the fix |
 | `pcap_files` | Ring contents and how far back the capture reaches |
 | `pcap_control` | Start / stop / restart (deploy and stop refresh the filter automatically) |
 
@@ -415,30 +381,25 @@ uv run python scripts/attack_report.py --days 30 --format markdown
 
 **MCP resources:** `honeypot://active` · `alerts://stream` · `honeytoken://triggered` · `stats://dashboard`
 
-**MCP prompts:** `shift_handover` · `investigate_ip` · `honeytoken_tripped` · `hunt_campaigns` · `deploy_deception` · `weekly_report` — ready-made workflows for the common jobs. Each tells the model that captured text was written by an attacker and that destructive actions need confirmation.
+**MCP prompts:** `shift_handover` · `investigate_ip` · `honeytoken_tripped` · `hunt_campaigns` · `deploy_deception` · `weekly_report`. Each tells the model that captured text was written by an attacker and that destructive actions need confirmation.
 
-**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification (the recorded sensors must not launch on your laptop). `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and writes the headline numbers, ATT&CK techniques, top-source journeys, campaigns, fingerprint clusters and report/STIX/blocklist exports to `<workdir>/reports/` ([DEPLOY.md](docs/DEPLOY.md), step 13).
-
-Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool that is not in it cannot register.
-
-**Two processes, one database.** The first server to start owns the sensors (an OS file lock beside the SQLite file). A second one — another chat session — starts read-only: it can query, triage and report, and refuses to deploy or stop, instead of fighting the owner and raising false "sensor dead" alerts. `ping` reports the role.
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register.
 
 ---
 
 ## SIEM integration
 
-`alert_subscribe(url=..., format=...)` picks the body shape and auth scheme. The
-`hmac_secret` field carries whatever credential that format needs:
+`alert_subscribe(url=..., format=...)` picks the body shape and auth scheme. `hmac_secret` carries whatever credential that format needs:
 
-| `format` | Body | `hmac_secret` is… |
+| `format` | Body | `hmac_secret` is |
 |---|---|---|
-| `json` (default) | native JSON envelope | HMAC key → `X-HoneyPot-Signature` |
-| `splunk_hec` | HEC `{time, host, sourcetype, event}` | HEC token → `Authorization: Splunk` |
-| `elastic_ecs` | ECS document, raw payload in `event.original` | API key → `Authorization: ApiKey` |
-| `cef` | ArcSight CEF line (QRadar-compatible) | — |
-| `syslog` | RFC 5424; `udp://host:514` or `tcp://host:514` | — |
-| `loki` | Loki push API, stringified-ns timestamps | `base64(userid:token)` → `Basic` |
-| `datadog` | Logs API v2 list | API key → `DD-API-KEY` |
+| `json` (default) | native JSON envelope | HMAC key, sent as `X-HoneyPot-Signature` |
+| `splunk_hec` | HEC `{time, host, sourcetype, event}` | HEC token, `Authorization: Splunk` |
+| `elastic_ecs` | ECS document, raw payload in `event.original` | API key, `Authorization: ApiKey` |
+| `cef` | ArcSight CEF line (QRadar-compatible) | n/a |
+| `syslog` | RFC 5424; `udp://host:514` or `tcp://host:514` | n/a |
+| `loki` | Loki push API, stringified-ns timestamps | `base64(userid:token)`, `Basic` |
+| `datadog` | Logs API v2 list | API key, `DD-API-KEY` |
 
 ```text
 > alert_subscribe(
@@ -448,9 +409,7 @@ Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorl
   )
 ```
 
-**Slack, Teams and email are first-class formats**, not raw JSON you have to shape
-yourself — severity-coloured, with the captured credentials, command or exploit
-category up front and honeytoken trips called out:
+**Slack, Teams and email are first-class formats**: severity-coloured, with captured credentials, command or exploit category up front and honeytoken trips called out.
 
 ```
 > alert_subscribe(url="https://hooks.slack.com/services/...",
@@ -460,24 +419,13 @@ category up front and honeytoken trips called out:
                   label="soc-mail", format="email", severity_threshold="critical")
 ```
 
-These three are **coalesced**: the same (event_type, source_ip) notifies at most
-once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed count carried
-on the next message. CRITICAL always goes through. One scanner produces thousands of
-events an hour, and a channel that relays them one-to-one gets muted — which is worse
-than no integration, because everyone then believes they are covered.
-
-For Discord / PagerDuty / SOAR, use the default `json` format — passing
-`hmac_secret=""` generates and returns a 32-byte signing secret. Check delivery health
-any time with `alert_subscriptions_list`.
+These three are **coalesced**: the same (event_type, source_ip) notifies at most once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed count carried on the next message. CRITICAL always goes through. For Discord / PagerDuty / SOAR use the default `json` format; `hmac_secret=""` generates and returns a 32-byte signing secret. Check delivery health with `alert_subscriptions_list`.
 
 ---
 
 ## Packet capture (optional)
 
-Per-event payloads capture what the engines *understood*. Three jobs need the bytes
-on the wire: carving a dropper's second stage out of a TCP stream, replaying real
-attacker traffic through Suricata or Zeek, and producing an artefact rather than an
-assertion by our own code when IR asks.
+Payloads capture what the engines *understood*; carving a dropper's second stage, replaying traffic through Suricata or Zeek, or handing IR an artefact needs the wire bytes.
 
 ```bash
 PCAP_ENABLED=true
@@ -490,103 +438,68 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # or run as root
 > pcap_files                                   # how far back the ring reaches
 ```
 
-`pcap_extract` is the point — a 1 GB ring buffer is not an answer to "what did this
-IP send". The capture filter is built from the deployed honeypot ports (so your own
-admin SSH session is never recorded) and refreshes automatically on deploy/stop.
-Disk is bounded by construction: `PCAP_FILE_MB × PCAP_FILES` is a ceiling tcpdump
-enforces itself.
+The capture filter is built from the deployed honeypot ports (your own admin SSH is never recorded) and refreshes on deploy/stop. Disk is bounded: `PCAP_FILE_MB × PCAP_FILES` is a ceiling tcpdump enforces itself.
 
 ---
 
 ## Cloud honeytokens (optional)
 
-Generated AWS/Azure/GCP credentials only fire if your cloud audit logs reach the canary
-server's HMAC-signed `/cloud-event` endpoint. Ready-to-deploy forwarders ship under
-[`examples/cloud-forwarders/`](examples/cloud-forwarders/) — AWS (Lambda + Terraform +
-EventBridge), Azure (Function App + Bicep), GCP (Cloud Function + Log Sink).
+Generated AWS/Azure/GCP credentials fire only if your cloud audit logs reach the canary server's HMAC-signed `/cloud-event` endpoint. Forwarders ship under [`examples/cloud-forwarders/`](examples/cloud-forwarders/): AWS (Lambda + Terraform + EventBridge), Azure (Function App + Bicep), GCP (Cloud Function + Log Sink).
 
 ```bash
 # .env
 CLOUD_EVENT_HMAC_SECRET=$(openssl rand -hex 32)
 ```
 
-Without a forwarder these are believable decoys with no callback. Said plainly in
-[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+Without a forwarder these are believable decoys with no callback ([KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)).
 
 ---
 
 ## Development
 
 ```bash
-uv run pytest tests/unit/ -v     # 2216 unit tests
+uv run pytest tests/unit/ -v
 uv run ruff check src/ tests/
 uv run mypy src/
 ```
 
-**PostgreSQL** for production — install the driver extra and swap the URL:
+**PostgreSQL:** `pip install -e ".[postgres]"` and `DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/honeypot`. CI runs the whole suite against a real PostgreSQL on every push.
 
-```bash
-pip install -e ".[postgres]"
-DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/honeypot
-```
-
-A CI job runs the whole suite against a real PostgreSQL on every push, so the
-"drop-in swap" claim stays true rather than aspirational.
-
-Schema changes are Alembic-managed and apply at startup:
-
-```bash
-uv run alembic revision --autogenerate -m "what changed"   # review before committing
-```
+Schema changes are Alembic-managed and apply at startup: `uv run alembic revision --autogenerate -m "what changed"` (review before committing).
 
 ```
 src/honeypot_mcp/
-├── server.py            — FastMCP app, lifespan, transports, MCP resources
-├── canary.py            — Callback server: canary URLs, PDF trackers, /cloud-event
-├── webhooks.py          — SIEM + Slack/Teams/email delivery worker (HMAC, retries,
-│                         coalescing for the human-facing channels)
-├── pcap.py              — Optional tcpdump ring buffer + per-attacker extract
-├── suppression.py       — Drop / rate-limit rule engine
-├── credential_match.py  — Planted-credential cross-reference (auto-CRITICAL)
-├── credential_verify.py — Hashed-auth verification (MySQL scramble, VNC DES)
-├── watchdog.py          — Health checks + opt-in retention sweep
-├── reconcile.py         — Re-establishes RUNNING honeypots after a restart
-├── engines/             — Honeypot engines (plugin ABC: HoneypotEngine)
-├── tokens/              — Honeytoken providers (plugin ABC: HoneytokenProvider)
-├── storage/             — Models, async DB layer, batched event buffer
-├── intel/               — VirusTotal, AbuseIPDB, GeoIP, MITRE, optional GreyNoise / abuse.ch / OTX / Shodan InternetDB (TTL-cached)
-├── analysis/            — Correlator, profiler, Jinja2 reporter
-└── tools/               — MCP tool modules
+├── server.py            FastMCP app, lifespan, transports, MCP resources
+├── canary.py            Callback server: canary URLs, PDF trackers, /cloud-event
+├── webhooks.py          SIEM + Slack/Teams/email delivery worker (HMAC, retries, coalescing)
+├── pcap.py              Optional tcpdump ring buffer + per-attacker extract
+├── suppression.py       Drop / rate-limit rule engine
+├── credential_match.py  Planted-credential cross-reference (auto-CRITICAL)
+├── credential_verify.py Hashed-auth verification (MySQL scramble, VNC DES)
+├── flood_guard.py       Per (source, event type) storage cap
+├── watchdog.py          Health checks + opt-in retention sweep
+├── reconcile.py         Re-establishes RUNNING honeypots after a restart
+├── engines/             Honeypot engines (plugin ABC: HoneypotEngine)
+├── tokens/              Honeytoken providers (plugin ABC: HoneytokenProvider)
+├── storage/             Models, async DB layer, batched event buffer, rollups
+├── intel/               VirusTotal, AbuseIPDB, GeoIP, MITRE, optional GreyNoise / abuse.ch / OTX / InternetDB
+├── analysis/            Correlator, profiler, Jinja2 reporter
+└── tools/               MCP tool modules
 ```
 
-Adding an engine or token type is a subclass plus one line in a registry —
-[CLAUDE.md](CLAUDE.md) documents both plugin patterns along with the event pipeline and
-persona systems.
+Adding an engine or token type is a subclass plus a registry line; [CLAUDE.md](CLAUDE.md) documents both plugin patterns, the event pipeline and the persona systems.
 
 ---
 
 ## What this is and isn't
 
-**Good fit:** SOC research and training labs, internal tripwire deception, small-to-medium
-alert pipelines, and collecting internet-scale automated attack traffic on a public IP.
+**Good fit:** SOC research and training labs, internal tripwire deception, small-to-medium alert pipelines, collecting internet-scale automated attack traffic on a public IP.
 
-**Not a fit without more work:** fooling a skilled human probing by hand. SSH is Cowrie
-and genuinely high-fidelity; the custom protocol engines are detection-focused facades,
-so an expert can eventually fingerprint them. For maximal fidelity across more protocols
-see [T-Pot](https://github.com/telekom-security/tpotce),
-[OpenCanary](https://github.com/thinkst/opencanary), or
-[Thinkst Canary](https://canary.tools/).
+**Not a fit without more work:** fooling a skilled human probing by hand. SSH is Cowrie and high-fidelity; the custom engines are detection-focused, so an expert can eventually fingerprint them. For fidelity across more protocols see [T-Pot](https://github.com/telekom-security/tpotce), [OpenCanary](https://github.com/thinkst/opencanary) or [Thinkst Canary](https://canary.tools/).
 
-The full rundown is in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+**Not verified:** GreyNoise enrichment and the pfSense, Cloudflare and AWS WAF push tools were never run against real services.
 
----
-
-## Contributing & security
-
-[CONTRIBUTING.md](CONTRIBUTING.md) covers setup and the non-obvious rules
-(engines never write to the database; tool responses are sized for a context
-window; Alembic revision ids must be ≤32 chars). Security issues go through
-[SECURITY.md](SECURITY.md) — privately, please, not a public issue.
+Full rundown: [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Security issues go privately through [SECURITY.md](SECURITY.md).
 
 ## License
 
