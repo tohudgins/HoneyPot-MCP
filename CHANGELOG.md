@@ -4,6 +4,33 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The operations console could not load on a real run; `sql_query` ignored its time limit
+
+**Rendering the console on the live droplet showed it never returned.** `/api/overview` did not answer in
+120 s for the 24 h window, nor in 100 s for 1 h or 6 h, on 17.6M alerts. It re-aggregated the raw table ten
+times per 5-second poll (one pass with a 48-branch `CASE` per row, one extracting JSON from every row for
+geography), which was fine for thousands of alerts. The same defect the MCP tools had before the rollups,
+left behind in the one component nobody had run at scale. It now reads the exact hourly rollups
+(`rollups.window`: whole hours from the rollups, partial edge hours raw) in one grouped pass, builds the
+chart from rollups (clock-aligned hour and 6-hour columns; sub-hour columns only for windows of two hours
+or less, by integer arithmetic in SQL), and reads geography from CRITICAL alerts only, the only ones that
+carry enrichment. Measured on the 17.5M-alert backup: 1 h 0.19 s, 6 h 0.53 s, 24 h 0.16 s, 7 d 0.61 s (it
+was 22 s for 7 d even after the first rewrite); live on the droplet 0.2 to 3 s. Every number is checked
+against a plain computation (`test_console_rollups.py`; three mutations caught), the chart total equals the
+headline count in every window, and 7 d equals the database's 17,539,280.
+
+**The last 22 s was one planner detail.** The CRITICAL lookup used the timestamp index and loaded every row
+in the window to test its severity (12.7 s for 7 days). A partial index (`ix_alerts_urgent`) exists for
+exactly this, but SQLite only uses a partial index when the query states its predicate as literal text;
+SQLAlchemy sends `.in_([...])` as bound parameters, which hides it. Emitting the predicate as literal SQL
+gives 0.47 s for the same 27,686 rows, and a test reads the real query plan so it cannot regress.
+
+**`sql_query` did not enforce its 15 s limit.** `asyncio.wait_for` cannot stop a SQLite scan running in
+aiosqlite's worker thread: a slow query ran 87 s and left the session in `PendingRollbackError`. The deadline
+is now a SQLite progress handler that aborts the statement itself; the same query now stops at 16.5 s with
+a clear message and the next query works. The Grafana engine panel also labels alerts from recreated
+sensors "(removed sensors)" instead of "null".
+
 ## Found by running it live: bait in the wrong home, `tail`, and a slow MalwareBazaar
 
 **The Cowrie bait was never visible to anyone.** It was written under the persona's own user

@@ -206,27 +206,31 @@ async def test_console_rejects_unknown_host_names(monkeypatch):
 async def test_console_feed_is_limited_but_stats_count_everything():
     from honeypot_mcp.console.server import _FEED_ROWS, _overview
 
-    await _seed(ip="203.0.113.5", n=_FEED_ROWS + 25, severity="low", country="Neverland")
+    # Enrichment (GeoIP) is stored on CRITICAL alerts only (event_buffer._enrich_ip), so the flood of
+    # routine alerts carries no country and the geography panel is built from the critical ones.
+    await _seed(ip="203.0.113.5", n=_FEED_ROWS + 25, severity="low", country=None)
+    await _seed(ip="203.0.113.6", n=7, severity="critical", country="Neverland")
     await _seed(ip="198.51.100.9", n=3, severity="critical", country="Atlantis")
     await _seed(ip="192.0.2.77", n=2, severity="high", country=None)
 
     data = await _overview(24)
     assert len(data["feed"]) == _FEED_ROWS
-    assert data["stats"]["events"] == _FEED_ROWS + 30
-    assert data["stats"]["unique_ips"] == 3
-    assert data["stats"]["critical"] == 3 and data["stats"]["high"] == 2
-    assert data["stats"]["untriaged"] == _FEED_ROWS + 30
+    assert data["stats"]["events"] == _FEED_ROWS + 37
+    assert data["stats"]["unique_ips"] == 4
+    assert data["stats"]["critical"] == 10 and data["stats"]["high"] == 2
+    assert data["stats"]["untriaged"] == _FEED_ROWS + 37
     points = data["series"]["points"]
     assert sum(p["routine"] for p in points) == _FEED_ROWS + 25
-    assert sum(p["serious"] for p in points) == 5
+    assert sum(p["serious"] for p in points) == 12
     assert data["top_countries"] == [
-        {"country": "Neverland", "hits": _FEED_ROWS + 25},
+        {"country": "Neverland", "hits": 7},
         {"country": "Atlantis", "hits": 3},
     ]
     attackers = {a["ip"]: a for a in data["top_attackers"]}
-    assert attackers["203.0.113.5"]["country"] == "Neverland"
+    assert attackers["203.0.113.6"]["country"] == "Neverland"
     assert attackers["198.51.100.9"]["country"] == "Atlantis"
     assert attackers["192.0.2.77"]["country"] is None
+    assert attackers["203.0.113.5"]["country"] is None, "never raised a critical, so never enriched"
     assert data["top_attackers"][0]["ip"] == "203.0.113.5"
 
 
