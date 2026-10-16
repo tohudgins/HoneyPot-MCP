@@ -69,6 +69,12 @@ Design points:
 
 Real run (the 116-hour droplet; the Grafana captures stop at 2026-10-16 10:00 UTC, about four hours before the end):
 
+![Grafana overview, real run](docs/screenshots/real-run/overview.png)
+<p align="center"><em>Real run: Grafana overview. 17.5M alerts and 3.3K sources in the window, the two flood windows on 12 October, and the per-engine split (the "(removed sensors)" slice is alerts from sensors that were recreated during the run). The top-attackers table is cropped out: it lists real addresses.</em></p>
+
+![Operations console, real run](docs/screenshots/real-run/operations-console.png)
+<p align="center"><em>Real run: the built-in operations console on the live droplet, 24 h window: 4,013,956 events, 913 attackers, 23 of 23 sensors up, 1 honeytoken triggered, and per-sensor counts. The attacker and live-feed panels are cropped out for the same reason.</em></p>
+
 ![Threat map, real run](docs/screenshots/real-run/threat-map.png)
 <p align="center"><em>Real run: Grafana threat map of attacker origins.</em></p>
 
