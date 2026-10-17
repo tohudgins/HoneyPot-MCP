@@ -174,13 +174,13 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 **Public internet.** Use a dedicated throwaway host, move your admin SSH off port 22 first, and never reuse production keys. Scanners arrive within minutes.
 
-**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification. Everything done in the [results](RESULTS.md) is available as MCP tools there: `run_analysis` for the whole post-run workflow, `attack_patterns` and `bait_trips` for what attackers did, `pcap_analyze` for capture files, `sql_query` for anything else, and `grafana_start` for dashboards. `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and calls `run_analysis` ([DEPLOY.md](DEPLOY.md), step 13). For a live database, `scripts/attack_report.py --days 30 --format markdown` writes campaign statistics.
+**Analysing a backup offline.** `ANALYSIS_MODE=true` opens a database without starting any sensor, capture, canary, watchdog or notification. Everything done in the [results](RESULTS.md) is available as MCP tools there: `run_analysis` for the whole post-run workflow, `attack_patterns` and `bait_trips` for what attackers did, `pcap_analyze` and `pcap_detect` for capture files, `sample_scan` for captured files, `sql_query` for anything else, and `grafana_start` for dashboards. `scripts/analyze_backup.py <backup-dir|db>` copies a backup, runs the server in that mode over real MCP stdio and calls `run_analysis` ([DEPLOY.md](DEPLOY.md), step 13). For a live database, `scripts/attack_report.py --days 30 --format markdown` writes campaign statistics.
 
 ---
 
 ## MCP tools
 
-78 tools in three roles (39 viewer, 26 operator, 13 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
+82 tools in three roles (39 viewer, 28 operator, 15 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
 
 ### Honeypots and deception planning
 
@@ -257,6 +257,8 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `pcap_status` | Running? Disk used? If not running, the actual reason plus the fix |
 | `pcap_files` | Ring files and written extracts (`kind`), sizes, and how far back the ring reaches |
 | `pcap_analyze` | **Read a capture back**: protocol and conversation digest, SIP/HTTP/DNS/SSH/TLS decoding, credentials, payload samples; works on extracts in `REPORTS_DIR` with capture off |
+| `pcap_detect` | **Replay a capture through Suricata or Zeek** in a throwaway sandbox container with no network; alerts, protocol logs and anomalies as a digest. Operator role |
+| `detection_rules_update` | Fetch and validate the Emerging Threats Open ruleset for `pcap_detect` (the only tool that gives a container network). Admin role |
 | `pcap_control` | Start, stop or restart (deploy and stop refresh the filter automatically) |
 
 ### Dashboards and backups
@@ -267,6 +269,13 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `grafana_status` / `grafana_stop` | Is it running, where, serving which database / stop and remove only the container this server started, plus its private files |
 | `database_backup` | Verified SQLite backup: online backup API (safe under WAL), integrity check, free-space check, 0600 file plus `MANIFEST.json` with alert count, sources, window and checksum, inside `BACKUP_DIR`. Admin role. PostgreSQL: use `pg_dump` |
 | `run_analysis` | The post-run workflow as one call: headline numbers, ATT&CK by tactic, the busiest sources' journeys, campaigns, SSH-client clusters, coverage and the report, STIX and blocklist exports, with `analysis-summary.md` written to `REPORTS_DIR`. A failing part is reported and the rest still lands |
+
+### Captured files
+
+| Tool | Description |
+|---|---|
+| `sample_collect` | Copy the downloads and terminal recordings out of the running SSH and Telnet sensors into a quarantine (SHA-256 names, mode 000, checksums). Admin role |
+| `sample_scan` | Hash, type and YARA-scan the quarantine without executing or altering it, with the capture context of each hash from the database |
 
 **MCP resources:** `honeypot://active` · `alerts://stream` · `honeytoken://triggered` · `stats://dashboard`
 
@@ -324,11 +333,20 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # or run as root
 > pcap_extract source_ip=203.0.113.44          # that attacker's packets, as one file
 > pcap_files                                   # ring files and the extracts already written, with sizes
 > pcap_analyze path=pcap-203.0.113.44-<stamp>.pcap   # decode an extract: protocols, SIP/HTTP/DNS/SSH detail, credentials
+> pcap_detect path=pcap-203.0.113.44-<stamp>.pcap engine=suricata   # what the ruleset says about it (run detection_rules_update first)
 ```
 
 The capture filter is built from the deployed honeypot ports (your own admin SSH is never recorded) and refreshes on deploy and stop. Disk is bounded: `PCAP_FILE_MB × PCAP_FILES` is a ceiling tcpdump enforces itself.
 
 `pcap_analyze` reads a capture file back as a bounded digest, in pure Python with no Wireshark dependency. It accepts classic pcap and pcapng (Ethernet, Linux cooked, raw IP and loopback framing; IPv4 and IPv6) and reports the capture window, per-port and per-conversation totals, TCP scan indicators, and what each protocol said: SIP methods, user agents and dialled numbers grouped by dial prefix, HTTP requests, DNS names, cleartext Telnet/FTP/POP3/IMAP/SMTP/Redis commands and credentials, SSH identification strings with HASSH, TLS ClientHello with SNI and JA3, plus a few clipped payload samples. It only opens files inside `REPORTS_DIR` or `PCAP_DIR` (no `..`, no symlink escapes), refuses files above `PCAP_ANALYZE_MAX_FILE_MB` (512), stops at `PCAP_ANALYZE_MAX_PACKETS` (2,000,000) and says so when it truncates. It works on a backup with `ANALYSIS_MODE=true`: put the extracts you want analysed in `REPORTS_DIR`.
+
+### Replaying a capture through Suricata or Zeek
+
+`pcap_detect path=<extract> engine=suricata|zeek` runs the real engine on a capture and returns a digest (Suricata alerts by signature, category and severity, protocol counts and engine statistics; or Zeek notices, anomalies, connection states and per-protocol logs for DNS, HTTP, SSH, SIP and TLS). The capture is hostile input, so each run is a throwaway container with no network, a read-only root filesystem, all capabilities dropped, no new privileges, a non-root user, memory, CPU and process limits and a hard timeout, and the capture mounted read-only from a private copy. The full parsed output is written to `REPORTS_DIR` and no payload bytes appear in the result. Only `detection_rules_update` (admin) ever gives a container network: it fetches the Emerging Threats Open ruleset into `DETECTION_RULES_DIR`, validates it with `suricata -T` and keeps the old rules if validation fails. Detection itself runs offline, and a `custom.rules` file in that directory is loaded too. Two practical notes: Suricata below 8 cannot read the Linux cooked (SLL2) captures that `tcpdump -i any` writes, so the image is pinned to 8; and Suricata reports a flood of "invalid checksum" alerts on packets captured on the host because of NIC checksum offload, which the tool sorts last and flags as `capture_artifact`. The first use pulls the engine image. Needs Docker; on Docker Desktop the system temp directory must be shared.
+
+### Scanning captured files with YARA
+
+Sensors keep what attackers drop. `sample_collect` (admin) copies Cowrie's downloads and terminal recordings out of the running SSH and Telnet containers into the quarantine (`SAMPLES_DIR`), named by SHA-256, mode 000, never overwriting, with `SHA256SUMS`; the archive from the container is treated as hostile (regular files only, size and count caps). Run it before redeploying, because the files live in the container. `sample_scan` (operator) then hashes, types and YARA-scans the quarantine without executing anything and without changing the originals, and joins each hash to what the database knows (distinct sources, first and last seen, written by the session or fetched from the network). It reports hits with rule family and severity and short clipped excerpts only, never raw bytes, and writes the full table to `REPORTS_DIR`. Bundled rules cover Mirai and Gafgyt droppers, IoT busybox and `echo -ne` droppers, UPX and static ELF loaders, miners, reverse shells, SSH key persistence, webshells and fetch-run-delete scripts; the harmless "write a script, run it, delete it" execution probe is flagged `info`. Add your own `*.yar` files in `YARA_RULES_DIR`; a rule that fails to compile is reported by file and line and does not disable the bundled ones. YARA is an optional extra: `pip install -e ".[forensics]"` (yara-python up to Python 3.13, yara-x on 3.14); without it the tool answers `available: false`. Pass a hash to `lookup_hash` for MalwareBazaar.
 
 ---
 

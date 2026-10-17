@@ -4,6 +4,37 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Suricata, Zeek and YARA on captured data
+
+**The docs said capture extracts could be replayed through Suricata or Zeek, and that captured files were
+worth scanning, but nothing did either.** Four tools (78 to 82) close that, all checked on the real run.
+
+- **`pcap_detect`** replays a capture through Suricata 8.0.7 or Zeek 8.0.10 in a sandbox container: no
+  network, read-only root, all capabilities dropped, no new privileges, non-root user, memory, CPU and
+  process limits, a hard timeout, the capture mounted read-only from a private copy, the container always
+  removed. Output is a digest (alerts by signature, protocol counts, Zeek notices and logs), never payload
+  bytes. **`detection_rules_update`** is the only tool that ever gives a container network: it fetches
+  Emerging Threats Open (69,171 rules, 53,211 enabled), validates it with `suricata -T`, and keeps the old
+  rules if validation fails. Both engines agree with `pcap_analyze` on the 18,050-packet SIP capture.
+- Findings that shaped it: **Suricata 7 decodes zero packets** from `tcpdump -i any` captures (Linux
+  cooked v2, link type 276), so the image is Suricata 8. **Replay was not deterministic** (flood-threshold
+  rules gave a different count each run) until the runmode was pinned to `single`. **7,276 of 7,286
+  alerts on the first SIP capture were "invalid checksum"** from NIC checksum offload, now sorted last and
+  labelled `capture_artifact`, which leaves the real signal at ten generic SIP flood alerts.
+- **`sample_scan`** hashes, types and YARA-scans the quarantine without executing or altering it, and
+  joins each hash to the database (sources, first and last seen, written by the session or fetched).
+  Bundled original rules cover Mirai and Gafgyt droppers, IoT busybox and `echo -ne` droppers, UPX and
+  static ELF loaders, miners, reverse shells, key persistence, webshells and fetch-run-delete scripts.
+  YARA is the optional `forensics` extra: yara-python up to Python 3.13 and yara-x on 3.14, which has no
+  yara-python wheel. On the real run it scanned 159 files in 0.17 s: no ELF binary, 46 rule hits of which
+  45 are terminal recordings matching typed commands, no Mirai, Gafgyt, miner or webshell match; originals
+  stayed mode 000 and matched `SHA256SUMS`.
+- **`sample_collect`** copies Cowrie's downloads and recordings out of running containers into the
+  quarantine (SHA-256 names, mode 000, hostile-archive handling). It needed one deliberate change to the
+  production Docker guard: `GET`/`HEAD` of exactly the two Cowrie capture directories (an exact-path
+  allowlist, still label-scoped), with tests that the host keys, config, parent and child paths and every
+  write stay denied.
+
 ## Every manual analysis step is now an MCP tool
 
 **Analysing the final run took a shell, `sqlite3`, `tcpdump` and a Grafana container; an MCP user could

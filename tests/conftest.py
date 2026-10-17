@@ -84,3 +84,6 @@ def _isolated_data_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "reports_dir", tmp_path / "reports")
     monkeypatch.setattr(settings, "backup_dir", tmp_path / "backups")
     monkeypatch.setattr(settings, "grafana_dir", tmp_path / "grafana")
+    monkeypatch.setattr(settings, "samples_dir", tmp_path / "samples")
+    monkeypatch.setattr(settings, "yara_rules_dir", tmp_path / "yara-rules")
+    monkeypatch.setattr(settings, "detection_rules_dir", tmp_path / "detection-rules")

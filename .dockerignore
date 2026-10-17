@@ -42,6 +42,7 @@ honeypot_mcp.db*
 tls/
 backups/
 grafana/
+detection-rules/
 
 # Documentation + tests — the runtime image doesn't need them
 docs/
@@ -64,3 +65,7 @@ config/mitre_attack.json
 # Scratch / reports — scripts/ is intentionally NOT excluded so the demo
 # seed script and ops helpers are available via `docker compose exec`.
 reports/
+
+# Captured malware quarantine and operator YARA rules: never part of an image.
+/samples/
+/yara-rules/

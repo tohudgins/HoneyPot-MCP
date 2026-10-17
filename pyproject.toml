@@ -89,6 +89,14 @@ dependencies = [
 postgres = [
     "asyncpg>=0.29.0",
 ]
+# YARA for `sample_scan`. yara-python publishes wheels for CPython 3.11-3.13 (macOS arm64/x86_64,
+# Linux x86_64/aarch64, Windows) but not 3.14, where it would have to compile from source, so
+# 3.14 gets yara-x (VirusTotal's Rust YARA, abi3 wheels for every platform and every Python).
+# `samples.load_backend` uses whichever imports; with neither, the tool answers `available: False`.
+forensics = [
+    "yara-python>=4.5.4; python_version < '3.14'",
+    "yara-x>=1.21.0; python_version >= '3.14'",
+]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
@@ -111,6 +119,9 @@ dev = [
     # The same for SMB2: impacket negotiates SMB2 and runs NTLM session setup, so the SMB
     # capture test exercises the server against a client we did not write.
     "impacket>=0.12",
+    # YARA engine for the sample_scan tests (see the `forensics` extra for the version split).
+    "yara-python>=4.5.4; python_version < '3.14'",
+    "yara-x>=1.21.0; python_version >= '3.14'",
 ]
 
 [project.urls]
@@ -135,6 +146,8 @@ artifacts = [
     # package (importlib.resources), and both compose files mount them from here too.
     "src/honeypot_mcp/grafana_assets/provisioning/**/*.yml",
     "src/honeypot_mcp/grafana_assets/dashboards/*.json",
+    # Bundled YARA rules: `sample_scan` loads them through importlib.resources.
+    "src/honeypot_mcp/yara_rules/*.yar",
 ]
 
 [tool.pytest.ini_options]

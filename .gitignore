@@ -70,6 +70,9 @@ backups/
 # Grafana working files written by the grafana_start tool (admin password, database view).
 grafana/
 
+# Suricata rules cache written by detection_rules_update (downloaded ruleset + custom.rules).
+detection-rules/
+
 # Packet captures — attacker traffic, potentially large, never committed.
 pcap/
 *.pcap
@@ -104,3 +107,8 @@ desktop.ini
 
 # Serena (MCP code-intelligence tool) per-developer cache
 .serena/
+
+# Captured malware quarantine (sample_scan / sample_collect) and operator-written YARA rules.
+# The quarantine holds live malware: it must never be committed or baked into an image.
+/samples/
+/yara-rules/

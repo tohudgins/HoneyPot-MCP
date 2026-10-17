@@ -187,6 +187,8 @@ The `friendly-scanner` user agent, which the engine names, is 26.4% of probes (2
 
 What the toll-fraud sources were doing is visible in the dialled strings. Each of the five heaviest sources keeps to one or two destination numbers (country codes 1, 44, 421 and 972 between them) and sends them behind many dial prefixes: `00`, `000`, `0011`, `9011`, `#0`, `*0`, `00+`, `~00` and combinations. One source used 275 different strings for one number; another 3. The pattern fits probing which outbound-route prefix a PBX accepts toward a number the caller controls, as international revenue-share fraud does [inference]. The packet captures of three toll-fraud sources show the same INVITEs on the wire, with the `pplsip`, `Linksys-SPA942` and `VOIP` user agents. Their destination numbers are third-party phone numbers and are not published here.
 
+Replaying the capture extracts through Suricata (`pcap_detect`, Suricata 8.0.7 with the Emerging Threats Open ruleset, 53,211 rules loaded) decodes all 18,050 packets of the first SIP file and agrees with `pcap_analyze` on the method counts (INVITE 4,195, ACK 3,495, REGISTER 3,084). The real signal is small: generic `GPL VOIP SIP 401 Unauthorized Flood` (26) and `INVITE message flooding` rules, and no sipvicious-style signature. 7,276 of its 7,286 alerts are "invalid checksum" artifacts, because the host's network card computes checksums after capture; the tool sorts them last and labels them. Zeek's `sip.log` gives the same INVITE and REGISTER counts and no ACK rows, since Zeek logs request and response pairs and an ACK has no response.
+
 ### 2.3 Credentials
 
 The SSH and Telnet sensors (Cowrie) accepted almost every login: Telnet accepted 291,298 from 358 sources and refused 3,727, SSH accepted 19,971 from 102 sources and refused 49. The only pairs ever refused were `root/root` and `root/123456` (both protocols) and `root` with no password (SSH, 4). The cause in the Cowrie configuration was not checked.
@@ -308,6 +310,8 @@ What did not trip: 33 of the 35 revoked tokens carry field-test labels (`ft...`,
 
 *Hashes: `payload.shasum` or `payload.sha256` of those five event types, operator's test address removed; `SELECT count(*) FROM alerts WHERE event_type='ssh_file_download'` is 1,175, with 21 distinct hashes.*
 
+A YARA scan of the quarantine (`sample_scan`, after the page above was first written; every original was left at mode 0000 and re-checked against `SHA256SUMS`) covers 159 files: 94 distinct hashes, 86 terminal recordings, 55 text files, 14 empty and 4 scripts, and **no ELF binary at all**. Among the files that survived (most were lost with the containers, see above) there is no malware binary, which fits closed egress and section 2.4: what the sensors kept is commands and script text [inference]. 46 files matched a bundled rule (droppers, echo-based droppers, IoT busybox chains, one reverse-shell one-liner with SSH key persistence), but 45 of those are Telnet terminal recordings, which match because the recording contains the commands typed in the session, not a downloaded file. No Mirai, Gafgyt, miner or webshell rule matched; the rules were not tuned to this data. Of the 159 files, 18 are linked to database events (15 uploaded by the client, 3 written by the session).
+
 ## 5. What live traffic taught us
 
 Each of these needed real traffic, a real client or a real backup; the unit suite did not catch them. Figures are the ones in `../CHANGELOG.md` and `FIELD_TEST.md`.
@@ -370,11 +374,11 @@ Everything on this page was first done by hand (SQL, `tcpdump`, a Grafana contai
 | 2.5 HTTP | "What did the web scanners ask for?" | `attack_patterns` `kind=http` |
 | 2.6 to 2.7 Container APIs, databases | "Show Docker API escape attempts" | `alerts_search`, `analyze_attacker_journey`, `sql_query` |
 | 3. Who used the bait | "Who used the planted credential and what did they do first?" | `bait_trips`, `honeytoken_list` |
-| 4. Captured artifacts | "Which hashes were captured? Is this one known malware?" | `attack_patterns` `kind=files`, `extract_iocs`, `lookup_hash` |
-| Packet captures | "Decode this capture" | `pcap_extract` (live ring), `pcap_files`, `pcap_analyze` |
+| 4. Captured artifacts | "Which hashes were captured? Is this one known malware? Does any rule match?" | `attack_patterns` `kind=files`, `extract_iocs`, `lookup_hash`, `sample_collect`, `sample_scan` |
+| Packet captures | "Decode this capture; what does Suricata or Zeek say about it?" | `pcap_extract` (live ring), `pcap_files`, `pcap_analyze`, `pcap_detect`, `detection_rules_update` |
 | Dashboards | "Put the dashboards on this database" | `grafana_start`, `grafana_status`, `grafana_stop` |
 | Backup | "Back the database up and verify it" | `database_backup` |
 
 These were checked against the database behind this page: `attack_patterns` returns 30,491 successful Telnet logins for the top pair, 1,152 executions of the `filter` script from 15 sources, 17,972 events for the top SSH fingerprint from 37 sources, and the top four sources' 70.41% share; `pcap_analyze` decodes the 12 MB SIP extracts in under a second and its packet counts equal `tcpdump`'s.
 
-Still outside the server, by design: deploying and hardening the host, fetching a backup from a remote machine over SSH (`scripts/fetch_backup.sh`), and the captured malware samples and terminal recordings, which live in the sensors' containers and are copied by that script into a quarantine directory. The field-test scripts attack the engines from outside, so they cannot be a tool.
+Still outside the server, by design: deploying and hardening the host, fetching a backup from a remote machine over SSH (`scripts/fetch_backup.sh`), and the terminal and download files on a sensor you no longer reach (`sample_collect` copies them out of running containers; once the container or host is gone so are they). The field-test scripts attack the engines from outside, so they cannot be a tool.

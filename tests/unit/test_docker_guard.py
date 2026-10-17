@@ -21,6 +21,10 @@ from unittest import mock
 
 import pytest
 
+# Before any honeypot_mcp import: importing the engines builds Settings, and without this the first
+# module of a run to do so creates ./honeypot_mcp.db in the working directory.
+os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
 from honeypot_mcp.engines.cowrie_fs import BASE_PICKLE_PATH, PERSONA_DIR
 from honeypot_mcp.engines.cowrie_limits import (
     COWRIE_IMAGE,
@@ -221,6 +225,10 @@ def test_empty_values_for_forbidden_settings_are_what_the_sdk_sends_and_are_acce
         ("PUT", f"/containers/abc123/archive?path={PERSONA_DIR}"),
         ("GET", f"/containers/abc123/archive?path={BASE_PICKLE_PATH}"),
         ("HEAD", f"/containers/abc123/archive?path={BASE_PICKLE_PATH}"),
+        ("GET", "/containers/abc123/archive?path=/cowrie/cowrie-git/var/lib/cowrie/downloads"),
+        ("GET", "/containers/abc123/archive?path=/cowrie/cowrie-git/var/lib/cowrie/tty"),
+        ("GET", "/containers/abc123/archive?path=/cowrie/var/lib/cowrie/downloads"),
+        ("HEAD", "/containers/abc123/archive?path=/cowrie/var/lib/cowrie/tty"),
         ("GET", f"/images/{COWRIE_IMAGE}/json"),
         ("GET", f"/v1.43/images/{COWRIE_IMAGE}/json"),
         ("POST", f"/images/create?fromImage={COWRIE_IMAGE}"),
@@ -311,6 +319,32 @@ def test_the_archive_endpoint_only_reads_and_writes_the_two_paths_the_engine_use
         check("PUT", f"/containers/abc/archive?path={BASE_PICKLE_PATH}", b"x")
     with pytest.raises(Denied):
         check("GET", f"/containers/abc/archive?path={PERSONA_DIR}", b"")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/cowrie/cowrie-git/var/lib/cowrie",
+        "/cowrie/cowrie-git/var/lib/cowrie/downloads/x",
+        "/cowrie/cowrie-git/var/lib/cowrie/downloads/../../../etc",
+        "/cowrie/cowrie-git/var/lib/cowrie/ssh_host_rsa_key",
+        "/cowrie/cowrie-git/etc",
+        "/cowrie/var/lib/cowrie/tty/",
+    ],
+)
+def test_the_capture_directories_are_readable_but_nothing_around_them(path):
+    """`sample_collect` copies the two directories out. The host keys that sit beside them, the
+    config and anything below or above must stay unreachable, and nothing may be written there."""
+    with pytest.raises(Denied):
+        check("GET", f"/containers/abc/archive?path={path}", b"")
+    with pytest.raises(Denied):
+        check("PUT", f"/containers/abc/archive?path={path}", b"x")
+
+
+def test_the_capture_directories_cannot_be_written_through_the_guard():
+    for path in ("/cowrie/cowrie-git/var/lib/cowrie/downloads", "/cowrie/var/lib/cowrie/tty"):
+        with pytest.raises(Denied):
+            check("PUT", f"/containers/abc/archive?path={path}", b"x")
 
 
 def test_an_oversized_archive_is_refused():

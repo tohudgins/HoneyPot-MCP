@@ -110,6 +110,12 @@ _FLAGS: dict[str, str] = {
     "honeytoken_rotate": "D",
     "pcap_control": "",
     "pcap_extract": "",
+    # Starts a throwaway container (no network) and writes one JSON Lines artifact; the first
+    # use pulls the engine image from a registry, hence open-world.
+    "pcap_detect": "W",
+    # Reads quarantined files (briefly granting itself read on mode-000 ones, then restoring the
+    # mode) and writes one new JSON artifact; runs no code and contacts nothing.
+    "sample_scan": "",
     # Writes new files into the reports directory (a fixed-name summary that is regenerated each
     # run, plus timestamped exports); calls threat-intel lookups for the busiest sources.
     "run_analysis": "W",
@@ -127,6 +133,9 @@ _FLAGS: dict[str, str] = {
     "audit_log_search": "R",
     # Writes a new directory under the backups directory and never replaces an existing one.
     "database_backup": "",
+    # Downloads the Emerging Threats Open ruleset (the only container with a network) and
+    # replaces the cached rules after Suricata has validated them.
+    "detection_rules_update": "W",
     "blocklist_push_aws_waf": "IW",
     "blocklist_push_cloudflare": "IW",
     "blocklist_push_pfsense": "IW",
@@ -134,6 +143,8 @@ _FLAGS: dict[str, str] = {
     # its own previous container.
     "grafana_start": "W",
     "grafana_stop": "DI",
+    # Adds new files to the quarantine and never overwrites; talks only to the local Docker daemon.
+    "sample_collect": "",
 }
 
 _ACRONYMS = {

@@ -547,7 +547,8 @@ claude mcp add honeypot-analysis \
 | A question no tool anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300). Prefer `alert_rollups` for anything over the whole run. Grafana's **Query** dashboard takes SQL in its `sql` box. |
 | What attackers did, without SQL | `attack_patterns` with `kind` = `credentials`, `commands`, `files`, `clients`, `sip_dialling`, `http` or `concentration` (top logins, command shapes, dropped files, SSH client families, dial-prefix cycling, how concentrated the volume is) |
 | Who used a planted credential and what they did first | `bait_trips` |
-| What is in a packet capture | `pcap_analyze` (extracts in `REPORTS_DIR`; protocol and conversation digest, SIP/HTTP/DNS/SSH/TLS decoding, credentials), `pcap_files` |
+| What is in a packet capture | `pcap_analyze` (extracts in `REPORTS_DIR`; protocol and conversation digest, SIP/HTTP/DNS/SSH/TLS decoding, credentials), `pcap_files`; `pcap_detect` replays it through Suricata or Zeek in a sandbox container (run `detection_rules_update` first for the Suricata ruleset) |
+| What captured files contain | `sample_collect` (live server: copies downloads and terminal recordings out of the sensor containers into the quarantine), `sample_scan` (hash, type, YARA, capture context; needs `pip install -e ".[forensics]"`) |
 | The whole post-run workflow in one call | `run_analysis` (headline, ATT&CK table, busiest sources, campaigns, clusters, exports, `analysis-summary.md`) |
 | Dashboards on this database | `grafana_start` (loopback only, read-only datasource; the admin password goes to a file whose path is returned), `grafana_status`, `grafana_stop` |
 | A verified copy of the database | `database_backup` (online backup, integrity check, manifest, inside `BACKUP_DIR`; SQLite only) |

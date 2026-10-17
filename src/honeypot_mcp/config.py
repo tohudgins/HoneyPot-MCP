@@ -359,6 +359,51 @@ class Settings(BaseSettings):
     # 0 forbids copying altogether.
     grafana_max_copy_mb: int = 2048
 
+    # ── Captured samples (`sample_scan`, `sample_collect`) ───────────────────
+    # The quarantine: captured malware, one directory per sensor, laid out as
+    # `scripts/fetch_backup.sh --samples` lays it out (`<container>/downloads/<sha256>`,
+    # `<container>/tty/...`, `SHA256SUMS`). Files are kept mode 000 and are never executed.
+    # `sample_scan` reads nothing outside this directory and `sample_collect` writes nothing
+    # outside it. Created owner-only (0700) and gitignored.
+    samples_dir: Path = _PROJECT_ROOT / "samples"
+    # Operator-written YARA rules (`*.yar`/`*.yara`, top level only), loaded in addition to the
+    # bundled ones. A file that does not compile is reported by name and line and skipped; it
+    # never disables the other rules. Created owner-only (0700) and gitignored.
+    yara_rules_dir: Path = _PROJECT_ROOT / "yara-rules"
+    # Largest single sample `sample_scan` reads (it is held in memory while hashed and matched)
+    # and `sample_collect` keeps. Bigger files are reported as skipped, never silently ignored.
+    sample_max_mb: int = Field(default=64, ge=1, le=2048)
+    # Most files one `sample_scan` call opens; the result says when a directory held more.
+    sample_scan_max_files: int = Field(default=500, ge=1, le=20000)
+    # What one `sample_collect` call accepts from a container it does not trust: members and
+    # bytes. Whatever is over either cap is reported, not copied.
+    sample_collect_max_files: int = Field(default=2000, ge=1, le=100000)
+    sample_collect_max_total_mb: int = Field(default=512, ge=1, le=16384)
+
+    # ── Replaying a capture through Suricata or Zeek (`pcap_detect`) ─────────
+    # The capture is hostile input, so each engine runs in a sandboxed container (no network,
+    # read-only root filesystem, every capability dropped). Images are pinned by tag; both are
+    # published for amd64 and arm64 and read SLL2 ("cooked v2") captures, which is what
+    # tcpdump produces on `-i any` (Suricata before 8 cannot read them).
+    detection_suricata_image: str = "jasonish/suricata:8.0.7"
+    detection_zeek_image: str = "zeek/zeek:8.0.10"
+    # Hard wall-clock limit for one engine run (and for one rules update). The container is
+    # killed and removed when it is exceeded.
+    detection_timeout_seconds: int = Field(default=300, ge=10, le=3600)
+    # Memory limit of the engine container (swap disabled). Suricata with the full Emerging
+    # Threats Open ruleset is the large one; Zeek needs far less.
+    detection_memory_mb: int = Field(default=2048, ge=256)
+    detection_cpus: float = Field(default=2.0, gt=0, le=64)
+    # Largest capture `pcap_detect` stages into a container.
+    detection_max_pcap_mb: int = Field(default=256, ge=1)
+    # The engine's output directory is watched while it runs and the container is killed
+    # when it grows past this, so a crafted capture cannot fill the disk.
+    detection_max_output_mb: int = Field(default=512, ge=1)
+    # Rules cache written by `detection_rules_update` and read (offline) by `pcap_detect`:
+    # `suricata.rules` + `classification.config` from Emerging Threats Open, and an optional
+    # operator-written `custom.rules` that is loaded alongside. Created owner-only.
+    detection_rules_dir: Path = _PROJECT_ROOT / "detection-rules"
+
     # ── Control plane / delivery hardening (slice C1) ───────────────────────
     # Webhook/syslog/SMTP destinations are validated at subscribe AND delivery
     # time. Link-local (cloud metadata), unspecified, multicast and reserved
@@ -461,6 +506,9 @@ class Settings(BaseSettings):
         "tls_dir",
         "backup_dir",
         "grafana_dir",
+        "samples_dir",
+        "yara_rules_dir",
+        "detection_rules_dir",
         mode="after",
     )
     @classmethod

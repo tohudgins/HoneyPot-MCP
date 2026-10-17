@@ -16,7 +16,8 @@ one of the handful of operations the SSH engine performs, with arguments the eng
   ports published, the engine's tmpfs mounts and one anonymous volume): no privileged mode, no
   host paths, no host namespaces, no devices, no other image;
 * start, stop, restart, kill, pause, unpause, inspect, read logs of, remove, and copy the
-  persona archive into/out of containers that carry that label, and no others;
+  persona archive into containers that carry that label, and read the base pickle and Cowrie's
+  two capture directories (`downloads`, `tty`) out of them, and no others;
 * list containers filtered to that label; pull the pinned image; ping and version.
 
 Everything else (exec, attach, networks, volumes, builds, `info`, events, other images, other
@@ -56,6 +57,7 @@ from honeypot_mcp.engines.cowrie_limits import (
     COWRIE_MEM_LIMIT_BYTES,
     COWRIE_NANO_CPUS,
     COWRIE_PIDS_LIMIT,
+    COWRIE_SAMPLE_DIRS,
     COWRIE_TELNET_PORT,
     COWRIE_TMPFS,
 )
@@ -404,8 +406,14 @@ def check(method: str, target: str, body: bytes = b"") -> Verdict:
                 if action == "kill" and (query.get("signal") or ["KILL"])[0] not in _SIGNALS:
                     raise Denied("signal not permitted")
                 if action == "archive":
-                    wanted = PERSONA_DIR if method == "PUT" else BASE_PICKLE_PATH
-                    if (query.get("path") or [""])[0] != wanted:
+                    # Written: the persona directory. Read: the base pickle (persona
+                    # construction) and Cowrie's two capture directories (`sample_collect`).
+                    permitted = (
+                        {PERSONA_DIR}
+                        if method == "PUT"
+                        else {BASE_PICKLE_PATH, *COWRIE_SAMPLE_DIRS}
+                    )
+                    if (query.get("path") or [""])[0] not in permitted:
                         raise Denied("archive path not permitted")
                     if method == "PUT" and len(body) > MAX_ARCHIVE_BODY:
                         raise Denied("request body too large", 413)

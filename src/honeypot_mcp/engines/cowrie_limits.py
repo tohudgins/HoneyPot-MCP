@@ -44,3 +44,10 @@ COWRIE_TMPFS = {
 # Ports Cowrie listens on inside the container, before any host publishing.
 COWRIE_INTERNAL_PORT = 2222
 COWRIE_TELNET_PORT = 2223
+# Where Cowrie keeps what attackers leave behind (`downloads/`, `tty/`), under either root: the
+# image's own state directory (an anonymous volume) or the path the compose stack mounts a
+# volume on. Read by `samples.collect` and allowed, read-only, by the Docker guard.
+COWRIE_STATE_DIRS = ("/cowrie/cowrie-git/var/lib/cowrie", "/cowrie/var/lib/cowrie")
+COWRIE_SAMPLE_DIRS = tuple(
+    f"{root}/{leaf}" for root in COWRIE_STATE_DIRS for leaf in ("downloads", "tty")
+)

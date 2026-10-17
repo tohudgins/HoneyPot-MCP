@@ -417,6 +417,8 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
         "deception_deploy_plan",
         "pcap_control",
         "pcap_extract",
+        "pcap_detect",
+        "sample_scan",
         "run_analysis",
         "export_blocklist",
         "export_stix",
@@ -434,10 +436,12 @@ ADMIN_TOOLS: frozenset[str] = frozenset(
         "blocklist_push_aws_waf",
         "audit_log_search",
         "database_backup",
+        "detection_rules_update",
         "api_key_create",
         "api_key_revoke",
         "api_key_list",
         "grafana_start",
         "grafana_stop",
+        "sample_collect",
     }
 )
