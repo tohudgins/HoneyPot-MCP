@@ -536,12 +536,14 @@ claude mcp add honeypot-analysis \
   -- /path/to/HoneyPot-MCP/.venv/bin/python -m honeypot_mcp.server
 ```
 
+In analysis mode every `since_hours` window ends at the newest alert in the database, not at the current time, so "the last 12 hours" of a week-old backup describes the end of the run instead of coming back empty; results say so (`window_anchor`). Enrichment keys come from the environment or the `.env` in the server's working directory, as on a live server; a missing one makes `enrich_ip` or `lookup_hash` report `available: false` for that provider (add `-e ABUSECH_AUTH_KEY=...` to the `claude mcp add` command, for example).
+
 | To answer | Tool |
 |---|---|
 | What happened, what needs triage | `soc_brief`, `alerts_stats`, `alerts_recent`, `alerts_search` |
 | Which ATT&CK techniques | `attack_summary` (whole run, by tactic, exact counts), `map_ttps` (an IP, event types or text), `deception_coverage` |
 | Who is this attacker, what did they do in order | `analyze_attacker`, `analyze_attacker_journey`, `analyze_session` |
-| Which sources act together | `analyze_campaign`, `fingerprint_clusters` (SSH client fingerprints) |
+| Which sources act together | `analyze_campaign` (ranked by a documented score, behavioural campaigns before connection sweeps, recurring windows of one botnet merged into one entry), `fingerprint_clusters` (SSH client fingerprints) |
 | Record a verdict | `alerts_acknowledge` (a source, an event type or ids; sets true/false positive) |
 | Hand it on | `generate_report` (markdown or html), `export_stix`, `export_blocklist`, `alerts_export` |
 | A question no tool anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300). Prefer `alert_rollups` for anything over the whole run. Grafana's **Query** dashboard takes SQL in its `sql` box. |

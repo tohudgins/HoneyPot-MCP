@@ -21,6 +21,7 @@ from honeypot_mcp.tools._format import (
     truncate_payload,
     write_artifact,
 )
+from honeypot_mcp.tools._window import annotate_window, window_bounds
 
 
 @mcp.tool(**hints("alerts_recent"))
@@ -65,11 +66,11 @@ async def alerts_recent(
                 return {"error": f"No honeypot named '{honeypot_name}' found."}
             honeypot_id = hp.id
 
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(
@@ -108,6 +109,7 @@ async def alerts_recent(
     result: dict[str, Any] = {"count": len(rows), "alerts": rows}
     if since is not None:
         result["window"] = f"last {since_hours}h (since {since.isoformat()})"
+        await annotate_window(result)
     if len(rows) == limit:
         result["note"] = (
             f"Hit the limit of {limit} — there may be more. Narrow with "
@@ -176,11 +178,11 @@ async def alerts_search(
         since_hours: Only search alerts from the last N hours. Omit for all time.
     """
     limit = max(1, min(limit, 200))
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
         alerts = await queries.search_alerts(session, query=query, limit=limit, since=since)
@@ -199,6 +201,9 @@ async def alerts_search(
         for a in alerts
     ]
     result: dict[str, Any] = {"query": query, "count": len(rows), "alerts": rows}
+    if since is not None:
+        result["window"] = f"last {since_hours}h (since {since.isoformat()})"
+        await annotate_window(result)
     if not rows:
         result["note"] = (
             "No matches. The search is a literal substring match — try a shorter "
@@ -218,16 +223,17 @@ async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
         since_hours: Restrict the stats to the last N hours (e.g. 24 for today's
               activity). Omit for all-time totals.
     """
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
-        stats = await queries.get_alert_stats(session, since=since)
+        stats = await queries.get_alert_stats(session, since=since, now=window_to)
     if since is not None:
         stats["window"] = f"last {since_hours}h (since {since.isoformat()})"
+        await annotate_window(stats)
     return stats
 
 
@@ -280,11 +286,11 @@ async def alerts_acknowledge(
 
     disp = AlertDisposition(disposition) if disposition else None
     sev = AlertSeverity(severity) if severity else None
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
 
     # `triaged_by` is shown on shift handover and by alerts_get, so it must be who
     # actually made the call. A networked caller is identified by its token; the
@@ -449,11 +455,11 @@ async def alerts_export(
     """
     limit = max(1, min(limit, 50_000))
     sev = AlertSeverity(severity) if severity else None
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=limit, severity=sev, since=since)
@@ -487,7 +493,7 @@ async def alerts_export(
     if "error" in written:
         return written
 
-    return {
+    exported: dict[str, Any] = {
         "path": written["path"],
         "format": format,
         "alerts_exported": len(rows),
@@ -497,6 +503,9 @@ async def alerts_export(
             for r in rows[:5]
         ],
     }
+    if since is not None:
+        await annotate_window(exported)
+    return exported
 
 
 @mcp.tool(auth=require_role("admin"), **hints("audit_log_search"))

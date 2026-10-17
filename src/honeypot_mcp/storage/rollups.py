@@ -168,9 +168,10 @@ async def stats(
     since: datetime | None = None,
     ip: str | None = None,
     top: int = 10,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Totals, unique sources, severity split, top sources and top event types for a window."""
-    w = window(since, ip)
+    w = window(since, ip, now)
     total = (await session.execute(select(func.coalesce(func.sum(w.c.n), 0)))).scalar_one()
     unique = (await session.execute(select(func.count(func.distinct(w.c.source_ip))))).scalar_one()
     severity = (
@@ -203,17 +204,20 @@ async def stats(
     }
 
 
-async def event_type_counts(session: AsyncSession, since: datetime | None = None) -> dict[str, int]:
+async def event_type_counts(
+    session: AsyncSession, since: datetime | None = None, now: datetime | None = None
+) -> dict[str, int]:
     """{event_type: alerts} for a window, every type (the stats call only returns the top N)."""
-    w = window(since)
+    w = window(since, now=now)
     rows = await session.execute(select(w.c.event_type, func.sum(w.c.n)).group_by(w.c.event_type))
     return {str(r[0]): int(r[1]) for r in rows.all()}
 
 
 async def campaign_rows(
     session: AsyncSession, since: datetime | None = None, limit: int = 500_001
-) -> list[tuple[datetime, str, str, int, int]]:
-    """(hour, event type, source, sensor id, alerts), exact at hour resolution, oldest first.
+) -> list[tuple[datetime, str, str, int, int, str]]:
+    """(hour, event type, source, sensor id, alerts, severity), exact at hour resolution, oldest
+    first. One event type recorded at two severities in an hour is two rows.
 
     A rollup row is written with every alert, so the current hour is included; `since` keeps the
     whole hours that contain or follow it."""
@@ -223,13 +227,21 @@ async def campaign_rows(
         AlertRollup.source_ip,
         AlertRollup.honeypot_id,
         func.sum(AlertRollup.count),
+        AlertRollup.severity,
     ).group_by(
-        AlertRollup.bucket, AlertRollup.event_type, AlertRollup.source_ip, AlertRollup.honeypot_id
+        AlertRollup.bucket,
+        AlertRollup.event_type,
+        AlertRollup.source_ip,
+        AlertRollup.honeypot_id,
+        AlertRollup.severity,
     )
     if since is not None:
         q = q.where(AlertRollup.bucket >= hour_floor(since))
     rows = await session.execute(q.order_by(AlertRollup.bucket).limit(limit))
-    return [(r[0], str(r[1]), str(r[2]), int(r[3]), int(r[4])) for r in rows.all()]
+    return [
+        (r[0], str(r[1]), str(r[2]), int(r[3]), int(r[4]), getattr(r[5], "value", str(r[5])))
+        for r in rows.all()
+    ]
 
 
 async def hit_counts(
@@ -263,9 +275,11 @@ async def acknowledged_by_severity(session: AsyncSession, since: datetime) -> di
     return {(r[0].value if hasattr(r[0], "value") else str(r[0])): int(r[1]) for r in rows}
 
 
-async def honeypot_ids(session: AsyncSession, since: datetime | None, ip: str | None) -> set[int]:
+async def honeypot_ids(
+    session: AsyncSession, since: datetime | None, ip: str | None, now: datetime | None = None
+) -> set[int]:
     """The sensors (ids) that recorded anything in the window, for one source or for all."""
-    w = window(since, ip)
+    w = window(since, ip, now)
     rows = await session.execute(select(w.c.honeypot_id).where(w.c.honeypot_id != 0).distinct())
     return {int(r[0]) for r in rows.all()}
 

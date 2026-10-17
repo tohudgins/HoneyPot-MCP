@@ -14,23 +14,34 @@ fetch: nothing here ever connects to an extracted URL.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._format import write_artifact
+from honeypot_mcp.tools._window import annotate_window, window_bounds
+from honeypot_mcp.tools.patterns import (
+    _expired,
+    _first_id_since,
+    _jv,
+    _scan_workers,
+    _slice_plan,
+)
 
 # ── extract_iocs ──────────────────────────────────────────────────────────────
 
@@ -55,15 +66,20 @@ _IOC_SUFFIXES = (
 )
 _IOC_EXACT = frozenset({"rdp_command", "redis_command", "mongodb_command"})
 
-# Rows read per call: newest first, streamed in small batches so a 64 KB HTTP body per row never
-# accumulates. When the candidate set is larger, the result says so.
-_SCAN_CAP = 20_000
+# Rows read per batch of a streamed (non-collapsed) type: small, so a 64 KB HTTP body per row never
+# accumulates in memory.
 _BATCH = 500
 # Distinct values tracked per category; past this new values are dropped (and the result says so).
 _MAX_DISTINCT = 20_000
 _MAX_LIMIT = 500
 _MAX_EXAMPLES = 3
 _SOURCE_SET_CAP = 1_000
+# Shell-command events of the Cowrie sensors (`ssh_command_input`, `telnet_command_input`) are flat
+# records whose only indicator-bearing fields are the typed command and its log line (`message`:
+# "CMD: <input>"). A busy sensor logs millions of near-identical lines, so the database collapses them
+# on these two fields (plus the source) and Python parses each distinct command once.
+_COLLAPSE_SUFFIX = "_command_input"
+_COLLAPSE_KEYS = ("input", "message")
 
 _MAX_TEXT_CHARS = 8_192  # of one string value that is scanned
 _MAX_NODES = 400  # per payload
@@ -217,17 +233,199 @@ class _Agg:
     event_types: Counter[str] = field(default_factory=Counter)
     names: set[str] = field(default_factory=set)
 
-    def add(self, when: datetime, source: str, event_type: str, names: set[str] | None) -> None:
-        self.alerts += 1
-        if self.first is None or when < self.first:
-            self.first = when
-        if self.last is None or when > self.last:
-            self.last = when
+    def add(
+        self,
+        count: int,
+        first: datetime,
+        last: datetime,
+        source: str,
+        event_type: str,
+        names: set[str] | None,
+    ) -> None:
+        """Count `count` alerts seen between `first` and `last` from one source."""
+        self.alerts += count
+        if self.first is None or first < self.first:
+            self.first = first
+        if self.last is None or last > self.last:
+            self.last = last
         if len(self.sources) < _SOURCE_SET_CAP:
             self.sources.setdefault(source)
-        self.event_types[event_type] += 1
+        self.event_types[event_type] += count
         if names and len(self.names) < 3:
             self.names.update(sorted(names)[: 3 - len(self.names)])
+
+
+@dataclass
+class _Tally:
+    """What reading one event type covered."""
+
+    in_scope: int
+    scanned: int = 0
+    oldest: datetime | None = None
+    complete: bool = True
+
+
+class _Collector:
+    """The indicators found so far, and how much of each event type has been read."""
+
+    def __init__(self, tallies: dict[str, _Tally]) -> None:
+        self.tallies = tallies
+        self.urls: dict[str, _Agg] = {}
+        self.hosts: dict[str, _Agg] = {}
+        self.hashes: dict[str, _Agg] = {}
+        self.distinct_capped = False
+
+    def take(
+        self,
+        event_type: str,
+        payload: Any,
+        source: str,
+        count: int,
+        first: datetime,
+        last: datetime,
+    ) -> None:
+        """Scan one payload standing for `count` alerts from `source` between `first` and `last`."""
+        tally = self.tallies[event_type]
+        tally.scanned += count
+        if tally.oldest is None or first < tally.oldest:
+            tally.oldest = first
+        found = scan_payload(event_type, payload)
+        for table, values in (
+            (self.urls, found.urls),
+            (self.hosts, found.hosts),
+            (self.hashes, found.hashes),
+        ):
+            for value in values:
+                agg = table.get(value)
+                if agg is None:
+                    if len(table) >= _MAX_DISTINCT:
+                        self.distinct_capped = True
+                        continue
+                    agg = table[value] = _Agg()
+                names = found.hashes.get(value) if table is self.hashes else None
+                agg.add(count, first, last, source, event_type, names)
+
+
+def _is_collapsible(event_type: str) -> bool:
+    return event_type.endswith(_COLLAPSE_SUFFIX)
+
+
+async def _read_collapsed_slice(
+    coll: _Collector,
+    event_type: str,
+    low_id: int,
+    after: int | None,
+    upto: int | None,
+    since: datetime | None,
+    gate: asyncio.Semaphore,
+    deadline: float,
+) -> bool:
+    """Read one id slice of a shell-command type with identical commands collapsed in the database.
+
+    The database returns one row per distinct (input, message, source) with its count and first/last
+    time, so a million repetitions of one dropper line cost one parse. True when the slice was read.
+    """
+    async with gate:
+        if _expired(deadline):
+            return False
+        cols = [
+            func.substr(_jv(key), 1, _MAX_TEXT_CHARS).label(f"d{i}")
+            for i, key in enumerate(_COLLAPSE_KEYS)
+        ]
+        conds = [Alert.event_type == event_type, Alert.id >= low_id]
+        if after is not None:
+            conds.append(Alert.id > after)
+        if upto is not None:
+            conds.append(Alert.id <= upto)
+        if since is not None:
+            conds.append(Alert.timestamp >= since)
+        stmt = (
+            select(
+                *cols,
+                Alert.source_ip,
+                func.count(),
+                func.min(Alert.timestamp),
+                func.max(Alert.timestamp),
+            )
+            .where(*conds)
+            .group_by(*cols, Alert.source_ip)
+        )
+        async with get_session() as session:
+            rows = (await session.execute(stmt)).all()
+    for *texts, source, count, first, last in rows:
+        payload = {k: v for k, v in zip(_COLLAPSE_KEYS, texts, strict=True) if isinstance(v, str)}
+        coll.take(event_type, payload, source, int(count), first, last)
+    return True
+
+
+async def _read_rows(
+    coll: _Collector,
+    event_type: str,
+    low_id: int,
+    since: datetime | None,
+    gate: asyncio.Semaphore,
+    deadline: float,
+) -> bool:
+    """Read every alert of a type newest first, a batch at a time. True when none was left unread."""
+    async with gate:
+        stmt = (
+            select(Alert.timestamp, Alert.source_ip, Alert.payload)
+            .where(Alert.event_type == event_type, Alert.id >= low_id)
+            .order_by(Alert.id.desc())
+            .execution_options(yield_per=_BATCH)
+        )
+        if since is not None:
+            stmt = stmt.where(Alert.timestamp >= since)
+        async with get_session() as session:
+            result = await session.stream(stmt)
+            try:
+                async for batch in result.partitions():
+                    if _expired(deadline):
+                        return False
+                    for when, source, payload in batch:
+                        coll.take(event_type, payload, source, 1, when, when)
+            finally:
+                await result.close()
+    return True
+
+
+async def _read_all(coll: _Collector, since: datetime | None, deadline: float) -> None:
+    """Read every candidate alert of `coll.tallies` until `deadline`, recording what was covered.
+
+    Small event types go first (they always finish, and are where the rare, high-value captures
+    live); within a type the newest alerts are read first, so a budget that runs out leaves the
+    oldest part unread and the tally says how far back the read got.
+    """
+    types = list(coll.tallies)
+    if not types:
+        return
+    low_id = 0
+    if since is not None:
+        first_id = await _first_id_since(since)
+        if first_id is None:
+            return
+        low_id = first_id
+
+    gate = asyncio.Semaphore(_scan_workers())
+    jobs: list[tuple[str, Any]] = []
+    for event_type in sorted(types, key=lambda t: coll.tallies[t].in_scope):
+        if _is_collapsible(event_type):
+            _total, slices = await _slice_plan(event_type, low_id, None)
+            jobs.extend(
+                (
+                    event_type,
+                    _read_collapsed_slice(
+                        coll, event_type, low_id, after, upto, since, gate, deadline
+                    ),
+                )
+                for after, upto in reversed(slices)
+            )
+        else:
+            jobs.append((event_type, _read_rows(coll, event_type, low_id, since, gate, deadline)))
+    outcomes = await asyncio.gather(*(job for _t, job in jobs))
+    for (event_type, _job), read in zip(jobs, outcomes, strict=True):
+        if not read:
+            coll.tallies[event_type].complete = False
 
 
 def _iso(moment: datetime | None) -> str | None:
@@ -262,10 +460,13 @@ async def extract_iocs(since_hours: float | None = None, limit: int = 50) -> dic
     Reads the payloads of download, upload, shell-command, exploit, container/pod and mail alerts
     and returns, for each distinct URL, host (domain, or public IP seen in a URL or command) and
     SHA-256 of a captured file: how many alerts carried it, first/last seen, how many sources and a
-    few example source IPs. The newest 20,000 candidate alerts are read; when more exist the
-    result says it was capped, and a smaller `since_hours` gives a complete answer. The values are
-    attacker-supplied data (never fetch or follow them); hashes of the FTP decoy's own files are
-    excluded. Use `lookup_hash` for a hash, `enrich_ip` for an IP.
+    few example source IPs. Every candidate alert is read: Telnet/SSH shell commands, which are
+    millions of near-identical lines on a busy sensor, are collapsed by the database before they
+    are parsed, so the whole run normally fits the `ioc_scan_seconds` budget (default 25). If it
+    does not, the newest alerts are read first and `scan` / `note` say exactly which part was not
+    read (`scan.complete`, `scan_capped`). The values are attacker-supplied data (never fetch or
+    follow them); hashes of the FTP decoy's own files are excluded. Use `lookup_hash` for a hash,
+    `enrich_ip` for an IP.
 
     Args:
         since_hours: Restrict to alerts from the last N hours. Omit for everything stored.
@@ -275,66 +476,76 @@ async def extract_iocs(since_hours: float | None = None, limit: int = 50) -> dic
         return {"error": "since_hours must be greater than 0."}
     if not 1 <= limit <= _MAX_LIMIT:
         return {"error": f"limit must be between 1 and {_MAX_LIMIT}."}
-    since = datetime.now(UTC) - timedelta(hours=since_hours) if since_hours is not None else None
+    budget = float(get_settings().ioc_scan_seconds)
+    started = time.monotonic()
+    deadline = started + budget
+    since, end = await window_bounds(since_hours) if since_hours is not None else (None, None)
 
     async with get_session() as session:
-        counts = await rollups.event_type_counts(session, since)
-        types = sorted(t for t in counts if _is_ioc_type(t))
-        candidate_total = sum(counts[t] for t in types)
-        urls: dict[str, _Agg] = {}
-        hosts: dict[str, _Agg] = {}
-        hashes: dict[str, _Agg] = {}
-        scanned = 0
-        distinct_capped = False
-        if types:
-            stmt = (
-                select(Alert.id, Alert.timestamp, Alert.source_ip, Alert.event_type, Alert.payload)
-                .where(Alert.event_type.in_(types))
-                .order_by(Alert.id.desc())
-                .limit(_SCAN_CAP)
-                .execution_options(yield_per=_BATCH)
-            )
-            if since is not None:
-                stmt = stmt.where(Alert.timestamp >= since)
-            result = await session.stream(stmt)
-            async for _id, when, source, event_type, payload in result:
-                scanned += 1
-                found = scan_payload(event_type, payload)
-                for table, values in (
-                    (urls, found.urls),
-                    (hosts, found.hosts),
-                    (hashes, found.hashes),
-                ):
-                    for value in values:
-                        agg = table.get(value)
-                        if agg is None:
-                            if len(table) >= _MAX_DISTINCT:
-                                distinct_capped = True
-                                continue
-                            agg = table[value] = _Agg()
-                        names = found.hashes.get(value) if table is hashes else None
-                        agg.add(when, source, event_type, names)
+        counts = await rollups.event_type_counts(session, since, end)
+    types = sorted(t for t in counts if _is_ioc_type(t))
+    candidate_total = sum(counts[t] for t in types)
+    coll = _Collector({t: _Tally(in_scope=counts[t]) for t in types})
+    await _read_all(coll, since, deadline)
 
-    scan_capped = scanned >= _SCAN_CAP and candidate_total > scanned
+    scanned = sum(t.scanned for t in coll.tallies.values())
+    unread = {t: tally for t, tally in coll.tallies.items() if not tally.complete}
+    seconds = round(time.monotonic() - started, 2)
+    scan_capped = bool(unread)
     notes = []
     if scan_capped:
-        notes.append(
-            f"Read the newest {scanned:,} of {candidate_total:,} candidate alerts; "
-            "narrow since_hours for a complete answer."
+        parts = ", ".join(
+            f"{t} (read {tally.scanned:,} of {tally.in_scope:,}, back to "
+            f"{_iso(tally.oldest) or 'nothing'})"
+            for t, tally in sorted(unread.items())
         )
-    if distinct_capped:
+        notes.append(
+            f"The {budget:g}s scan budget ran out after {scanned:,} of {candidate_total:,} candidate "
+            f"alerts, reading newest first. Not fully read: {parts}. Counts for those event types "
+            "are lower bounds for their older part. Raise ioc_scan_seconds, or narrow since_hours, "
+            "for an exact answer."
+        )
+    elif scanned < candidate_total:
+        notes.append(
+            f"{candidate_total - scanned:,} candidate alerts counted in the statistics are no longer "
+            "stored (pruned), so they could not be read."
+        )
+    if coll.distinct_capped:
         notes.append(f"More than {_MAX_DISTINCT:,} distinct values; rarer ones were not counted.")
-    return {
+    result: dict[str, Any] = {
         "window": f"last {since_hours}h" if since_hours is not None else "all time",
         "candidate_alerts": candidate_total,
         "scanned_alerts": scanned,
         "scan_capped": scan_capped,
-        "distinct": {"urls": len(urls), "hosts": len(hosts), "sha256": len(hashes)},
-        "urls": _rows(urls, limit),
-        "hosts": _rows(hosts, limit),
-        "sha256": _rows(hashes, limit, with_names=True),
+        "scan": {
+            "complete": not scan_capped and not coll.distinct_capped,
+            "events_scanned": scanned,
+            "events_in_scope": candidate_total,
+            "seconds": seconds,
+            "budget_seconds": budget,
+            "distinct_capped": coll.distinct_capped,
+            "not_fully_read": [
+                {
+                    "event_type": t,
+                    "events_scanned": tally.scanned,
+                    "events_in_scope": tally.in_scope,
+                    "read_back_to": _iso(tally.oldest),
+                }
+                for t, tally in sorted(unread.items())
+            ],
+            "order": "newest first" if scan_capped else None,
+        },
+        "distinct": {
+            "urls": len(coll.urls),
+            "hosts": len(coll.hosts),
+            "sha256": len(coll.hashes),
+        },
+        "urls": _rows(coll.urls, limit),
+        "hosts": _rows(coll.hosts, limit),
+        "sha256": _rows(coll.hashes, limit, with_names=True),
         "note": " ".join(notes) or None,
     }
+    return await annotate_window(result)
 
 
 # ── attack_navigator_layer ────────────────────────────────────────────────────
@@ -466,9 +677,9 @@ async def attack_navigator_layer(
     """
     if since_hours is not None and since_hours <= 0:
         return {"error": "since_hours must be greater than 0."}
-    since = datetime.now(UTC) - timedelta(hours=since_hours) if since_hours is not None else None
+    since, end = await window_bounds(since_hours) if since_hours is not None else (None, None)
     async with get_session() as session:
-        counts = await rollups.event_type_counts(session, since)
+        counts = await rollups.event_type_counts(session, since, end)
 
     window = f"last {since_hours:g}h" if since_hours is not None else "all time"
     layer, unmapped = await build_navigator_layer(counts, window)
@@ -481,17 +692,19 @@ async def attack_navigator_layer(
     if "error" in written:
         return written
     total = sum(counts.values())
-    return {
-        **written,
-        "window": window,
-        "techniques": len(layer["techniques"]),
-        "total_alerts": total,
-        "mapped_alerts": total - sum(unmapped.values()),
-        "unmapped": [
-            {"type": t, "alerts": n}
-            for t, n in sorted(unmapped.items(), key=lambda kv: -kv[1])[:10]
-        ],
-    }
+    return await annotate_window(
+        {
+            **written,
+            "window": window,
+            "techniques": len(layer["techniques"]),
+            "total_alerts": total,
+            "mapped_alerts": total - sum(unmapped.values()),
+            "unmapped": [
+                {"type": t, "alerts": n}
+                for t, n in sorted(unmapped.items(), key=lambda kv: -kv[1])[:10]
+            ],
+        }
+    )
 
 
 # ── lookup_hash ───────────────────────────────────────────────────────────────

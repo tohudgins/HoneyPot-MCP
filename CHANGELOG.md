@@ -4,6 +4,32 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Four blind spots found by using the tools on the real run
+
+**Calling the tools over MCP against the frozen 12 GB backup showed answers that were technically
+honest and practically wrong.** Each was fixed and checked on the same database.
+
+- **`extract_iocs` read 20,000 of 2,816,679 candidate alerts** and reported 17 URLs, 16 hosts and one
+  hash. It now reads every candidate in 6.7 s (152 URLs, 115 hosts, 31 hashes), because 2.79M of them are
+  Telnet commands with only 1,019 distinct (command, message) pairs: the scan groups identical commands in
+  SQL, parses each once and carries the count. It matches a brute-force oracle over all rows exactly. A
+  budget (`IOC_SCAN_SECONDS`) still applies and, when it ends a scan, the result names which event types
+  were not fully read and how far back it got.
+- **Windows were measured from the wall clock.** In analysis mode a backup is a frozen run, so a day-old
+  backup answered every "last N hours" question with nothing. Every windowed tool now ends its window at
+  the newest alert (`tools/_window.py`) and says so (`window_anchor`); a test fails the build if a tool
+  computes a window from the clock again (`alerts_prune` and `audit_log_search` are deliberate exceptions:
+  they work in real time). Live behaviour is unchanged.
+- **`analyze_campaign` buried the interesting campaigns.** 2,070 campaigns, mostly three-source sweeps, in
+  an order that put a 52-source Docker probe first. It now ranks by a documented score (behavioural before
+  connection sweeps, then severity, breadth, recurrence, duration, intensity) and merges recurring
+  windows of one event type with largely the same sources into one campaign: 2,609 windows became 783
+  campaigns, and the default top 10 shows seven event types where the top 50 used to be one botnet
+  repeating hourly.
+- **`deception_coverage` recommended DNS and SMTP sensors with no warning** that the project leaves both
+  off a public cloud host on purpose (open resolver and open relay). The recommendation, `deception_plan`
+  and `deception_deploy_plan` now carry that caution.
+
 ## Suricata, Zeek and YARA on captured data
 
 **The docs said capture extracts could be replayed through Suricata or Zeek, and that captured files were

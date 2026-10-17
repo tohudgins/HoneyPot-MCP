@@ -18,7 +18,6 @@ thinner way to call an API:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import select
@@ -42,6 +41,7 @@ from honeypot_mcp.storage.models import (
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import digest_payload
+from honeypot_mcp.tools._window import annotate_window, window_bounds
 
 
 @mcp.tool(**hints("deception_profiles"))
@@ -116,7 +116,9 @@ async def deception_plan(
 
     Review the `coherence` block with the user before deploying — it names the
     seams an attacker would notice, and any credential token that could never
-    fire. Then pass the returned plan to `deception_deploy_plan`.
+    fire — and any `caution` on a sensor (SMTP and DNS: leave them off a public
+    cloud VPS, where they look like an open relay and an open resolver). The
+    same text is in `warnings`. Then pass the returned plan to `deception_deploy_plan`.
 
     Args:
         profile: Environment shape. Call `deception_profiles` to see the options.
@@ -194,6 +196,7 @@ async def deception_deploy_plan(
     from honeypot_mcp.tools.honeytoken import honeytoken_create
 
     deployed: list[str] = []
+    deployed_types: dict[str, str] = {}
     created_tokens: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
 
@@ -217,6 +220,7 @@ async def deception_deploy_plan(
                 break
         else:
             deployed.append(str(name))
+            deployed_types[str(name)] = sensor_type
 
     rolled_back = False
     aborted = bool(failures and stop_on_error)
@@ -225,6 +229,7 @@ async def deception_deploy_plan(
             await honeypot_stop(name=name, remove=True)
         rolled_back = True
         deployed = []
+        deployed_types = {}
 
     # No tokens after a failed deployment, whether or not anything had been
     # deployed yet: a credential token whose target service has no sensor can
@@ -270,12 +275,18 @@ async def deception_deploy_plan(
         error="; ".join(f["error"] for f in failures) if failures else None,
     )
 
+    cautions = [
+        f"{name}: {BY_TYPE[sensor_type].public_cloud_caution}"
+        for name, sensor_type in deployed_types.items()
+        if BY_TYPE[sensor_type].public_cloud_caution
+    ]
     return {
         "deployed_sensors": deployed,
         "created_tokens": created_tokens,
         "failures": failures,
         "rolled_back": rolled_back,
         "status": "ok" if not failures else ("rolled_back" if rolled_back else "partial"),
+        **({"cautions": cautions} if cautions else {}),
         "next_step": (
             "Plant each token at its `plant_location`, then call `deception_coverage` "
             "to confirm what this now detects."
@@ -295,7 +306,11 @@ async def deception_coverage(include_recommendations: bool = True) -> dict[str, 
     actually be caught rather than what was intended.
 
     `blind_spots` names the cheapest concrete action that closes each gap,
-    ranked by how many new techniques it adds.
+    ranked by how many new techniques it adds. A recommendation for a sensor the
+    project advises against on a public cloud VPS (`dns`, `smtp`: they look like an
+    open resolver and an open relay to automated checks, and several providers'
+    acceptable-use policies prohibit both) carries a `caution` saying so; check
+    where the deployment runs before acting on it.
 
     Args:
         include_recommendations: Include the ranked blind-spot list.
@@ -344,10 +359,10 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         since_hours: Window to summarise. 12 covers a shift, 24 a day.
         max_highlights: Cap on individual items returned in `needs_attention`.
     """
-    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=since_hours)
+    cutoff, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
-        stats = await rollups.stats(session, cutoff, top=5)
+        stats = await rollups.stats(session, cutoff, top=5, now=window_to)
         totals = [(AlertSeverity(name), n) for name, n in stats["by_severity"].items()]
         unique_ips = stats["unique_source_ips"]
 
@@ -453,7 +468,7 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
             "all routine."
         )
 
-    return {
+    brief: dict[str, Any] = {
         "window_hours": since_hours,
         "headline": headline,
         "volume": {
@@ -495,3 +510,5 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
             "profile a source, and `alerts_acknowledge` to record a disposition once handled."
         ),
     }
+    await annotate_window(brief)
+    return brief

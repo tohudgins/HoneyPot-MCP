@@ -54,6 +54,7 @@ from honeypot_mcp.storage.models import (
 )
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._format import validate_ip
+from honeypot_mcp.tools._window import window_anchor, window_end
 
 Kind = Literal[
     "credentials", "commands", "files", "clients", "sip_dialling", "http", "concentration"
@@ -80,11 +81,17 @@ _CLIP = 200
 # ── window, budget and scan bookkeeping ───────────────────────────────────────
 
 
-def _window(since_hours: float | None) -> tuple[datetime | None, dict[str, Any], str | None]:
-    """`(since, window description, error)` for the caller's `since_hours`."""
-    now = datetime.now(UTC)
+async def _window(
+    since_hours: float | None,
+) -> tuple[datetime | None, dict[str, Any], str | None]:
+    """`(since, window description, error)` for the caller's `since_hours`.
+
+    The window ends at `window_end()`: now on a live server, the newest alert in analysis mode
+    (and the description then carries `window_anchor`)."""
+    now = await window_end()
+    anchor = await window_anchor() or {}
     if since_hours is None:
-        return None, {"since": None, "until": now.isoformat(), "hours": None}, None
+        return None, {"since": None, "until": now.isoformat(), "hours": None, **anchor}, None
     try:
         hours = float(since_hours)
     except (TypeError, ValueError):
@@ -92,7 +99,8 @@ def _window(since_hours: float | None) -> tuple[datetime | None, dict[str, Any],
     if not 0 < hours <= _MAX_WINDOW_HOURS or hours != hours:
         return None, {}, f"since_hours must be greater than 0 and at most {_MAX_WINDOW_HOURS}."
     since = now - timedelta(hours=hours)
-    return since, {"since": since.isoformat(), "until": now.isoformat(), "hours": hours}, None
+    described = {"since": since.isoformat(), "until": now.isoformat(), "hours": hours, **anchor}
+    return since, described, None
 
 
 def _hour_floor(moment: datetime) -> datetime:
@@ -1729,7 +1737,7 @@ async def attack_patterns(
     """
     if kind not in _KINDS:
         return {"error": f"kind must be one of: {', '.join(_KINDS)}."}
-    since, window, error = _window(since_hours)
+    since, window, error = await _window(since_hours)
     if error:
         return {"error": error}
     if source_ip is not None:
@@ -2064,7 +2072,7 @@ async def bait_trips(
         exclude_sources: Source addresses to leave out (your own test machines, scanners you triaged).
         lookback_hours: How far before a trip to read a source's activity (default 72, at most a year).
     """
-    since, window, error = _window(since_hours)
+    since, window, error = await _window(since_hours)
     if error:
         return {"error": error}
     if not isinstance(lookback_hours, int | float) or not 0 < lookback_hours <= 24 * 365:

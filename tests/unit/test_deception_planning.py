@@ -466,3 +466,164 @@ async def test_brief_note_does_not_claim_truncation_when_nothing_was_cut():
     brief = await soc_brief(since_hours=12, max_highlights=8)
     assert brief["needs_attention_total"] == brief["needs_attention_showing"] == 1
     assert "raise `max_highlights`" not in brief["note"]
+
+
+# ── Public-cloud caution: SMTP and DNS ───────────────────────────────────────
+#
+# The project leaves SMTP and DNS off a public cloud VPS (they look like an open relay and an open
+# resolver to automated checks, and several providers' acceptable-use policies prohibit both). The
+# blind-spot list used to say "deploy a `dns` sensor" with no caveat.
+
+
+async def _recommendations(deployed: list[str]) -> dict[str, dict]:
+    from honeypot_mcp.deception.coverage import build_coverage
+
+    result = await build_coverage(deployed, [])
+    return {
+        b["action"].split("`")[1]: b
+        for b in result["blind_spots"]
+        if not b.get("pinned") and "`" in b["action"]
+    }
+
+
+async def test_only_dns_and_smtp_carry_a_public_cloud_caution():
+    from honeypot_mcp.deception.capabilities import all_capabilities
+
+    cautioned = {c.type for c in all_capabilities() if c.public_cloud_caution}
+    assert cautioned == {"dns", "smtp"}
+    caps = {c.type: c for c in all_capabilities()}
+    assert "open DNS resolver" in (caps["dns"].public_cloud_caution or "")
+    assert "open mail relay" in (caps["smtp"].public_cloud_caution or "")
+    for cap in (caps["dns"], caps["smtp"]):
+        assert "acceptable-use" in (cap.public_cloud_caution or "")
+        assert "KNOWN_LIMITATIONS.md" in (cap.public_cloud_caution or "")
+
+
+async def test_blind_spot_recommendations_for_dns_and_smtp_carry_the_caution():
+    from honeypot_mcp.deception.capabilities import BY_TYPE
+
+    everything_else = [t for t in BY_TYPE if t not in ("dns", "smtp")]
+    recs = await _recommendations(everything_else)
+
+    assert set(recs) == {"dns", "smtp"}, "this deployment leaves exactly those two gaps"
+    assert recs["dns"]["caution"] == BY_TYPE["dns"].public_cloud_caution
+    assert recs["smtp"]["caution"] == BY_TYPE["smtp"].public_cloud_caution
+    assert "resolver" in recs["dns"]["caution"] and "relay" in recs["smtp"]["caution"]
+
+
+async def test_blind_spot_recommendations_for_other_sensors_carry_no_caution():
+    recs = await _recommendations(["ssh"])
+
+    assert {"kubernetes", "http", "docker_api", "nfs"} <= set(recs)
+    for sensor_type, rec in recs.items():
+        if sensor_type not in ("dns", "smtp"):
+            assert "caution" not in rec, sensor_type
+    pinned = (await _recommendations_raw(["ssh"]))[0]
+    assert pinned["pinned"] and "caution" not in pinned
+
+
+async def _recommendations_raw(deployed: list[str]) -> list[dict]:
+    from honeypot_mcp.deception.coverage import build_coverage
+
+    return (await build_coverage(deployed, []))["blind_spots"]
+
+
+async def test_the_caution_changes_no_coverage_number_and_no_ranking(monkeypatch):
+    """The caveat is advice about the recommendation, not a change to the measurement."""
+    import dataclasses
+
+    from honeypot_mcp.deception import capabilities
+    from honeypot_mcp.deception.coverage import build_coverage
+
+    deployed = ["ssh", "http", "smb", "rdp", "ldap", "mysql"]
+    with_caution = await build_coverage(deployed, ["credential"])
+    assert any("caution" in b for b in with_caution["blind_spots"])
+
+    stripped = tuple(
+        dataclasses.replace(c, public_cloud_caution=None) for c in capabilities._CAPABILITIES
+    )
+    monkeypatch.setattr(capabilities, "_CAPABILITIES", stripped)
+    for cap in stripped:
+        monkeypatch.setitem(capabilities.BY_TYPE, cap.type, cap)
+    without = await build_coverage(deployed, ["credential"])
+
+    assert not any("caution" in b for b in without["blind_spots"])
+    for key in ("techniques_covered", "tactics", "summary", "sensors_live", "tokens_live"):
+        assert with_caution[key] == without[key], key
+    assert [
+        {k: v for k, v in b.items() if k != "caution"} for b in with_caution["blind_spots"]
+    ] == without["blind_spots"]
+
+
+async def test_deception_coverage_tool_exposes_the_caution():
+    from honeypot_mcp.deception.capabilities import BY_TYPE
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
+    from honeypot_mcp.tools.deception import deception_coverage
+
+    async with get_session() as session:
+        for i, t in enumerate(t for t in BY_TYPE if t not in ("dns", "smtp")):
+            session.add(
+                Honeypot(
+                    name=f"hp-{t}",
+                    type=HoneypotType(t),
+                    port=40000 + i,
+                    status=HoneypotStatus.RUNNING,
+                    config={},
+                )
+            )
+
+    result = await deception_coverage()
+
+    cautions = {b["action"]: b["caution"] for b in result["blind_spots"] if "caution" in b}
+    assert set(cautions) == {"deploy a `dns` sensor", "deploy a `smtp` sensor"}
+
+
+async def test_plan_names_the_caution_where_it_places_dns_and_smtp():
+    from honeypot_mcp.deception.capabilities import BY_TYPE
+    from honeypot_mcp.deception.planner import build_plan
+
+    plan = build_plan(services=["ssh", "dns", "smtp"], identity_prefix="acme")
+
+    by_type = {s["type"]: s for s in plan["sensors"]}
+    assert by_type["dns"]["caution"] == BY_TYPE["dns"].public_cloud_caution
+    assert by_type["smtp"]["caution"] == BY_TYPE["smtp"].public_cloud_caution
+    assert "caution" not in by_type["ssh"]
+    assert len([w for w in plan["warnings"] if "cloud" in w]) == 2
+    assert any(w.startswith("DNS sensor 'acme-dns'") for w in plan["warnings"])
+    assert any(w.startswith("SMTP sensor 'acme-smtp'") for w in plan["warnings"])
+    # What is deployed is unchanged: both sensors are still planned, on their usual ports.
+    assert {t: by_type[t]["port"] for t in ("dns", "smtp")} == {"dns": 5353, "smtp": 2525}
+
+
+async def test_plan_without_dns_or_smtp_has_no_caution():
+    from honeypot_mcp.deception.planner import build_plan
+
+    plan = build_plan(services=["ssh", "http", "postgresql"])
+
+    assert not any("caution" in s for s in plan["sensors"])
+    assert plan["warnings"] == []
+
+
+async def test_deploy_plan_reports_the_caution_for_what_it_deployed(monkeypatch):
+    from honeypot_mcp.deception.capabilities import BY_TYPE
+    from honeypot_mcp.tools import honeypot as honeypot_tools
+    from honeypot_mcp.tools.deception import deception_deploy_plan
+
+    async def fake_deploy(**kwargs):
+        return {"name": kwargs["name"]}
+
+    monkeypatch.setattr(honeypot_tools, "honeypot_deploy", fake_deploy)
+
+    out = await deception_deploy_plan(
+        sensors=[
+            {"type": "ssh", "name": "acme-ssh", "port": 2222},
+            {"type": "dns", "name": "acme-dns", "port": 5353},
+        ]
+    )
+
+    assert out["status"] == "ok"
+    assert out["cautions"] == [f"acme-dns: {BY_TYPE['dns'].public_cloud_caution}"]
+
+    plain = await deception_deploy_plan(sensors=[{"type": "ssh", "name": "x-ssh", "port": 2223}])
+    assert "cautions" not in plain

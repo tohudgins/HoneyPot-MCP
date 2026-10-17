@@ -96,6 +96,7 @@ class PlannedSensor:
     config: dict[str, Any] = field(default_factory=dict)
     hostname: str = ""
     rationale: str = ""
+    caution: str | None = None
 
 
 @dataclass
@@ -232,8 +233,11 @@ def build_plan(
                 config=config,
                 hostname=hostname,
                 rationale=cap.summary,
+                caution=cap.public_cloud_caution,
             )
         )
+        if cap.public_cloud_caution:
+            warnings.append(f"{cap.display_name} sensor '{name}': {cap.public_cloud_caution}")
 
     tokens = _plan_tokens(sensors, prefix, resolved_domain) if include_tokens else []
     coherence = check_coherence(sensors, tokens)
@@ -254,6 +258,7 @@ def build_plan(
                 "hostname": s.hostname,
                 "detects": list(BY_TYPE[s.type].signature_events),
                 "rationale": s.rationale,
+                **({"caution": s.caution} if s.caution else {}),
             }
             for s in sensors
         ],

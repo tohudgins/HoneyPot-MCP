@@ -58,7 +58,25 @@ class EngineCapability:
     # a lone Windows box on an otherwise-Linux estate.
     pairs_well_with: tuple[str, ...] = ()
     notes: str = ""
+    # Why this sensor is better left off a public cloud VPS, or None. Set only where the project's
+    # own docs say so (KNOWN_LIMITATIONS.md "What to leave off a cloud VPS", docs/DEPLOY.md,
+    # docs/HARDENING.md). Coverage recommendations and plans carry it as `caution`, so advice to
+    # "deploy a dns sensor" is not given without the reason it is off in the recommended deployment.
+    public_cloud_caution: str | None = None
 
+
+_CLOUD_AUP = (
+    "Leave this off a public cloud VPS: to an automated {check} check it looks like {looks_like}, "
+    "and several cloud providers' acceptable-use policies prohibit that (nothing is ever "
+    "{action}, but the check cannot tell). Run it on a network you control, or accept the "
+    "provider risk deliberately. See KNOWN_LIMITATIONS.md, 'What to leave off a cloud VPS'."
+)
+_SMTP_CLOUD_CAUTION = _CLOUD_AUP.format(
+    check="relay", looks_like="an open mail relay", action="relayed"
+)
+_DNS_CLOUD_CAUTION = _CLOUD_AUP.format(
+    check="resolver", looks_like="an open DNS resolver", action="resolved"
+)
 
 _CAPABILITIES: tuple[EngineCapability, ...] = (
     EngineCapability(
@@ -149,6 +167,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         config_options=("fake_banner_hostname",),
         captures_credentials_as="smtp",
         notes="Also the trigger surface for db_row canary email addresses.",
+        public_cloud_caution=_SMTP_CLOUD_CAUTION,
     ),
     EngineCapability(
         type="ftp",
@@ -182,6 +201,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "dns_version_probe",
         ),
         config_options=("fake_soa", "zones"),
+        public_cloud_caution=_DNS_CLOUD_CAUTION,
     ),
     EngineCapability(
         type="rdp",

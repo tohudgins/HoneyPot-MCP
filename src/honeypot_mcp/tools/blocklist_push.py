@@ -44,6 +44,7 @@ from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
+from honeypot_mcp.tools._window import window_end
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -120,9 +121,10 @@ async def _offender_ips(hours: int, min_hits: int) -> tuple[list[str], int]:
     typo) cut off the operator's own infrastructure.
     """
     never = _never_push()
+    end = await window_end()
     async with get_session() as session:
         rows = await queries.get_top_offenders(
-            session, hours, min_hits, global_only=True, exclude_udp_only=True
+            session, hours, min_hits, global_only=True, exclude_udp_only=True, now=end
         )
     ips = [ip for ip, _cnt in rows]
     pushable = [ip for ip in ips if _pushable(ip, never)]

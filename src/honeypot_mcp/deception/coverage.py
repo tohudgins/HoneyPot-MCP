@@ -13,7 +13,11 @@ correct signal: an unmapped capture is invisible on the ATT&CK dashboard too.
 
 The gap list is deliberately actionable. "No Privilege Escalation coverage" is
 a fact; "deploy `docker_api` to cover T1611 Escape to Host" is a next step, and
-the difference is whether the report changes anything.
+the difference is whether the report changes anything. A next step that the
+project itself advises against is not advice: a recommendation for a sensor with a
+`public_cloud_caution` (SMTP and DNS, which look like an open relay and an open
+resolver) carries that reason as `caution`. The ranking is unchanged, since the
+coverage numbers are still true; the caveat is what the reader needs to act on them.
 """
 
 from __future__ import annotations
@@ -176,19 +180,22 @@ async def _recommend(
         new = [t for t in techniques if t["technique_id"] not in covered]
         if not new:
             continue
-        recommendations.append(
-            {
-                "action": f"deploy a `{capability.type}` sensor",
-                "adds_techniques": [
-                    {"id": t["technique_id"], "name": t["technique_name"], "tactic": t["tactic"]}
-                    for t in sorted(new, key=lambda t: t["technique_id"])
-                ],
-                "new_technique_count": len(new),
-                "tactics_opened": sorted({t["tactic"] for t in new}),
-                "why": capability.summary,
-                "command": f'honeypot_deploy(type="{capability.type}")',
-            }
-        )
+        recommendation: dict[str, Any] = {
+            "action": f"deploy a `{capability.type}` sensor",
+            "adds_techniques": [
+                {"id": t["technique_id"], "name": t["technique_name"], "tactic": t["tactic"]}
+                for t in sorted(new, key=lambda t: t["technique_id"])
+            ],
+            "new_technique_count": len(new),
+            "tactics_opened": sorted({t["tactic"] for t in new}),
+            "why": capability.summary,
+            "command": f'honeypot_deploy(type="{capability.type}")',
+        }
+        # Present only where the project's docs advise against deploying this on a public cloud VPS,
+        # so the recommendation is not given without the reason it is off in the recommended setup.
+        if capability.public_cloud_caution:
+            recommendation["caution"] = capability.public_cloud_caution
+        recommendations.append(recommendation)
 
     recommendations.sort(key=lambda r: r["new_technique_count"], reverse=True)
 

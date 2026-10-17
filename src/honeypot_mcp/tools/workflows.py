@@ -373,6 +373,8 @@ async def run_analysis(
             "campaigns": [
                 {
                     "event_type": c["event_type"],
+                    "kind": c["kind"],
+                    "score": c["score"],
                     "start_time": c["start_time"],
                     "duration_minutes": c["duration_minutes"],
                     "unique_source_ips": c["unique_source_ips"],
@@ -381,7 +383,7 @@ async def run_analysis(
                 for c in shown
             ],
             "note": (
-                f"Largest {len(shown)} of {campaigns['campaigns_total']} shown."
+                f"Top {len(shown)} of {campaigns['campaigns_total']} by score shown."
                 if campaigns["campaigns_total"] > len(shown)
                 else None
             ),

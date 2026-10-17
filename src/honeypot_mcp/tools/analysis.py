@@ -13,6 +13,7 @@ from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import validate_ip, write_artifact
+from honeypot_mcp.tools._window import annotate_window, window_bounds, window_end
 
 _MAX_ABUSE_COMMENT_CHARS = 500
 _MAX_REPORT_ALERTS = 1000
@@ -167,8 +168,8 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
     return profile
 
 
-# Most rollup rows the campaign tool will load. A row is one (hour, event type, source, sensor), so
-# this is far beyond any real run, but a bound that is reported beats one that is silent.
+# Most rollup rows the campaign tool will load. A row is one (hour, event type, source, sensor,
+# severity), so this is far beyond any real run, but a bound that is reported beats a silent one.
 _CAMPAIGN_ROW_CAP = 500_000
 
 
@@ -178,30 +179,71 @@ async def analyze_campaign(
     min_sources: int = 3,
     since_hours: float | None = None,
     limit: int = 50,
+    rank_by: Literal["score", "sources", "events", "recent"] = "score",
+    merge_recurring: bool = True,
 ) -> dict[str, Any]:
     """Detect coordinated attack campaigns: several source IPs hitting the same event type in the
-    same time window, across the whole run (or the last `since_hours`).
+    same time window, across the whole run (or the last `since_hours`), ranked.
 
     Built from the exact hourly rollups, so it covers every alert however many there are. Time
     resolution is therefore one hour: a window of `window_minutes` spans ceil(window/60) whole
     hours, and `start_time`/`end_time` are hour boundaries. (It used to read only the latest
     5,000 alerts, which on a flooded database is a few minutes of one source.)
 
+    One group of sources in one window is a *window*. A botnet that keeps coming back produces
+    one window per hour, so windows of the same event type are merged into one campaign when at
+    least half of a window's sources already took part in it (`merge_recurring`, default on). A
+    merged campaign reports `occurrences` (windows), `first_window`/`last_window`,
+    `sources_per_window` (median) and `max_sources_per_window`; `unique_source_ips` is the union
+    over all windows, `total_events` the sum, `start_time`/`end_time` the first window's start and
+    the last window's end, and `source_ips` lists at most 20 (the most persistent first, with
+    `source_ips_shown`). `campaigns_total` counts campaigns; `windows_total` counts the windows
+    they were built from, including windows whose sources were a subset of another's (merging
+    keeps their events and hours; `merge_recurring=false` drops them, so its `windows_total` is
+    smaller). `merge_recurring=false` returns every remaining window as its own campaign.
+
+    On a real run most campaigns are a few sources sweeping one service in the same hour, so the
+    default order is by `score`, which puts campaigns that *did* something first. Each campaign has:
+    `kind` - `behavioural` (commands, login/auth, exploit, container or file activity, anything
+    critical) or `sweep` (only connections, probes, handshakes); `severity` - the highest recorded
+    on the event type in the campaign's hours; `score` 0-100; `why` - one sentence; and
+    `score_breakdown` - the points per term. The score is a plain sum, nothing hidden:
+
+    - kind: 45 if behavioural, 0 if a sweep
+    - severity: low 0, medium 4, high 10, critical 15
+    - breadth: 3 * log2(distinct sources over all windows), at most 12 (16 sources)
+    - shared_types: 3 per *other* event type that at least half the sources also produced while
+      the campaign ran (`shared_event_types` lists them), at most 9
+    - duration: 1 per hour from the first window to the last, at most 4
+    - recurrence: 1.5 * log2(occurrences), at most 6 (16 windows)
+    - intensity: 2.25 * log10(events per source), at most 9 (10,000 per source)
+
+    So a behavioural campaign scores at least 45 and a sweep at most 50: three sources running
+    commands outrank hundreds opening connections. Use `rank_by="sources"` or `"events"` for size
+    orders, or `"recent"` for newest first (ties always fall back to score). Sources that
+    share an SSH client fingerprint are not used: that needs the alert payloads, which the
+    rollups do not hold; `fingerprint_clusters` answers it.
+
     Args:
         window_minutes: Time window to consider events correlated (default 60; hour resolution).
         min_sources: Minimum distinct source IPs to constitute a campaign (default 3).
         since_hours: Only look at the last N hours. Omit for the whole run.
-        limit: Most campaigns returned, largest first; `campaigns_total` says how many there are.
+        limit: Most campaigns returned, best first by `rank_by`; `campaigns_total` says how many
+            there are.
+        rank_by: `score` (default), `sources`, `events` or `recent`.
+        merge_recurring: Merge recurring windows of one event type into one campaign (default
+            true); false lists the raw windows.
     """
-    from datetime import timedelta
 
-    from honeypot_mcp.analysis.correlator import detect_campaigns, rolled_alerts
+    from honeypot_mcp.analysis.correlator import RANK_BY_VALUES, detect_campaigns, rolled_alerts
 
+    if rank_by not in RANK_BY_VALUES:
+        return {"error": f"rank_by must be one of {', '.join(RANK_BY_VALUES)}."}
     since = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, _ = await window_bounds(since_hours)
     hours = max(1, -(-window_minutes // 60))
     async with get_session() as session:
         rows = await rollups.campaign_rows(session, since, _CAMPAIGN_ROW_CAP + 1)
@@ -215,14 +257,26 @@ async def analyze_campaign(
         alerts=rolled_alerts(rows),
         window_minutes=(hours - 1) * 60,  # whole hours: items are hour-aligned
         min_sources=min_sources,
+        rank_by=rank_by,
+        merge_recurring=merge_recurring,
     )
-    return {
+    shown = max(0, min(len(found), limit))
+    result: dict[str, Any] = {
         "window": f"last {since_hours}h" if since_hours is not None else "whole run",
         "resolution": f"hourly: a window spans {hours} whole hour(s)",
+        "rank_by": rank_by,
+        "merge_recurring": merge_recurring,
         "campaigns_total": len(found),
-        "count": min(len(found), limit),
-        "campaigns": found[:limit],
+        "windows_total": sum(c["occurrences"] for c in found),
+        "count": shown,
+        "campaigns": found[:limit] if limit > 0 else [],
     }
+    if shown < len(found):
+        result["note"] = (
+            f"Showing the top {shown} of {len(found):,} campaigns by {rank_by}; "
+            "raise `limit` or change `rank_by` to see others."
+        )
+    return await annotate_window(result)
 
 
 @mcp.tool(**hints("map_ttps"))
@@ -273,17 +327,16 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
     Args:
         since_hours: Restrict to the last N hours. Omit for everything.
     """
-    from datetime import timedelta
 
     from honeypot_mcp.intel.mitre import TACTIC_ORDER, map_to_attack
 
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
     async with get_session() as session:
-        counts = await rollups.event_type_counts(session, since)
+        counts = await rollups.event_type_counts(session, since, now=window_to)
 
     techniques: dict[str, dict[str, Any]] = {}
     tactic_types: dict[str, dict[str, int]] = {}
@@ -336,7 +389,7 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
         )
     total = sum(counts.values())
     unmapped_total = sum(unmapped.values())
-    return {
+    summary: dict[str, Any] = {
         "window": f"last {since_hours}h" if since_hours is not None else "all time",
         "total_alerts": total,
         "mapped_alerts": total - unmapped_total,
@@ -352,6 +405,9 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
             "whose technique comes from the payload (use map_ttps with an ip for that)."
         ),
     }
+    if since_hours is not None:
+        await annotate_window(summary)
+    return summary
 
 
 @mcp.tool(**hints("generate_report"))
@@ -381,7 +437,6 @@ async def generate_report(
               `.html` / `.md` to match the format. An existing file is never overwritten.
               Defaults to `reports/report-<timestamp>.<ext>`.
     """
-    from datetime import timedelta
 
     from honeypot_mcp.analysis.reporter import generate
 
@@ -398,15 +453,15 @@ async def generate_report(
     if ip and (err := validate_ip(ip)):
         return {"error": err}
     ip = ip.strip() if ip else ip
-    since = None
+    since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
             return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+        since, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
         alerts = await queries.get_recent_alerts(session, limit=limit, source_ip=ip, since=since)
-        stats = await queries.get_alert_stats(session, since=since)
+        stats = await queries.get_alert_stats(session, since=since, now=window_to)
         totals, first_seen, last_seen = await _exact_totals(session, ip) if ip else ({}, None, None)
 
     # For an IP-scoped report, attach the full intelligence picture (geo/ASN/
@@ -468,7 +523,7 @@ async def generate_report(
         },
         target=ip or written["path"],
     )
-    return {
+    generated: dict[str, Any] = {
         **written,
         "title": title,
         "format": format,
@@ -478,6 +533,9 @@ async def generate_report(
         "unique_source_ips": stats.get("unique_source_ips"),
         "by_severity": stats.get("by_severity"),
     }
+    if since is not None:
+        await annotate_window(generated)
+    return generated
 
 
 # MITRE kill-chain order — used to lay out journey phases left-to-right.
@@ -583,8 +641,6 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
     ip = ip.strip()
     hours = max(1, min(hours, 24 * 365 * 5))
 
-    from datetime import datetime, timedelta
-
     from sqlalchemy import case, func, select
 
     from honeypot_mcp.intel.mitre import map_to_attack
@@ -596,7 +652,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         Honeytoken,
     )
 
-    since = datetime.now(UTC) - timedelta(hours=hours)
+    since, window_to = await window_bounds(hours)
     in_window = (Alert.source_ip == ip, Alert.timestamp >= since)
     severity_rank = case(
         (Alert.severity == AlertSeverity.CRITICAL, 3),
@@ -608,7 +664,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
     async with get_session() as session:
         # Exact totals come from the rollups and the edges from an index seek, so the cost does not
         # grow with how many rows a heavy attacker left behind.
-        exact = await rollups.stats(session, since, ip=ip, top=100)
+        exact = await rollups.stats(session, since, ip=ip, top=100, now=window_to)
         total = exact["total_alerts"]
         first_ts, last_ts = (
             await session.execute(
@@ -631,12 +687,14 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         total_events = total
 
         if not total and not token_events:
-            return {
-                "ip": ip,
-                "total_alerts": 0,
-                "total_events": 0,
-                "summary": f"No activity for {ip} in the last {hours}h.",
-            }
+            return await annotate_window(
+                {
+                    "ip": ip,
+                    "total_alerts": 0,
+                    "total_events": 0,
+                    "summary": f"No activity for {ip} in the last {hours}h.",
+                }
+            )
 
         sampled = total > _JOURNEY_DETAIL_LIMIT
         if not sampled:
@@ -666,7 +724,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
             alerts = sorted(picked.values(), key=lambda a: (a.timestamp, a.id))
 
         # Which honeypots, and which tokens, over the WHOLE window (not just the sample).
-        hp_ids = await rollups.honeypot_ids(session, since, ip)
+        hp_ids = await rollups.honeypot_ids(session, since, ip, now=window_to)
         honeypot_names: dict[int, str] = {}
         if hp_ids:
             hp_result = await session.execute(
@@ -862,7 +920,7 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
             f"{len(alerts)} (earliest, latest, most severe), and transitions come from "
             "that sample. Use alerts_recent / alerts_search with source_ip for raw events."
         )
-    return out
+    return await annotate_window(out)
 
 
 # Most rows the fingerprint tool will read from the window; it reports when it hit this.
@@ -891,7 +949,6 @@ async def fingerprint_clusters(
             use 1 to include every fingerprint).
         limit: Maximum clusters to return, largest first (default 15).
     """
-    from datetime import datetime, timedelta
 
     from sqlalchemy import select
 
@@ -899,7 +956,7 @@ async def fingerprint_clusters(
 
     hours = max(1, min(hours, 24 * 90))
     limit = max(1, min(limit, 100))
-    since = datetime.now(UTC) - timedelta(hours=hours)
+    since, _ = await window_bounds(hours)
 
     async with get_session() as session:
         kex = (
@@ -975,23 +1032,25 @@ async def fingerprint_clusters(
                 "kex_offer_start": offer[:3],
             }
         )
-    return {
-        "window_hours": hours,
-        "fingerprints_seen": len(clusters),
-        "clusters_matching": len(ranked),
-        "clusters": out_clusters,
-        "truncated": truncated,
-        "note": (
-            "Scan hit its row cap, so older activity in the window is missing."
-            if truncated
-            else (
-                None
-                if clusters
-                else "No SSH key-exchange fingerprints recorded in this window "
-                "(needs an SSH honeypot that has seen connections)."
-            )
-        ),
-    }
+    return await annotate_window(
+        {
+            "window_hours": hours,
+            "fingerprints_seen": len(clusters),
+            "clusters_matching": len(ranked),
+            "clusters": out_clusters,
+            "truncated": truncated,
+            "note": (
+                "Scan hit its row cap, so older activity in the window is missing."
+                if truncated
+                else (
+                    None
+                    if clusters
+                    else "No SSH key-exchange fingerprints recorded in this window "
+                    "(needs an SSH honeypot that has seen connections)."
+                )
+            ),
+        }
+    )
 
 
 @mcp.tool(**hints("analyze_session"))
@@ -1127,9 +1186,10 @@ async def export_blocklist(
         min_hits: Only include IPs with at least this many alerts (default 5).
         output_path: Where to write. Defaults to `reports/blocklist-<timestamp>.txt`.
     """
+    end = await window_end()
     async with get_session() as session:
         raw_offenders = await queries.get_top_offenders(
-            session, hours, min_hits, global_only=True, exclude_udp_only=True
+            session, hours, min_hits, global_only=True, exclude_udp_only=True, now=end
         )
     try:
         offenders = _usable_offenders(raw_offenders)
@@ -1163,14 +1223,16 @@ async def export_blocklist(
     written = write_artifact(content, prefix="blocklist", extension="txt", output_path=output_path)
     if "error" in written:
         return written
-    return {
-        **written,
-        "format": format,
-        "ip_count": len(offenders),
-        "window_hours": hours,
-        "min_hits": min_hits,
-        "top_offenders": [{"ip": str(addr), "hits": cnt} for addr, cnt in offenders[:10]],
-    }
+    return await annotate_window(
+        {
+            **written,
+            "format": format,
+            "ip_count": len(offenders),
+            "window_hours": hours,
+            "min_hits": min_hits,
+            "top_offenders": [{"ip": str(addr), "hits": cnt} for addr, cnt in offenders[:10]],
+        }
+    )
 
 
 @mcp.tool(auth=require_role("operator"), **hints("export_stix"))
@@ -1197,9 +1259,10 @@ async def export_stix(
     import uuid
     from datetime import datetime
 
+    end = await window_end()
     async with get_session() as session:
         raw_offenders = await queries.get_top_offenders(
-            session, hours, min_hits, global_only=True, exclude_udp_only=True
+            session, hours, min_hits, global_only=True, exclude_udp_only=True, now=end
         )
     try:
         offenders = _usable_offenders(raw_offenders)
@@ -1233,13 +1296,15 @@ async def export_stix(
     )
     if "error" in written:
         return written
-    return {
-        **written,
-        "bundle_id": bundle["id"],
-        "indicator_count": len(objects),
-        "window_hours": hours,
-        "min_hits": min_hits,
-    }
+    return await annotate_window(
+        {
+            **written,
+            "bundle_id": bundle["id"],
+            "indicator_count": len(objects),
+            "window_hours": hours,
+            "min_hits": min_hits,
+        }
+    )
 
 
 @mcp.tool(**hints("threat_timeline"))
@@ -1260,13 +1325,12 @@ async def threat_timeline(
               not the oldest — since recency is what a caller filtering to
               "the last N hours" almost always wants.
     """
-    from datetime import datetime, timedelta
 
     from sqlalchemy import select
 
     from honeypot_mcp.storage.models import Alert
 
-    since = datetime.now(UTC) - timedelta(hours=hours)
+    since, _ = await window_bounds(hours)
 
     async with get_session() as session:
         q = select(Alert).where(Alert.timestamp >= since)
@@ -1289,6 +1353,7 @@ async def threat_timeline(
         for a in alerts
     ]
     out: dict[str, Any] = {"count": len(events), "events": events, "window": f"last {hours}h"}
+    await annotate_window(out)
     if len(events) == limit:
         out["note"] = (
             f"Hit the limit of {limit} — there may be more (and older) events in "

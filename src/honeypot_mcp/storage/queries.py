@@ -205,7 +205,9 @@ async def acknowledge_alert(session: AsyncSession, alert_id: int) -> bool:
     return result.rowcount > 0  # type: ignore[attr-defined]
 
 
-async def get_alert_stats(session: AsyncSession, since: datetime | None = None) -> dict:
+async def get_alert_stats(
+    session: AsyncSession, since: datetime | None = None, now: datetime | None = None
+) -> dict:
     """Totals, unique sources, severity split, top sources and event types for a window.
 
     Read from the hourly rollups (plus the alert rows for the window's partial edges), so the cost
@@ -213,7 +215,7 @@ async def get_alert_stats(session: AsyncSession, since: datetime | None = None) 
     alerts: on the live VPS the same five aggregates over the alert table took 27 s all-time
     and over 100 s for one hour, at 4.9M rows.
     """
-    return await rollups.stats(session, since)
+    return await rollups.stats(session, since, now=now)
 
 
 # ── Honeytoken queries ────────────────────────────────────────────────────────
@@ -366,9 +368,10 @@ async def get_top_offenders(
     *,
     exclude_udp_only: bool = False,
     global_only: bool = False,
+    now: datetime | None = None,
 ) -> list[tuple[str, int]]:
     """Return [(ip, count), ...] for IPs with at least `min_hits` alerts in
-    the last `hours`. Used by export_blocklist and the blocklist pushes.
+    the last `hours` (ending at `now`, default the wall clock). Used by export_blocklist and the blocklist pushes.
 
     The result feeds firewalls, so two optional filters guard against blocking
     the wrong thing (both default off, preserving the plain behaviour):
@@ -385,8 +388,9 @@ async def get_top_offenders(
     """
     from datetime import timedelta
 
-    since = datetime.now(UTC) - timedelta(hours=hours)
-    w = rollups.window(since)
+    now = now or datetime.now(UTC)
+    since = now - timedelta(hours=hours)
+    w = rollups.window(since, now=now)
     result = await session.execute(
         select(w.c.source_ip, func.sum(w.c.n).label("c"))
         .group_by(w.c.source_ip)
@@ -410,7 +414,7 @@ async def get_top_offenders(
         from honeypot_mcp.deception.capabilities import source_is_spoofable
 
         candidates = {ip for ip, _ in offenders}
-        w = rollups.window(since)
+        w = rollups.window(since, now=now)
         rows = (
             await session.execute(
                 select(w.c.source_ip, Honeypot.type)

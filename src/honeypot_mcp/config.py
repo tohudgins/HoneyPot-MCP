@@ -320,6 +320,10 @@ class Settings(BaseSettings):
     # runs out, so a huge table gives a bounded answer instead of a hung call. Raise it for an
     # exact whole-run answer on a very large database.
     attack_patterns_time_budget_seconds: float = Field(default=12.0, ge=1, le=300)
+    # Wall-clock budget `extract_iocs` spends reading candidate alerts. Shell-command events are
+    # de-duplicated in the database, so the whole of a multi-million-row run normally fits; when it
+    # does not, the scan reads the newest events first and the result says how far back it got.
+    ioc_scan_seconds: float = Field(default=25.0, ge=1, le=300)
 
     # Live operations console — a read-only wall display served by the server
     # itself (see console/). Bound to localhost by default: it exposes every

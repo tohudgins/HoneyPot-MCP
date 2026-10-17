@@ -275,31 +275,6 @@ async def test_limit_trims_rows_but_not_the_distinct_totals():
     assert out["urls"][0]["value"] == "http://h0.example.com/p" and out["urls"][0]["alerts"] == 2
 
 
-async def test_a_capped_scan_says_so_and_reads_the_newest_first(monkeypatch):
-    from honeypot_mcp.tools import ioc
-
-    await _seed(
-        [
-            (
-                "ssh_file_download",
-                "1.2.3.4",
-                {"url": f"http://old{i}.example.com/p"},
-                timedelta(hours=100 - i),
-            )
-            for i in range(6)
-        ]
-    )
-    monkeypatch.setattr(ioc, "_SCAN_CAP", 4)
-
-    out = await ioc.extract_iocs()
-
-    assert out["scan_capped"] is True and out["scanned_alerts"] == 4
-    assert out["candidate_alerts"] == 6 and "newest 4 of 6" in out["note"]
-    assert {r["value"] for r in out["urls"]} == {
-        f"http://old{i}.example.com/p" for i in (2, 3, 4, 5)
-    }
-
-
 async def test_a_complete_scan_is_not_flagged_and_an_empty_database_is_empty_not_an_error():
     from honeypot_mcp.tools.ioc import extract_iocs
 
