@@ -142,9 +142,9 @@ The networked control plane can deploy honeypots and read everything they captur
 
 | Role | Tools | Can |
 |---|---|---|
-| `viewer` | 35 | read-only triage, analysis and reports |
-| `operator` | +25 | also deploy and stop honeypots, manage honeytokens, acknowledge alerts, run exports and packet capture (everything reversible and contained to this system's data) |
-| `admin` | +10 | also prune alerts, push to an external firewall or WAF, manage subscriptions, read the audit log, manage API keys |
+| `viewer` | 39 | read-only triage, analysis and reports |
+| `operator` | +28 | also deploy and stop honeypots, manage honeytokens, acknowledge alerts, run exports, packet capture, replay captures through Suricata or Zeek, scan captured files (everything reversible and contained to this system's data) |
+| `admin` | +15 | also prune alerts, push to an external firewall or WAF, manage subscriptions, read the audit log, manage API keys, start Grafana on the database, take backups, update detection rules, collect samples from the sensor containers |
 
 [`rbac.py`](../src/honeypot_mcp/rbac.py) lists which tool needs which role; [DEPLOY.md](DEPLOY.md) has the token format.
 

@@ -21,8 +21,8 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (2,200+ unit tests covering security-critical paths; about 6 minutes on 4 workers: `-n 4`)
-uv run pytest tests/unit/ -v
+# Tests (2,600+ unit tests covering security-critical paths; about 2 minutes on 4 workers: `-n 4`)
+uv run pytest tests/unit/ -n 4 -q
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
 uv run pytest tests/unit/ --cov=src/honeypot_mcp --cov-report=term-missing

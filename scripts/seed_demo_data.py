@@ -517,7 +517,9 @@ async def main() -> None:
             print(f"  inserted {inserted}/{len(alerts_to_insert)}")
 
     print(f"\nDone. {inserted} demo alerts inserted across {len(honeypot_specs)} honeypots.")
-    print("Open Grafana at http://localhost:3000 (admin / honeypot) to see the dashboards.")
+    print(
+        "Open Grafana at http://localhost:3000 (user admin, the GRAFANA_ADMIN_PASSWORD you set) to see the dashboards."
+    )
 
     await close_db()
 

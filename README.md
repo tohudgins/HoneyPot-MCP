@@ -58,18 +58,19 @@ The project was run on a public-IP VPS for about five days (116 hours). It store
 
 ## Get started
 
-A two-minute demo stack needs no API keys, no configuration and no MCP client:
+A two-minute demo stack needs Docker and one variable (the Grafana admin password, which has no default), no API keys and no MCP client:
 
 ```bash
 git clone https://github.com/tohudgins/HoneyPot-MCP.git
 cd HoneyPot-MCP/docker
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"   # required; echo it to log in
 docker compose up -d --build
 
 # Seed ~5,000 synthetic attack events across the last 24h
 docker compose exec honeypot-mcp python scripts/seed_demo_data.py
 
 open http://localhost:8090   # operations console
-open http://localhost:3000   # Grafana, admin / honeypot
+open http://localhost:3000   # Grafana: user admin, the password above
 ```
 
 This starts the server, a live Cowrie SSH honeypot on `:2222`, an HTTP honeypot on `:8080`, Prometheus and the Grafana dashboards. SSH into `localhost:2222` with any password and your session appears in the console within seconds.
