@@ -383,6 +383,9 @@ class Settings(BaseSettings):
     # bytes. Whatever is over either cap is reported, not copied.
     sample_collect_max_files: int = Field(default=2000, ge=1, le=100000)
     sample_collect_max_total_mb: int = Field(default=512, ge=1, le=16384)
+    # Wall-clock limit for one `sample_collect` call. The container is untrusted: without it a peer
+    # that streams slowly holds the collection lock and a worker thread for as long as it likes.
+    sample_collect_deadline_seconds: int = Field(default=300, ge=5, le=3600)
 
     # ── Replaying a capture through Suricata or Zeek (`pcap_detect`) ─────────
     # The capture is hostile input, so each engine runs in a sandboxed container (no network,

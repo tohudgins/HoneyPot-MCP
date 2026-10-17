@@ -688,6 +688,78 @@ async def test_oversize_output_kills_the_engine(docker_client, capture, monkeypa
     assert docker_client.store == []
 
 
+async def test_millions_of_empty_files_are_counted_not_ignored(docker_client, capture, monkeypatch):
+    """The watcher summed bytes only: files of 0 bytes cost nothing to it and everything to the
+    filesystem's inodes. Entries are bounded too."""
+    from honeypot_mcp import pcap_detect as module
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    monkeypatch.setattr(module, "_MAX_OUTPUT_ENTRIES", 200)
+
+    def spray(c):
+        docker_client._observe(c)
+        out = c.mounts["/out"][0]
+        for i in range(300):
+            (out / f"f{i}").touch()
+
+    docker_client.runner = spray
+    docker_client.hang = True
+
+    result = await pcap_detect(capture.name)
+
+    assert "more than 200 files and directories" in result["error"], result
+    assert docker_client.created[0].killed and docker_client.store == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list any directory")
+async def test_a_directory_the_host_cannot_read_ends_the_run(docker_client, capture):
+    """An engine runs as another user and can make a 0700 subdirectory; the watcher swallowed the
+    PermissionError, so whatever it held was never measured against the output limit."""
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    def hide(c):
+        docker_client._observe(c)
+        hidden = c.mounts["/out"][0] / "hidden"
+        hidden.mkdir()
+        (hidden / "huge.bin").write_bytes(b"x" * 1000)
+        hidden.chmod(0o000)
+
+    docker_client.runner = hide
+    docker_client.hang = True
+
+    result = await pcap_detect(capture.name)
+
+    assert "directory in its output that this server cannot read" in result["error"], result
+    assert docker_client.created[0].killed
+    assert not docker_client.seen[0]["root"].exists(), "the hidden directory must still be removed"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list any directory")
+def test_cleanup_removes_a_subdirectory_the_engine_left_unlistable(tmp_path):
+    """`rmtree(ignore_errors=True)` silently left the contents of a mode-000 directory on disk."""
+    from honeypot_mcp.pcap_detect import Staging
+
+    root = tmp_path / "work"
+    (root / "out" / "deep" / "deeper").mkdir(parents=True)
+    (root / "out" / "deep" / "deeper" / "f").write_bytes(b"x" * 100)
+    (root / "in").mkdir()
+    (root / "out" / "deep" / "deeper").chmod(0o000)
+    (root / "out" / "deep").chmod(0o500)
+    staging = Staging(root=root, in_dir=root / "in", out_dir=root / "out")
+
+    staging.cleanup()
+
+    assert not root.exists()
+
+
+def test_output_reason_prefers_the_byte_limit_then_entries(tmp_path):
+    from honeypot_mcp import pcap_detect as module
+
+    (tmp_path / "a").write_bytes(b"x" * 5000)
+    assert module._output_reason(tmp_path, 1 << 20) is None
+    assert module._output_reason(tmp_path, 100) == "output_limit"
+
+
 async def test_out_of_memory_is_reported_with_the_setting_to_raise(docker_client, capture):
     from honeypot_mcp.tools.detect import pcap_detect
 
@@ -1554,17 +1626,25 @@ def test_split_image():
     assert _split_image("zeek/zeek@sha256:" + "a" * 64) == ("zeek/zeek@sha256:" + "a" * 64, None)
 
 
-def test_dir_size_does_not_follow_symlinks(tmp_path):
-    from honeypot_mcp.pcap_detect import _dir_size
+def test_output_usage_does_not_follow_symlinks(tmp_path):
+    from honeypot_mcp.pcap_detect import _output_usage
 
-    (tmp_path / "a").write_bytes(b"x" * 100)
-    (tmp_path / "sub").mkdir()
-    (tmp_path / "sub" / "b").write_bytes(b"y" * 50)
-    big = tmp_path.parent / "big-outside.bin"
-    big.write_bytes(b"z" * 10_000)
-    (tmp_path / "link").symlink_to(big)
+    work = tmp_path / "w"
+    work.mkdir()
+    (work / "a").write_bytes(b"x" * 100)
+    (work / "sub").mkdir()
+    (work / "sub" / "b").write_bytes(b"y" * 50)
+    big = tmp_path / "big-outside.bin"
+    big.write_bytes(b"z" * 100_000)
+    (work / "link").symlink_to(big)
+    (work / "loop").symlink_to(work)
 
-    assert _dir_size(tmp_path, 1 << 20) < 1000
+    use = _output_usage(work, 1 << 20, 100)
+
+    assert use.nbytes < 50_000 and use.entries == 5 and use.unreadable == 0
+    assert _output_usage(work, 1 << 20, 3).entries == 4, (
+        "stops as soon as the entry limit is crossed"
+    )
 
 
 def test_capture_scan_reads_pcap_and_pcapng_headers(tmp_path):

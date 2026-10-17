@@ -212,3 +212,128 @@ def test_the_timeout_setting_defaults_to_15_and_is_validated_to_1_300():
     for bad in (0, -1, 301, 100_000):
         with pytest.raises(ValidationError):
             Settings(sql_query_timeout_seconds=bad)
+
+
+# --- resource bounds -------------------------------------------------------------------------------
+
+_SQLITE_ONLY = pytest.mark.skipif(
+    not os.environ["DATABASE_URL"].startswith("sqlite"),
+    reason="SQLite functions (zeroblob, hex, printf) and its length limit",
+)
+
+
+@_SQLITE_ONLY
+async def test_a_value_built_from_a_tiny_query_is_refused_before_it_is_allocated():
+    """`hex(zeroblob(N))` is ONE opcode, so the progress handler cannot stop it: three rows of
+    50 MB blobs grew the process by ~520 MB, and `zeroblob(499999999)` x the default 200 rows is
+    ~200 GB. SQLite's length limit makes the opcode itself fail. 30 MB here keeps the failure mode of
+    the old code survivable (about 180 MB) while still being far past the limit."""
+    from honeypot_mcp.tools.sql import sql_query
+
+    await _seed(3)
+    out = await sql_query("SELECT hex(zeroblob(30000000)) AS big FROM alerts")
+
+    assert "error" in out and "larger than" in out["error"], out
+    for builder in (
+        "SELECT randomblob(30000000) FROM alerts",
+        "SELECT replace(hex(zeroblob(2000000)), '0', 'abcd') FROM alerts",
+    ):
+        assert "error" in await sql_query(builder), builder
+    # printf() answers NULL rather than raising when it would exceed the limit: still no allocation.
+    padded = await sql_query("SELECT printf('%.*c', 30000000, 'x') FROM alerts")
+    assert all(r == [None] for r in padded["rows"]), padded
+
+
+@_SQLITE_ONLY
+async def test_the_length_limit_is_restored_for_the_next_user_of_the_pooled_connection():
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.tools.sql import sql_query
+
+    await sql_query("SELECT 1")
+    async with get_session() as session:
+        from sqlalchemy import text
+
+        size = (await session.execute(text("SELECT length(hex(zeroblob(3000000)))"))).scalar_one()
+
+    assert size == 6_000_000, "the 4 MiB cap must not outlive the query that set it"
+
+
+@_SQLITE_ONLY
+async def test_a_large_value_under_the_cap_is_returned_clipped_not_refused():
+    from honeypot_mcp.tools.sql import _MAX_CELL_CHARS, sql_query
+
+    await _seed(3)
+    out = await sql_query("SELECT hex(zeroblob(1000000)) AS v FROM alerts")
+
+    assert out["row_count"] == 3
+    assert all(
+        len(r[0]) == _MAX_CELL_CHARS + len(f"... [{2_000_000:,} chars]") for r in out["rows"]
+    )
+
+
+async def test_a_blob_cell_is_clipped_before_it_is_hexed():
+    from honeypot_mcp.tools.sql import _MAX_CELL_CHARS, _cell
+
+    assert len(_cell(b"\xab" * 3_000_000)) == _MAX_CELL_CHARS
+
+
+async def test_a_wide_result_is_cut_at_a_total_size_and_says_so(monkeypatch):
+    """Rows x columns x 2,000 characters is unbounded by `limit` alone, and the result lands in a
+    model's context."""
+    from honeypot_mcp.tools import sql
+
+    await _seed(50)
+    monkeypatch.setattr(sql, "_MAX_RESULT_CHARS", 300)
+    out = await sql.sql_query("SELECT id, event_type, source_ip FROM alerts ORDER BY id")
+
+    assert out["truncated"] is True and "characters" in out["note"], out
+    assert 0 < out["row_count"] < 50
+    assert out["row_count"] == len(out["rows"])
+
+
+async def test_the_first_row_is_always_returned_even_if_it_alone_exceeds_the_budget(monkeypatch):
+    from honeypot_mcp.tools import sql
+
+    await _seed(2)
+    monkeypatch.setattr(sql, "_MAX_RESULT_CHARS", 3)
+    out = await sql.sql_query("SELECT event_type FROM alerts")
+
+    assert out["row_count"] == 1 and out["truncated"] is True
+
+
+async def test_rows_are_streamed_in_small_batches_not_fetched_whole(monkeypatch):
+    """A buffered execute materialises every row, uncut, before any clipping: the batch size is the
+    most uncut rows ever held."""
+    from honeypot_mcp.tools import sql
+
+    await _seed(25)
+    monkeypatch.setattr(sql, "_FETCH_BATCH", 4)
+    out = await sql.sql_query("SELECT id FROM alerts ORDER BY id", limit=1000)
+
+    assert out["row_count"] == 25 and out["truncated"] is False
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT repeat('x', 500000000)",
+        "SELECT lpad('x', 500000000, 'y')",
+        "SELECT RPAD('x', 500000000)",
+        "SELECT array_fill(0, ARRAY[500000000])",
+    ],
+)
+async def test_padding_functions_are_refused_by_name(query):
+    from honeypot_mcp.tools.sql import sql_query
+
+    out = await sql_query(query)
+
+    assert "error" in out and "any size" in out["error"], out
+
+
+async def test_a_padding_word_inside_a_string_is_not_refused():
+    from honeypot_mcp.tools.sql import sql_query
+
+    await _seed(1)
+    out = await sql_query("SELECT count(*) FROM alerts WHERE payload ->> 'input' LIKE '%repeat(%'")
+
+    assert out["rows"] == [[0]]

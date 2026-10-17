@@ -139,9 +139,10 @@ _FLAGS: dict[str, str] = {
     "blocklist_push_aws_waf": "IW",
     "blocklist_push_cloudflare": "IW",
     "blocklist_push_pfsense": "IW",
-    # Pulls the Grafana image and the SQLite plugin from the internet; replaces (not deletes)
-    # its own previous container.
-    "grafana_start": "W",
+    # Downloads the Grafana image (first run) and the pinned SQLite plugin from the internet
+    # (open-world), and REMOVES its previous containers, networks and private directory before
+    # recreating them (destructive: an instance edited in the UI loses those edits).
+    "grafana_start": "WD",
     "grafana_stop": "DI",
     # Adds new files to the quarantine and never overwrites; talks only to the local Docker daemon.
     "sample_collect": "",

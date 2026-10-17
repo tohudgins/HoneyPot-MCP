@@ -55,7 +55,8 @@ DEFAULT_MAX_PACKETS = 2_000_000
 DEFAULT_TIME_BUDGET_SECONDS = 120.0
 
 _STREAM_BYTES = 16 * 1024  # first N bytes kept per direction of a TCP flow
-_REASSEMBLY_BUDGET = 64 * 1024 * 1024
+_REASSEMBLY_BUDGET = 64 * 1024 * 1024  # bytes pinned by live streams (`_Stream.held`), all flows
+_SEGMENT_OVERHEAD = 96  # per waiting out-of-order segment: bytes object + dict entry + int key
 _MAX_FLOWS = 50_000
 _MAX_CONVERSATIONS = 20_000
 _TALLY_KEYS = 5_000
@@ -1154,11 +1155,17 @@ class _Stream:
         self.pending_bytes = 0
         self.retrans = 0
 
+    def held(self) -> int:
+        """Memory this stream pins: the reassembled bytes plus every out-of-order segment waiting
+        behind a hole (the segments' payload and a per-entry allowance for the object and dict slot,
+        which for one-byte segments is most of the cost)."""
+        return len(self.buf) + self.pending_bytes + _SEGMENT_OVERHEAD * len(self.pending)
+
     def add(self, seq: int, payload: bytes) -> int:
-        """Feed a segment; returns the number of bytes newly buffered."""
+        """Feed a segment; returns the change in `held()`."""
         if self.full or not payload:
             return 0
-        before = len(self.buf)
+        before = self.held()
         if self.next is None:
             self.next = seq
         diff = (seq - self.next) & 0xFFFFFFFF
@@ -1180,7 +1187,7 @@ class _Stream:
             if len(self.pending) >= _PENDING_SEGMENTS or self.pending_bytes >= 2 * self.cap:
                 self._skip_gap()
                 self._drain()
-        return len(self.buf) - before
+        return self.held() - before
 
     def _append(self, payload: bytes) -> None:
         room = self.cap - len(self.buf)
@@ -1721,7 +1728,7 @@ class _Analyzer:
             for idx, stream in enumerate(flow.streams):
                 if stream is None:
                     continue
-                self.buffered -= len(stream.buf)
+                self.buffered -= stream.held()
                 content = stream.finish()
                 self.stream_gaps += stream.gaps
                 self.stream_retrans += stream.retrans

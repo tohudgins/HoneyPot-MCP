@@ -1378,6 +1378,17 @@ limit, ban or geo-block. `docs/HARDENING.md` is the guide; the invariants worth 
   `test_the_engines_own_create_requests_pass_the_guard` runs the real engine and checks its request
   passes: change the engine's container settings and that test (and the guard) must change with it.
   The guard runs under a syscall deny-list that forbids `chown`, so it must never ask to.
+  The guard validates, then forwards: it is only as strong as the agreement between what it checks and
+  what the daemon reads. A real daemon showed three gaps in that agreement, all fixed and pinned by
+  `tests/integration/test_docker_guard.py`: (1) the client's `Content-Type` was forwarded, and Go
+  merges an `application/x-www-form-urlencoded` body into the parameters the query check had already
+  approved (`kill?signal=TERM` with body `signal=HUP` delivered HUP; a body on `images/create` made the
+  daemon import from a URL), so the guard now sets `Content-Type` itself per endpoint and refuses a
+  body on endpoints that take none; (2) a create body with a repeated key (`HostConfig` twice) was
+  validated as its last value while the daemon merged both and created a `Privileged` container, so
+  bodies are parsed strictly and a repeated key at any depth is refused; (3) `stop` and `restart`
+  take `?signal=` too and now use the same allowlist as `kill`. Add any new endpoint with an explicit
+  content type and an explicit "takes a body or not".
 - **`hardening/firewall.py` renders the nftables ruleset** (table `inet hp_fw`, the only thing it
   touches): default-drop input, redirects only for `fib daddr type local` (a bare `dport 80
   redirect` also caught containers' outbound web requests), container egress closed or `limited`,

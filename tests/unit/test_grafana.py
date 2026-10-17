@@ -23,12 +23,17 @@ from types import SimpleNamespace
 from typing import Any
 
 import docker.errors
+import httpx
 import pytest
 import yaml
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# A root-owned database is (deliberately) never hardlinked, so tests that need the live hardlink
+# view cannot run as root; the root cases are covered explicitly with a patched uid.
+not_root = pytest.mark.skipif(os.geteuid() == 0, reason="a root-owned database is snapshotted")
 
 
 # ── a fake Docker daemon ─────────────────────────────────────────────────────────────────────
@@ -111,6 +116,46 @@ class FakeImages:
         self.client.have_image = True
 
 
+class FakeNetwork:
+    def __init__(self, client: FakeClient, name: str, internal: bool, labels: dict[str, str]):
+        self.client = client
+        self.name = name
+        self.internal = internal
+        self.attrs: dict[str, Any] = {"Labels": dict(labels)}
+        self.connected: list[FakeContainer] = []
+
+    def connect(self, container: FakeContainer, **kw: Any) -> None:
+        self.connected.append(container)
+
+    def remove(self) -> None:
+        self.client.network_store.remove(self)
+        self.client.networks_removed.append(self)
+
+
+class FakeNetworks:
+    def __init__(self, client: FakeClient) -> None:
+        self.client = client
+
+    def create(
+        self, name: str, driver: str = "bridge", internal: bool = False, labels: Any = None
+    ) -> FakeNetwork:
+        net = FakeNetwork(self.client, name, internal, labels or {})
+        self.client.network_store.append(net)
+        self.client.networks_created.append(net)
+        return net
+
+    def list(
+        self, names: list[str] | None = None, filters: dict[str, str] | None = None
+    ) -> list[FakeNetwork]:
+        out = list(self.client.network_store)
+        if names:
+            out = [n for n in out if n.name in names]
+        if filters and "label" in filters:
+            key, _, value = filters["label"].partition("=")
+            out = [n for n in out if n.attrs["Labels"].get(key) == value]
+        return out
+
+
 class FakeClient:
     def __init__(self) -> None:
         import itertools
@@ -119,6 +164,9 @@ class FakeClient:
         self.store: list[FakeContainer] = []
         self.created: list[FakeContainer] = []
         self.removed: list[FakeContainer] = []
+        self.network_store: list[FakeNetwork] = []
+        self.networks_created: list[FakeNetwork] = []
+        self.networks_removed: list[FakeNetwork] = []
         self.pulled: list[str] = []
         self.have_image = True
         self.pull_error: Exception | None = None
@@ -126,9 +174,21 @@ class FakeClient:
         self.fail_start: str | None = None
         self.containers = FakeContainers(self)
         self.images = FakeImages(self)
+        self.networks = FakeNetworks(self)
 
     def ping(self) -> bool:
         return True
+
+    @property
+    def grafana(self) -> FakeContainer:
+        """The container that holds the database (the other one is the port forwarder)."""
+        return next(
+            c for c in self.created if c.labels.get("honeypot-mcp-grafana-role") == "grafana"
+        )
+
+    @property
+    def proxy(self) -> FakeContainer:
+        return next(c for c in self.created if c.labels.get("honeypot-mcp-grafana-role") == "proxy")
 
 
 def _foreign(client: FakeClient, name: str, labels: dict[str, str] | None = None) -> FakeContainer:
@@ -187,6 +247,14 @@ def docker_client(monkeypatch):
 
     client = FakeClient()
     monkeypatch.setattr(grafana, "_docker_client", lambda: client)
+
+    def fake_install(plugins_dir: Path) -> None:
+        """No download in unit tests: leave a plugin directory where the real one would be."""
+        target = plugins_dir / grafana.SQLITE_PLUGIN
+        target.mkdir(parents=True)
+        (target / "plugin.json").write_text("{}")
+
+    monkeypatch.setattr(grafana, "_install_plugin", fake_install)
     return client
 
 
@@ -229,16 +297,19 @@ async def _audit_rows():
 # ── what Docker is asked to run ──────────────────────────────────────────────────────────────
 
 
-async def test_port_is_published_on_loopback_only(database, docker_client, healthy_probe):
+async def test_port_is_published_on_loopback_only_by_the_forwarder(
+    database, docker_client, healthy_probe
+):
     from honeypot_mcp.tools.grafana import grafana_start
 
     result = await grafana_start(port=3300)
 
     assert "error" not in result, result
-    spec = docker_client.created[0].spec
-    assert spec["ports"] == {"3000/tcp": ("127.0.0.1", 3300)}
+    # The container that holds the data publishes nothing; the forwarder publishes loopback only.
+    assert "ports" not in docker_client.grafana.spec
+    assert docker_client.proxy.spec["ports"] == {"3000/tcp": ("127.0.0.1", 3300)}
     assert result["url"] == "http://127.0.0.1:3300/"
-    assert "0.0.0.0" not in json.dumps(spec, default=str)
+    assert "0.0.0.0" not in json.dumps([c.spec for c in docker_client.created], default=str)
 
 
 async def test_there_is_no_way_to_ask_for_another_bind_address():
@@ -254,13 +325,15 @@ async def test_container_is_locked_down(database, docker_client, healthy_probe):
     from honeypot_mcp.tools.grafana import grafana_start
 
     await grafana_start(port=3300)
-    spec = docker_client.created[0].spec
+    spec = docker_client.grafana.spec
     env = spec["environment"]
 
     assert spec["image"] == "grafana/grafana:11.3.0"
     assert env["GF_AUTH_ANONYMOUS_ENABLED"] == "false"
-    assert env["GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS"] == "frser-sqlite-datasource"
-    assert env["GF_INSTALL_PLUGINS"] == "frser-sqlite-datasource"
+    # Nothing is installed by Grafana, and no unsigned plugin is waved through.
+    assert "GF_INSTALL_PLUGINS" not in env
+    assert "GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS" not in env
+    assert env["GF_PATHS_PLUGINS"] == "/mcp-plugins"
     assert spec["read_only"] is True
     assert spec["cap_drop"] == ["ALL"]
     assert spec["security_opt"] == ["no-new-privileges:true"]
@@ -269,6 +342,63 @@ async def test_container_is_locked_down(database, docker_client, healthy_probe):
     assert spec["volumes"] and all(v["mode"] == "ro" for v in spec["volumes"].values())
 
 
+async def test_the_container_with_the_data_has_no_route_out(database, docker_client, healthy_probe):
+    """The finding: no `network_mode` meant the default bridge with full egress. Grafana is on an
+    `internal` network (no gateway) and nothing else, and only the forwarder reaches an edge one."""
+    from honeypot_mcp import grafana
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    result = await grafana_start(port=3300)
+
+    internal = next(n for n in docker_client.networks_created if n.name == grafana.NETWORK_INTERNAL)
+    edge = next(n for n in docker_client.networks_created if n.name == grafana.NETWORK_EDGE)
+    assert internal.internal is True and edge.internal is False
+    spec = docker_client.grafana.spec
+    assert spec["network"] == grafana.NETWORK_INTERNAL
+    assert "network_mode" not in spec
+    assert "ports" not in spec
+    assert "extra_hosts" not in spec and "dns" not in spec
+    # The forwarder holds no data and no secret, and is the only thing on the edge network.
+    proxy = docker_client.proxy.spec
+    assert proxy["network"] == grafana.NETWORK_EDGE
+    assert "volumes" not in proxy and "mounts" not in proxy and "environment" not in proxy
+    assert proxy["user"] == "65534:65534"
+    assert proxy["read_only"] is True and proxy["cap_drop"] == ["ALL"]
+    assert docker_client.proxy in internal.connected  # reaches Grafana over the internal network
+    assert docker_client.grafana not in internal.connected  # created on it, not connected later
+    assert result["grafana_has_outbound_network"] is False
+    assert any("no route out" in n and "forwarder" in n for n in result["notes"])
+    # Both networks carry our label, so stop() can find them and nothing else.
+    assert all(n.attrs["Labels"] == {"honeypot-mcp": "grafana"} for n in (internal, edge))
+
+
+async def test_a_network_that_is_not_ours_is_never_touched(database, docker_client, healthy_probe):
+    from honeypot_mcp import grafana
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    foreign = docker_client.networks.create(grafana.NETWORK_INTERNAL, internal=False, labels={})
+    result = await grafana_start(port=3300)
+
+    assert "was not created by this server" in result["error"]
+    assert foreign in docker_client.network_store
+    assert docker_client.networks_removed == []
+    assert docker_client.created == []
+
+
+async def test_the_plugin_is_never_installed_by_grafana_and_comes_from_a_ro_mount(
+    database, docker_client, healthy_probe
+):
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    await grafana_start(port=3300)
+    spec = docker_client.grafana.spec
+    plugins = next(Path(h) for h, v in spec["volumes"].items() if v["bind"] == "/mcp-plugins")
+
+    assert spec["volumes"][str(plugins)]["mode"] == "ro"
+    assert (plugins / "frser-sqlite-datasource" / "plugin.json").is_file()
+
+
+@not_root
 async def test_the_mount_holds_only_the_database(database, docker_client, healthy_probe):
     """The directory the database lives in also holds `.env` and `tls/`; neither may be mounted."""
     from honeypot_mcp import grafana
@@ -283,11 +413,13 @@ async def test_the_mount_holds_only_the_database(database, docker_client, health
     assert Path(data_mount).parent == get_settings().grafana_dir
     assert sorted(os.listdir(data_mount)) == [grafana.DB_FILENAME]
     assert result["db_mount"] == "hardlink"
-    # Nothing else of the host is mounted either: the other two are the packaged config copies.
+    # Nothing else of the host is mounted either: the other three are the packaged config copies
+    # and the unpacked plugin.
     others = {Path(h).name for h, v in spec["volumes"].items() if v["bind"] != "/mcp-data"}
-    assert others == {"provisioning", "dashboards"}
+    assert others == {"provisioning", "dashboards", "plugins"}
 
 
+@not_root
 async def test_hardlink_is_the_same_file_and_the_original_is_untouched(
     database, docker_client, healthy_probe
 ):
@@ -309,6 +441,7 @@ async def test_hardlink_is_the_same_file_and_the_original_is_untouched(
     assert oct(mount.stat().st_mode & 0o777) == "0o700"
 
 
+@not_root
 async def test_live_wal_sidecars_are_linked_and_not_immutable(
     database, docker_client, healthy_probe
 ):
@@ -339,6 +472,7 @@ async def test_live_wal_sidecars_are_linked_and_not_immutable(
     assert "pathOptions" not in honeypot["jsonData"]
 
 
+@not_root
 async def test_wal_database_nobody_has_open_is_read_as_immutable(
     database, docker_client, healthy_probe
 ):
@@ -396,7 +530,9 @@ async def test_each_start_generates_a_new_password(database, docker_client, heal
     await grafana_start(port=3300)
     await grafana_start(port=3300)
     first, second = (
-        c.spec["environment"]["GF_SECURITY_ADMIN_PASSWORD"] for c in docker_client.created
+        c.spec["environment"]["GF_SECURITY_ADMIN_PASSWORD"]
+        for c in docker_client.created
+        if c.labels.get("honeypot-mcp-grafana-role") == "grafana"
     )
     assert first != second
 
@@ -623,7 +759,7 @@ async def test_a_datasource_that_does_not_answer_is_reported_not_hidden(
     result = await grafana_start(port=3300)
 
     assert result["datasource_ok"] is False
-    assert any("grafana.com" in n for n in result["notes"])
+    assert any("did not register it" in n for n in result["notes"])
     assert result["datasource_error"] == "plugin_not_installed"
 
 
@@ -644,6 +780,7 @@ async def test_an_unexpected_exception_becomes_an_error_dict(
 # ── result shape ─────────────────────────────────────────────────────────────────────────────
 
 
+@not_root
 async def test_result_carries_what_the_caller_needs(database, docker_client, healthy_probe):
     from honeypot_mcp.tools.grafana import grafana_start
 
@@ -726,15 +863,17 @@ async def test_stop_removes_only_the_labelled_container(database, docker_client,
     docker_client.store.remove(named_like_ours)  # the name is free for ours to take
 
     await grafana_start(port=3300)
-    ours = docker_client.created[0]
+    ours = list(docker_client.created)
     docker_client.store.append(named_like_ours)  # ...and now an unlabelled one has that name too
 
     result = await grafana_stop()
 
-    assert result["stopped"] is True and result["removed_containers"] == 1
-    assert docker_client.removed == [ours]
-    assert ours.removed_with_volumes is True  # Grafana's anonymous volumes go with it
+    assert result["stopped"] is True and result["removed_containers"] == 2
+    assert result["removed_networks"] == 2
+    assert docker_client.removed == ours
+    assert all(c.removed_with_volumes is True for c in ours)  # Grafana's anonymous volumes go too
     assert set(docker_client.store) == {other_grafana, lookalike, named_like_ours}
+    assert docker_client.network_store == []
 
 
 async def test_stop_removes_the_private_directory_and_leaves_the_database(
@@ -783,20 +922,49 @@ async def test_stop_with_nothing_started_changes_nothing(docker_client, tmp_path
 async def test_stop_only_removes_what_it_created_under_grafana_dir(
     docker_client, tmp_path, monkeypatch
 ):
-    """GRAFANA_DIR is user-chosen; a stray file the user keeps there must survive a stop."""
+    """GRAFANA_DIR is user-chosen; a stray file the user keeps there must survive a stop, and
+    only the exact names this module creates go (never a wildcard, never the directory's other
+    contents)."""
     from honeypot_mcp import grafana
     from honeypot_mcp.config import get_settings
 
     base = get_settings().grafana_dir
-    (base / "db").mkdir(parents=True)
+    base.mkdir(parents=True)
+    (base / grafana._MARKER).write_text("ours")
+    (base / "db").mkdir()
     (base / "db" / "honeypot_mcp.db").write_bytes(b"x")
+    (base / "plugins").mkdir()
     (base / "keep-me.txt").write_text("mine")
+    (base / "keep-dir").mkdir()
 
     result = await grafana.stop()
 
     assert result["removed_link_dir"] is True
     assert (base / "keep-me.txt").read_text() == "mine"
-    assert not (base / "db").exists()
+    assert (base / "keep-dir").is_dir()
+    assert not (base / "db").exists() and not (base / "plugins").exists()
+    assert not (base / grafana._MARKER).exists()
+
+
+async def test_stop_touches_nothing_in_a_directory_it_did_not_create(
+    docker_client, tmp_path, monkeypatch
+):
+    """No marker, no deletion: a `config/` or `db/` that is the operator's own survives."""
+    from honeypot_mcp import grafana
+    from honeypot_mcp.config import get_settings
+
+    base = get_settings().grafana_dir
+    (base / "config").mkdir(parents=True)
+    (base / "config" / "settings.env").write_text("precious")
+    (base / "db").mkdir()
+    (base / "admin_password").write_text("also theirs")
+
+    result = await grafana.stop()
+
+    assert result["removed_link_dir"] is False
+    assert (base / "config" / "settings.env").read_text() == "precious"
+    assert (base / "db").is_dir()
+    assert (base / "admin_password").read_text() == "also theirs"
 
 
 async def test_stop_reports_unreachable_docker_and_leaves_files(database, monkeypatch, tmp_path):
@@ -822,15 +990,19 @@ async def test_starting_again_replaces_the_previous_instance(
     from honeypot_mcp.tools.grafana import grafana_start
 
     await grafana_start(port=3300)
-    first = docker_client.created[0]
+    first = docker_client.created[:2]
     # The port is busy only because of our own container: that must not block the restart.
     monkeypatch.setattr(grafana, "_port_free", lambda port: False)
 
     result = await grafana_start(port=3300)
 
     assert "error" not in result, result
-    assert first in docker_client.removed
-    assert [c.name for c in docker_client.store] == [grafana.CONTAINER_NAME]
+    assert all(c in docker_client.removed for c in first)
+    assert sorted(c.name for c in docker_client.store) == [
+        grafana.CONTAINER_NAME,
+        grafana.PROXY_NAME,
+    ]
+    assert len(docker_client.network_store) == 2  # the old pair was removed, a new pair created
 
 
 # ── status ───────────────────────────────────────────────────────────────────────────────────
@@ -843,6 +1015,7 @@ async def test_status_when_nothing_runs(docker_client):
     assert result["running"] is False and "grafana_start" in result["note"]
 
 
+@not_root
 async def test_status_reports_what_it_serves_and_no_secrets(database, docker_client, healthy_probe):
     from honeypot_mcp.tools.grafana import grafana_start, grafana_status
 
@@ -1234,3 +1407,423 @@ async def test_start_and_stop_carry_an_admin_gate_and_status_does_not():
     assert tools["grafana_status"].auth is None
     assert tools["grafana_status"].annotations.readOnlyHint is True
     assert tools["grafana_start"].annotations.openWorldHint is True
+    # It removes the previous instance (containers, networks, private directory) before
+    # recreating it, so a client must be told it is destructive, not merely additive.
+    assert tools["grafana_start"].annotations.destructiveHint is True
+    assert tools["grafana_start"].annotations.readOnlyHint is False
+
+
+# ── the plugin: pinned, checksummed, unpacked as hostile ─────────────────────────────────────
+
+
+def _plugin_zip(members: dict[str, bytes], *, symlink: tuple[str, str] | None = None) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (0o100755 if "gpx_" in name else 0o100644) << 16
+            zf.writestr(info, data)
+        if symlink:
+            info = zipfile.ZipInfo(symlink[0])
+            info.external_attr = 0o120777 << 16
+            zf.writestr(info, symlink[1])
+    return buf.getvalue()
+
+
+_GOOD_MEMBERS = {
+    "frser-sqlite-datasource/plugin.json": b'{"id": "frser-sqlite-datasource"}',
+    "frser-sqlite-datasource/module.js": b"//",
+    "frser-sqlite-datasource/gpx_sqlite-datasource_linux_amd64": b"\x7fELF-linux",
+    "frser-sqlite-datasource/gpx_sqlite-datasource_darwin_arm64": b"MACH-O",
+}
+
+
+@pytest.fixture
+def plugin_download(monkeypatch):
+    """Serve `payload` as the plugin download, with the pinned checksum following it."""
+    import hashlib
+
+    from honeypot_mcp import grafana
+
+    class Download:
+        requested: list[str] = []
+
+        def serve(self, payload: bytes, *, pin: bool = True) -> None:
+            if pin:
+                monkeypatch.setattr(
+                    grafana, "SQLITE_PLUGIN_SHA256", hashlib.sha256(payload).hexdigest()
+                )
+            real = httpx.Client
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.requested.append(str(request.url))
+                return httpx.Response(200, content=payload)
+
+            monkeypatch.setattr(
+                grafana.httpx,
+                "Client",
+                lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
+            )
+
+    return Download()
+
+
+def test_the_plugin_is_pinned_to_an_exact_version_and_a_checksum():
+    import re
+
+    from honeypot_mcp import grafana
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", grafana.SQLITE_PLUGIN_VERSION)
+    assert re.fullmatch(r"[0-9a-f]{64}", grafana.SQLITE_PLUGIN_SHA256)
+    assert f"/versions/{grafana.SQLITE_PLUGIN_VERSION}/download" in grafana.SQLITE_PLUGIN_URL
+    assert grafana.SQLITE_PLUGIN_URL.startswith("https://")
+
+
+def test_a_verified_plugin_is_unpacked_whole_and_executable(tmp_path, plugin_download):
+    from honeypot_mcp import grafana
+
+    plugin_download.serve(_plugin_zip(_GOOD_MEMBERS))
+    grafana._install_plugin(tmp_path / "plugins")
+
+    root = tmp_path / "plugins" / "frser-sqlite-datasource"
+    # Every file, other platforms' binaries included: Grafana checks the whole signed manifest.
+    assert sorted(p.name for p in root.iterdir()) == sorted(n.split("/")[1] for n in _GOOD_MEMBERS)
+    assert oct((root / "gpx_sqlite-datasource_linux_amd64").stat().st_mode & 0o777) == "0o755"
+    assert oct((root / "plugin.json").stat().st_mode & 0o777) == "0o644"
+    assert oct((tmp_path / "plugins").stat().st_mode & 0o777) == "0o755"
+    assert plugin_download.requested[-1] == grafana.SQLITE_PLUGIN_URL
+    # The downloaded archive lived in an unnamed temporary file: nothing else is left behind.
+    assert [p.name for p in tmp_path.iterdir()] == ["plugins"]
+
+
+def test_a_plugin_that_does_not_match_the_pinned_checksum_is_refused_and_not_unpacked(
+    tmp_path, plugin_download
+):
+    """The finding: unpinned and unsigned. A different file at the same URL must fail closed."""
+    from honeypot_mcp import grafana
+
+    plugin_download.serve(_plugin_zip(_GOOD_MEMBERS), pin=False)
+    with pytest.raises(grafana.GrafanaError) as exc:
+        grafana._install_plugin(tmp_path / "plugins")
+
+    assert "does not match the pinned checksum" in exc.value.message
+    assert exc.value.hint and "SQLITE_PLUGIN_SHA256" in exc.value.hint
+    assert list((tmp_path / "plugins").iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "members, symlink, why",
+    [
+        ({"frser-sqlite-datasource/../evil": b"x"}, None, "unexpected entry"),
+        ({"other-plugin/plugin.json": b"x"}, None, "unexpected entry"),
+        ({"/etc/cron.d/x": b"x"}, None, "unexpected entry"),
+        ({"frser-sqlite-datasource\\..\\x": b"x"}, None, "unexpected entry"),
+        ({}, ("frser-sqlite-datasource/link", "/etc/passwd"), "symlink"),
+    ],
+)
+def test_a_hostile_archive_cannot_write_outside_or_plant_symlinks(
+    tmp_path, plugin_download, members, symlink, why
+):
+    """Pinned and hashed, but unpacked as if it were not: defence in depth."""
+    from honeypot_mcp import grafana
+
+    plugin_download.serve(_plugin_zip(members, symlink=symlink))
+    with pytest.raises(grafana.GrafanaError) as exc:
+        grafana._install_plugin(tmp_path / "plugins")
+
+    assert why in exc.value.message
+    assert not (tmp_path / "evil").exists()
+    assert not any(p.is_symlink() for p in (tmp_path / "plugins").rglob("*"))
+
+
+def test_an_archive_that_unpacks_to_an_implausible_size_is_refused(
+    tmp_path, plugin_download, monkeypatch
+):
+    from honeypot_mcp import grafana
+
+    monkeypatch.setattr(grafana, "_PLUGIN_MAX_UNPACKED", 10)
+    plugin_download.serve(_plugin_zip(_GOOD_MEMBERS))
+    with pytest.raises(grafana.GrafanaError, match="implausible size"):
+        grafana._install_plugin(tmp_path / "plugins")
+
+
+def test_an_oversized_download_is_refused(tmp_path, plugin_download, monkeypatch):
+    from honeypot_mcp import grafana
+
+    monkeypatch.setattr(grafana, "_PLUGIN_MAX_DOWNLOAD", 10)
+    plugin_download.serve(_plugin_zip(_GOOD_MEMBERS))
+    with pytest.raises(grafana.GrafanaError, match="exceeded"):
+        grafana._install_plugin(tmp_path / "plugins")
+
+
+def test_an_offline_plugin_download_is_a_clear_error_with_the_way_out(tmp_path, monkeypatch):
+    from honeypot_mcp import grafana
+
+    def offline(**kw):
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(grafana.httpx, "Client", offline)
+    with pytest.raises(grafana.GrafanaError) as exc:
+        grafana._install_plugin(tmp_path / "plugins")
+
+    assert "Could not download" in exc.value.message and "ConnectError" in exc.value.message
+    assert exc.value.hint and "internet access" in exc.value.hint
+
+
+async def test_a_failed_plugin_install_leaves_no_containers_and_no_files(
+    database, docker_client, healthy_probe, monkeypatch, tmp_path
+):
+    from honeypot_mcp import grafana
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    def refuse(plugins_dir):
+        raise grafana.GrafanaError("Could not download the SQLite datasource plugin", "retry")
+
+    monkeypatch.setattr(grafana, "_install_plugin", refuse)
+    result = await grafana_start(port=3300)
+
+    assert "Could not download" in result["error"]
+    assert docker_client.created == [] and docker_client.network_store == []
+    assert not (tmp_path / "grafana").exists()
+
+
+# ── GRAFANA_DIR must be dedicated ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["root", "parent_of_root", "config", "inside_config"],
+)
+async def test_a_grafana_dir_that_is_the_project_root_or_config_is_refused_untouched(
+    where, database, docker_client, healthy_probe, tmp_path, monkeypatch
+):
+    """The finding: GRAFANA_DIR=<project root> chmod'ed it 0700 and rmtree'd the operator's
+    `config/`. Refused before anything is created, removed or changed. (A stand-in project
+    root: this test must never be able to hurt the real checkout.)"""
+    from honeypot_mcp import grafana
+    from honeypot_mcp.config import get_settings
+
+    root = (tmp_path / "project").resolve()
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "GeoLite2-City.mmdb").write_text("precious")
+    monkeypatch.setattr(grafana, "_PROJECT_ROOT", root)
+    chosen = {
+        "root": root,
+        "parent_of_root": root.parent,
+        "config": root / "config",
+        "inside_config": root / "config" / "grafana-work",
+    }[where]
+    root_mode = root.stat().st_mode
+    chosen_mode = chosen.stat().st_mode if chosen.exists() else None
+    get_settings().grafana_dir = chosen
+
+    started = await grafana.start(3300)
+    stopped = await grafana.stop()
+
+    assert "GRAFANA_DIR" in started["error"]
+    assert "project root" in started["error"] or "config/" in started["error"]
+    assert "error" not in stopped and stopped["removed_link_dir"] is False
+    assert docker_client.created == [] and docker_client.network_store == []
+    assert (root / "config" / "GeoLite2-City.mmdb").read_text() == "precious"
+    assert root.stat().st_mode == root_mode  # not chmod'ed 0700
+    if chosen_mode is not None:
+        assert chosen.stat().st_mode == chosen_mode
+    assert not (chosen / grafana._MARKER).exists()
+
+
+async def test_a_directory_with_other_things_in_it_is_refused_and_nothing_is_deleted(
+    database, docker_client, healthy_probe, tmp_path
+):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    shared = tmp_path / "shared"
+    (shared / "config").mkdir(parents=True)
+    (shared / "config" / "mine.yaml").write_text("keep")
+    (shared / "db").mkdir()
+    (shared / "notes.txt").write_text("keep")
+    get_settings().grafana_dir = shared
+    before = oct(shared.stat().st_mode & 0o777)
+
+    result = await grafana_start(port=3300)
+
+    assert "not empty and was not created by grafana_start" in result["error"]
+    assert "config" in result["error"] and "notes.txt" in result["error"]
+    assert (shared / "config" / "mine.yaml").read_text() == "keep"
+    assert (shared / "db").is_dir() and (shared / "notes.txt").read_text() == "keep"
+    assert oct(shared.stat().st_mode & 0o777) == before  # not chmod'ed
+    assert docker_client.created == []
+
+
+async def test_a_refused_grafana_dir_does_not_take_down_the_running_instance(
+    database, docker_client, healthy_probe, tmp_path
+):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    await grafana_start(port=3300)
+    running = list(docker_client.store)
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "x").write_text("x")
+    get_settings().grafana_dir = tmp_path / "other"
+
+    result = await grafana_start(port=3300)
+
+    assert "error" in result
+    assert docker_client.store == running and docker_client.removed == []
+
+
+async def test_an_empty_or_new_dedicated_directory_is_claimed_with_a_marker(
+    database, docker_client, healthy_probe, tmp_path
+):
+    from honeypot_mcp import grafana
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.grafana import grafana_start, grafana_stop
+
+    for name in ("fresh", "empty"):
+        base = tmp_path / name
+        if name == "empty":
+            base.mkdir()
+        get_settings().grafana_dir = base
+        result = await grafana_start(port=3300)
+        assert "error" not in result, result
+        assert (base / grafana._MARKER).is_file()
+        assert oct(base.stat().st_mode & 0o777) == "0o700"
+        assert sorted(p.name for p in base.iterdir()) == sorted(
+            [grafana._MARKER, "admin_password", "config", "db", "plugins"]
+        )
+        await grafana_stop()
+        assert not base.exists()  # marker and contents gone, and the then-empty directory too
+
+
+async def test_a_symlinked_grafana_dir_cannot_point_the_cleanup_at_the_project(
+    database, docker_client, healthy_probe, tmp_path, monkeypatch
+):
+    from honeypot_mcp import grafana
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    root = (tmp_path / "project").resolve()
+    (root / "config").mkdir(parents=True)
+    monkeypatch.setattr(grafana, "_PROJECT_ROOT", root)
+    link = tmp_path / "innocent-looking"
+    link.symlink_to(root, target_is_directory=True)
+    get_settings().grafana_dir = link
+
+    result = await grafana_start(port=3300)
+
+    assert "project root" in result["error"]
+    assert not (root / grafana._MARKER).exists()
+    assert (root / "config").is_dir()
+
+
+async def test_a_marker_that_is_a_symlink_does_not_make_a_directory_ours(tmp_path):
+    from honeypot_mcp import grafana
+
+    base = tmp_path / "d"
+    base.mkdir()
+    (base / "db").mkdir()
+    real = tmp_path / "real-marker"
+    real.write_text("x")
+    (base / grafana._MARKER).symlink_to(real)
+
+    assert grafana._cleanup_files(base) is False
+    assert (base / "db").is_dir()
+
+
+# ── never uid 0 ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_container_spec_refuses_uid_zero(tmp_path):
+    from honeypot_mcp import grafana
+
+    kw = dict(
+        password="x" * 24,
+        view_dir=tmp_path,
+        config_dir=tmp_path,
+        plugins_dir=tmp_path,
+        db=tmp_path / "a.db",
+    )
+    with pytest.raises(grafana.GrafanaError, match="uid 0"):
+        grafana._container_spec(db_uid=0, **kw)
+    # An unknown owner falls back to Grafana's own uid, never to root.
+    assert grafana._container_spec(db_uid=None, **kw)["user"] == "472:0"
+    assert grafana._container_spec(db_uid=1000, **kw)["user"] == "1000:0"
+
+
+@pytest.mark.parametrize(
+    "server_uid, db_owner_uid",
+    [(0, 0), (0, 1000), (1000, 0), (1000, 1000), (1000, 2000)],
+)
+async def test_grafana_never_runs_as_root_whoever_owns_what(
+    server_uid, db_owner_uid, database, docker_client, healthy_probe, monkeypatch
+):
+    """The finding: the container ran as `<db owner>:0`, so a root server (or a root-owned
+    database) put Grafana and a downloaded native binary at uid 0."""
+    import dataclasses
+
+    from honeypot_mcp import grafana
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    real_inspect = grafana.inspect_database
+    monkeypatch.setattr(
+        grafana,
+        "inspect_database",
+        lambda url: dataclasses.replace(real_inspect(url), uid=db_owner_uid),
+    )
+    monkeypatch.setattr(grafana, "_host_uid", lambda: server_uid)
+    chowned: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(os, "chown", lambda p, u, g: chowned.append((str(p), u, g)))
+
+    result = await grafana_start(port=3300)
+
+    assert "error" not in result, result
+    uid, _, gid = docker_client.grafana.spec["user"].partition(":")
+    assert int(uid) != 0, docker_client.grafana.spec["user"]
+    assert gid == "0"  # group 0 is what Grafana's own data directory is writable by
+    if db_owner_uid == 0:
+        # A root-owned file is never hardlinked (that would need a root container): a snapshot.
+        assert result["db_mount"] in ("reflink", "copy")
+        if server_uid == 0:
+            assert int(uid) == 472
+            # ... and a snapshot made by a root server is handed to that unprivileged uid.
+            assert chowned and all(u == 472 and g == 0 for _, u, g in chowned)
+            db = get_settings().grafana_dir / "db" / grafana.DB_FILENAME
+            assert chowned[0][0] == str(db)
+        else:
+            assert int(uid) == server_uid
+    else:
+        assert result["db_mount"] == "hardlink"
+        assert int(uid) == db_owner_uid
+        assert chowned == []  # a live hardlink is the original inode: never chowned
+
+
+async def test_a_snapshot_is_readable_by_the_container_user_not_just_the_owner(
+    database, docker_client, healthy_probe, monkeypatch
+):
+    """Root server + root-owned DB: the container is 472, so the private directory it must
+    traverse is opened up; the snapshot file itself stays 0600."""
+    import dataclasses
+
+    from honeypot_mcp import grafana
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    real_inspect = grafana.inspect_database
+    monkeypatch.setattr(
+        grafana, "inspect_database", lambda url: dataclasses.replace(real_inspect(url), uid=0)
+    )
+    monkeypatch.setattr(grafana, "_host_uid", lambda: 0)
+    monkeypatch.setattr(os, "chown", lambda *a: None)
+
+    result = await grafana_start(port=3300)
+
+    assert "error" not in result, result
+    view = get_settings().grafana_dir / "db"
+    assert oct(view.stat().st_mode & 0o777) == "0o755"
+    assert oct((view / grafana.DB_FILENAME).stat().st_mode & 0o777) == "0o600"
+    assert os.listdir(view) == [grafana.DB_FILENAME]

@@ -4,6 +4,49 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## A fresh install and an independent security review of the new tools
+
+**Installing from a clean clone found four things the author's machine hid; an independent review of the
+new privileged code found one that could freeze the server and, proving its claims on a real daemon, one
+that was worse.**
+
+- **Fresh install** (clone of GitHub at the pushed commit, README commands): the README's first command
+  failed (`docker compose up` requires `GRAFANA_ADMIN_PASSWORD`, the README promised no configuration and
+  a login, `admin / honeypot`, that does not exist; the seed script printed the same); `pytest -n 4`, the
+  documented way to run the suite, failed because `pytest-xdist` was never declared (and `uv sync` kept
+  removing it from the working environment); the role table still said 35/25/10 tools. Fixed; the demo
+  stack, the SSH-to-console path and all 2,625 unit tests then passed from the clone.
+- **A hostile command could freeze the server (high).** `_TFTP_HOST_RE` let each `-x` token parse as a
+  loop iteration or as the value of the previous option, so a failing tail backtracked exponentially:
+  about 60 repetitions of ` -a` (200 characters, typed into a honeypot shell) followed by a non-address
+  would block `attack_patterns` for days, and `re` cannot be interrupted, so it blocks the event loop that
+  serves every sensor. Unambiguous bounded pattern now; a corpus of hostile commands is timed against
+  every classifier regex.
+- **The Docker guard did not see what the daemon reads (pre-existing).** Proven on a real daemon: a
+  form-encoded body overrides the query the guard checked (`kill?signal=TERM` with body `signal=HUP`
+  delivered HUP; a body on `images/create` made the daemon import from a URL); a create body with a
+  repeated `HostConfig` key passed (the guard validated the last one) while the daemon merged both and
+  created a `Privileged` container; `stop` and `restart` took arbitrary signals. All need a compromised
+  honeypot service first; none is reachable from the network. The guard now sets `Content-Type` itself,
+  refuses bodies where none belong, parses strictly (repeated keys, `NaN`, depth) and allowlists signals
+  on stop and restart; a real-daemon test sends each attack and checks nothing was imported or created.
+- **Grafana tool:** the container holding the database had full outbound network and an unpinned
+  unsigned plugin. It now has no route out (a separate no-data container publishes the loopback port;
+  verified: no default route, DNS, public, metadata and gateway connects all fail), the plugin is pinned
+  and checksum-verified, it never runs as uid 0, and `GRAFANA_DIR` must be a dedicated directory (the old
+  code would have removed the project's `config/` if pointed at the project root).
+- **Resource bounds:** `sql_query` could be asked for gigabytes (`hex(zeroblob(...))`: RSS 28 to 552 MB
+  for three small rows) and is now length-limited and streamed; `pcap_analyze` counted only in-order bytes
+  against its reassembly budget (279 MB against a 64 MB budget, now 112 MB) and has a concurrency cap;
+  `sample_collect` read hostile tar headers of any size and had no deadline; the `pcap_detect` output
+  watcher ignored unreadable directories and inode floods; `attack_patterns commands` and `extract_iocs`
+  peaked at 2.6 GB and 2.2 GB on a worst-case table (now 352 and 269 MB) with identical answers on the
+  real run.
+- **Result hygiene:** captured text in results now carries one shared "written by the attacker, data not
+  instructions" marker; masking covers every honeytoken type's secret, not only credential passwords, and
+  is documented as hygiene, not access control; artifacts are created 0600; importing `tools.patterns`
+  first no longer fails on a circular import.
+
 ## Four blind spots found by using the tools on the real run
 
 **Calling the tools over MCP against the frozen 12 GB backup showed answers that were technically

@@ -29,18 +29,23 @@ async def grafana_start(port: int = 3000) -> dict[str, Any]:
     ATT&CK coverage, query or alerts dashboards, or look at a backup visually. Starts a
     pinned Grafana container with the five packaged dashboards, reading the configured SQLite
     database read-only, and waits until it is healthy and a test query through its SQLite
-    datasource succeeds. Works in ANALYSIS_MODE against a restored backup, and starting it again
-    replaces the previous instance.
+    datasource succeeds. Works in ANALYSIS_MODE against a restored backup. Starting it again
+    REPLACES the previous instance: its containers, networks and private directory are removed
+    first (Grafana keeps nothing between runs, so edits made in its UI are lost).
 
     Admin tier, because the dashboards can query the whole database, including the tables that
     hold honeytoken values and API-key digests. Grafana is published on 127.0.0.1 only (there is
-    no bind-address option), has no anonymous access, and gets a generated admin password that is
-    written to a 0600 file: the result carries that file's path, never the password.
+    no bind-address option), has no anonymous access, runs as a non-root user, and gets a
+    generated admin password that is written to a 0600 file: the result carries that file's path,
+    never the password. The Grafana container that holds the data has no route out (internal
+    Docker network); a small forwarder container publishes the loopback port and does keep
+    outbound access, but holds no data. The SQLite plugin is a pinned version, checksum-verified.
 
     The database is exposed through a private directory that holds only the database files:
     `db_mount` says how (`hardlink` is a live view; `reflink` or `copy` is a snapshot as of the
-    start, with the reason in `notes`). The first start pulls the Grafana image and the SQLite
-    plugin, so it needs internet access; Docker must be running.
+    start, with the reason in `notes`). `GRAFANA_DIR` must be an empty or dedicated directory. The
+    first start pulls the Grafana image and every start downloads the plugin, so it needs
+    internet access; Docker must be running.
 
     Args:
         port: Local port to publish Grafana on (default 3000). Loopback only.
@@ -72,14 +77,15 @@ async def grafana_start(port: int = 3000) -> dict[str, Any]:
 async def grafana_stop() -> dict[str, Any]:
     """Stop the Grafana started by `grafana_start` and remove its private files.
 
-    Removes only the container this server created (identified by its label, never by name
-    alone) and the private directory holding the database view and the password file. Safe to call
-    when nothing is running: it reports that and changes nothing. Does not touch the database or
-    anyone else's Grafana. Admin tier, like `grafana_start`.
+    Removes only the containers and networks this server created (identified by their label,
+    never by name alone) and, from `GRAFANA_DIR`, only the exact names `grafana_start` made there
+    (the database view, config, plugin, password file, marker) and only if the marker is present.
+    Safe to call when nothing is running: it reports that and changes nothing. Does not touch the
+    database or anyone else's Grafana. Admin tier, like `grafana_start`.
 
     Returns:
-        `stopped`, `was_running`, `removed_containers`, `removed_link_dir`, `note`; or `error`
-        when Docker cannot be reached.
+        `stopped`, `was_running`, `removed_containers`, `removed_networks`, `removed_link_dir`,
+        `note`; or `error` when Docker cannot be reached.
     """
     result = await grafana.stop()
     ok = "error" not in result

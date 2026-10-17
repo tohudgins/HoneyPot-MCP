@@ -18,6 +18,7 @@ import asyncio
 import ipaddress
 import json
 import re
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -33,15 +34,15 @@ from honeypot_mcp.storage import rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert
 from honeypot_mcp.tool_hints import hints
-from honeypot_mcp.tools._format import write_artifact
-from honeypot_mcp.tools._window import annotate_window, window_bounds
-from honeypot_mcp.tools.patterns import (
+from honeypot_mcp.tools._format import mark_untrusted, write_artifact
+from honeypot_mcp.tools._scan import (
     _expired,
     _first_id_since,
     _jv,
     _scan_workers,
     _slice_plan,
 )
+from honeypot_mcp.tools._window import annotate_window, window_bounds
 
 # ── extract_iocs ──────────────────────────────────────────────────────────────
 
@@ -69,6 +70,9 @@ _IOC_EXACT = frozenset({"rdp_command", "redis_command", "mongodb_command"})
 # Rows read per batch of a streamed (non-collapsed) type: small, so a 64 KB HTTP body per row never
 # accumulates in memory.
 _BATCH = 500
+# Rows of a collapsed slice folded per round trip: each row can hold two 8,192-character strings, so
+# a whole slice (60,000 distinct commands) used to be 1 GB before the first one was parsed.
+_COLLAPSED_BATCH = 200
 # Distinct values tracked per category; past this new values are dropped (and the result says so).
 _MAX_DISTINCT = 20_000
 _MAX_LIMIT = 500
@@ -286,6 +290,7 @@ class _Collector:
     ) -> None:
         """Scan one payload standing for `count` alerts from `source` between `first` and `last`."""
         tally = self.tallies[event_type]
+        source = sys.intern(source)  # one string per address, not one per row kept in an `_Agg`
         tally.scanned += count
         if tally.oldest is None or first < tally.oldest:
             tally.oldest = first
@@ -351,10 +356,25 @@ async def _read_collapsed_slice(
             .group_by(*cols, Alert.source_ip)
         )
         async with get_session() as session:
-            rows = (await session.execute(stmt)).all()
-    for *texts, source, count, first, last in rows:
-        payload = {k: v for k, v in zip(_COLLAPSE_KEYS, texts, strict=True) if isinstance(v, str)}
-        coll.take(event_type, payload, source, int(count), first, last)
+            streamed = await session.stream(stmt.execution_options(yield_per=_COLLAPSED_BATCH))
+            try:
+                first_batch = True
+                async for batch in streamed.partitions():
+                    # The slice-start check above covers the first batch.
+                    if not first_batch and _expired(deadline):
+                        return (
+                            False  # `coll.take` counted the rows already folded: the tally is exact
+                        )
+                    first_batch = False
+                    for *texts, source, count, first, last in batch:
+                        payload = {
+                            k: v
+                            for k, v in zip(_COLLAPSE_KEYS, texts, strict=True)
+                            if isinstance(v, str)
+                        }
+                        coll.take(event_type, payload, source, int(count), first, last)
+            finally:
+                await streamed.close()
     return True
 
 
@@ -545,7 +565,7 @@ async def extract_iocs(since_hours: float | None = None, limit: int = 50) -> dic
         "sha256": _rows(coll.hashes, limit, with_names=True),
         "note": " ".join(notes) or None,
     }
-    return await annotate_window(result)
+    return mark_untrusted(await annotate_window(result))
 
 
 # ── attack_navigator_layer ────────────────────────────────────────────────────

@@ -228,7 +228,7 @@ async def test_a_planted_credential_is_masked_everywhere_and_other_passwords_are
         f"[masked: planted honeytoken #{revoked}]",
     }
     assert next(s for s in out["services"] if s["service"] == "ssh")["planted_credential_hits"] == 1
-    assert out["planted_passwords_masked"] == 2
+    assert out["planted_secrets_masked"] == 2
 
 
 async def test_credentials_window_source_and_service_filters():
@@ -273,7 +273,7 @@ async def test_credentials_window_source_and_service_filters():
 async def test_slicing_a_scan_does_not_change_its_answer(monkeypatch):
     """The scan cuts an event type into id slices. Whatever the slice size, every event is counted
     once: an off-by-one at a boundary would drop or double a row exactly there."""
-    from honeypot_mcp.tools import patterns
+    from honeypot_mcp.tools import _scan
 
     rows = [
         ("telnet_login_success", f"192.0.2.{i % 4 + 1}", _login("root", f"pw{i % 3}"), None)
@@ -283,7 +283,7 @@ async def test_slicing_a_scan_does_not_change_its_answer(monkeypatch):
     expected = await _call("credentials", service="telnet", top=10)
 
     for chunk in (1, 2, 5, 7, 22, 23, 24):
-        monkeypatch.setattr(patterns, "_CHUNK_ROWS", chunk)
+        monkeypatch.setattr(_scan, "_CHUNK_ROWS", chunk)
         out = await _call("credentials", service="telnet", top=10)
         assert out["count"] == 23, chunk
         assert out["top_pairs"] == expected["top_pairs"], chunk
@@ -293,12 +293,12 @@ async def test_slicing_a_scan_does_not_change_its_answer(monkeypatch):
 
 async def test_an_exhausted_time_budget_returns_the_newest_events_and_says_so(monkeypatch):
     from honeypot_mcp.config import get_settings
-    from honeypot_mcp.tools import patterns
+    from honeypot_mcp.tools import _scan
 
     await _seed(
         [("telnet_login_success", "192.0.2.1", _login("root", f"pw{i}"), None) for i in range(10)]
     )
-    monkeypatch.setattr(patterns, "_CHUNK_ROWS", 3)
+    monkeypatch.setattr(_scan, "_CHUNK_ROWS", 3)
     monkeypatch.setattr(get_settings(), "attack_patterns_time_budget_seconds", 0.0)
 
     out = await _call("credentials", service="telnet")
@@ -311,7 +311,7 @@ async def test_an_exhausted_time_budget_returns_the_newest_events_and_says_so(mo
 
 
 async def test_a_partial_budget_covers_the_newest_slices_first(monkeypatch):
-    from honeypot_mcp.tools import patterns
+    from honeypot_mcp.tools import _scan, patterns
 
     await _seed(
         [
@@ -319,7 +319,7 @@ async def test_a_partial_budget_covers_the_newest_slices_first(monkeypatch):
             for i in range(9)
         ]
     )
-    monkeypatch.setattr(patterns, "_CHUNK_ROWS", 3)
+    monkeypatch.setattr(_scan, "_CHUNK_ROWS", 3)
     started = {"n": 0}
 
     def expired(_deadline: float) -> bool:
@@ -342,7 +342,7 @@ async def test_parallel_slices_on_a_file_database_match_the_sequential_answer(
     A file database runs several at once; the answer must not depend on it."""
     from honeypot_mcp.config import get_settings
     from honeypot_mcp.storage.database import close_db, init_db
-    from honeypot_mcp.tools import patterns
+    from honeypot_mcp.tools import _scan, patterns
 
     await close_db()
     monkeypatch.setattr(get_settings(), "database_url", f"sqlite+aiosqlite:///{tmp_path / 'p.db'}")
@@ -353,7 +353,7 @@ async def test_parallel_slices_on_a_file_database_match_the_sequential_answer(
             for i in range(40)
         ]
     )
-    monkeypatch.setattr(patterns, "_CHUNK_ROWS", 4)
+    monkeypatch.setattr(_scan, "_CHUNK_ROWS", 4)
     assert patterns._scan_workers() > 1
 
     out = await _call("credentials", service="telnet", top=10)

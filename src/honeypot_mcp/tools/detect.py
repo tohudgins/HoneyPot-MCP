@@ -19,6 +19,7 @@ from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools import _audit
+from honeypot_mcp.tools._format import mark_untrusted
 
 
 @mcp.tool(auth=require_role("operator"), **hints("pcap_detect"))
@@ -82,7 +83,7 @@ async def pcap_detect(
         outcome="ok" if ok else "error",
         error=None if ok else str(result["error"])[:500],
     )
-    return result
+    return mark_untrusted(result)
 
 
 @mcp.tool(auth=require_role("admin"), **hints("detection_rules_update"))

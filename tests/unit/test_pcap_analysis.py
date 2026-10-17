@@ -1144,6 +1144,158 @@ async def test_pcap_files_lists_extracts_when_capture_is_disabled_and_dirs_are_m
         pcap_module._capture = None
 
 
+def _hostile_out_of_order_frames(flows: int, segments: int = 24, size: int = 1460) -> list[bytes]:
+    """Each flow: one in-order byte, then non-contiguous out-of-order segments that never fill the hole,
+    so the reassembler holds them all in `pending` (up to ~32 KB per stream) and never finishes."""
+    frames = []
+    for f in range(flows):
+        sport = 1024 + f % 60000
+        src = f"198.51.100.{1 + f // 60000}"
+        frames.append(ipv4(src, SERVER, 6, tcp(sport, 80, 1000, 0, 0x18, b"A")))
+        for k in range(segments):
+            seq = 1000 + 1 + 10 + k * (size + 540)
+            frames.append(ipv4(src, SERVER, 6, tcp(sport, 80, seq, 0, 0x18, b"B" * size)))
+    return frames
+
+
+def _held_by_live_flows(analyzer) -> int:
+    return sum(s.held() for flow in analyzer.live.values() for s in flow.streams if s is not None)
+
+
+def test_out_of_order_segments_count_against_the_reassembly_budget(monkeypatch):
+    """`_REASSEMBLY_BUDGET` counted only reassembled bytes, so out-of-order segments waiting behind a
+    hole were free: 6,000 flows of 24 such segments held ~200 MB against a 64 MB budget (measured peak
+    RSS 279 MB; 112 MB once pending is counted). The budget is now on what a stream pins."""
+    budget = 400_000
+    monkeypatch.setattr(pa, "_REASSEMBLY_BUDGET", budget)
+    analyzer = pa._Analyzer(10, 5)
+    peak = 0
+    for i, frame in enumerate(_hostile_out_of_order_frames(60)):
+        analyzer.feed(BASE_TS + i * 0.001, 101, frame, len(frame))
+        peak = max(peak, _held_by_live_flows(analyzer))
+    # One stream's worst case (cap + 2 x cap of waiting segments + overhead) is the slack.
+    assert peak <= budget + 3 * pa._STREAM_BYTES + 64 * pa._SEGMENT_OVERHEAD, peak
+    assert peak > budget // 2, "the hostile pattern must actually fill the budget"
+    assert analyzer.buffered == _held_by_live_flows(analyzer), "the counter must not drift"
+
+
+def test_the_budget_counter_matches_what_streams_hold_after_mixed_traffic():
+    rng = random.Random(7)
+    analyzer = pa._Analyzer(10, 5)
+    frames = []
+    for f in range(40):
+        sport = 2000 + f
+        frames.append(ipv4(CLIENT, SERVER, 6, tcp(sport, 80, 500, 0, 0x18, b"x")))
+        for _ in range(rng.randrange(1, 80)):
+            seq = 500 + rng.randrange(1, 40_000)
+            frames.append(
+                ipv4(CLIENT, SERVER, 6, tcp(sport, 80, seq, 0, 0x18, b"y" * rng.randrange(1, 900)))
+            )
+    for i, frame in enumerate(frames):
+        analyzer.feed(BASE_TS + i * 0.001, 101, frame, len(frame))
+        assert analyzer.buffered == _held_by_live_flows(analyzer), i
+
+
+def test_stream_held_counts_pending_segments_with_their_overhead():
+    stream = pa._Stream(1024, 0)
+    stream.add(0, b"a")
+    stream.add(100, b"bbbb")
+    stream.add(200, b"cc")
+    assert stream.held() == 1 + 6 + 2 * pa._SEGMENT_OVERHEAD
+
+
+@pytest.mark.asyncio
+async def test_pcap_analyze_runs_at_most_two_analyses_at_once(dirs, monkeypatch):
+    """The analysis is pure Python in a thread: N parallel calls compete with the event loop that
+    serves every honeypot for the GIL. The rest wait for a slot."""
+    import asyncio
+    import threading
+
+    from honeypot_mcp.tools import pcap as pcap_tool
+
+    reports, _ring = dirs
+    write(reports / "one.pcap", pcap_bytes([]))
+    lock = threading.Lock()
+    state = {"now": 0, "peak": 0, "calls": 0}
+    real = pa.analyze_capture
+
+    def slow(*args, **kwargs):
+        with lock:
+            state["now"] += 1
+            state["calls"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+        time.sleep(0.15)
+        try:
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                state["now"] -= 1
+
+    monkeypatch.setattr(pa, "analyze_capture", slow)
+    results = await asyncio.gather(*(pcap_tool.pcap_analyze("one.pcap") for _ in range(7)))
+
+    assert state["calls"] == 7 and all("error" not in r for r in results)
+    assert state["peak"] == pcap_tool._ANALYZE_SLOTS == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_pcap_analyze_keeps_its_slot_until_the_thread_ends(dirs, monkeypatch):
+    """A client that times out cancels the await but cannot stop the thread. Freeing the slot then
+    let any number of abandoned analyses run together."""
+    import asyncio
+    import threading
+
+    from honeypot_mcp.tools import pcap as pcap_tool
+
+    reports, _ring = dirs
+    write(reports / "one.pcap", pcap_bytes([]))
+    release = threading.Event()
+    started = threading.Semaphore(0)
+    running = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+    real = pa.analyze_capture
+
+    def blocked(*args, **kwargs):
+        with lock:
+            running["now"] += 1
+            running["peak"] = max(running["peak"], running["now"])
+        started.release()
+        release.wait(10)
+        try:
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                running["now"] -= 1
+
+    monkeypatch.setattr(pa, "analyze_capture", blocked)
+    first = [asyncio.ensure_future(pcap_tool.pcap_analyze("one.pcap")) for _ in range(2)]
+    for _ in range(2):
+        assert await asyncio.to_thread(started.acquire, True, 5)
+    for task in first:
+        task.cancel()
+    await asyncio.gather(*first, return_exceptions=True)
+
+    later = [asyncio.ensure_future(pcap_tool.pcap_analyze("one.pcap")) for _ in range(3)]
+    await asyncio.sleep(0.3)
+    assert running["now"] == 2 and not any(t.done() for t in later), "slots were handed out early"
+
+    release.set()
+    results = await asyncio.gather(*later)
+    assert all("error" not in r for r in results)
+    assert running["peak"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_refused_path_does_not_leak_a_slot(dirs):
+    from honeypot_mcp.tools import pcap as pcap_tool
+
+    for _ in range(pcap_tool._ANALYZE_SLOTS * 3):
+        assert "error" in await pcap_tool.pcap_analyze("missing.pcap")
+    reports, _ring = dirs
+    write(reports / "ok.pcap", pcap_bytes([]))
+    assert "error" not in await pcap_tool.pcap_analyze("ok.pcap")
+
+
 def test_pcap_analyze_is_viewer_tier_and_read_only():
     import honeypot_mcp.server  # noqa: F401  (registers the tools)
     import honeypot_mcp.tools.pcap  # noqa: F401

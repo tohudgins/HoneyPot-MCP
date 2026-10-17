@@ -29,6 +29,13 @@ Wire handling is deliberately minimal: one request per connection (``Connection:
 forced upstream), bounded head and body, no chunked request bodies, no protocol upgrades, and
 the response is relayed byte for byte. The caller must be on the socket's owning group (file
 mode) and, on Linux, one of the allowed UIDs (``SO_PEERCRED``).
+
+The guard validates what the daemon will *read*, so it never lets the client choose how a body
+is read: only a small header allowlist is forwarded, `Content-Type` is set by the guard per
+endpoint (JSON for create, tar for the persona archive), endpoints that take no body refuse one
+(the daemon merges a form-encoded body into the same parameters as the query string, ahead of
+it), and a create body with a repeated key is refused (the daemon merges repeats, a validator
+sees only the last).
 """
 
 from __future__ import annotations
@@ -80,20 +87,15 @@ _IMAGE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,200}$")
 _PORTS = {f"{COWRIE_INTERNAL_PORT}/tcp", f"{COWRIE_TELNET_PORT}/tcp"}
 _SIGNALS = {"KILL", "SIGKILL", "TERM", "SIGTERM", "INT", "SIGINT", "9", "15", "2"}
 
-# Headers that are not forwarded: the guard sets its own framing and never upgrades.
-_DROP_HEADERS = {
-    "host",
-    "connection",
-    "content-length",
-    "transfer-encoding",
-    "expect",
-    "upgrade",
-    "keep-alive",
-    "te",
-    "trailer",
-    "proxy-authorization",
-    "proxy-connection",
-}
+# The only request headers forwarded (case-insensitive). Everything else is dropped, not
+# blacklisted: the daemon reads `Content-Type` to decide whether a body is JSON, a tar or a *form
+# whose fields override the query string the guard validated*, `X-Registry-Auth` carries registry
+# credentials, and method-override or hop-by-hop headers are exactly what a blocklist forgets. The
+# guard writes its own Host, Connection, Content-Length and Content-Type.
+_FORWARD_HEADERS = {"user-agent", "accept", "accept-encoding"}
+
+_JSON = "application/json"
+_TAR = "application/x-tar"
 
 
 class Denied(Exception):
@@ -110,6 +112,9 @@ class Verdict:
     """What the guard decided: forward, and whether the target container needs a label check."""
 
     container: str | None = None  # a container reference whose label must be checked
+    # The Content-Type the guard sends upstream (never the client's). None: the endpoint takes no
+    # body, so none was accepted and none is declared.
+    content_type: str | None = None
 
 
 # ── the policy ───────────────────────────────────────────────────────────────────────────────
@@ -327,10 +332,46 @@ def validate_create(body: Any, query: dict[str, list[str]]) -> None:
     _validate_host_config(body.get("HostConfig"))
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse an object that names a key twice (compared case-insensitively).
+
+    Python keeps the *last* duplicate and checks that. Go's `encoding/json`, which the daemon
+    decodes with, matches struct fields case-insensitively and decodes a repeated object *into the
+    value already there*, so `{"HostConfig": {"Privileged": true}, "HostConfig": {<the engine's
+    settings>}}` is a privileged container to the daemon and an ordinary one to a validator that
+    saw only the last object. (Reproduced against a real daemon.) No legitimate client repeats a
+    key, so the one safe reading is none.
+    """
+    seen: set[str] = set()
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        folded = key.casefold()
+        if folded in seen:
+            raise Denied(f"duplicate JSON key {key!r}", 400)
+        seen.add(folded)
+        out[key] = value
+    return out
+
+
+def _reject_constant(name: str) -> Any:
+    raise Denied(f"JSON constant {name} is not permitted", 400)
+
+
+def _loads_strict(raw: bytes | str) -> Any:
+    """`json.loads` for bytes the daemon will also decode: no duplicate keys, no NaN/Infinity."""
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        return json.loads(
+            text, object_pairs_hook=_no_duplicate_keys, parse_constant=_reject_constant
+        )
+    except (ValueError, RecursionError) as exc:
+        raise Denied("body is not valid JSON", 400) from exc
+
+
 def _label_filter_ok(raw: str) -> bool:
     try:
-        filters = json.loads(raw)
-    except ValueError:
+        filters = _loads_strict(raw)
+    except Denied:
         return False
     if not isinstance(filters, dict):
         return False
@@ -353,7 +394,21 @@ def check(method: str, target: str, body: bytes = b"") -> Verdict:
 
     Raises `Denied` otherwise. Pure: nothing here touches Docker or the network, so every rule
     is exercised by the unit tests.
+
+    The returned `Verdict.content_type` is what the proxy declares upstream. A body is accepted
+    only where the endpoint takes one (container create: JSON; persona archive: tar) and the
+    client never chooses how it is read: the daemon parses a form-encoded POST body into the same
+    `r.Form` as the query string, with the body's values *first*, so a body the guard did not
+    inspect could replace `fromImage`/`signal`/`name` after the query had passed. (Reproduced
+    against a real daemon.)
     """
+    verdict = _route(method, target, body)
+    if body and verdict.content_type is None:
+        raise Denied(f"{method} {urlsplit(target).path} takes no request body", 400)
+    return verdict
+
+
+def _route(method: str, target: str, body: bytes) -> Verdict:
     parts = urlsplit(target)
     path = _VERSION_PREFIX.sub("", parts.path, count=1)
     if (
@@ -380,12 +435,8 @@ def check(method: str, target: str, body: bytes = b"") -> Verdict:
         if path == "/containers/create" and method == "POST":
             if len(body) > MAX_JSON_BODY:
                 raise Denied("request body too large", 413)
-            try:
-                parsed = json.loads(body.decode("utf-8"))
-            except ValueError as exc:
-                raise Denied("container create body is not valid JSON", 400) from exc
-            validate_create(parsed, query)
-            return Verdict()
+            validate_create(_loads_strict(body), query)
+            return Verdict(content_type=_JSON)
         if len(segments) >= 2 and _CONTAINER_REF.match(segments[1]):
             ref, action = segments[1], "/".join(segments[2:])
             allowed = {
@@ -403,7 +454,11 @@ def check(method: str, target: str, body: bytes = b"") -> Verdict:
                 ("HEAD", "archive"),
             }
             if (method, action) in allowed:
-                if action == "kill" and (query.get("signal") or ["KILL"])[0] not in _SIGNALS:
+                if (
+                    action in ("kill", "stop", "restart")
+                    and "signal" in query
+                    and query["signal"][0] not in _SIGNALS
+                ):
                     raise Denied("signal not permitted")
                 if action == "archive":
                     # Written: the persona directory. Read: the base pickle (persona
@@ -417,13 +472,16 @@ def check(method: str, target: str, body: bytes = b"") -> Verdict:
                         raise Denied("archive path not permitted")
                     if method == "PUT" and len(body) > MAX_ARCHIVE_BODY:
                         raise Denied("request body too large", 413)
-                return Verdict(container=ref)
+                return Verdict(
+                    container=ref,
+                    content_type=_TAR if (method, action) == ("PUT", "archive") else None,
+                )
 
     if segments[0] == "images":
         if path == "/images/create" and method == "POST":
             image = (query.get("fromImage") or [""])[0]
             tag = (query.get("tag") or [""])[0] or None
-            if (query.get("fromSrc") or query.get("repo")) or not _image_matches(image, tag):
+            if set(query) - {"fromImage", "tag", "platform"} or not _image_matches(image, tag):
                 raise Denied("only the pinned Cowrie image may be pulled")
             return Verdict()
         if method == "GET" and len(segments) >= 3 and segments[-1] == "json":
@@ -574,7 +632,9 @@ class Guard:
             lengths = [v for k, v in headers if k.lower() == "content-length"]
             if any(k.lower() == "transfer-encoding" for k, _ in headers):
                 raise Denied("chunked request bodies are not supported", 411)
-            if len(lengths) > 1 or (lengths and not lengths[0].isdigit()):
+            if len(lengths) > 1 or (
+                lengths and not (lengths[0].isascii() and lengths[0].isdigit())
+            ):
                 raise Denied("bad Content-Length", 400)
             length = int(lengths[0]) if lengths else 0
             if length > MAX_ARCHIVE_BODY:
@@ -596,7 +656,7 @@ class Guard:
             log.warning("denied %s", denial.message)
             await self._reply(writer, denial)
             return
-        await self._forward(reader, writer, method, target, headers, body)
+        await self._forward(reader, writer, method, target, headers, body, verdict.content_type)
 
     async def _reply(self, writer: asyncio.StreamWriter, denial: Denied) -> None:
         self.denied += 1
@@ -612,6 +672,7 @@ class Guard:
         target: str,
         headers: list[tuple[str, str]],
         body: bytes,
+        content_type: str | None,
     ) -> None:
         try:
             up_reader, up_writer = await asyncio.wait_for(
@@ -622,7 +683,9 @@ class Guard:
             return
         self.forwarded += 1
         out = [f"{method} {target} HTTP/1.1", "Host: docker", "Connection: close"]
-        out += [f"{k}: {v}" for k, v in headers if k.lower() not in _DROP_HEADERS]
+        out += [f"{k}: {v}" for k, v in headers if k.lower() in _FORWARD_HEADERS]
+        if content_type is not None:
+            out.append(f"Content-Type: {content_type}")
         if body or method in ("POST", "PUT"):
             out.append(f"Content-Length: {len(body)}")
         up_writer.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1") + body)

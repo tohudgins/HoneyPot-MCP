@@ -23,15 +23,9 @@ from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools import _audit
-from honeypot_mcp.tools._format import write_artifact
-from honeypot_mcp.tools.patterns import (
-    _FILE_TYPES,
-    _clip,
-    _iso,
-    _jv,
-    _load_planted,
-    file_origin,
-)
+from honeypot_mcp.tools._format import mark_untrusted, write_artifact
+from honeypot_mcp.tools._planted import load_planted
+from honeypot_mcp.tools._scan import _FILE_TYPES, _clip, _iso, _jv, file_origin
 
 _HASH_CHUNK = 200
 _EVENT_ROW_CAP = 200_000
@@ -44,7 +38,7 @@ async def database_context(hashes: list[str]) -> dict[str, dict[str, Any]]:
     type, and only the first is a download. Planted honeytoken passwords are masked, as there."""
     if not hashes:
         return {}
-    planted = await _load_planted()
+    planted = await load_planted()
     types = sorted({t for pair in _FILE_TYPES.values() for t in pair})
     sha_expr = func.coalesce(_jv("shasum"), _jv("sha256"))
     rows: list[Any] = []
@@ -223,7 +217,7 @@ async def sample_scan(
         arguments={"path": path, "rules": rules, "top": top},
         target=(path or ".")[:128],
     )
-    return result
+    return mark_untrusted(result)
 
 
 @mcp.tool(auth=require_role("admin"), **hints("sample_collect"))

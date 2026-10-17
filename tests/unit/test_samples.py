@@ -1308,3 +1308,266 @@ async def test_what_collect_stores_is_what_scan_reads(docker_client, engine):
     result = await scan(path="honeypot-hp-ssh")
     assert result["files_scanned"] == 1 and result["files_with_hits"] == 1
     assert result["top_files"][0]["path"] == f"honeypot-hp-ssh/downloads/{sha(body)}"
+
+
+# ── resource bounds ──────────────────────────────────────────────────────────────────────────
+
+
+def _tar_with_member(name: str, *, fmt: int, size: int = 1, pax: dict | None = None) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=fmt) as tar:
+        info = tarfile.TarInfo(name)
+        info.size = size
+        info.pax_headers = pax or {}
+        tar.addfile(info, io.BytesIO(b"x" * size))
+    return buffer.getvalue()
+
+
+def _ingest(data: bytes, tmp_path: Path, *, piece: int = 4096):
+    """Run `_ingest_tar` over `data` served in small chunks; returns (stream, collected)."""
+    from honeypot_mcp import samples
+
+    stream = samples._ByteStream((data[i : i + piece] for i in range(0, len(data), piece)), 1 << 30)
+    collected = samples._Collected("c", "c")
+    try:
+        samples._ingest_tar(
+            stream, "downloads", tmp_path / "hp", tmp_path, {}, collected, samples._Totals(),
+            100, 1 << 30, 1 << 30,
+        )  # fmt: skip
+    finally:
+        stream.close()
+    return stream, collected
+
+
+@pytest.mark.parametrize(
+    ("fmt", "pax"),
+    [(tarfile.GNU_FORMAT, None), (tarfile.PAX_FORMAT, {"comment": "z" * (3 << 20)})],
+    ids=["gnu-long-name", "pax-record"],
+)
+def test_an_oversized_extended_header_is_refused_before_it_is_read(tmp_path, fmt, pax):
+    """tarfile reads a long-name or PAX header at whatever size the archive declares, and copies it
+    several times: a 40 MB one peaked ~180 MB above baseline (a 512 MB cap would mean ~2.5 GB). The
+    declared size is refused after the 512-byte header, so almost none of it is pulled in."""
+    name = "downloads/" + ("n" * (3 << 20) if pax is None else "f")
+    data = _tar_with_member(name, fmt=fmt, pax=pax)
+    assert len(data) > 3 << 20
+
+    from honeypot_mcp import samples
+
+    stream = samples._ByteStream((data[i : i + 4096] for i in range(0, len(data), 4096)), 1 << 30)
+    try:
+        with pytest.raises(tarfile.ReadError, match="oversized extended header"):
+            samples._ingest_tar(
+                stream, "downloads", tmp_path / "hp", tmp_path, {}, samples._Collected("c", "c"),
+                samples._Totals(), 100, 1 << 30, 1 << 30,
+            )  # fmt: skip
+    finally:
+        stream.close()
+    assert stream.received < 100_000, f"{stream.received} bytes were pulled in"
+
+
+def test_an_ordinary_long_name_and_pax_record_still_parse(tmp_path):
+    long_name = "downloads/" + "n" * 300  # beyond the 100-byte ustar field: a GNU long-name header
+    stream, collected = _ingest(_tar_with_member(long_name, fmt=tarfile.GNU_FORMAT), tmp_path)
+    assert collected.skipped == {"unexpected path": 1}  # parsed, then refused as a name
+    stream, collected = _ingest(
+        _tar_with_member("downloads/ok", fmt=tarfile.PAX_FORMAT, pax={"comment": "x" * 2000}),
+        tmp_path,
+    )
+    assert len(collected.new) == 1
+
+
+def test_a_gnu_sparse_member_is_refused_without_expanding_its_map(tmp_path):
+    from honeypot_mcp import samples
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        info = tarfile.TarInfo("downloads/sparse")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    block = bytearray(buffer.getvalue()[:512])
+    block[156:157] = tarfile.GNUTYPE_SPARSE  # retype the header as a GNU sparse member
+    block[148:156] = b" " * 8  # the checksum is summed with its own field as spaces
+    block[148:156] = b"%06o\0 " % sum(block)
+    data = bytes(block) + buffer.getvalue()[512:]
+    stream = samples._ByteStream(iter([data]), 1 << 20)
+    try:
+        with pytest.raises(tarfile.ReadError, match="sparse"):
+            samples._ingest_tar(
+                stream, "downloads", tmp_path / "hp", tmp_path, {}, samples._Collected("c", "c"),
+                samples._Totals(), 100, 1 << 20, 1 << 20,
+            )  # fmt: skip
+    finally:
+        stream.close()
+
+
+def test_a_member_is_read_in_pieces_and_stored_intact(tmp_path, monkeypatch):
+    from honeypot_mcp import samples
+
+    monkeypatch.setattr(samples, "_READ_CHUNK", 1000)
+    body = os.urandom(10_500)
+    _stream, empty = _ingest(
+        _tar_with_member("downloads/x", fmt=tarfile.PAX_FORMAT, size=0), tmp_path
+    )
+    assert empty.new[0]["size"] == 0  # an empty member is still stored
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo("downloads/y")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
+    (tmp_path / "second").mkdir()
+    _stream, collected = _ingest(buffer.getvalue(), tmp_path / "second")
+    assert collected.new[0]["sha256"] == sha(body) and collected.new[0]["size"] == len(body)
+    stored = tmp_path / "second" / "hp" / "downloads" / sha(body)
+    os.chmod(stored, 0o600)
+    assert stored.read_bytes() == body
+
+
+def test_a_byte_stream_never_returns_more_than_its_read_ceiling():
+    """Whatever size a caller asks for (or -1), a read is bounded, so one call cannot buffer the
+    whole per-call cap and copy it again; short reads hand back every byte in order."""
+    from honeypot_mcp import samples
+
+    data = os.urandom(samples._MAX_READ * 3 + 17)
+    stream = samples._ByteStream(iter([data]), 1 << 30)
+    try:
+        sizes, got = [], b""
+        for ask in (-1, 1 << 40, 5, 1 << 20, -1, -1):
+            piece = stream.read(ask)
+            sizes.append(len(piece))
+            got += piece
+        assert max(sizes) == samples._MAX_READ and sizes[:2] == [samples._MAX_READ] * 2
+        while piece := stream.read(1 << 40):
+            got += piece
+        assert got == data
+    finally:
+        stream.close()
+
+
+def test_a_stalled_stream_gives_up_at_the_deadline_even_while_the_socket_read_blocks():
+    """The Docker SDK turns the socket timeout off, so a peer that goes quiet blocks the read for
+    ever; the wait for the next chunk must not be that read."""
+    import threading
+    import time
+
+    from honeypot_mcp import samples
+
+    stall = threading.Event()
+
+    def quiet():
+        yield b"a" * 100
+        stall.wait(30)  # the peer sends nothing more
+        yield b"b"
+
+    stream = samples._ByteStream(quiet(), 1 << 20, deadline=time.monotonic() + 0.5)
+    try:
+        assert stream.read(10) == b"a" * 10
+        assert stream.read(1000) == b"a" * 90, "what has arrived is returned, not held back"
+        started = time.monotonic()
+        with pytest.raises(samples._DeadlineExceeded):
+            stream.read(1000)
+        assert time.monotonic() - started < 3
+    finally:
+        stall.set()
+        stream.close()
+
+
+def test_a_stream_error_reaches_the_reader_and_end_of_stream_is_sticky():
+    from honeypot_mcp import samples
+
+    def broken():
+        yield b"ok"
+        raise ConnectionError("peer reset")
+
+    stream = samples._ByteStream(broken(), 1 << 20)
+    try:
+        assert stream.read(2) == b"ok"
+        with pytest.raises(ConnectionError):
+            stream.read(1)
+        assert stream.read(1) == b""
+    finally:
+        stream.close()
+    done = samples._ByteStream(iter([b"x"]), 1 << 20)
+    assert done.read(10) == b"x" and done.read(10) == b"" and done.read(10) == b""
+    done.close()
+
+
+async def test_collect_gives_up_on_a_stalled_container_and_frees_the_lock(
+    docker_client, monkeypatch
+):
+    """A container that goes quiet held `_COLLECT_LOCK` and a worker thread for as long as it
+    liked (the SDK disables the socket timeout). Now the call ends at its deadline, keeps what
+    arrived, says so, and the next call can run."""
+    import threading
+    import time
+
+    from honeypot_mcp import samples
+    from honeypot_mcp.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "sample_collect_deadline_seconds", 1)
+    stall = threading.Event()
+    good = tarfile.TarInfo("downloads/first")
+    good.size = 4
+    head = good.tobuf() + b"data" + b"\0" * 508  # one whole member, then silence
+
+    def drip():
+        yield head
+        stall.wait(30)
+        yield b"never"
+
+    container = docker_client.add("honeypot-hp-ssh", {})
+    container.tars = {f"{COWRIE_ROOT}/downloads": drip()}
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(collect(), timeout=20)
+        elapsed = time.monotonic() - started
+        assert elapsed < 8, f"a 1 s deadline took {elapsed:.1f}s"
+        entry = result["honeypots"][0]
+        assert "time limit" in entry["truncated"], entry
+        assert entry["new_files"] == 1, "what arrived before the deadline is kept"
+        assert not samples._COLLECT_LOCK.locked()
+    finally:
+        stall.set()
+    container.tars = {f"{COWRIE_ROOT}/downloads": normal_archives()["downloads"]}
+    again = await asyncio.wait_for(collect(), timeout=20)
+    assert again["new_files"] >= 1
+
+
+def test_the_collect_deadline_setting_has_a_default_and_bounds():
+    from pydantic import ValidationError
+
+    from honeypot_mcp.config import Settings
+
+    assert Settings().sample_collect_deadline_seconds == 300
+    for bad in (0, 4, 3601):
+        with pytest.raises(ValidationError):
+            Settings(sample_collect_deadline_seconds=bad)
+
+
+async def test_a_swap_for_a_symlink_after_the_inspection_never_chmods_the_target(
+    engine, tmp_path, monkeypatch
+):
+    """`read_sample` grants itself read on a mode-000 file with a *path* chmod. A swap for a
+    symlink between its `lstat` and that chmod made the chmod follow the link and change the mode
+    of whatever it pointed at (and the failure path then set it to the original file's mode)."""
+    from honeypot_mcp import samples
+
+    path = put("victim", BENIGN, mode=0o000)
+    target = tmp_path / "elsewhere.txt"
+    target.write_bytes(b"not a sample")
+    os.chmod(target, 0o640)
+    real_open = os.open
+    calls = []
+
+    def swapping_open(p, flags, *args, **kwargs):
+        calls.append(p)
+        if len(calls) == 1:
+            os.unlink(path)
+            os.symlink(target, path)
+            raise PermissionError(13, "Permission denied")
+        return real_open(p, flags, *args, **kwargs)
+
+    monkeypatch.setattr(samples, "os", _OsProxy(open=swapping_open))
+    with pytest.raises(samples.SkipFile):
+        samples.read_sample(path, 1 << 20)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640, "the link's target must be left alone"

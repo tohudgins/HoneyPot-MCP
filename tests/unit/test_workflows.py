@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -484,3 +485,77 @@ async def test_the_backup_opens_with_the_projects_own_init_db(source_db, tmp_pat
     await init_db()
     async with get_session() as session:
         assert (await session.execute(select(func.count(Alert.id)))).scalar_one() == 30
+
+
+async def test_concurrent_backups_do_not_both_pass_the_same_free_space_check(
+    source_db, tmp_path, monkeypatch
+):
+    """Each call checked the free space and then wrote that much, so two at once both passed a check
+    only one could satisfy and doubled the disk use. They now run one at a time, and the second
+    sees what the first used."""
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools import workflows
+
+    needed = source_db.stat().st_size + source_db.with_name(source_db.name + "-wal").stat().st_size
+    reserve = get_settings().min_free_disk_mb * 1024 * 1024
+    state = {"free": needed + reserve + 1024, "running": 0, "peak": 0}
+    real_backup = workflows._backup_into
+
+    def tight_free(_path):
+        return state["free"]
+
+    def slow_backup(source, work_dir, verify, expected):
+        import time
+
+        state["running"] += 1
+        state["peak"] = max(state["peak"], state["running"])
+        try:
+            time.sleep(0.2)
+            manifest = real_backup(source, work_dir, verify, expected)
+            state["free"] -= expected  # what this backup took from the disk
+            return manifest
+        finally:
+            state["running"] -= 1
+
+    monkeypatch.setattr(workflows, "_free_bytes", tight_free)
+    monkeypatch.setattr(workflows, "_backup_into", slow_backup)
+    first, second = await asyncio.gather(
+        workflows.database_backup(destination="one"), workflows.database_backup(destination="two")
+    )
+
+    outcomes = sorted("error" in r for r in (first, second))
+    assert outcomes == [False, True], (first, second)
+    assert "Not enough free disk space" in (first.get("error") or second.get("error"))
+    assert state["peak"] == 1
+    assert len(list((tmp_path / "backups").iterdir())) == 1
+
+
+async def test_a_nested_destination_creates_every_missing_directory_owner_only(
+    source_db, tmp_path, monkeypatch
+):
+    """`mkdir(mode=0o700, parents=True)` applies the mode to the leaf only: the directories above
+    it took the umask's 0755 over a backup that holds every captured credential."""
+    from honeypot_mcp.tools import workflows
+
+    old = os.umask(0o022)
+    try:
+        out = await workflows.database_backup(destination="weekly/2026/w42")
+    finally:
+        os.umask(old)
+    assert "error" not in out, out
+    root = tmp_path / "backups"
+    for directory in (root, root / "weekly", root / "weekly" / "2026", root / "weekly/2026/w42"):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+
+
+async def test_an_existing_backup_directory_keeps_the_mode_the_operator_gave_it(
+    source_db, tmp_path
+):
+    from honeypot_mcp.tools import workflows
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    root.chmod(0o750)
+    out = await workflows.database_backup(destination="nightly")
+    assert "error" not in out, out
+    assert stat.S_IMODE(root.stat().st_mode) == 0o750

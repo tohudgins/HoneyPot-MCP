@@ -18,6 +18,7 @@ from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import (
     digest_payload,
+    mark_untrusted,
     truncate_payload,
     write_artifact,
 )
@@ -115,7 +116,7 @@ async def alerts_recent(
             f"Hit the limit of {limit} — there may be more. Narrow with "
             f"since_hours/severity/source_ip, or raise limit (max 200)."
         )
-    return result
+    return mark_untrusted(result)
 
 
 @mcp.tool(**hints("alerts_get"))
@@ -140,22 +141,24 @@ async def alerts_get(alert_id: int) -> dict[str, Any]:
             return {"error": f"No alert with id={alert_id}."}
         names = await queries.get_honeypot_names(session)
 
-        return {
-            "id": alert.id,
-            "honeypot": names.get(alert.honeypot_id) if alert.honeypot_id else None,
-            "honeypot_id": alert.honeypot_id,
-            "source_ip": alert.source_ip,
-            "source_port": alert.source_port,
-            "event_type": alert.event_type,
-            "severity": alert.severity.value,
-            "payload": truncate_payload(alert.payload),
-            "acknowledged": alert.acknowledged,
-            "disposition": alert.disposition.value if alert.disposition else None,
-            "triage_note": alert.triage_note,
-            "triaged_by": alert.triaged_by,
-            "triaged_at": alert.triaged_at.isoformat() if alert.triaged_at else None,
-            "timestamp": alert.timestamp.isoformat(),
-        }
+        return mark_untrusted(
+            {
+                "id": alert.id,
+                "honeypot": names.get(alert.honeypot_id) if alert.honeypot_id else None,
+                "honeypot_id": alert.honeypot_id,
+                "source_ip": alert.source_ip,
+                "source_port": alert.source_port,
+                "event_type": alert.event_type,
+                "severity": alert.severity.value,
+                "payload": truncate_payload(alert.payload),
+                "acknowledged": alert.acknowledged,
+                "disposition": alert.disposition.value if alert.disposition else None,
+                "triage_note": alert.triage_note,
+                "triaged_by": alert.triaged_by,
+                "triaged_at": alert.triaged_at.isoformat() if alert.triaged_at else None,
+                "timestamp": alert.timestamp.isoformat(),
+            }
+        )
 
 
 @mcp.tool(**hints("alerts_search"))
@@ -209,7 +212,7 @@ async def alerts_search(
             "No matches. The search is a literal substring match — try a shorter "
             "or more distinctive fragment."
         )
-    return result
+    return mark_untrusted(result)
 
 
 @mcp.tool(**hints("alerts_stats"))

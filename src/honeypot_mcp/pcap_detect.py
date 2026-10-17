@@ -98,6 +98,8 @@ _TMPFS_MB = 64
 _UPDATE_TMPFS_MB = 1024
 _LOG_TAIL_LINES = 2000
 _POLL_SECONDS = 0.25
+# Files and directories an engine may leave in its output directory. A real run writes a few dozen.
+_MAX_OUTPUT_ENTRIES = 5000
 _MAX_RULES_BYTES = 512 * _MB
 
 # Row/line caps. The output directory is already bounded in bytes; these bound parse time.
@@ -295,33 +297,64 @@ def _container_spec(
 class RunOutcome:
     exit_code: int | None
     oom: bool
-    reason: str | None  # "timeout" | "output_limit" | None
+    # "timeout" | "output_limit" | "output_entries" | "output_unreadable" | None
+    reason: str | None
     logs: str
     seconds: float
 
 
-def _dir_size(path: Path, limit: int) -> int:
-    """Bytes under `path` (no symlink followed), stopping once `limit` is exceeded."""
-    total = 0
+@dataclass
+class OutputUsage:
+    nbytes: int = 0
+    entries: int = 0
+    unreadable: int = 0  # directories that could not be listed (so were not measured)
+
+
+def _output_usage(path: Path, byte_limit: int, entry_limit: int) -> OutputUsage:
+    """What lives under `path` (no symlink followed), stopping as soon as any limit is crossed.
+
+    Every entry counts, not only bytes: millions of empty files cost no bytes and exhaust the
+    filesystem's inodes. Disk actually allocated counts, not the apparent size, so a sparse file
+    cannot hide. A directory that cannot be listed is counted, never skipped: the engine runs as a
+    different user and can make a 0700 subdirectory the host cannot read, and a limit that only sees
+    what it can read is no limit."""
+    use = OutputUsage()
     stack = [path]
     while stack:
         current = stack.pop()
         try:
             with os.scandir(current) as it:
                 for entry in it:
+                    use.entries += 1
                     try:
                         info = entry.stat(follow_symlinks=False)
                     except OSError:
-                        continue
-                    if stat.S_ISDIR(info.st_mode):
-                        stack.append(Path(entry.path))
-                    else:
-                        total += info.st_size
-                    if total > limit:
-                        return total
+                        info = None
+                    if info is not None:
+                        if stat.S_ISDIR(info.st_mode):
+                            stack.append(Path(entry.path))
+                        else:
+                            use.nbytes += max(info.st_size, getattr(info, "st_blocks", 0) * 512)
+                    if use.nbytes > byte_limit or use.entries > entry_limit:
+                        return use
+        except FileNotFoundError:
+            continue  # removed while the engine was working
         except OSError:
-            continue
-    return total
+            use.unreadable += 1
+            return use
+    return use
+
+
+def _output_reason(path: Path, byte_limit: int) -> str | None:
+    """The `RunOutcome.reason` that output under `path` calls for, or None while it is within bounds."""
+    use = _output_usage(path, byte_limit, _MAX_OUTPUT_ENTRIES)
+    if use.unreadable:
+        return "output_unreadable"
+    if use.nbytes > byte_limit:
+        return "output_limit"
+    if use.entries > _MAX_OUTPUT_ENTRIES:
+        return "output_entries"
+    return None
 
 
 def _remove_container(container: Any) -> None:
@@ -391,9 +424,10 @@ def _run_container(
             if elapsed >= timeout:
                 reason = "timeout"
                 break
-            if out_dir is not None and out_limit and _dir_size(out_dir, out_limit) > out_limit:
-                reason = "output_limit"
-                break
+            if out_dir is not None and out_limit:
+                reason = _output_reason(out_dir, out_limit)
+                if reason is not None:
+                    break
             time.sleep(_POLL_SECONDS if poll is None else poll)
         if reason is not None:
             with contextlib.suppress(Exception):
@@ -452,6 +486,20 @@ def _outcome_error(
             "killed.",
             "Replay a smaller capture or raise DETECTION_MAX_OUTPUT_MB.",
         )
+    if outcome.reason == "output_entries":
+        return DetectError(
+            f"{engine} created more than {_MAX_OUTPUT_ENTRIES} files and directories in its output "
+            "and was killed.",
+            "A capture produces a handful of log files; this one was likely crafted to exhaust the "
+            "filesystem.",
+        )
+    if outcome.reason == "output_unreadable":
+        return DetectError(
+            f"{engine} created a directory in its output that this server cannot read and was "
+            "killed.",
+            "The output is read back from the host, so anything unreadable cannot be measured "
+            "against DETECTION_MAX_OUTPUT_MB.",
+        )
     if outcome.oom or outcome.exit_code == 137:
         return DetectError(
             f"{engine} ran out of memory (limit {settings.detection_memory_mb} MB) and was killed.",
@@ -483,9 +531,29 @@ class Staging:
     rules_dir: Path | None = None
 
     def cleanup(self) -> None:
+        """Remove the working directory. Blocking: run in a thread."""
+        _open_up_directories(self.root)
         shutil.rmtree(self.root, ignore_errors=True)
         if self.root.exists():
-            log.warning("could not fully remove the detection working directory")
+            log.warning(
+                "could not fully remove the detection working directory %s (an engine created "
+                "files this user does not own); remove it as root",
+                self.root,
+            )
+
+
+def _open_up_directories(root: Path) -> None:
+    """Give this user rwx on every directory under `root`, so `rmtree` can list and empty it. The
+    engine runs as another user and may have made a subdirectory 0700; without this the removal
+    silently left whatever it held on disk. Works on what this user owns; never follows a link."""
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        with contextlib.suppress(OSError, NotImplementedError):
+            if current != root:
+                os.chmod(current, 0o700, follow_symlinks=False)
+        with contextlib.suppress(OSError), os.scandir(current) as it:
+            stack.extend(Path(e.path) for e in it if e.is_dir(follow_symlinks=False))
 
 
 def _open_regular(path: Path, max_bytes: int) -> tuple[BinaryIO, int]:

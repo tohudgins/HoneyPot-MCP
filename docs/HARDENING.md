@@ -208,6 +208,13 @@ Hardening reduces risk; it does not remove it. Know what is left:
   writes outside `data/`), not whether it can be taken.
 - **HTTPS egress** from the service is open (alert webhooks, threat intel): a hijacked process could
   exfiltrate to any HTTPS host. Pin or remove the integrations you do not use.
+- **The analysis tools that start containers need Docker access the guard does not give.**
+  `grafana_start`, `pcap_detect` and `detection_rules_update` run containers that are not Cowrie
+  (host bind mounts, their own images), so the Docker guard refuses them by design. On a hardened VPS
+  run them where Docker is yours to use, on a copy of the data (analysis mode on your own machine is
+  the intended place), not on the sensor host with the real Docker socket handed to the honeypot
+  service. `sample_collect` is the exception: it only reads Cowrie's two capture directories, which
+  the guard allows.
 - **Provider policy.** Check your provider's acceptable-use policy; some prohibit open mail relays or
   resolvers (leave SMTP and DNS out of a first deployment) or "security research" on their platform.
 - **Denial of service.** A flood can fill disk or exhaust connections. Per-IP connection caps, a disk

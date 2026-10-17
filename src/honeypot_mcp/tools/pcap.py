@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 from honeypot_mcp import instance_lock, pcap_analysis
 from honeypot_mcp import pcap as pcap_module
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
@@ -33,6 +34,9 @@ log = logging.getLogger(__name__)
 _COUNT_MAX_BYTES = 32 * 1024 * 1024
 _COUNT_TIME_BUDGET_SECONDS = 2.0
 _MAX_EXTRACTS_LISTED = 500
+# At most this many `pcap_analyze` runs at once (see the call site for why).
+_ANALYZE_SLOTS = 2
+_analysis_slots: LoopBound[asyncio.Semaphore] = LoopBound(lambda: asyncio.Semaphore(_ANALYZE_SLOTS))
 
 
 @mcp.tool(**hints("pcap_status"))
@@ -215,21 +219,45 @@ async def pcap_analyze(
         ("ring", Path(settings.pcap_dir).expanduser()),
     ]
     max_bytes = max(1, settings.pcap_analyze_max_file_mb) * 1024 * 1024
+    # The analysis is pure Python in a worker thread, so it shares the GIL with the loop that is
+    # serving every honeypot: several at once (up to ~2M packets and 120 s each) slow capture, not
+    # just this call. Callers beyond the cap wait their turn, holding no file open. The slot is
+    # released when the *thread* ends, not when this call does: a client that gives up cancels the
+    # await but cannot stop the thread, and a slot freed then would let the cap be walked past.
+    slots = _analysis_slots.get()
+    await slots.acquire()
+    job: asyncio.Future[dict[str, Any]] | None = None
     try:
-        fh, resolved, kind, size = pcap_analysis.open_capture(path, roots, max_bytes)
-    except pcap_analysis.CaptureAccessError as exc:
-        return {"error": str(exc)}
-    try:
-        digest = await asyncio.to_thread(
-            pcap_analysis.analyze_capture,
-            fh,
-            size,
-            max_packets=max(1, settings.pcap_analyze_max_packets),
-            top=top,
-            samples=samples_per_service,
-        )
+        try:
+            fh, resolved, kind, size = pcap_analysis.open_capture(path, roots, max_bytes)
+        except pcap_analysis.CaptureAccessError as exc:
+            return {"error": str(exc)}
+        try:
+            job = asyncio.ensure_future(
+                asyncio.to_thread(
+                    pcap_analysis.analyze_capture,
+                    fh,
+                    size,
+                    max_packets=max(1, settings.pcap_analyze_max_packets),
+                    top=top,
+                    samples=samples_per_service,
+                )
+            )
+        except BaseException:
+            fh.close()
+            raise
+
+        def _release(done: asyncio.Future[dict[str, Any]]) -> None:
+            fh.close()
+            slots.release()
+            if not done.cancelled():
+                done.exception()  # retrieved: a cancelled caller never awaits it
+
+        job.add_done_callback(_release)
+        digest = await asyncio.shield(job)
     finally:
-        fh.close()
+        if job is None:
+            slots.release()
     if "error" in digest:
         return {**digest, "file": {"name": resolved.name, "kind": kind}}
     return {"file": {"name": resolved.name, "kind": kind, "bytes": size}, **digest}

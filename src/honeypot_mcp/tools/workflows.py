@@ -37,9 +37,10 @@ from typing import Any
 
 from sqlalchemy import func, select
 
+from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.rbac import require_role
-from honeypot_mcp.secure_io import ensure_private_dir, write_private_file
+from honeypot_mcp.secure_io import write_private_file
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert
@@ -553,6 +554,24 @@ def _resolve_backup_destination(destination: str | None, root: Path) -> Path:
     return final
 
 
+def _make_private_tree(path: Path) -> None:
+    """Create `path` and every missing ancestor owner-only (0700); existing directories are left as
+    they are. `mkdir(mode=, parents=True)` applies the mode to the leaf only, so a nested
+    destination left its intermediate directories at the umask's 0755 above a 0600 backup."""
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
+# One backup at a time. Each call checks the free space and then writes up to that much, so two
+# concurrent calls both passed a check that only one of them could satisfy and doubled the disk use.
+_backup_lock: LoopBound[asyncio.Lock] = LoopBound(asyncio.Lock)
+
+
 def _free_bytes(path: Path) -> int:
     """Free space on the filesystem that holds `path` (or its nearest existing ancestor)."""
     probe = path
@@ -738,6 +757,11 @@ async def database_backup(destination: str | None = None, verify: bool = True) -
         verify: Run `PRAGMA integrity_check` on the copy and record its SHA-256. False skips both
               (the headline counts are always read, which also proves the copy opens).
     """
+    async with _backup_lock.get():
+        return await _database_backup(destination, verify)
+
+
+async def _database_backup(destination: str | None, verify: bool) -> dict[str, Any]:
     arguments = {"destination": destination, "verify": verify}
     settings = get_settings()
     root = settings.backup_dir.resolve()
@@ -767,7 +791,7 @@ async def database_backup(destination: str | None = None, verify: bool = True) -
 
     work_dir = final.parent / f".{final.name}.{secrets.token_hex(4)}.partial"
     try:
-        ensure_private_dir(final.parent)
+        _make_private_tree(final.parent)
         work_dir.mkdir(mode=0o700)
         manifest = await asyncio.to_thread(_backup_into, source, work_dir, verify, needed)
         if final.exists():  # lost a race with another backup of the same name

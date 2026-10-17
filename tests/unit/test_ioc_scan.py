@@ -201,10 +201,10 @@ async def test_a_window_with_no_alerts_is_an_empty_complete_answer():
 
 
 async def test_an_exhausted_budget_says_which_part_was_read(monkeypatch):
-    from honeypot_mcp.tools import ioc, patterns
+    from honeypot_mcp.tools import _scan, ioc
 
     # 2 small-type rows (read first), then 9 collapsible rows in 3 slices of 3, newest slice first.
-    monkeypatch.setattr(patterns, "_CHUNK_ROWS", 3)
+    monkeypatch.setattr(_scan, "_CHUNK_ROWS", 3)
     rows: list[tuple[str, str, dict[str, Any], timedelta]] = [
         ("ssh_file_download", "192.0.2.1", {"url": f"http://dl{i}.example.com/p"}, H * (i + 1))
         for i in range(2)
@@ -248,9 +248,9 @@ async def test_an_exhausted_budget_says_which_part_was_read(monkeypatch):
 
 
 async def test_the_oldest_read_timestamp_is_the_oldest_event_actually_covered(monkeypatch):
-    from honeypot_mcp.tools import ioc, patterns
+    from honeypot_mcp.tools import _scan, ioc
 
-    monkeypatch.setattr(patterns, "_CHUNK_ROWS", 3)
+    monkeypatch.setattr(_scan, "_CHUNK_ROWS", 3)
     base = datetime(2026, 10, 1, tzinfo=UTC)
     await _seed(
         [

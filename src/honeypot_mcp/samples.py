@@ -40,6 +40,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import os
+import queue
 import re
 import secrets
 import stat
@@ -763,15 +764,22 @@ def read_sample(path: Path, max_bytes: int) -> tuple[bytes, str]:
         except PermissionError:
             if not owner_ok:
                 raise SkipFile("not readable and not owned by this user") from None
-            os.chmod(path, 0o400)
+            # Never follows a symlink: a path swapped for a link after the `lstat` above would
+            # otherwise have its *target* made owner-readable (the fchmod below restores only the
+            # mode of the file this was meant to be). Linux raises NotImplementedError for a link
+            # and leaves the target alone; macOS changes the link itself.
+            try:
+                os.chmod(path, 0o400, follow_symlinks=False)
+            except NotImplementedError:
+                raise SkipFile("symlink") from None
             granted = True
             fd = os.open(path, _O_FLAGS)
     except SkipFile:
         raise
     except OSError as exc:
         if granted:
-            with contextlib.suppress(OSError):
-                os.chmod(path, original_mode)
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.chmod(path, original_mode, follow_symlinks=False)
         raise SkipFile("unreadable", exc.strerror or "") from None
     try:
         if granted:
@@ -994,21 +1002,124 @@ class _CapExceeded(Exception):
     pass
 
 
-class _ByteStream:
-    """A file-like over the chunks `Container.get_archive` yields, bounded in bytes, so a
-    container that streams without end is cut off at the limit instead of filling memory."""
+class _DeadlineExceeded(Exception):
+    pass
 
-    def __init__(self, chunks: Iterator[bytes], limit: int) -> None:
+
+_MAX_READ = (
+    4 << 20
+)  # the most one `_ByteStream.read` returns; a caller asking for more gets a short read
+_READ_CHUNK = 1 << 20  # how a member's content is pulled out of the tar: never in one allocation
+_MAX_EXTENDED_HEADER = 64 * 1024  # a GNU long name or PAX record that is longer is not a file name
+_EXTENDED_HEADER_TYPES = frozenset(
+    {
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.SOLARIS_XHDTYPE,
+    }
+)
+
+
+class _BoundedTarInfo(tarfile.TarInfo):
+    """`tarfile` reads a GNU long-name or PAX header *whatever size the archive declares*, copying it
+    several times (measured: a 40 MB long name peaked at ~180 MB over baseline, so the 512 MB
+    per-call cap meant ~2.5 GB), and expands a GNU sparse map into tuples at ~5x the archive's bytes.
+    Docker's archives have neither, so both are refused before any of it is read."""
+
+    def _proc_member(self, tarfile_: tarfile.TarFile) -> Any:  # type: ignore[override]
+        if self.type in _EXTENDED_HEADER_TYPES and self.size > _MAX_EXTENDED_HEADER:
+            raise tarfile.ReadError("oversized extended header")
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise tarfile.ReadError("GNU sparse member")
+        return super()._proc_member(tarfile_)  # type: ignore[misc]
+
+
+class _ByteStream:
+    """A file-like over the chunks `Container.get_archive` yields, bounded in bytes and in time, so a
+    container that streams without end, or that stalls, is cut off instead of filling memory or
+    holding the collection lock.
+
+    The chunks are pulled by a helper thread: the Docker SDK turns the socket timeout off for the
+    stream, so a peer that goes quiet blocks the read for ever, and only a wait that is not itself
+    the read can give up on it. An abandoned thread ends when the connection does (it is a daemon
+    thread and holds at most two chunks)."""
+
+    _END = object()
+
+    def __init__(self, chunks: Iterator[bytes], limit: int, deadline: float | None = None) -> None:
         self._chunks = iter(chunks)
         self._buffer = bytearray()
         self._limit = limit
+        self._deadline = deadline
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=2)
+        self._stopped = threading.Event()
+        self._pump_thread: threading.Thread | None = None
+        self._eof = False
         self.received = 0
+
+    def _pump(self) -> None:
+        item: Any
+        try:
+            for chunk in self._chunks:
+                item = chunk
+                while not self._stopped.is_set():
+                    try:
+                        self._queue.put(item, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+                if self._stopped.is_set():
+                    return
+            item = self._END
+        except BaseException as exc:  # handed to the reader, which raises it
+            item = exc
+        while not self._stopped.is_set():
+            try:
+                self._queue.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    def close(self) -> None:
+        """Stop the helper thread. It exits within a moment unless it is blocked inside the peer's
+        socket, in which case it is left to end with the connection."""
+        self._stopped.set()
+        thread = self._pump_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def _next_chunk(self) -> bytes | None:
+        if self._eof:
+            return None
+        if self._pump_thread is None:
+            self._pump_thread = threading.Thread(
+                target=self._pump, name="sample-collect-pump", daemon=True
+            )
+            self._pump_thread.start()
+        while True:
+            wait = 1.0
+            if self._deadline is not None:
+                wait = min(wait, self._deadline - time.monotonic())
+                if wait <= 0:
+                    raise _DeadlineExceeded
+            try:
+                item = self._queue.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if item is self._END:
+                self._eof = True
+                return None
+            if isinstance(item, BaseException):
+                self._eof = True
+                raise item
+            return item  # type: ignore[no-any-return]
 
     def _fill(self, want: int) -> None:
         while len(self._buffer) < want:
-            try:
-                chunk = next(self._chunks)
-            except StopIteration:
+            chunk = self._next_chunk()
+            if chunk is None:
                 return
             self.received += len(chunk)
             if self.received > self._limit:
@@ -1016,11 +1127,17 @@ class _ByteStream:
             self._buffer += chunk
 
     def read(self, size: int = -1) -> bytes:
-        self._fill(1 << 62 if size < 0 else size)
-        if size < 0:
-            size = len(self._buffer)
-        taken = bytes(self._buffer[:size])
-        del self._buffer[:size]
+        """Up to `size` bytes, never more than `_MAX_READ`, and as soon as any are available: a
+        short read is how a file-like says "call again", `tarfile` does, and waiting for a full
+        `size` would hold back a complete member until the peer sent a block's worth more. Reading
+        the whole stream in one call is not offered."""
+        size = _MAX_READ if size < 0 else min(size, _MAX_READ)
+        if not self._buffer:
+            self._fill(1)
+        count = min(size, len(self._buffer))
+        with memoryview(self._buffer) as view:
+            taken = bytes(view[:count])
+        del self._buffer[:count]
         return taken
 
 
@@ -1087,7 +1204,7 @@ def _make_dir(path: Path) -> None:
         raise SampleError(f"{path.name!r} in the samples directory is not a directory")
 
 
-def _store(directory: Path, name: str, data: bytes) -> bool:
+def _store(directory: Path, name: str, data: bytes | bytearray) -> bool:
     """Write `data` as `directory/name`, mode 000, and never over an existing file. True when the
     file is new. Written to a private temp file and linked into place, so a reader never sees a
     half-written sample and an existing one can never be replaced."""
@@ -1139,7 +1256,7 @@ def _ingest_tar(
     stopped it. Nothing is extracted by `tarfile`: only regular files are read, by declared size,
     into memory, and written by `_store`. `expected` is the directory that was asked for."""
     category_dir: Path | None = None
-    with tarfile.open(fileobj=stream, mode="r|") as tar:  # type: ignore[call-overload]
+    with tarfile.open(fileobj=stream, mode="r|", tarinfo=_BoundedTarInfo) as tar:  # type: ignore[call-overload]
         for member in tar:
             if member.isdir():
                 continue
@@ -1163,13 +1280,23 @@ def _ingest_tar(
                 )
                 return False
             handle = tar.extractfile(member)
-            data = handle.read(member.size) if handle is not None else b""
+            # Pulled in pieces into one buffer (hashed as it goes): `handle.read(member.size)` made
+            # tarfile build the member several times over (a 40 MB file peaked ~180 MB above baseline).
+            data = bytearray()
+            digest = hashlib.sha256()
+            if handle is not None:
+                while len(data) < member.size:
+                    piece = handle.read(min(_READ_CHUNK, member.size - len(data)))
+                    if not piece:
+                        break
+                    data += piece
+                    digest.update(piece)
             if len(data) != member.size:
                 result.skipped["truncated member"] += 1
                 continue
             totals.files += 1
             totals.nbytes += len(data)
-            sha256 = hashlib.sha256(data).hexdigest()
+            sha256 = digest.hexdigest()
             if category_dir is None:
                 _make_dir(honeypot_dir)
                 category_dir = honeypot_dir / category
@@ -1202,7 +1329,19 @@ _GUARD_HINT = (
 )
 
 
-def _collect_container(client: Any, container: Any, root: Path, sums: dict[str, str]) -> _Collected:
+_DEADLINE_NOTE = (
+    "Stopped at the time limit (SAMPLE_COLLECT_DEADLINE_SECONDS); what arrived before that was "
+    "kept. Run sample_collect again to continue."
+)
+
+
+def _collect_container(
+    client: Any,
+    container: Any,
+    root: Path,
+    sums: dict[str, str],
+    deadline: float | None = None,
+) -> _Collected:
     """Copy `downloads/` and `tty/` out of one container with `Container.get_archive` (what
     `docker cp` does). Files in a tmpfs mount are invisible to it; Cowrie's state directory is
     on the image's anonymous volume, which it does see."""
@@ -1220,11 +1359,14 @@ def _collect_container(client: Any, container: Any, root: Path, sums: dict[str, 
         for state_dir in COWRIE_STATE_DIRS:
             for category in COLLECT_CATEGORIES:
                 try:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        result.truncated = _DEADLINE_NOTE
+                        return result
                     chunks, _stat = container.get_archive(f"{state_dir}/{category}")
                 except docker.errors.NotFound:
                     continue
                 found = True
-                stream = _ByteStream(chunks, max_total + (8 << 20))
+                stream = _ByteStream(chunks, max_total + (8 << 20), deadline)
                 try:
                     complete = _ingest_tar(
                         stream, category, honeypot_dir, root, sums, result, totals,
@@ -1237,10 +1379,14 @@ def _collect_container(client: Any, container: Any, root: Path, sums: dict[str, 
                         "was kept."
                     )
                     complete = False
+                except _DeadlineExceeded:
+                    result.truncated = _DEADLINE_NOTE
+                    complete = False
                 except tarfile.TarError as exc:
                     result.skipped[f"unreadable archive ({type(exc).__name__})"] += 1
                     complete = True
                 finally:
+                    stream.close()
                     close = getattr(chunks, "close", None)
                     if close is not None:
                         with contextlib.suppress(Exception):
@@ -1314,7 +1460,9 @@ def collect(honeypot: str | None = None) -> dict[str, Any]:
         sums_path = root / "SHA256SUMS"
         sums = _read_sums(sums_path)
         before = dict(sums)
-        results = [_collect_container(client, c, root, sums) for c in running]
+        # One clock for the whole call (every container shares it); it starts once the lock is held.
+        deadline = time.monotonic() + settings.sample_collect_deadline_seconds
+        results = [_collect_container(client, c, root, sums, deadline) for c in running]
         new_lines = {p: h for p, h in sums.items() if before.get(p) != h}
         notes: list[str] = []
         if new_lines:
