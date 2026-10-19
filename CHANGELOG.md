@@ -31,6 +31,10 @@ file in without seeing either; `score` compares them with population-weighted es
 - **Docs corrected:** Cowrie's capture directories are on an anonymous volume with the pinned image (checked
   with the real engine: files land in `/cowrie/cowrie-git/var/lib/cowrie`, the tmpfs at
   `/cowrie/var/lib/cowrie` stays empty), not in a tmpfs; they survive a restart and go with a rebuild.
+- **Dependency audit:** three advisories were published against `aiohttp` 3.14.3 (CVE-2026-111063,
+  CVE-2026-111064, GHSA-2g87-pp6c-29x5) while this change was in CI, and the blocking audit job failed. The
+  lock moves to 3.14.5 and the declared floor to 3.14.4, so a plain install cannot pick the vulnerable
+  version; the same audit passes locally on the new lock.
 
 ## A fresh install and an independent security review of the new tools
 
