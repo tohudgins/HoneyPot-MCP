@@ -488,7 +488,10 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                 "id": t.id,
                 "type": t.type.value,
                 "label": t.label,
-                "planted_at": (t.token_meta or {}).get("planted_at", ""),
+                # The operator's free-text plant location, None when none was recorded.
+                "planted_at": (t.token_meta or {}).get("planted_at") or None,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "triggered_at": t.triggered_at.isoformat() if t.triggered_at else None,
             }
             for t in token_trips
         ],

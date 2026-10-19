@@ -361,6 +361,9 @@ async def test_brief_surfaces_triggered_tokens_and_unhealthy_sensors():
 
     brief = await soc_brief(since_hours=12)
     assert [t["label"] for t in brief["triggered_tokens"]] == ["prod-db-svc"]
+    token = brief["triggered_tokens"][0]
+    assert token["planted_at"] is None  # no location was recorded: null, not an empty string
+    assert token["created_at"] is not None and token["triggered_at"] is None
     assert [s["name"] for s in brief["sensors"]["unhealthy"]] == ["dead-one"]
     joined = " ".join(brief["headline"])
     assert "honeytoken" in joined and "ERROR" in joined
