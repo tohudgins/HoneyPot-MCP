@@ -82,6 +82,7 @@ Current tool modules:
 - `tools/workflows.py` — `run_analysis` (the post-run workflow as one call, composing the existing tools in-process) and `database_backup` (SQLite online backup into `backup_dir`, verified, with a manifest)
 - `tools/detect.py` — `pcap_detect` and `detection_rules_update` (orchestration and parsers in `pcap_detect.py`): Suricata/Zeek replay of a capture in a sandbox container (no network, read-only root, all caps dropped, no-new-privileges, non-root, resource limits, label `honeypot-mcp=detect`, always removed). Only the rules update ever gets a network
 - `tools/samples.py` — `sample_scan` and `sample_collect` (`samples.py`, bundled rules in `yara_rules/`): YARA over the mode-000 quarantine without executing or altering anything, joined to the database by hash; collection from Cowrie containers through the Docker guard's read-only allowlist of the two capture directories (`hardening/docker_guard.py`, `COWRIE_SAMPLE_DIRS`)
+- `tools/mapping_audit.py` — `mapping_audit` (`sample` / `score`): the measurement of `intel/mitre.py`. A seeded sample stratified by event type is written as a BLIND file (no technique or tactic anywhere) and a KEY file; independent labellers fill in techniques from the blind file only; `score` compares at strict and parent-technique level with a stratified Jeffreys Monte Carlo interval per metric, and reports concentration (one huge event type can carry a population rate: `sip_extension_probe` was 97.5% of the weighted disagreement) plus the estimate without the largest stratum. Change `intel/mitre.py` only with evidence of this kind
 - `tools/api_keys.py` — `api_key_create`, `api_key_revoke`, `api_key_list` (live-provisioned, per-person credentials — see "Role-based access control" below)
 
 **Rule: anything an analyst does by hand with the data must exist as a tool.** The project's point is that a
@@ -1405,8 +1406,9 @@ limit, ban or geo-block. `docs/HARDENING.md` is the guide; the invariants worth 
   admin SSH is limited to 6 new connections a minute. It must keep working under macOS bash 3.2
   (no `mapfile`, no associative arrays). Report rows are `LEVEL|message` from SQL run on a read-only
   connection with `trusted_schema=OFF`; self-test probes (`selftest_` marker) and platform alerts
-  (`0.0.0.0`) are excluded from "attacker activity". Cowrie's samples are in a tmpfs that
-  `docker cp` cannot read, so the script runs Python inside the container.
+  (`0.0.0.0`) are excluded from "attacker activity". Cowrie's samples are inside the container (an
+  anonymous volume on the pinned image; `docker cp` cannot read a tmpfs, so the script runs Python
+  inside the container, which works for either layout).
 - **`deploy/harden-host.sh`** is `prepare` (sshd on 22 *and* the admin port) -> `finalize` (admin
   port only, firewall loaded with a rollback timer) -> `confirm` -> `status` / `teardown`. Re-running
   `prepare` after `finalize` must not reopen port 22; sshd re-binds after the reload returns, so

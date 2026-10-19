@@ -822,6 +822,202 @@ async def test_a_planted_credential_is_masked_in_the_capture_context(engine):
     assert "masked: planted honeytoken" in json.dumps(result)
 
 
+# ── the database join: one pass per chunk, a wall-clock budget, identical answers ─────────────
+
+H = [hashlib.sha256(f"ctx-{i}".encode()).hexdigest() for i in range(7)]
+
+
+async def _seed_context_events() -> None:
+    """Seven hashes with deliberately distinct counts (no ties, so ordering cannot differ), several
+    sources, URLs, names, origins and both event types; plus noise that must never be counted."""
+    for i, h in enumerate(H):
+        for n in range(i + 1):
+            await _seed(
+                "ssh_file_download",
+                f"198.51.100.{1 + n % 4}",
+                {
+                    "shasum": h,
+                    "url": f"http://192.0.2.{n % 3}/f{i}.sh",
+                    "destfile": f"/tmp/f{n % 2}",
+                },
+                age_minutes=100 - i * 10 - n,
+            )
+        await _seed("ssh_file_upload", "198.51.100.9", {"sha256": h, "filename": f"up{i}"}, 5 + i)
+    await _seed("telnet_file_download", "198.51.100.8", {"shasum": H[0], "destfile": "/root/t"}, 1)
+    # Not file events: a hash in the payload of anything else is not capture context.
+    await _seed("ssh_login_attempt", "203.0.113.5", {"shasum": H[0], "username": "root"})
+    await _seed("http_request", "203.0.113.6", {"sha256": H[1]})
+
+
+async def _reference_fold(hashes: list[str]) -> dict[str, dict[str, Any]]:
+    """The per-event fold the database does in aggregate now, written the obvious way."""
+    from collections import Counter
+
+    from sqlalchemy import select
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert
+    from honeypot_mcp.tools._scan import _FILE_TYPES, file_origin
+
+    types = {t for pair in _FILE_TYPES.values() for t in pair}
+    out: dict[str, dict[str, Any]] = {}
+    async with get_session() as session:
+        alerts = (await session.execute(select(Alert).order_by(Alert.id))).scalars().all()
+    for h in hashes:
+        mine = [
+            a
+            for a in alerts
+            if a.event_type in types and (a.payload.get("shasum") or a.payload.get("sha256")) == h
+        ]
+        if not mine:
+            continue
+        origins = Counter(
+            file_origin(
+                a.event_type,
+                a.payload.get("url"),
+                a.payload.get("message"),
+                a.payload.get("destfile"),
+            )
+            for a in mine
+        )
+        names = Counter(
+            a.payload.get("destfile") or a.payload.get("filename")
+            for a in mine
+            if a.payload.get("destfile") or a.payload.get("filename")
+        )
+        urls = Counter(a.payload["url"] for a in mine if "://" in a.payload.get("url", ""))
+        out[h] = {
+            "events": len(mine),
+            "distinct_sources": len({a.source_ip for a in mine}),
+            "first_seen": min(a.timestamp for a in mine).isoformat(),
+            "last_seen": max(a.timestamp for a in mine).isoformat(),
+            "origin": origins.most_common(1)[0][0],
+            "origins": dict(origins),
+            "event_types": dict(Counter(a.event_type for a in mine)),
+            "destination_names": [n for n, _ in names.most_common(3)],
+            "source_urls": [u for u, _ in urls.most_common(3)],
+        }
+    return out
+
+
+def _comparable(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: v for k, v in entry.items() if k not in ("written_by_session", "fetched_from_network")
+    }
+
+
+async def test_a_completed_context_equals_the_per_event_fold():
+    from honeypot_mcp.tools.samples import database_context
+
+    await _seed_context_events()
+    expected = await _reference_fold(sorted(H))
+    context = await database_context(sorted(H))
+    assert context.complete and context.not_looked_up == 0 and not context.capped
+    assert set(context.by_hash) == set(expected) == set(H)
+    for h in H:
+        assert _comparable(context.by_hash[h]) == expected[h]
+        assert context.by_hash[h]["events"] >= 2
+    assert context.by_hash[H[0]]["event_types"] == {
+        "ssh_file_download": 1,
+        "ssh_file_upload": 1,
+        "telnet_file_download": 1,
+    }, "events of other types carrying the hash must not count"
+
+
+async def test_the_chunk_size_does_not_change_the_answer(monkeypatch):
+    from honeypot_mcp.tools import samples as tool
+
+    await _seed_context_events()
+    whole = await tool.database_context(sorted(H))
+    monkeypatch.setattr(tool, "_HASH_CHUNK", 2)
+    chunked = await tool.database_context(sorted(H))
+    assert chunked.complete and chunked.by_hash == whole.by_hash
+
+
+async def test_the_context_budget_stops_between_passes_and_says_what_was_skipped(monkeypatch):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools import samples as tool
+
+    await _seed_context_events()
+    monkeypatch.setattr(tool, "_HASH_CHUNK", 3)
+    monkeypatch.setattr(get_settings(), "sample_context_seconds", 0.0)
+    ordered = sorted(H)
+    context = await tool.database_context(ordered)
+    # The first pass always runs; the budget is spent before the second.
+    assert not context.complete and context.not_looked_up == len(H) - 3
+    assert context.looked_up == set(ordered[:3]) and set(context.by_hash) == set(ordered[:3])
+    assert context.total == len(H)
+
+    # A real clock that runs out partway behaves the same: nothing is read after the deadline.
+    clock = iter([0.0, 99.0])  # deadline = 0 + 5; the check before the second pass reads 99
+    monkeypatch.setattr(get_settings(), "sample_context_seconds", 5.0)
+    monkeypatch.setattr(tool, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    partial = await tool.database_context(ordered)
+    assert partial.looked_up == set(ordered[:3]) and not partial.complete
+
+
+async def test_the_result_cap_is_reported_as_incomplete(monkeypatch):
+    from honeypot_mcp.tools import samples as tool
+
+    await _seed_context_events()
+    monkeypatch.setattr(tool, "_GROUP_ROW_CAP", 3)
+    monkeypatch.setattr(tool, "_HASH_CHUNK", 2)
+    context = await tool.database_context(sorted(H))
+    assert context.capped and not context.complete
+    assert len(context.looked_up) == 2 and context.not_looked_up == len(H) - 2
+
+
+async def test_no_hashes_means_no_query_and_a_complete_answer():
+    from honeypot_mcp.tools.samples import database_context
+
+    context = await database_context([])
+    assert context.complete and context.by_hash == {} and context.total == 0
+
+
+async def test_a_budgeted_scan_reports_an_incomplete_context_honestly(engine, monkeypatch):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools import samples as tool
+
+    bodies = [b"#!/bin/sh\necho sample %d\n" % i for i in range(4)]
+    for i, body in enumerate(bodies):
+        put(f"h/downloads/s{i}", body)
+        await _seed("ssh_file_download", "198.51.100.1", {"shasum": sha(body), "url": "http://192.0.2.1/x"})  # fmt: skip
+    monkeypatch.setattr(tool, "_HASH_CHUNK", 1)
+    monkeypatch.setattr(get_settings(), "sample_context_seconds", 0.0)
+    result = await scan()
+    assert result["database_context_complete"] is False
+    assert result["database"]["files_with_context"] == 1
+    assert "3 of 4 distinct hashes were not looked up" in result["database"]["context_note"]
+    table = json.loads(Path(result["artifact"]["path"]).read_text())
+    assert table["database_context_complete"] is False
+    skipped = [f for f in table["files"] if f.get("database_looked_up") is False]
+    assert len(skipped) == 3 and all(f["database"] is None for f in skipped)
+
+
+async def test_a_scan_that_finishes_in_budget_says_the_context_is_complete(engine):
+    body = TEXT_SAMPLES["fetch_run_delete"][0]
+    put("h/downloads/f", body)
+    await _seed("ssh_file_download", "198.51.100.1", {"shasum": sha(body), "url": "http://192.0.2.9/a.sh"})  # fmt: skip
+    result = await scan()
+    assert result["database_context_complete"] is True
+    assert "context_note" not in result["database"]
+    table = json.loads(Path(result["artifact"]["path"]).read_text())
+    assert all("database_looked_up" not in f for f in table["files"])
+
+
+def test_the_context_budget_setting_has_a_default_and_bounds():
+    import pydantic
+
+    from honeypot_mcp.config import Settings
+
+    assert Settings().sample_context_seconds == 20
+    for bad in (0, 0.5, 301):
+        with pytest.raises(pydantic.ValidationError):
+            Settings(sample_context_seconds=bad)
+    assert Settings(sample_context_seconds=1).sample_context_seconds == 1
+    assert Settings(sample_context_seconds=300).sample_context_seconds == 300
+
+
 # ── audit and tiers ──────────────────────────────────────────────────────────────────────────
 
 

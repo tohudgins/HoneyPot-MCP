@@ -116,6 +116,9 @@ _FLAGS: dict[str, str] = {
     # Reads quarantined files (briefly granting itself read on mode-000 ones, then restoring the
     # mode) and writes one new JSON artifact; runs no code and contacts nothing.
     "sample_scan": "",
+    # Writes new JSON Lines files (a blind sample and its key, or a score report) into the reports
+    # directory and never replaces a named file; reads the database and the files it wrote.
+    "mapping_audit": "",
     # Writes new files into the reports directory (a fixed-name summary that is regenerated each
     # run, plus timestamped exports); calls threat-intel lookups for the busiest sources.
     "run_analysis": "W",

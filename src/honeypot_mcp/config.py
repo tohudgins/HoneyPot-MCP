@@ -324,6 +324,11 @@ class Settings(BaseSettings):
     # de-duplicated in the database, so the whole of a multi-million-row run normally fits; when it
     # does not, the scan reads the newest events first and the result says how far back it got.
     ioc_scan_seconds: float = Field(default=25.0, ge=1, le=300)
+    # Wall-clock budget `sample_scan` spends looking its files' hashes up among the captured file
+    # events. Each database pass reads every file event once, so many hashes on a multi-million-row
+    # run can take minutes; the budget is checked between passes, and the result says how many
+    # hashes were not looked up (`database_context_complete: false`) instead of blocking the call.
+    sample_context_seconds: float = Field(default=20.0, ge=1, le=300)
 
     # Live operations console — a read-only wall display served by the server
     # itself (see console/). Bound to localhost by default: it exposes every

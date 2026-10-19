@@ -419,6 +419,7 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
         "pcap_extract",
         "pcap_detect",
         "sample_scan",
+        "mapping_audit",
         "run_analysis",
         "export_blocklist",
         "export_stix",

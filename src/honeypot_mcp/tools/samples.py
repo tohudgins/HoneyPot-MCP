@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
 
 from honeypot_mcp import samples
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage.database import get_session
@@ -27,65 +30,107 @@ from honeypot_mcp.tools._format import mark_untrusted, write_artifact
 from honeypot_mcp.tools._planted import load_planted
 from honeypot_mcp.tools._scan import _FILE_TYPES, _clip, _iso, _jv, file_origin
 
-_HASH_CHUNK = 200
-_EVENT_ROW_CAP = 200_000
+# Hashes per database pass. Every pass reads the file-event rows once (the `event_type` index, then
+# the payload of each row), so the number of passes is what costs: 900 stays under SQLite's old
+# 999-variable ceiling with the six event types, and is 4.5x fewer passes than the 200 it was.
+_HASH_CHUNK = 900
+# Distinct (hash, event type, source, url, message, name) groups kept in memory: a bound on the
+# result, never reached by a capture of any realistic size.
+_GROUP_ROW_CAP = 200_000
 
 
-async def database_context(hashes: list[str]) -> dict[str, dict[str, Any]]:
+@dataclass
+class DatabaseContext:
+    """What `database_context` found and how much of the question it got to ask."""
+
+    by_hash: dict[str, dict[str, Any]]
+    looked_up: set[str]
+    total: int
+    budget_seconds: float
+    capped: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return len(self.looked_up) == self.total
+
+    @property
+    def not_looked_up(self) -> int:
+        return self.total - len(self.looked_up)
+
+
+async def database_context(hashes: list[str]) -> DatabaseContext:
     """What the database knows about each hash: the file-capture events (`*_file_download`,
     `*_file_upload`) that carry it. The origin logic is `attack_patterns kind=files`'s own
     (`file_origin`): Cowrie logs a `wget` and an attacker's `echo ... > file` as the same event
-    type, and only the first is a download. Planted honeytoken passwords are masked, as there."""
+    type, and only the first is a download. Planted honeytoken passwords are masked, as there.
+
+    Each pass over the file events answers up to `_HASH_CHUNK` hashes and is aggregated in the
+    database, one row per distinct (hash, event type, source, url, message, name) with its count
+    and first/last time, so a million repeats of one dropper cost one row. The wall-clock budget
+    (`sample_context_seconds`) is checked between passes; when it runs out the hashes not yet
+    asked about are left out and `DatabaseContext.complete` is False. The first pass always runs.
+    """
+    budget = float(get_settings().sample_context_seconds)
+    result = DatabaseContext(by_hash={}, looked_up=set(), total=len(hashes), budget_seconds=budget)
     if not hashes:
-        return {}
+        return result
     planted = await load_planted()
     types = sorted({t for pair in _FILE_TYPES.values() for t in pair})
-    sha_expr = func.coalesce(_jv("shasum"), _jv("sha256"))
+    # Label names, not expressions, in GROUP BY: on PostgreSQL the key of `payload ->> $n` is a
+    # bound parameter, so the same expression written twice would be two different expressions.
+    sha_expr = func.coalesce(_jv("shasum"), _jv("sha256")).label("sha")
+    cols = [
+        sha_expr,
+        Alert.event_type.label("etype"),
+        Alert.source_ip.label("src"),
+        _jv("url").label("url"),
+        _jv("message").label("msg"),
+        _jv("destfile").label("destfile"),
+        _jv("filename").label("fname"),
+    ]
     rows: list[Any] = []
+    deadline = time.monotonic() + budget
     async with get_session() as session:
         for start in range(0, len(hashes), _HASH_CHUNK):
+            if start and time.monotonic() >= deadline:
+                break
             chunk = hashes[start : start + _HASH_CHUNK]
             stmt = (
-                select(
-                    sha_expr,
-                    Alert.event_type,
-                    Alert.source_ip,
-                    Alert.timestamp,
-                    _jv("url"),
-                    _jv("message"),
-                    _jv("destfile"),
-                    _jv("filename"),
-                )
+                select(*cols, func.count(), func.min(Alert.timestamp), func.max(Alert.timestamp))
                 .where(Alert.event_type.in_(types), sha_expr.in_(chunk))
-                .limit(_EVENT_ROW_CAP - len(rows))
+                .group_by(*cols)
+                .limit(_GROUP_ROW_CAP - len(rows))
             )
             rows.extend((await session.execute(stmt)).all())
-            if len(rows) >= _EVENT_ROW_CAP:
+            result.looked_up.update(chunk)
+            if len(rows) >= _GROUP_ROW_CAP:
+                result.capped = True
                 break
 
     grouped: dict[str, list[Any]] = defaultdict(list)
     for row in rows:
         grouped[row[0]].append(row)
-    out: dict[str, dict[str, Any]] = {}
     for sha, events in grouped.items():
         origins: Counter[str] = Counter()
         types_seen: Counter[str] = Counter()
         names: Counter[str] = Counter()
         urls: Counter[str] = Counter()
         sources: set[str] = set()
+        total = 0
         first = last = None
-        for _sha, event_type, ip, ts, url, message, destfile, filename in events:
-            origins[file_origin(event_type, url, message, destfile)] += 1
-            types_seen[event_type] += 1
+        for _sha, event_type, ip, url, message, destfile, filename, count, lo, hi in events:
+            total += count
+            origins[file_origin(event_type, url, message, destfile)] += count
+            types_seen[event_type] += count
             sources.add(ip)
-            first = ts if first is None or ts < first else first
-            last = ts if last is None or ts > last else last
+            first = lo if first is None or lo < first else first
+            last = hi if last is None or hi > last else last
             if destfile or filename:
-                names[destfile or filename] += 1
+                names[destfile or filename] += count
             if url and "://" in url:
-                urls[url] += 1
-        out[sha] = {
-            "events": len(events),
+                urls[url] += count
+        result.by_hash[sha] = {
+            "events": total,
             "distinct_sources": len(sources),
             "first_seen": _iso(first),
             "last_seen": _iso(last),
@@ -97,7 +142,7 @@ async def database_context(hashes: list[str]) -> dict[str, dict[str, Any]]:
             "destination_names": [_clip(planted.redact(n), 120) for n, _ in names.most_common(3)],
             "source_urls": [_clip(planted.redact(u)) for u, _ in urls.most_common(3)],
         }
-    return out
+    return result
 
 
 @mcp.tool(auth=require_role("operator"), **hints("sample_scan"))
@@ -142,7 +187,11 @@ async def sample_scan(
     Returns:
         `files_scanned`, `distinct_hashes`, `files_skipped`, `by_type`, `hits_by_rule`,
         `hits_by_family`, `hits_by_severity`, `top_files`, `duplicates`, `database`, `rules`
-        (what loaded, with any compile errors) and `artifact` (the full table's path). When no
+        (what loaded, with any compile errors) and `artifact` (the full table's path). The
+        capture-context lookup has a wall-clock budget (`sample_context_seconds`, default 20 s):
+        `database_context_complete` is false when it ran out, and `database.context_note` says
+        how many hashes were not looked up (their files carry `database_looked_up: false` in the
+        artifact; `database: null` there then means "not asked", not "no events"). When no
         YARA engine is installed: `{"available": False, "note": ...}`. On a bad path or an
         unusable directory: `error` and `hint`.
     """
@@ -165,7 +214,9 @@ async def sample_scan(
 
     context = await database_context(sorted({r["sha256"] for r in report.records}))
     for record in report.records:
-        record["database"] = context.get(record["sha256"])
+        record["database"] = context.by_hash.get(record["sha256"])
+        if record["sha256"] not in context.looked_up:
+            record["database_looked_up"] = False
     summary = samples.digest(
         report.records,
         report.skipped,
@@ -179,25 +230,37 @@ async def sample_scan(
         "scope": path or ".",
         "rules": rules_info,
         "summary": {k: v for k, v in summary.items() if k != "top_files"},
+        "database_context_complete": context.complete,
         "files": report.records,
         "skipped": report.skipped,
     }
     artifact = write_artifact(
         json.dumps(table, indent=1, default=str), prefix="sample-scan", extension="json"
     )
+    database: dict[str, Any] = {
+        "files_with_context": sum(1 for r in report.records if r["database"]),
+        "note": (
+            "Context comes from ssh/telnet/ftp file-capture events whose hash equals the "
+            "file's SHA-256. A file the database has no event for was collected from a "
+            "container or a backup but never reported by a session (or the events were pruned)."
+        ),
+    }
+    if not context.complete:
+        database["context_note"] = (
+            f"The capture-context lookup stopped at its {context.budget_seconds:g} s budget "
+            f"(sample_context_seconds): {context.not_looked_up} of {context.total} distinct "
+            "hashes were not looked up"
+            + (" (the result-size cap was reached)" if context.capped else "")
+            + ", so a file with `database: null` and `database_looked_up: false` may well have "
+            "events. Raise sample_context_seconds, or scan one directory at a time."
+        )
     result: dict[str, Any] = {
         "available": True,
         "engine": status["engine"],
         "scope": path or ".",
         **summary,
-        "database": {
-            "files_with_context": sum(1 for r in report.records if r["database"]),
-            "note": (
-                "Context comes from ssh/telnet/ftp file-capture events whose hash equals the "
-                "file's SHA-256. A file the database has no event for was collected from a "
-                "container or a backup but never reported by a session (or the events were pruned)."
-            ),
-        },
+        "database_context_complete": context.complete,
+        "database": database,
         "rules": rules_info,
         "seconds": report.seconds,
         "next_step": (

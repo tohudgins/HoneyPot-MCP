@@ -143,7 +143,7 @@ The networked control plane can deploy honeypots and read everything they captur
 | Role | Tools | Can |
 |---|---|---|
 | `viewer` | 39 | read-only triage, analysis and reports |
-| `operator` | +28 | also deploy and stop honeypots, manage honeytokens, acknowledge alerts, run exports, packet capture, replay captures through Suricata or Zeek, scan captured files (everything reversible and contained to this system's data) |
+| `operator` | +29 | also deploy and stop honeypots, manage honeytokens, acknowledge alerts, run exports, packet capture, replay captures through Suricata or Zeek, scan captured files, audit the ATT&CK mapping (everything reversible and contained to this system's data) |
 | `admin` | +15 | also prune alerts, push to an external firewall or WAF, manage subscriptions, read the audit log, manage API keys, start Grafana on the database, take backups, update detection rules, collect samples from the sensor containers |
 
 [`rbac.py`](../src/honeypot_mcp/rbac.py) lists which tool needs which role; [DEPLOY.md](DEPLOY.md) has the token format.
@@ -180,7 +180,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 ## MCP tools
 
-82 tools in three roles (39 viewer, 28 operator, 15 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
+83 tools in three roles (39 viewer, 29 operator, 15 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
 
 ### Honeypots and deception planning
 
@@ -237,6 +237,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300); also the **Query** box on Grafana dashboard 04. Whole-run questions over millions of rows belong in `attack_patterns` or `alert_rollups` |
 | `attack_patterns` | **What attackers actually did, without SQL.** `kind` = `credentials` (top pairs, usernames, passwords, accepted vs refused, per service), `commands` (classified by shape: shell-menu words, writable-directory probes, download chains with staging hosts, fingerprint checks, execution-capability probes), `files` (by hash, with *written by the session* separated from *fetched from the network*), `clients` (SSH versions and HASSH families, shared-fingerprint clusters), `sip_dialling` (dial-prefix cycling toward each destination, number masked), `http`, `concentration` (share held by the busiest sources, the long tail, per-day volume). Planted honeytoken passwords are masked, including inside commands |
 | `bait_trips` | **Who used the bait, and what they did first.** For each tripped honeytoken: creation time, delay to the first trip, each source's earlier contact, decoy fetches and how many seconds before the trip, user-agent rotation, commands, replays on other services, and the sources that reached the bait with no earlier contact. Never returns token secrets |
+| `mapping_audit` | **How accurate is the ATT&CK mapping?** `action=sample` draws a reproducible stratified sample of alerts (every event type represented) into two files: a blind one for a labeller (event type, severity and a clipped payload, no technique) and a key with the mapper's answer. `action=score` reads one or two label files and reports agreement, precision and recall per technique and tactic, strict and at parent-technique level, with population-weighted estimates and 95% intervals, the event types that disagree most, how concentrated the result is in a few huge event types (and the estimate without the largest), and inter-labeller agreement. Operator role (it writes files) |
 | `ping` | Server role (owner or read-only) and liveness |
 
 ### Integrations, suppression and access
@@ -275,7 +276,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | Tool | Description |
 |---|---|
 | `sample_collect` | Copy the downloads and terminal recordings out of the running SSH and Telnet sensors into a quarantine (SHA-256 names, mode 000, checksums). Admin role |
-| `sample_scan` | Hash, type and YARA-scan the quarantine without executing or altering it, with the capture context of each hash from the database |
+| `sample_scan` | Hash, type and YARA-scan the quarantine without executing or altering it, with the capture context of each hash from the database (a time budget, `SAMPLE_CONTEXT_SECONDS`, default 20, bounds that lookup and reports `database_context_complete` and how many hashes it skipped when it runs out) |
 
 **MCP resources:** `honeypot://active` · `alerts://stream` · `honeytoken://triggered` · `stats://dashboard`
 

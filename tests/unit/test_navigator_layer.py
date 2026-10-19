@@ -129,7 +129,7 @@ def _layer(result: dict) -> dict:
 async def _seed_run() -> None:
     await _seed(
         [
-            ("sip_extension_probe", 40, timedelta(0)),  # Discovery, T1046
+            ("sip_request", 40, timedelta(0)),  # Discovery, T1046
             ("redis_config_set", 7, timedelta(0)),  # Initial Access, T1190
             ("ssh_login_failed", 12, timedelta(0)),  # Credential Access, T1110.001
             ("telnet_session_connect", 15, timedelta(0)),  # bookkeeping: unmapped
@@ -177,7 +177,7 @@ async def test_scores_are_the_alert_counts_attack_summary_reports_for_the_same_d
     by_id = {t["techniqueID"]: t for t in layer["techniques"]}
     assert by_id["T1046"]["tactic"] == "discovery" and by_id["T1190"]["tactic"] == "initial-access"
     assert by_id["T1110.001"]["tactic"] == "credential-access"
-    assert "sip_extension_probe (40)" in by_id["T1046"]["comment"]
+    assert "sip_request (40)" in by_id["T1046"]["comment"]
     assert layer["gradient"]["maxValue"] == 40
 
 

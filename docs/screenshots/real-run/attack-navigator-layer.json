@@ -6,7 +6,7 @@
     "layer": "4.5"
   },
   "domain": "enterprise-attack",
-  "description": "ATT&CK techniques HoneyPot-MCP sensors observed, all time. Score = alerts whose event type maps to the technique (an alert counts under every technique it maps to). 16,625,899 of 17,638,144 alerts mapped; the rest are connection bookkeeping.",
+  "description": "ATT&CK techniques HoneyPot-MCP sensors observed, all time. Score = alerts whose event type maps to the technique (an alert counts under every technique it maps to). 16,710,164 of 17,726,494 alerts mapped; the rest are connection bookkeeping.",
   "sorting": 3,
   "layout": {
     "layout": "side",
@@ -22,8 +22,8 @@
     {
       "techniqueID": "T1005",
       "tactic": "collection",
-      "score": 13,
-      "comment": "13 alert(s): postgresql_file_access (13)",
+      "score": 15,
+      "comment": "15 alert(s): postgresql_file_access (15)",
       "enabled": true
     },
     {
@@ -36,8 +36,8 @@
     {
       "techniqueID": "T1213",
       "tactic": "collection",
-      "score": 739,
-      "comment": "739 alert(s): elasticsearch_query_probe (381), elasticsearch_recon_probe (273), elasticsearch_data_access (52), nfs_portmap_dump (29), elasticsearch_health_probe (4)",
+      "score": 781,
+      "comment": "781 alert(s): elasticsearch_query_probe (386), elasticsearch_recon_probe (309), elasticsearch_data_access (53), nfs_portmap_dump (29), elasticsearch_health_probe (4)",
       "enabled": true
     },
     {
@@ -73,15 +73,15 @@
     {
       "techniqueID": "T1090",
       "tactic": "command-and-control",
-      "score": 992,
-      "comment": "992 alert(s): ssh_port_forward (440), ssh_port_forward_data (276), ssh_port_forward_ja4h (276)",
+      "score": 994,
+      "comment": "994 alert(s): ssh_port_forward (442), ssh_port_forward_data (276), ssh_port_forward_ja4h (276)",
       "enabled": true
     },
     {
       "techniqueID": "T1105",
       "tactic": "command-and-control",
-      "score": 1206,
-      "comment": "1,206 alert(s): ssh_file_download (1,175), ftp_file_upload (13), telnet_file_download (10), ssh_file_upload (7), ldap_jndi_lookup (1)",
+      "score": 1208,
+      "comment": "1,208 alert(s): ssh_file_download (1,175), ftp_file_upload (13), telnet_file_download (10), ssh_file_upload (9), ldap_jndi_lookup (1)",
       "enabled": true
     },
     {
@@ -95,8 +95,8 @@
     {
       "techniqueID": "T1110.001",
       "tactic": "credential-access",
-      "score": 4952569,
-      "comment": "4,952,569 alert(s): sip_register_attempt (4,483,280), telnet_login_success (290,645), vnc_auth_attempt (66,111), smb_ntlm_auth (58,712), ssh_login_success (19,793)",
+      "score": 4988588,
+      "comment": "4,988,588 alert(s): sip_register_attempt (4,517,777), telnet_login_success (291,339), vnc_auth_attempt (66,682), smb_ntlm_auth (58,712), ssh_login_success (19,993)",
       "enabled": true
     },
     {
@@ -131,8 +131,8 @@
     {
       "techniqueID": "T1046",
       "tactic": "discovery",
-      "score": 8803439,
-      "comment": "8,803,439 alert(s): sip_extension_probe (8,637,755), smb_negotiate (59,390), sip_request (53,346), sip_invite (49,305), nfs_unknown_program (2,223)",
+      "score": 165164,
+      "comment": "165,164 alert(s): smb_negotiate (59,391), sip_request (53,517), sip_invite (49,707), nfs_unknown_program (2,223), docker_api_recon (286)",
       "enabled": true
     },
     {
@@ -145,15 +145,15 @@
     {
       "techniqueID": "T1082",
       "tactic": "discovery",
-      "score": 298,
-      "comment": "298 alert(s): mysql_recon_query (97), redis_info_probe (76), postgresql_recon_query (68), redis_config_get (42), memcached_version_probe (11)",
+      "score": 303,
+      "comment": "303 alert(s): mysql_recon_query (98), redis_info_probe (76), postgresql_recon_query (72), redis_config_get (42), memcached_version_probe (11)",
       "enabled": true
     },
     {
       "techniqueID": "T1087",
       "tactic": "discovery",
-      "score": 0,
-      "comment": "No alert mapped to the parent technique itself; see sub-techniques.",
+      "score": 8677807,
+      "comment": "8,677,807 alert(s): sip_extension_probe (8,677,807)",
       "enabled": true,
       "showSubtechniques": true
     },
@@ -174,23 +174,23 @@
     {
       "techniqueID": "T1613",
       "tactic": "discovery",
-      "score": 1312,
-      "comment": "1,312 alert(s): docker_api_probe (884), kubernetes_probe (212), docker_api_enumerate (111), kubernetes_recon (54), kubernetes_enumerate (51)",
+      "score": 1317,
+      "comment": "1,317 alert(s): docker_api_probe (885), kubernetes_probe (216), docker_api_enumerate (111), kubernetes_recon (54), kubernetes_enumerate (51)",
       "enabled": true
     },
     {
       "techniqueID": "T1059",
       "tactic": "execution",
-      "score": 222,
-      "comment": "222 alert(s): mysql_udf_rce (118), redis_eval (34), redis_rogue_replica (23), postgresql_copy_program_rce (21), redis_module_load (18)",
+      "score": 223,
+      "comment": "223 alert(s): mysql_udf_rce (118), redis_eval (34), redis_rogue_replica (23), postgresql_copy_program_rce (22), redis_module_load (18)",
       "enabled": true,
       "showSubtechniques": true
     },
     {
       "techniqueID": "T1059.004",
       "tactic": "execution",
-      "score": 2806626,
-      "comment": "2,806,626 alert(s): telnet_command_input (2,784,853), ssh_command_input (21,773)",
+      "score": 2813998,
+      "comment": "2,813,998 alert(s): telnet_command_input (2,792,024), ssh_command_input (21,974)",
       "enabled": true
     },
     {
@@ -224,8 +224,8 @@
     {
       "techniqueID": "T1496",
       "tactic": "impact",
-      "score": 25817,
-      "comment": "25,817 alert(s): sip_toll_fraud_attempt (25,817)",
+      "score": 25880,
+      "comment": "25,880 alert(s): sip_toll_fraud_attempt (25,880)",
       "enabled": true
     },
     {
@@ -253,15 +253,15 @@
     {
       "techniqueID": "T1078",
       "tactic": "initial-access",
-      "score": 310457,
-      "comment": "310,457 alert(s): telnet_login_success (290,645), ssh_login_success (19,793), honeytoken_triggered_credential_via_mysql_login_attempt (10), honeytoken_triggered_credential_via_ssh_login_success (6), honeytoken_triggered_canary_url (3)",
+      "score": 311351,
+      "comment": "311,351 alert(s): telnet_login_success (291,339), ssh_login_success (19,993), honeytoken_triggered_credential_via_mysql_login_attempt (10), honeytoken_triggered_credential_via_ssh_login_success (6), honeytoken_triggered_canary_url (3)",
       "enabled": true
     },
     {
       "techniqueID": "T1133",
       "tactic": "initial-access",
-      "score": 26517,
-      "comment": "26,517 alert(s): rdp_connection (13,378), rdp_handshake (13,041), rdp_nla_negotiate (53), rdp_nla_probe (36), rdp_mcs_handshake (9)",
+      "score": 26636,
+      "comment": "26,636 alert(s): rdp_connection (13,438), rdp_handshake (13,099), rdp_nla_negotiate (54), rdp_nla_probe (36), rdp_mcs_handshake (9)",
       "enabled": true
     },
     {
@@ -311,8 +311,8 @@
     {
       "techniqueID": "T1595",
       "tactic": "reconnaissance",
-      "score": 1420,
-      "comment": "1,420 alert(s): http_probe (926), rdp_invalid_probe (196), http_recon_probe (92), ldap_invalid_probe (80), sip_invalid_probe (65)",
+      "score": 8680328,
+      "comment": "8,680,328 alert(s): sip_extension_probe (8,677,807), http_probe (929), sip_scan (656), sip_options_probe (439), rdp_invalid_probe (197)",
       "enabled": true,
       "showSubtechniques": true
     },
@@ -331,7 +331,7 @@
       "#a50f15"
     ],
     "minValue": 0,
-    "maxValue": 8803439
+    "maxValue": 8680328
   },
   "legendItems": [],
   "metadata": [],

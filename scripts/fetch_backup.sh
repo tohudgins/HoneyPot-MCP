@@ -13,8 +13,8 @@
 #   3. checks the transfer (the database's SHA-256 here equals the one computed on the VPS) and the
 #      database (PRAGMA integrity_check);
 #   4. optionally (--samples) copies Cowrie's downloaded files and TTY recordings out of each
-#      container. They live in a tmpfs, which `docker cp` does not see, so this runs Python inside
-#      the container;
+#      container. They live inside the container (an anonymous volume on the pinned image), so they
+#      are lost with it; this runs Python inside the container, which works wherever they sit;
 #   5. prints a report: the time window, events per sensor, silent or dead sensors, outages, the top
 #      sources and credentials, honeytoken trips, platform alerts, and a PASS/WARN/FAIL verdict.
 #
@@ -249,7 +249,8 @@ fi
 
 if [ "$SAMPLES" = 1 ]; then
   say "pulling Cowrie downloads and TTY recordings (LIVE MALWARE: quarantined, no permissions)"
-  # Python inside the container, because `docker cp` does not see a tmpfs. The script is passed
+  # Python inside the container: it works wherever the files are (the pinned image keeps them on an
+  # anonymous volume; `docker cp` cannot read a tmpfs). The script is passed
   # base64-encoded so no shell quoting can mangle it.
   PYSRC='import os, sys, tarfile
 # Cowrie keeps its state under /cowrie/cowrie-git in the image the honeypots use, and under /cowrie in

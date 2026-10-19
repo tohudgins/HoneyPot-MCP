@@ -27,6 +27,20 @@ async def test_dns_canary_maps_to_c2():
 
 
 @pytest.mark.asyncio
+async def test_sip_extension_enumeration_is_account_discovery_and_active_scanning_not_service_discovery():
+    """Blind labelling of a real run put these under Active Scanning (and extension guessing under
+    Account Discovery); filing 8.7M extension probes under T1046 made up half the Discovery tactic."""
+    ids = {r["technique_id"] for r in await map_to_attack(["sip_extension_probe"])}
+    assert {"T1087", "T1595"} <= ids and "T1046" not in ids
+    for event_type in ("sip_scan", "sip_options_probe"):
+        ids = {r["technique_id"] for r in await map_to_attack([event_type])}
+        assert "T1595" in ids and "T1046" not in ids, event_type
+    # Plain SIP requests and NFS probes stay service enumeration.
+    ids = {r["technique_id"] for r in await map_to_attack(["sip_request"])}
+    assert "T1046" in ids
+
+
+@pytest.mark.asyncio
 async def test_empty_terms_returns_empty():
     results = await map_to_attack([])
     assert results == []

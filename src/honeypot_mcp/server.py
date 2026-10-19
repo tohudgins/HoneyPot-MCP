@@ -343,6 +343,7 @@ import honeypot_mcp.tools.honeypot  # noqa: E402, F401
 import honeypot_mcp.tools.honeytoken  # noqa: E402, F401
 import honeypot_mcp.tools.integrations  # noqa: E402, F401
 import honeypot_mcp.tools.ioc  # noqa: E402, F401
+import honeypot_mcp.tools.mapping_audit  # noqa: E402, F401
 import honeypot_mcp.tools.patterns  # noqa: E402, F401
 import honeypot_mcp.tools.pcap  # noqa: E402, F401
 import honeypot_mcp.tools.samples  # noqa: E402, F401

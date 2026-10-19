@@ -446,10 +446,26 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Discovery",
     ),
     (
-        # SIP sweeps and extension guessing are service/host enumeration.
+        # SIP extension guessing enumerates accounts on a service the sweeper already found, and an
+        # OPTIONS/scan sweep is active scanning. An independent blind labelling of 200 alerts
+        # (docs/RESULTS.md, section 6) put sip_extension_probe, sip_scan and sip_options_probe under
+        # Active Scanning, not Network Service Discovery.
+        re.compile(r"(sip_scan|sip_options_probe|sip_extension_probe)", re.I),
+        "T1595",
+        "Active Scanning",
+        "Reconnaissance",
+    ),
+    (
+        re.compile(r"sip_extension_probe", re.I),
+        "T1087",
+        "Account Discovery",
+        "Discovery",
+    ),
+    (
+        # SIP requests and NFS probes are service enumeration.
         re.compile(
-            r"(sip_scan|sip_options_probe|sip_extension_probe|sip_(request|invite)\b|"
-            r"nfs_portmap_query|nfs_portmap_probe|nfs_request|nfs_unknown_program)",
+            r"(sip_(request|invite)\b|nfs_portmap_query|nfs_portmap_probe|nfs_request|"
+            r"nfs_unknown_program)",
             re.I,
         ),
         "T1046",

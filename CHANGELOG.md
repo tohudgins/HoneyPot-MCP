@@ -4,6 +4,34 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The ATT&CK mapping measured against blind labels; half the Discovery tactic was wrong
+
+**The docs said the ATT&CK mapping had never been checked, so `mapping_audit` (tool 83) checks it:** it
+draws a seeded sample stratified by event type (200 alerts, all 168 event types) into a blind file with no
+technique or tactic in it, and a key with the mapper's answer; two independent labellers filled the blind
+file in without seeing either; `score` compares them with population-weighted estimates and intervals.
+
+- **One event type was the whole problem.** `sip_extension_probe` (8.68M alerts, 49% of the run) was filed
+  under T1046 Network Service Discovery; both labellers rejected that (Active Scanning T1595, one also
+  Account Discovery T1087), and it carries 97.5% of the weighted disagreement. Without it the mapping agrees
+  with the labellers on 96 to 98% of alerts at parent-technique level (precision 0.97 to 0.98, recall 0.97 to
+  0.99). It now maps to T1595 and T1087 (and `sip_scan`, `sip_options_probe` to T1595); the Discovery
+  tactic's T1046 row fell from 8,844,066 to 165,164 alerts. The unmapped share is unchanged (94.3%). The
+  labellers are language-model agents, not analysts, and agreed with each other at kappa 0.82: evidence,
+  not ground truth. Debatable event types (`rdp_connection`, `smb_negotiate`, `sip_request`) were left as
+  they are.
+- **The first scoring run had two defects the tool's own review caught:** parent-level intervals had zero
+  width (a stratum of one item, or whose items all agree, was treated as certain), and a headline "87% of
+  mapped alerts wrong" was really one stratum. Intervals are now resampled over every possible outcome, and
+  each metric reports its concentration and the estimate without the largest stratum.
+- **`sample_scan`'s database lookup had no time budget and silently truncated:** with 5,000 hashes it
+  stopped at a 200,000-row cap and returned context for 1,400 of them without saying so. It now runs in
+  aggregated passes under `SAMPLE_CONTEXT_SECONDS` (default 20) and reports `database_context_complete`
+  and how many hashes it skipped.
+- **Docs corrected:** Cowrie's capture directories are on an anonymous volume with the pinned image (checked
+  with the real engine: files land in `/cowrie/cowrie-git/var/lib/cowrie`, the tmpfs at
+  `/cowrie/var/lib/cowrie` stays empty), not in a tmpfs; they survive a restart and go with a rebuild.
+
 ## A fresh install and an independent security review of the new tools
 
 **Installing from a clean clone found four things the author's machine hid; an independent review of the

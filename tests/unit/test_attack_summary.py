@@ -47,7 +47,7 @@ async def test_every_event_type_is_mapped_with_exact_counts_in_kill_chain_order(
 
     await _seed(
         [
-            ("sip_extension_probe", 40, timedelta(0)),  # Discovery, T1046
+            ("sip_request", 40, timedelta(0)),  # Discovery, T1046
             ("redis_config_set", 7, timedelta(0)),  # Initial Access, T1190
             ("ssh_login_failed", 12, timedelta(0)),  # Credential Access, T1110.001
         ]
@@ -60,7 +60,7 @@ async def test_every_event_type_is_mapped_with_exact_counts_in_kill_chain_order(
     assert by_tactic["Credential Access"]["alerts"] == 12
     discovery = {t["technique_id"]: t for t in by_tactic["Discovery"]["techniques"]}
     assert discovery["T1046"]["alerts"] == 40
-    assert discovery["T1046"]["top_event_types"] == [{"type": "sip_extension_probe", "alerts": 40}]
+    assert discovery["T1046"]["top_event_types"] == [{"type": "sip_request", "alerts": 40}]
     order = [TACTIC_ORDER.index(t["tactic"]) for t in out["tactics"]]
     assert order == sorted(order), "tactics must follow the kill chain, not the alphabet"
     assert out["total_alerts"] == out["mapped_alerts"] == 59 and out["mapped_share"] == 1.0

@@ -44,10 +44,10 @@ countries, never source addresses.
 |---|---|
 | `real-run/overview.png` | Grafana overview: alerts, unique sources, severity over time, per-engine split |
 | `real-run/threat-map.png` | Grafana: attacker origins and top countries |
-| `real-run/mitre-coverage.png` | Grafana: ATT&CK tactics and event types |
+| `real-run/mitre-coverage.png` | Grafana: ATT&CK tactics and event types (captured before the SIP remapping) |
 | `real-run/operations-console.png` | The operations console against the live database |
-| `real-run/attack-navigator.png` | ATT&CK Navigator layer from the `attack_navigator_layer` tool |
-| `real-run/attack-navigator-layer.json` | The layer file behind that image (event-type scoring at 17,638,144 alerts) |
+| `real-run/attack-navigator.png` | ATT&CK Navigator layer from the `attack_navigator_layer` tool (captured before the SIP remapping) |
+| `real-run/attack-navigator-layer.json` | The layer file, regenerated on the final database (17,726,494 alerts) with the current mapping |
 
 Snapshots were taken while the run was still going, so their counts are lower than the final
 figures in RESULTS.md; each caption there says when the snapshot was taken. Check a new capture for

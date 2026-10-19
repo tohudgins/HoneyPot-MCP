@@ -161,9 +161,10 @@ sudo deploy/harden-host.sh teardown --i-have-a-backup       # stop, remove conta
 
 Then **destroy the VPS** in the provider console: a powered-off VPS typically keeps its disk and
 may still be billed. Do not reuse it for anything else. The backup holds secrets (`.env` tokens,
-honeytoken values, TLS keys): store it where you would store the `.env`. Cowrie's downloads live in
-a tmpfs, which `docker cp` cannot read, so the script runs Python inside the container to copy
-them; they exist only while the container does, so fetch before teardown. Packet capture is a
+honeytoken values, TLS keys): store it where you would store the `.env`. Cowrie's downloads live
+inside the container (an anonymous volume on the pinned image), and the script runs Python inside it
+to copy them, which works wherever they sit; they are removed with the container, so fetch before
+teardown or a rebuild. Packet capture is a
 bounded ring (100 MB × 10 by default): use `pcap_extract` for the attackers you care about during
 the run.
 
