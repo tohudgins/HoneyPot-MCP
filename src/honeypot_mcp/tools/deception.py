@@ -441,6 +441,22 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            if example is None:
+                # The newest hour held only acknowledged rows (a partly triaged type): take the
+                # newest open alert of the type. Rare, and bounded by the type's own rows.
+                example = (
+                    await session.execute(
+                        select(Alert)
+                        .where(
+                            Alert.severity == severity,
+                            Alert.event_type == entry["event_type"],
+                            Alert.acknowledged.is_(False),
+                            Alert.timestamp >= cutoff,
+                        )
+                        .order_by(Alert.timestamp.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
             if example is not None:
                 urgent.append(example)
 
@@ -545,11 +561,12 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         "needs_attention_total": urgent_total,
         "needs_attention_showing": len(needs_attention),
         "untriaged_by_severity": {"critical": untriaged_critical, "high": untriaged_high},
-        # The whole urgent queue by event type, rarest first within a severity, so the shape of
-        # the queue is visible: a few flood types usually hold nearly all of it. Counts are every
-        # CRITICAL/HIGH alert in the window (acknowledged ones included).
+        # The open (unacknowledged) urgent queue by event type, rarest first within a severity, so
+        # the shape of the queue is visible: a few flood types usually hold nearly all of it. Types
+        # whose every alert was acknowledged are not listed; `acknowledged` says how many alerts of
+        # a listed type were already triaged.
         "urgent_by_event_type": [
-            {k: t[k] for k in ("severity", "event_type", "alerts", "sources")}
+            {k: t[k] for k in ("severity", "event_type", "alerts", "acknowledged", "sources")}
             for t in ranked[:_MAX_URGENT_TYPES]
         ],
         "urgent_event_types_total": len(ranked),

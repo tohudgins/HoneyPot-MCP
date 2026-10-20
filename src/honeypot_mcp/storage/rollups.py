@@ -247,11 +247,12 @@ async def campaign_rows(
 async def urgent_by_type(
     session: AsyncSession, since: datetime | None = None, now: datetime | None = None
 ) -> list[dict[str, Any]]:
-    """CRITICAL and HIGH alerts per (severity, event type): alerts, distinct sources, newest hour.
+    """Open (unacknowledged) CRITICAL and HIGH alerts per (severity, event type): how many, how
+    many were already acknowledged, distinct sources and the newest hour.
 
     Exact at hour resolution (a rollup row is written with every alert, so the current hour is
-    included) and it does not subtract acknowledged alerts: it says what happened, not what is
-    still open. This is what lets a brief tell a handful of flood types from the rare ones."""
+    included). `sources` counts every source seen for the type, acknowledged alerts included. A
+    type whose alerts were all acknowledged is left out: it is not part of the queue."""
     severities = (AlertSeverity.CRITICAL, AlertSeverity.HIGH)
     q = (
         select(
@@ -269,14 +270,32 @@ async def urgent_by_type(
     if now is not None:
         q = q.where(AlertRollup.bucket <= now)
     rows = (await session.execute(q)).all()
+    # Acknowledged alerts per type, from the tiny partial index (acknowledgement is a deliberate
+    # human act, so these rows are few). A type whose every alert was triaged is not in the queue.
+    ack_q = (
+        select(Alert.severity, Alert.event_type, func.count())
+        .where(Alert.acknowledged.is_(True), Alert.severity.in_(severities))
+        .group_by(Alert.severity, Alert.event_type)
+    )
+    if since is not None:
+        ack_q = ack_q.where(Alert.timestamp >= since)
+    acked = {
+        (getattr(r[0], "value", str(r[0])), str(r[1])): int(r[2])
+        for r in (await session.execute(ack_q)).all()
+    }
     out = []
     for severity, event_type, alerts, sources, newest in rows:
+        key = (getattr(severity, "value", str(severity)), str(event_type))
+        done = acked.get(key, 0)
+        if int(alerts) - done <= 0:
+            continue
         bucket = newest if newest.tzinfo else newest.replace(tzinfo=UTC)
         out.append(
             {
-                "severity": getattr(severity, "value", str(severity)),
-                "event_type": str(event_type),
-                "alerts": int(alerts),
+                "severity": key[0],
+                "event_type": key[1],
+                "alerts": int(alerts) - done,
+                "acknowledged": done,
                 "sources": int(sources),
                 "newest_hour": bucket,
             }

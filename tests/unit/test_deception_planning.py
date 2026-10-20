@@ -523,6 +523,85 @@ async def test_brief_says_when_a_few_event_types_are_nearly_the_whole_queue():
     assert "6 alert(s) across 6 other event type(s)" in flood[0]
 
 
+async def test_brief_leaves_fully_acknowledged_event_types_out_of_the_queue():
+    """Triaged types took the top (rarest-first) slots and were then silently skipped, so
+    "showing 10 of 79 event types" overstated what was left to do."""
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.deception import soc_brief
+
+    now = datetime.now(UTC) - timedelta(minutes=30)
+    async with get_session() as session:
+        session.add(
+            Alert(
+                source_ip="203.0.113.1",
+                event_type="triaged_type",
+                payload={},
+                severity=AlertSeverity.CRITICAL,
+                acknowledged=True,
+                timestamp=now,
+            )
+        )
+        session.add(
+            Alert(
+                source_ip="203.0.113.2",
+                event_type="open_type",
+                payload={},
+                severity=AlertSeverity.CRITICAL,
+                timestamp=now,
+            )
+        )
+
+    brief = await soc_brief(since_hours=12, max_highlights=5)
+
+    assert [a["event_type"] for a in brief["needs_attention"]] == ["open_type"]
+    assert [t["event_type"] for t in brief["urgent_by_event_type"]] == ["open_type"]
+    assert brief["urgent_event_types_total"] == 1
+    assert "showing 1 of 1 event types" in brief["note"]
+
+
+async def test_brief_counts_open_alerts_of_a_partly_acknowledged_type_and_still_shows_one():
+    """The newest hour of a partly triaged type may hold only acknowledged rows: the example then
+    comes from an older open alert instead of the type vanishing."""
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.deception import soc_brief
+
+    now = datetime.now(UTC)
+    async with get_session() as session:
+        session.add(
+            Alert(
+                source_ip="203.0.113.3",
+                event_type="mixed_type",
+                payload={},
+                severity=AlertSeverity.CRITICAL,
+                timestamp=now - timedelta(hours=6),
+            )
+        )
+        for i in range(3):
+            session.add(
+                Alert(
+                    source_ip="203.0.113.4",
+                    event_type="mixed_type",
+                    payload={},
+                    severity=AlertSeverity.CRITICAL,
+                    acknowledged=True,
+                    timestamp=now - timedelta(minutes=i + 1),
+                )
+            )
+
+    brief = await soc_brief(since_hours=12, max_highlights=5)
+
+    (entry,) = brief["urgent_by_event_type"]
+    assert (entry["alerts"], entry["acknowledged"]) == (1, 3)
+    (shown,) = brief["needs_attention"]
+    assert shown["event_type"] == "mixed_type" and shown["event_type_alerts"] == 1
+
+
 async def test_brief_stays_quiet_about_floods_when_the_queue_is_small_or_varied():
     from datetime import UTC, datetime
 

@@ -19,6 +19,14 @@ that are nearly all of the queue ("93% of the CRITICAL/HIGH queue is 2 event typ
 type(s) remain"). On the real run it answers in 0.4 s. The totals are unchanged and are still the real queue,
 never the display cap.
 
+Re-running the handover on the registered server found the first fix's own gap: ten event types listed in
+the queue never appeared as examples, because every alert of them had been acknowledged (the operator
+triaged them during field testing). The per-type queue counted acknowledged alerts, ranked fully triaged
+types first and then silently skipped them, so "showing 10 of 79 event types" overstated what was left. It
+now counts open alerts only, leaves a fully acknowledged type out (79 types became 72 on the real run),
+reports how many alerts of a listed type were already triaged (`acknowledged`), and a partly triaged type
+whose newest hour is all acknowledged still gets an example from its newest open alert.
+
 ## The ATT&CK dashboard disagreed with the tool; packaging; flaky ports
 
 **Re-rendering the ATT&CK screenshots on the final data showed the Grafana dashboard and `attack_summary`
