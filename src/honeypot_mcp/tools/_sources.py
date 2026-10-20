@@ -39,11 +39,6 @@ def parse_source_filters(values: Iterable[str] | None) -> tuple[list[Network], l
     return networks, errors
 
 
-def split_setting(value: str) -> list[str]:
-    """A comma- or whitespace-separated setting value as a list."""
-    return [part for part in value.replace(",", " ").split() if part]
-
-
 def make_matcher(networks: list[Network]) -> Callable[[str], bool]:
     """A predicate `source_ip -> bool` for 'is inside one of these networks' (cached per address)."""
     cache: dict[str, bool] = {}

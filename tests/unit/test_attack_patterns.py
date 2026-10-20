@@ -986,7 +986,7 @@ async def test_bait_trips_chronology_for_the_read_then_replay_chain():
     ]
     await _seed(rows)
 
-    out = await _call_bait(detail=True)
+    out = await _call_bait()
     blob = json.dumps(out)
 
     assert PLANTED_PASSWORD not in blob, "the planted secret must never be returned"
@@ -1078,7 +1078,11 @@ async def test_bait_trips_exclude_sources_since_and_unknown_tokens():
 
     trimmed = await _call_bait(exclude_sources=["127.0.0.1"])
     assert [s["source_ip"] for s in trimmed["tokens"][0]["sources"]] == ["192.0.2.77"]
-    assert trimmed["excluded_trips"] == 1 and trimmed["excluded_sources"] == ["127.0.0.1"]
+    assert trimmed["excluded_trips"] == 1 and trimmed["excluded_sources"] == ["127.0.0.1/32"]
+    # A range works too, so "that's my test network" needs no list of addresses.
+    ranged = await _call_bait(exclude_sources=["127.0.0.0/8"])
+    assert [s["source_ip"] for s in ranged["tokens"][0]["sources"]] == ["192.0.2.77"]
+    assert ranged["excluded_sources"] == ["127.0.0.0/8"]
 
     assert (await _call_bait(since_hours=0.1))["count"] == 0
     assert (await _call_bait(since_hours=1))["count"] == 1
@@ -1091,7 +1095,7 @@ async def test_bait_trips_exclude_sources_since_and_unknown_tokens():
         and asked["tokens"][0]["sources"] == []
     )
     assert "No honeytoken" in (await _call_bait(token_id=99999))["error"]
-    assert "not a valid" in (await _call_bait(exclude_sources=["nonsense"]))["error"]
+    assert "not an IP address" in (await _call_bait(exclude_sources=["nonsense"]))["error"]
     assert "lookback_hours" in (await _call_bait(lookback_hours=0))["error"]
     only = await _call_bait(token_id=tid)
     assert only["tokens"][0]["trips"] == 2
@@ -1200,15 +1204,21 @@ async def test_bait_trips_lists_the_token_with_the_most_distinct_sources_first_a
 
     out = await _call_bait()
     assert [t["token_id"] for t in out["tokens"]] == [crowd, solo]
-    assert out["tokens_total"] == 2 and "Showing" not in (out["note"] or "")
+    assert out["tokens_total"] == 2 and out["other_tokens"] == []
+    assert "tokens are shown in full" not in (out["note"] or "")
 
-    cut = await _call_bait(limit=1)
-    assert [t["token_id"] for t in cut["tokens"]] == [crowd]
-    assert (cut["count"], cut["tokens_total"]) == (1, 2)
-    assert "Showing 1 of 2 tokens" in cut["note"]
-
-    for bad in (0, 101, True, 2.5):
-        assert "limit" in (await _call_bait(limit=bad))["error"]  # type: ignore[arg-type]
+    # More than five tokens: five in full, the rest as one-line summaries, nothing silently dropped.
+    for n in range(5):
+        await _token(label=f"minor-{n}", meta=_cred_meta(f"minor_user_{n}"))
+        await _seed(
+            [(_TRIP, f"192.0.2.{60 + n}", _login(f"minor_user_{n}", f"pw-minor_user_{n}-x"), None)]
+        )
+    many = await _call_bait()
+    assert many["count"] == 5 and many["tokens_total"] == 7
+    assert [t["token_id"] for t in many["tokens"]][:2] == [crowd, solo]
+    assert len(many["other_tokens"]) == 2
+    assert {"token_id", "label", "type", "trips", "sources_total"} == set(many["other_tokens"][0])
+    assert "5 of 7 tokens are shown in full" in many["note"]
 
 
 async def test_bait_trips_picks_a_token_by_label_text_case_insensitively():
@@ -1249,22 +1259,48 @@ async def test_bait_trips_compact_view_keeps_what_the_source_did_first_in_a_long
     rows.append((_TRIP, "192.0.2.77", _login("lead_user", "pw-lead_user-x"), trip_at))
     await _seed(rows)
 
-    compact_out = await _call_bait()
-    lead = compact_out["tokens"][0]["sources"][0]["lead_up"]
+    out = await _call_bait()
+    source = out["tokens"][0]["sources"][0]
+    lead = source["lead_up"]
     assert lead["first_actions"][0].endswith("before: http_decoy_served /.env")
     assert all(isinstance(step, str) for step in lead["first_actions"])
-    assert "earlier_contact_means" not in compact_out["tokens"][0]["sources"][0]
-    assert "same address more than" in compact_out["earlier_contact_meaning"]
+    assert "earlier_contact_means" not in source
+    assert "same address more than" in out["earlier_contact_meaning"]
     assert len(lead["first_actions"]) == 8
     assert lead["starts_at_first_contact"] is True
     assert lead["chronology_runs_total"] == 41
-    assert not {"commands", "user_agents", "chronology"} & set(lead)
-    assert compact_out["detail"] is False and "Compact view" in compact_out["note"]
+    # The only source is among the most relevant, so it also carries the last steps.
+    assert len(lead["chronology"]) == 30
+    assert lead["chronology"][0]["event_type"] != "http_decoy_served", "the tail drops the start"
+    assert {"commands", "user_agents"} <= set(lead)
 
-    full_out = await _call_bait(detail=True)
-    full = full_out["tokens"][0]["sources"][0]["lead_up"]
-    assert len(full["chronology"]) == 30
-    assert full["chronology"][0]["event_type"] != "http_decoy_served", "the tail drops the start"
-    assert full["first_actions"] == lead["first_actions"]
-    assert {"commands", "user_agents"} <= set(full)
-    assert len(json.dumps(compact_out)) < len(json.dumps(full_out))
+
+async def test_bait_trips_gives_full_detail_to_the_first_few_sources_and_stays_compact_for_the_rest():
+    """No flag: detail goes to the most relevant sources, so the answer is a readable size
+    however many addresses used a token."""
+    base = _now() - timedelta(hours=3)
+    await _token(label="busy", created_at=base - timedelta(hours=1), meta=_cred_meta("busy_user"))
+    rows: list[tuple[str, str, dict[str, Any], datetime | None]] = []
+    for n in range(5):
+        ip = f"198.51.100.{n + 1}"
+        rows.append(("ssh_session_connect", ip, {"session": f"s{n}"}, base + timedelta(minutes=n)))
+        for k in range(5 - n):  # the first source is the most active, the last the least
+            rows.append(
+                (
+                    _TRIP,
+                    ip,
+                    _login("busy_user", "pw-busy_user-x"),
+                    base + timedelta(minutes=30 + n + k),
+                )
+            )
+    await _seed(rows)
+
+    out = await _call_bait()
+    sources = out["tokens"][0]["sources"]
+    assert [s["trips"] for s in sources] == [5, 4, 3, 2, 1]
+    with_detail = ["chronology" in s["lead_up"] for s in sources]
+    assert with_detail == [True, True, True, False, False]
+    assert all("first_actions" in s["lead_up"] for s in sources), (
+        "every source says what it did first"
+    )
+    assert "3 most relevant source(s)" in out["note"] and "analyze_attacker" in out["note"]

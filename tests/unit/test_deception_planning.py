@@ -623,24 +623,6 @@ async def test_brief_sets_named_sources_aside_and_says_how_much_it_hid():
     assert brief["non_public_examples"] == 0
 
 
-async def test_brief_applies_the_configured_exclusions_too_and_reports_them_as_configured(
-    monkeypatch,
-):
-    from honeypot_mcp.config import get_settings
-    from honeypot_mcp.tools.deception import soc_brief
-
-    await _seed_two_scopes()
-    monkeypatch.setattr(get_settings(), "soc_exclude_sources", "8.8.8.8, ::1")
-    brief = await soc_brief(since_hours=12, max_highlights=10)
-
-    assert {a["event_type"] for a in brief["needs_attention"]} == {
-        "only_from_loopback",
-        "seen_from_both",
-    }
-    assert brief["excluded"]["configured"] == ["8.8.8.8/32", "::1/128"]
-    assert brief["excluded"]["requested"] == []
-
-
 async def test_brief_rejects_a_malformed_exclusion_instead_of_silently_excluding_nothing():
     from honeypot_mcp.tools.deception import soc_brief
 

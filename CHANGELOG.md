@@ -4,6 +4,23 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## No flags to know, no settings to set
+
+**The point of a natural-language interface is that nobody has to know a flag exists.** The two
+previous passes had added three things a user would have had to know about: a `SOC_EXCLUDE_SOURCES`
+setting for the handover, and `detail` and `limit` arguments on `bait_trips`. All three are gone.
+
+- **The setting is removed** (config field, `.env.example` block, parser, test). "Ignore my test
+  machine" is said to the assistant, which passes `exclude_sources`; the handover's note tells it to ask
+  whether non-public examples are the user's own and to call again with them set aside.
+- **`bait_trips` sizes itself** (above), so there is no `detail` or `limit` to ask for. Its
+  `exclude_sources` now takes ranges like the handover's, so "that's my test network" is one phrase
+  rather than a list of addresses.
+- **Both tools have no required argument, and their docstrings say what a user's words map to**
+  ("today" is 24 hours, "the whole run" a large number, "my test network" a CIDR range), so the assistant
+  fills arguments in from the sentence and never asks for a flag. The server starts and every tool
+  answers with only `DATABASE_URL`, `REPORTS_DIR` and `ANALYSIS_MODE` set, as in the real-run checks.
+
 ## "Who used the planted credential?" returned a wall of text, and dropped the first thing the attacker did
 
 **Asked in natural language on the registered server, `bait_trips` returned about 46 KB for ten tokens,
@@ -11,14 +28,14 @@ most of them the operator's own field-test tokens, each with a 30-line chronolog
 in the middle.** A first-time user asking this exact question would have had to know the token id and
 then read through noise to find it. Fixed without naming any token or address:
 
-- **Compact by default.** Each source now carries its verdict, delay, decoy fetches, services and a
-  `first_actions` list (the earliest steps, one short line each); commands, user agents and the last 30
-  steps are behind `detail=true`. The default call is 15 KB for five tokens, a focused one 6 KB.
+- **The tool sizes the answer, not a flag.** Each source carries its verdict, delay, decoy fetches,
+  services and a `first_actions` list (the earliest steps, one short line each); the three most relevant
+  sources also carry commands, user agents and the last 30 steps. Tokens beyond the first five are
+  one-line summaries, so nothing is dropped silently. The default call is 23 KB, a focused one 9 KB.
 - **Tokens are ranked by how many different addresses tripped them,** then by trips, so a credential that
   several addresses used leads and a token tripped repeatedly by one address (often your own test) does
-  not, whatever its position in time. `limit` (default 5) says how many are shown and the note says how
-  many were cut; `label` picks a token by part of its label, case-insensitively with wildcards taken
-  literally, so "the planted credential" no longer needs an id.
+  not, whatever its position in time. `label` picks a token by part of its label, case-insensitively
+  with wildcards taken literally, so "the planted credential" no longer needs an id.
 - **A real bug in "what did they do first".** The chronology kept the newest 30 runs of a source's
   lead-up, so with a long lead-up its first actions fell off the end: on the real run the bait reader's
   first request, the `/.env` read that started everything, was missing from its chronology and survived only
@@ -36,10 +53,10 @@ an internet-facing honeypot and the entire signal on a LAN tripwire or when a ho
 host, so the tool never guesses.
 
 - **The user states what to set aside:** `exclude_sources` (addresses and CIDR ranges, validated: a typo
-  is an error, not an empty filter) per call, and the `SOC_EXCLUDE_SOURCES` setting for good. The result
-  always carries an `excluded` block (what was requested and configured, how many open alerts and sources
-  it hid) and a headline line, so a filter cannot hide alerts silently; counts, `needs_attention` and
-  `urgent_by_event_type` follow the filter, while volume and busiest sources do not (said in the block).
+  is an error, not an empty filter). The result always carries an `excluded` block (what was requested,
+  how many open alerts and sources it hid) and a headline line, so a filter cannot hide alerts silently;
+  counts, `needs_attention` and `urgent_by_event_type` follow the filter, while volume and busiest
+  sources do not (said in the block).
 - **Every example says what kind of address it came from** (`source_scope`: public, private, loopback,
   link_local, multicast, other_non_public), derived from the standard `ipaddress` properties, and the note
   says when examples come from non-public addresses and what that can mean either way. On the real run the

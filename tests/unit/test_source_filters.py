@@ -9,7 +9,6 @@ from honeypot_mcp.tools._sources import (
     make_matcher,
     parse_source_filters,
     source_scope,
-    split_setting,
 )
 
 
@@ -41,15 +40,6 @@ def test_matcher_follows_networks_and_never_confuses_address_families():
     assert matches("198.51.100.77") and matches("::1")
     assert not matches("198.51.101.1") and not matches("127.0.0.1")
     assert not matches("not-an-ip"), "an unparseable source is never silently excluded"
-
-
-def test_settings_value_splits_on_commas_and_spaces():
-    assert split_setting("203.0.113.7, 198.51.100.0/24  ::1") == [
-        "203.0.113.7",
-        "198.51.100.0/24",
-        "::1",
-    ]
-    assert split_setting("") == []
 
 
 @pytest.mark.parametrize(

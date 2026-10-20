@@ -24,7 +24,6 @@ from typing import Any, Literal
 from sqlalchemy import select
 
 from honeypot_mcp import instance_lock
-from honeypot_mcp.config import get_settings
 from honeypot_mcp.deception.capabilities import BY_TYPE, all_capabilities, all_profiles
 from honeypot_mcp.deception.coverage import build_coverage
 from honeypot_mcp.deception.planner import build_plan
@@ -47,7 +46,6 @@ from honeypot_mcp.tools._sources import (
     make_matcher,
     parse_source_filters,
     source_scope,
-    split_setting,
 )
 from honeypot_mcp.tools._window import annotate_window, window_bounds
 
@@ -421,27 +419,27 @@ async def soc_brief(
     background radiation that makes up most honeypot traffic, so volume never
     buries the one thing that matters.
 
+    Every argument is optional; with none it summarises the last 12 hours. Fill them in from what
+    the user said, never ask them for a flag.
+
     Args:
-        since_hours: Window to summarise. 12 covers a shift, 24 a day.
-        max_highlights: Cap on individual items returned in `needs_attention`.
-        exclude_sources: Addresses or CIDR ranges to set aside from the urgent queue for this call
-              (your own scanner or monitoring host, a test machine), added to the
-              SOC_EXCLUDE_SOURCES setting. Nothing is assumed: on an internet-facing honeypot
-              loopback and private sources are often your own testing, on an internal network
-              they can be the signal, so each example is labelled with its `source_scope` and the
-              result states what was excluded and how many alerts that hid.
+        since_hours: The window: "overnight" or "this shift" is 12, "today" 24, "this week" 168,
+            "the whole run" a large number.
+        max_highlights: Individual items to show in `needs_attention` (default 8); raise it when
+            the user wants more detail.
+        exclude_sources: IP addresses or CIDR ranges to leave out of the urgent queue, when the
+            user says some traffic is theirs ("ignore my scanner at 203.0.113.7", "that's my test
+            network"). Nothing is excluded unless they say so: each example carries a
+            `source_scope`, and the result states what was excluded and how many alerts that hid.
     """
     requested, bad = parse_source_filters(exclude_sources)
-    configured, bad_configured = parse_source_filters(
-        split_setting(get_settings().soc_exclude_sources)
-    )
-    if bad or bad_configured:
+    if bad:
         return {
-            "error": "; ".join(bad + [f"SOC_EXCLUDE_SOURCES: {e}" for e in bad_configured]),
+            "error": "; ".join(bad),
             "hint": "exclude_sources takes IP addresses and CIDR ranges, for example 203.0.113.7 "
             "or 198.51.100.0/24.",
         }
-    exclude = make_matcher(requested + configured) if (requested or configured) else None
+    exclude = make_matcher(requested) if requested else None
     cutoff, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
@@ -588,9 +586,9 @@ async def soc_brief(
     non_public_count = sum(1 for s in scopes if s != "public")
     non_public_note = (
         f"{non_public_count} example(s) come from non-public addresses ({', '.join(non_public)}): "
-        "on an internet-facing host that is usually your own testing or monitoring, on an internal "
-        "network it can be the whole signal. Pass `exclude_sources` (or set SOC_EXCLUDE_SOURCES) to "
-        "set addresses or ranges aside. "
+        "on an internet-facing host that is usually the user's own testing or monitoring, on an "
+        "internal network it can be the whole signal. Ask whether they are the user's own; if so, "
+        "call again with `exclude_sources` set to those addresses. "
         if non_public_count
         else ""
     )
@@ -598,7 +596,6 @@ async def soc_brief(
     if excluded_result is not None:
         excluded_info = {
             "requested": [str(n) for n in requested],
-            "configured": [str(n) for n in configured],
             "alerts_excluded": excluded_result["excluded_open_alerts"],
             "sources_excluded": excluded_result["excluded_sources"],
             "applies_to": (

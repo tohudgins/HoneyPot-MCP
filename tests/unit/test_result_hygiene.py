@@ -391,7 +391,7 @@ async def test_bait_trips_masks_a_planted_secret_inside_a_user_agent():
         ]
     )
 
-    out = await bait_trips(detail=True)
+    out = await bait_trips()
 
     blob = json.dumps(out)
     assert secret not in blob and "Another-Planted-Pw" not in blob
