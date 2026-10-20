@@ -6,6 +6,8 @@
 .idea/
 .vscode/
 .claude/
+.serena/
+.hypothesis/
 
 # Python build artefacts / caches
 __pycache__/

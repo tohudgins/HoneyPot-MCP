@@ -3,20 +3,13 @@ Prometheus /metrics endpoint."""
 
 import asyncio
 import os
-import socket
 from collections import deque
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture(autouse=True)
@@ -237,7 +230,7 @@ async def test_metrics_endpoint_returns_text_format():
 
     from honeypot_mcp.metrics import start_metrics_server
 
-    port = _free_port()
+    port = free_port()
     runner = await start_metrics_server("127.0.0.1", port)
     assert runner is not None
     try:
@@ -279,7 +272,7 @@ async def test_metrics_endpoint_counts_alerts_by_severity():
                 severity=severity,
             )
 
-    port = _free_port()
+    port = free_port()
     runner = await start_metrics_server("127.0.0.1", port)
     assert runner is not None
     try:

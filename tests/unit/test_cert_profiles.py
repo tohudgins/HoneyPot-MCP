@@ -16,6 +16,8 @@ import pytest
 from cryptography import x509
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -233,16 +235,12 @@ async def _db():
 @pytest.mark.asyncio
 async def test_live_apache_404_on_a_non_default_port_says_so(_db):
     """A 404 on a listener that is not on port 80 used to claim `Port 80`."""
-    import socket
 
     import httpx
 
     from honeypot_mcp.engines.http import HTTPEngine
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    port = free_port()
     engine = HTTPEngine()
     cid = await engine.start("apache-404-port", port, {"persona": "apache_ubuntu"})
     try:

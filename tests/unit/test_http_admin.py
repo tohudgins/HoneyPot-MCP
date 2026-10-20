@@ -9,23 +9,18 @@ this honeypot derives from its name.
 import asyncio
 import os
 import re
-import socket
 
 import httpx
 import pytest
 from sqlalchemy.exc import OperationalError
+
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
 
 NAME = "http-admin-test"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +47,7 @@ async def _start(config: dict | None = None) -> tuple[int, object, str]:
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name=NAME, type=HoneypotType.HTTP, port=port))
         await session.flush()

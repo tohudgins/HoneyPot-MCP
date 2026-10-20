@@ -13,12 +13,13 @@ internet access for the SQLite plugin, and takes about 30 seconds. Skips itself 
 from __future__ import annotations
 
 import os
-import socket
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._ports import free_port
 
 
 def _docker_available() -> bool:
@@ -37,14 +38,6 @@ skip_docker = pytest.mark.skipif(
     os.environ.get("RUN_DOCKER_TESTS") != "1" or not _docker_available(),
     reason="needs Docker and RUN_DOCKER_TESTS=1 (runs a Grafana container)",
 )
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _make_wal_db(path: Path, rows: int) -> None:
@@ -101,7 +94,7 @@ async def test_grafana_reads_a_0600_wal_database_through_a_read_only_hardlink(
     settings = get_settings()
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db}")
     monkeypatch.setattr(settings, "grafana_dir", tmp_path / "grafana")
-    port = _free_port()
+    port = free_port()
 
     result = await grafana.start(port)
     try:
@@ -150,7 +143,7 @@ async def test_grafana_sees_a_live_writers_uncheckpointed_alerts(tmp_path, monke
     settings = get_settings()
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db}")
     monkeypatch.setattr(settings, "grafana_dir", tmp_path / "grafana")
-    port = _free_port()
+    port = free_port()
 
     result = await grafana.start(port)
     try:
@@ -178,7 +171,7 @@ async def test_the_container_that_holds_the_data_has_no_route_out(tmp_path, monk
     settings = get_settings()
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db}")
     monkeypatch.setattr(settings, "grafana_dir", tmp_path / "grafana")
-    port = _free_port()
+    port = free_port()
     client = docker.from_env()
     # A listener on the default bridge: reachable by its neighbours, which is what an SSRF from a
     # compromised Grafana would try to reach (another container, an internal service).
@@ -243,7 +236,7 @@ async def test_grafana_readers_do_not_hold_up_the_writers_checkpoints(tmp_path, 
     settings = get_settings()
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db}")
     monkeypatch.setattr(settings, "grafana_dir", tmp_path / "grafana")
-    port = _free_port()
+    port = free_port()
 
     result = await grafana.start(port)
     try:

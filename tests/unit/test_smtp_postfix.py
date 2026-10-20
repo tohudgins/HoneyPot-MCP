@@ -9,19 +9,14 @@ VRFY with the same 252 — a reply that is itself the tell.
 import asyncio
 import os
 import smtplib
-import socket
 
 import pytest
+
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +42,7 @@ async def smtp_port(tmp_path, monkeypatch):
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name="smtp-pf", type=HoneypotType.SMTP, port=port))
         await session.flush()

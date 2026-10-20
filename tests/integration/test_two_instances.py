@@ -19,14 +19,10 @@ from pathlib import Path
 
 from fastmcp import Client
 
+from tests._ports import free_port
+
 ROOT = Path(__file__).resolve().parents[2]
 TOKEN = "admin-token-0123456789abcdef"
-
-
-def _free() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _spawn(work: Path, tag: str, mcp_port: int):
@@ -37,9 +33,9 @@ def _spawn(work: Path, tag: str, mcp_port: int):
         "MCP_HOST": "127.0.0.1",
         "MCP_PORT": str(mcp_port),
         "MCP_AUTH_TOKENS": f"{TOKEN}:admin",
-        "METRICS_PORT": str(_free()),
+        "METRICS_PORT": str(free_port()),
         "CONSOLE_PORT": "0",
-        "CANARY_CALLBACK_PORT": str(_free()),
+        "CANARY_CALLBACK_PORT": str(free_port()),
         "REPORTS_DIR": str(work / "reports"),
         "TLS_DIR": str(work / "tls"),
         "OWNER_CHECK_SECONDS": "1",
@@ -71,7 +67,7 @@ async def _call(port: int, tool: str, args: dict):
 async def test_a_second_server_is_read_only_and_raises_no_false_alarm(tmp_path):
     work = tmp_path / "run"
     work.mkdir()
-    a_port, b_port, c_port, sensor_port = _free(), _free(), _free(), _free()
+    a_port, b_port, c_port, sensor_port = free_port(), free_port(), free_port(), free_port()
     procs = []
     try:
         a = _spawn(work, "A", a_port)
@@ -91,7 +87,7 @@ async def test_a_second_server_is_read_only_and_raises_no_false_alarm(tmp_path):
         # The second process says what it is, refuses to touch sensors, and still reads.
         assert (await _call(b_port, "ping", {})).data["role"] == "read-only"
         refused = await _call(
-            b_port, "honeypot_deploy", {"type": "http", "port": _free(), "name": "second"}
+            b_port, "honeypot_deploy", {"type": "http", "port": free_port(), "name": "second"}
         )
         assert "read-only" in str(refused.data) and "pid" in str(refused.data)
         listed = await _call(b_port, "honeypot_list", {})
@@ -130,7 +126,7 @@ async def test_a_second_server_is_read_only_and_raises_no_false_alarm(tmp_path):
         else:
             raise AssertionError("the promoted server did not restore the dead owner's sensor")
         deployed = await _call(
-            b_port, "honeypot_deploy", {"type": "http", "port": _free(), "name": "after"}
+            b_port, "honeypot_deploy", {"type": "http", "port": free_port(), "name": "after"}
         )
         assert not deployed.is_error and deployed.data["status"] == "running"
 

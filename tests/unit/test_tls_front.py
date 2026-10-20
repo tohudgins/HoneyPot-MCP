@@ -21,6 +21,8 @@ from collections.abc import AsyncIterator
 import pytest
 from aiohttp import web
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from honeypot_mcp.engines import _tasks  # noqa: E402
@@ -37,14 +39,6 @@ from honeypot_mcp.engines.tls_front import (  # noqa: E402
 pytestmark = pytest.mark.asyncio
 
 GO_400 = b"HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n"
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _client_hello(version: int, record_version: int | None = None) -> bytes:
@@ -276,7 +270,7 @@ async def test_one_source_cannot_exhaust_the_unclassified_connection_budget():
 
 async def test_runner_cleanup_releases_the_port_and_cancels_pending_connections():
     baseline = _tasks.live_count()
-    port = _free_port()
+    port = free_port()
     app = web.Application()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -383,7 +377,7 @@ async def _plain_http(port: int, request: bytes) -> bytes:
 async def test_https_honeypot_serves_the_persona_over_tls_and_frees_the_port_on_stop(_db):
     from honeypot_mcp.engines.http import HTTPEngine
 
-    port = _free_port()
+    port = free_port()
     engine = HTTPEngine()
     cid = await engine.start("front-engine", port, {"tls": True, "persona": "apache_ubuntu"})
     try:
@@ -406,7 +400,7 @@ async def test_apache_persona_explains_plain_http_on_its_tls_port_the_way_apache
 
     from honeypot_mcp.engines.http import HTTPEngine
 
-    port = _free_port()
+    port = free_port()
     engine = HTTPEngine()
     cid = await engine.start("front-apache", port, {"tls": True, "persona": "apache_ubuntu"})
     try:
@@ -429,7 +423,7 @@ async def test_apache_persona_explains_plain_http_on_its_tls_port_the_way_apache
 async def test_nginx_persona_sends_nginxs_own_400_for_plain_http_on_tls(_db):
     from honeypot_mcp.engines.http import HTTPEngine
 
-    port = _free_port()
+    port = free_port()
     engine = HTTPEngine()
     cid = await engine.start("front-nginx", port, {"tls": True, "persona": "nginx_stable"})
     try:
@@ -449,7 +443,7 @@ async def test_iis_persona_sends_nothing_to_plain_http_on_a_tls_binding(_db):
     """HTTP.sys drops plaintext on a TLS binding without writing a byte."""
     from honeypot_mcp.engines.http import HTTPEngine
 
-    port = _free_port()
+    port = free_port()
     engine = HTTPEngine()
     cid = await engine.start("front-iis", port, {"tls": True, "persona": "iis_windows"})
     try:

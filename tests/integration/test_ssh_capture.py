@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._ports import free_port
+
 # Deliberately NOT set at module scope. `config.get_settings()` caches the
 # first Settings it builds, so a module-level DATABASE_URL here would decide
 # the database for every integration module imported after this one — which is
@@ -59,14 +61,6 @@ skip_docker = pytest.mark.skipif(
 )
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 @skip_docker
 async def test_deployed_ssh_honeypot_records_a_real_connection():
     from sqlalchemy import select
@@ -89,7 +83,7 @@ async def test_deployed_ssh_honeypot_records_a_real_connection():
     await buffer.start()
 
     name = f"it-ssh-{uuid.uuid4().hex[:8]}"
-    port = _free_port()
+    port = free_port()
     deployed = False
     try:
         result = await honeypot_deploy(type="ssh", name=name, port=port)
@@ -189,7 +183,7 @@ async def test_deployed_cowrie_cannot_be_used_to_fetch_arbitrary_urls():
     await buffer.start()
 
     name = f"it-egress-{uuid.uuid4().hex[:8]}"
-    port = _free_port()
+    port = free_port()
     deployed = False
     try:
         result = await honeypot_deploy(type="ssh", name=name, port=port)
@@ -279,7 +273,7 @@ async def test_deployed_cowrie_tells_one_consistent_story_about_itself(persona_i
     await buffer.start()
 
     name = f"it-persona-{persona_id.replace('_', '-')}-{uuid.uuid4().hex[:6]}"
-    port = _free_port()
+    port = free_port()
     deployed = False
     try:
         result = await honeypot_deploy(
@@ -396,7 +390,7 @@ async def test_real_ssh_clients_with_different_offers_cluster_by_hassh():
     await buffer.start()
 
     name = f"it-hassh-{uuid.uuid4().hex[:8]}"
-    port = _free_port()
+    port = free_port()
     deployed = False
     try:
         result = await honeypot_deploy(type="ssh", name=name, port=port)

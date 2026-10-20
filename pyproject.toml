@@ -1,14 +1,17 @@
 [build-system]
-requires = ["hatchling"]
+# hatchling >=1.27: PEP 639 license metadata (`license` as an SPDX expression + `license-files`).
+# hatch-fancy-pypi-readme: rewrites the README's repo-relative links for the PyPI page (below).
+requires = ["hatchling>=1.27", "hatch-fancy-pypi-readme>=24.1"]
 build-backend = "hatchling.build"
 
 [project]
 name = "honeypot-mcp"
 version = "0.2.0"
 description = "Deception infrastructure you drive by talking to it — 25-protocol honeypots, honeytokens and attacker analysis over MCP"
-readme = "README.md"
+dynamic = ["readme"]
 requires-python = ">=3.11,<3.15"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "tohudgins" }]
 keywords = [
     "honeypot",
@@ -24,10 +27,12 @@ keywords = [
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Information Technology",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -128,6 +133,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/tohudgins/HoneyPot-MCP"
+Documentation = "https://github.com/tohudgins/HoneyPot-MCP/blob/main/docs/REFERENCE.md"
 Repository = "https://github.com/tohudgins/HoneyPot-MCP"
 Changelog = "https://github.com/tohudgins/HoneyPot-MCP/blob/main/CHANGELOG.md"
 Issues = "https://github.com/tohudgins/HoneyPot-MCP/issues"
@@ -151,6 +157,35 @@ artifacts = [
     # Bundled YARA rules: `sample_scan` loads them through importlib.resources.
     "src/honeypot_mcp/yara_rules/*.yar",
 ]
+
+# The sdist is a whitelist, not "everything git does not ignore": hatch only reads .gitignore, so
+# untracked local state that is not ignored (`.hypothesis/` example databases, `.claude/`,
+# generated `reports/`) rode into the tarball (584 files of `.hypothesis` in the first build).
+# What is listed is what the tests, the docs and a distro packager need to rebuild and check it.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/scripts",
+    "/docs",
+    "/examples",
+    "/deploy",
+    "/docker",
+    "/.github/workflows",
+    "/config/README.md",
+    "/alembic.ini",
+    "/uv.lock",
+    "/.env.example",
+    "/.dockerignore",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/SECURITY.md",
+    "/KNOWN_LIMITATIONS.md",
+    "/CLAUDE.md",
+]
+exclude = ["__pycache__", "*.pyc", ".hypothesis"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -190,3 +225,24 @@ check_untyped_defs = false
 disallow_untyped_calls = false
 disallow_untyped_defs = false
 disallow_any_generics = false
+
+# PyPI renders the README on its own host, where `docs/REFERENCE.md` and the screenshots resolve to
+# nothing. The README stays repo-relative (correct on GitHub and in a checkout); the metadata copy
+# is rewritten to absolute GitHub URLs at build time. Images need raw.githubusercontent.com.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(src=")(?!https?://)'
+replacement = '\1https://raw.githubusercontent.com/tohudgins/HoneyPot-MCP/main/'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(href=")(?!https?://|#|mailto:)'
+replacement = '\1https://github.com/tohudgins/HoneyPot-MCP/blob/main/'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(\]\()(?!https?://|#|mailto:)'
+replacement = '\1https://github.com/tohudgins/HoneyPot-MCP/blob/main/'

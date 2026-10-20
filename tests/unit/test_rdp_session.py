@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import socket
 
 import pytest
+
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
@@ -51,19 +52,13 @@ async def setup_db():
     await close_db()
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
-
-
 async def _serve(tmp_path, monkeypatch, config=None, name="rdp-sess"):
     monkeypatch.chdir(tmp_path)
     from honeypot_mcp.engines.rdp import RDPEngine
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name=name, type=HoneypotType.RDP, port=port))
         await session.flush()

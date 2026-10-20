@@ -13,21 +13,14 @@ rather than milliseconds.
 import asyncio
 import contextlib
 import os
-import socket
 
 import pytest
+
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +97,7 @@ async def test_attack_reaches_the_database_through_the_whole_pipeline():
     This is the path every feature depends on: engine → submit_event →
     suppression → credential match → buffer → flusher → DB.
     """
-    port = _free_port()
+    port = free_port()
     await _deploy("redis", port)
 
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -152,7 +145,7 @@ async def test_planted_credentials_escalate_to_critical_end_to_end():
         )
     invalidate_cache()
 
-    port = _free_port()
+    port = free_port()
     await _deploy("redis", port)
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(b"*3\r\n$4\r\nAUTH\r\n$10\r\nsvc-backup\r\n$12\r\nSup3rSecret!\r\n")
@@ -188,7 +181,7 @@ async def test_suppression_rule_stops_events_before_the_database():
         )
     suppression.invalidate_rule_cache()
 
-    port = _free_port()
+    port = free_port()
     await _deploy("redis", port)
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(b"*2\r\n$4\r\nAUTH\r\n$3\r\nabc\r\n")
@@ -222,7 +215,7 @@ async def test_webhook_receives_what_the_engine_captured(monkeypatch):
     app.router.add_post("/hook", handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    hook_port = _free_port()
+    hook_port = free_port()
     await web.TCPSite(runner, "127.0.0.1", hook_port).start()
 
     try:
@@ -244,7 +237,7 @@ async def test_webhook_receives_what_the_engine_captured(monkeypatch):
 
         get_buffer().set_on_flush(delivery.enqueue_batch)
 
-        port = _free_port()
+        port = free_port()
         await _deploy("redis", port)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"*2\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n")
@@ -269,7 +262,7 @@ async def test_http_engine_flags_an_exploit_attempt_end_to_end():
 
     from honeypot_mcp.storage.models import AlertSeverity
 
-    port = _free_port()
+    port = free_port()
     await _deploy("http", port)
 
     async with aiohttp.ClientSession() as session:

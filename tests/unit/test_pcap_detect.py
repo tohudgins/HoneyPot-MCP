@@ -1670,3 +1670,120 @@ def test_settings_are_pinned_and_bounded():
     assert ":" in s.detection_zeek_image and not s.detection_zeek_image.endswith(":latest")
     assert s.detection_timeout_seconds >= 10 and s.detection_memory_mb >= 256
     assert s.detection_rules_dir.is_absolute()
+
+
+# ── the hardened Docker guard refuses these containers by design ─────────────────────────────
+
+
+def _guard_refusal(path: str, reason: str, status: int = 403) -> docker.errors.APIError:
+    """The exception the Docker SDK raises for the guard's reply, built the way the SDK builds it
+    (captured against a real guard: `403 Client Error for ...: Forbidden ("honeypot docker guard:
+    <reason>")`, `explanation` = the guard's message, `status_code` 403)."""
+    import json as _json
+
+    import requests
+
+    response = requests.Response()
+    response.status_code = status
+    response.reason = "Forbidden"
+    response.url = f"http+docker://localhost/v1.55{path}"
+    response._content = _json.dumps({"message": f"honeypot docker guard: {reason}"}).encode()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            docker.errors.create_api_error_from_http_exception(exc)  # always raises
+        except docker.errors.APIError as api_error:
+            return api_error
+    raise AssertionError("unreachable")
+
+
+def test_guard_refusal_has_the_captured_shape():
+    err = _guard_refusal("/containers/create?name=x", "container name must match honeypot-*")
+    assert isinstance(err, docker.errors.APIError)
+    assert err.status_code == 403
+    assert 'Forbidden ("honeypot docker guard: container name must match honeypot-*")' in str(err)
+
+
+async def test_guard_refused_container_create_says_so_for_pcap_detect(docker_client, capture):
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    def refuse(**spec):
+        raise _guard_refusal("/containers/create", "only the pinned Cowrie image may be run")
+
+    docker_client.containers.create = refuse
+    result = await pcap_detect(capture.name)
+
+    assert "hardened Docker guard refused" in result["error"]
+    assert "only the pinned Cowrie image may be run" in result["error"]
+    assert "Docker itself is running" in result["error"]
+    assert "own machine" in result["hint"] and "docs/HARDENING.md" in result["hint"]
+    assert "Docker could not run" not in result["error"]
+
+
+async def test_guard_refused_image_lookup_says_so_for_pcap_detect(docker_client, capture):
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    def refuse(name):
+        raise _guard_refusal(
+            f"/images/{name}/json",
+            f"GET /images/{name}/json is not permitted through the honeypot Docker guard",
+        )
+
+    docker_client.images.get = refuse
+    result = await pcap_detect(capture.name)
+
+    assert "pcap_detect" in result["error"] and "hardened Docker guard refused" in result["error"]
+    assert "could not look up" not in result["error"]
+    assert "HARDENING.md" in result["hint"]
+
+
+async def test_guard_refusal_says_so_for_detection_rules_update(docker_client):
+    from honeypot_mcp.tools.detect import detection_rules_update
+
+    def refuse(name):
+        raise _guard_refusal(f"/images/{name}/json", "images are not permitted")
+
+    docker_client.images.get = refuse
+    result = await detection_rules_update()
+
+    assert "detection_rules_update" in result["error"]
+    assert "hardened Docker guard refused" in result["error"]
+    assert "HARDENING.md" in result["hint"]
+
+
+async def test_guard_refusal_wrapped_in_a_docker_exception_is_still_recognised(
+    docker_client, capture
+):
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    def refuse(**spec):
+        try:
+            raise _guard_refusal("/containers/create", "HostConfig.Privileged is not permitted")
+        except docker.errors.APIError as inner:
+            raise docker.errors.DockerException("could not create the container") from inner
+
+    docker_client.containers.create = refuse
+    result = await pcap_detect(capture.name)
+
+    assert "hardened Docker guard refused" in result["error"]
+
+
+async def test_other_docker_failures_keep_their_messages(docker_client, capture):
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    def other(**spec):
+        raise docker.errors.APIError("500 Server Error: boom")
+
+    docker_client.containers.create = other
+    result = await pcap_detect(capture.name)
+    assert result["error"].startswith("Docker could not run suricata: ")
+    assert "guard" not in result["error"]
+
+    # a 403 that is not the guard's (a registry or daemon policy) is not blamed on the guard
+    def forbidden(**spec):
+        raise docker.errors.APIError("403 Forbidden: authorization denied by plugin")
+
+    docker_client.containers.create = forbidden
+    result = await pcap_detect(capture.name)
+    assert result["error"].startswith("Docker could not run suricata: ")

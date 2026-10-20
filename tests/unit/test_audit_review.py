@@ -15,15 +15,11 @@ from typing import Any
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +44,7 @@ async def _register(name: str, type_name: str) -> int:
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name=name, type=HoneypotType(type_name), port=port))
         await session.flush()
@@ -381,7 +377,7 @@ async def test_malformed_http_does_not_flood_the_log_with_tracebacks(caplog):
     app.router.add_get("/", ok)
     runner = identity_runner(app, "nginx")
     await runner.setup()
-    port = _free_port()
+    port = free_port()
     await web.TCPSite(runner, "127.0.0.1", port).start()
     try:
         with caplog.at_level(logging.DEBUG, logger="aiohttp.server"):

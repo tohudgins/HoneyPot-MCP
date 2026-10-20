@@ -7,18 +7,13 @@ every call answered "Unknown tool" — while startup logged nothing wrong.
 """
 
 import os
-import socket
 import sys
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
 
 
 @pytest.mark.asyncio
@@ -30,8 +25,8 @@ async def test_module_launch_serves_the_registered_tools(tmp_path):
         **os.environ,
         "DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path / 'launch.db'}",
         "MCP_TRANSPORT": "stdio",
-        "METRICS_PORT": str(_free_port()),
-        "CANARY_CALLBACK_PORT": str(_free_port()),
+        "METRICS_PORT": str(free_port()),
+        "CANARY_CALLBACK_PORT": str(free_port()),
         "CONSOLE_PORT": "0",
     }
     transport = StdioTransport(

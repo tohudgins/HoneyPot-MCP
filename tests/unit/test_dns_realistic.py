@@ -11,6 +11,8 @@ exercises the synthesis function in isolation.
 
 import os
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -224,7 +226,6 @@ async def test_zone_transfers_arrive_over_tcp_and_are_recorded_and_refused():
     """AXFR is TCP-only in practice. With UDP alone `dns_zone_transfer` could only fire on a rare
     UDP attempt, and a real transfer got a refused connection and left no trace."""
     import asyncio
-    import socket
 
     import dnslib
 
@@ -234,9 +235,7 @@ async def test_zone_transfers_arrive_over_tcp_and_are_recorded_and_refused():
 
     event_buffer.reset_for_tests()
     await init_db()
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = free_port()
     engine = DNSEngine()
     recorded: list[tuple[str, str]] = []
 

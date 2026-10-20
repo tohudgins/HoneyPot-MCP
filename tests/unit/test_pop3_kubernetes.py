@@ -17,9 +17,10 @@ import asyncio
 import contextlib
 import hashlib
 import os
-import socket
 
 import pytest
+
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
@@ -41,19 +42,11 @@ async def setup_db():
     event_buffer.reset_for_tests()
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 async def _register(name: str, hp_type) -> int:
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotStatus
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(
             Honeypot(name=name, type=hp_type, port=port, status=HoneypotStatus.RUNNING, config={})

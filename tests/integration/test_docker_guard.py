@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._ports import free_port
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -50,16 +52,6 @@ def _upstream_socket() -> str:
         if os.path.exists(candidate):
             return candidate
     pytest.skip("cannot find the Docker socket")
-
-
-def _free_port() -> int:
-    import socket
-
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _raw(sock: str, method: str, target: str, body: bytes, content_type: str | None) -> bytes:
@@ -114,7 +106,7 @@ async def test_the_ssh_engine_works_through_the_guard_and_a_hijacked_service_is_
     deployed = False
     try:
         deploy = await honeypot_deploy(
-            type="ssh", name=name, port=_free_port(), config={"ssh_persona": "debian_12"}
+            type="ssh", name=name, port=free_port(), config={"ssh_persona": "debian_12"}
         )
         assert "error" not in deploy, deploy
         deployed = True

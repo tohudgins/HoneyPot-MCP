@@ -27,6 +27,8 @@ import httpx
 import pytest
 import yaml
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1224,10 +1226,7 @@ async def fake_grafana():
     app.router.add_post("/api/ds/query", query)
     runner = web.AppRunner(app)
     await runner.setup()
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
+    port = free_port()
     await web.TCPSite(runner, "127.0.0.1", port).start()
     state.port = port
     yield state
@@ -1295,10 +1294,10 @@ async def test_probe_gives_up_after_the_bound(fake_grafana):
 def test_port_probe_sees_a_listener_and_a_free_port():
     from honeypot_mcp.grafana import _port_free
 
+    busy = free_port()  # reserved for this process, so the "free again" assertion cannot race
     with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
+        listener.bind(("127.0.0.1", busy))
         listener.listen()
-        busy = listener.getsockname()[1]
         assert _port_free(busy) is False
     assert _port_free(busy) is True
 
@@ -1827,3 +1826,108 @@ async def test_a_snapshot_is_readable_by_the_container_user_not_just_the_owner(
     assert oct(view.stat().st_mode & 0o777) == "0o755"
     assert oct((view / grafana.DB_FILENAME).stat().st_mode & 0o777) == "0o600"
     assert os.listdir(view) == [grafana.DB_FILENAME]
+
+
+# ── the hardened Docker guard refuses these containers by design ─────────────────────────────
+
+
+def _guard_refusal(path: str, reason: str) -> docker.errors.APIError:
+    """The exception the Docker SDK raises for the guard's reply, built the way the SDK builds it
+    (captured against a real guard: `403 Client Error for ...: Forbidden ("honeypot docker guard:
+    <reason>")`, `explanation` = the guard's message, `status_code` 403)."""
+    import requests
+
+    response = requests.Response()
+    response.status_code = 403
+    response.reason = "Forbidden"
+    response.url = f"http+docker://localhost/v1.55{path}"
+    response._content = json.dumps({"message": f"honeypot docker guard: {reason}"}).encode()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            docker.errors.create_api_error_from_http_exception(exc)  # always raises
+        except docker.errors.APIError as api_error:
+            return api_error
+    raise AssertionError("unreachable")
+
+
+def _assert_guard_message(result: dict[str, Any], tool: str) -> None:
+    assert "hardened Docker guard refused" in result["error"]
+    assert tool in result["error"]
+    assert "Docker itself is running" in result["error"]
+    assert "own machine" in result["hint"] and "docs/HARDENING.md" in result["hint"]
+    assert "Unexpected failure" not in result["error"]
+
+
+async def test_guard_refused_listing_says_so_for_grafana_start(database, docker_client):
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    def refuse(**kw):
+        raise _guard_refusal(
+            "/containers/json", "container listings must be filtered to honeypot-mcp=true"
+        )
+
+    docker_client.containers.list = refuse
+    result = await grafana_start(port=3300)
+
+    _assert_guard_message(result, "grafana_start")
+    assert "container listings must be filtered" in result["error"]
+    rows = await _audit_rows()
+    assert rows[0].outcome == "error"
+
+
+async def test_guard_refused_create_says_so_for_grafana_start(
+    database, docker_client, healthy_probe
+):
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    def refuse(**spec):
+        raise _guard_refusal("/containers/create", "container name must match honeypot-*")
+
+    docker_client.containers.create = refuse
+    result = await grafana_start(port=3300)
+
+    _assert_guard_message(result, "grafana_start")
+    assert "Docker could not start Grafana" not in result["error"]
+
+
+async def test_guard_refusal_says_so_for_grafana_stop_and_status(database, docker_client):
+    from honeypot_mcp.tools.grafana import grafana_status, grafana_stop
+
+    def refuse(**kw):
+        raise _guard_refusal("/containers/json", "container listings must be filtered")
+
+    docker_client.containers.list = refuse
+    _assert_guard_message(await grafana_stop(), "grafana_stop")
+    status = await grafana_status()
+    _assert_guard_message(status, "grafana_status")
+    assert status["running"] is None
+
+
+async def test_guard_refusal_wrapped_in_a_docker_exception_is_recognised():
+    from honeypot_mcp.docker_errors import guard_refusal
+
+    try:
+        try:
+            raise _guard_refusal("/containers/create", "HostConfig.Privileged is not permitted")
+        except docker.errors.APIError as inner:
+            raise docker.errors.DockerException("create failed") from inner
+    except docker.errors.DockerException as wrapped:
+        found = guard_refusal(wrapped, "grafana_start")
+    assert found is not None
+    assert "HostConfig.Privileged is not permitted" in found["error"]
+
+
+async def test_other_docker_failures_keep_their_messages(database, docker_client, healthy_probe):
+    from honeypot_mcp.docker_errors import guard_refusal
+    from honeypot_mcp.tools.grafana import grafana_start
+
+    docker_client.fail_create = "driver failed: something else entirely"
+    result = await grafana_start(port=3300)
+    assert result["error"].startswith("Docker could not start Grafana: ")
+    assert "guard" not in result["error"]
+
+    assert guard_refusal(docker.errors.APIError("403 Forbidden: authorization denied")) is None
+    assert guard_refusal(ConnectionError("connection refused")) is None
+    assert guard_refusal(None) is None

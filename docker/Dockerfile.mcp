@@ -44,7 +44,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir pip==26.2.1 uv==0.12.21
 
 COPY pyproject.toml uv.lock README.md LICENSE ./
-RUN uv export --frozen --no-dev --no-emit-project --output-file /tmp/requirements.txt \
+# `--extra forensics`: YARA for `sample_scan`. Without it the tool answers `available: false`
+# in the container. yara-python ships manylinux wheels for this image's Python (3.12) on
+# amd64 and arm64, so --no-deps + --require-hashes still works and nothing compiles.
+RUN uv export --frozen --no-dev --extra forensics --no-emit-project --output-file /tmp/requirements.txt \
  && pip install --require-hashes --no-deps -r /tmp/requirements.txt
 
 COPY src ./src

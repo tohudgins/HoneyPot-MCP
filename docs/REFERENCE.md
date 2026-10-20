@@ -44,20 +44,21 @@ Ruff and mypy are blocking in CI across Python 3.11 to 3.14; a CI job also runs 
 **Prerequisites:** Python 3.11+. Docker only for the Cowrie SSH/Telnet honeypot.
 
 ```bash
-pipx install honeypot-mcp          # or: pip install honeypot-mcp
-honeypot-mcp                        # starts the server
+pipx install "git+https://github.com/tohudgins/HoneyPot-MCP"     # or: uv tool install git+https://github.com/tohudgins/HoneyPot-MCP
+honeypot-mcp                                                     # starts the server on stdio
 ```
 
-PostgreSQL: `pip install "honeypot-mcp[postgres]"`.
+Extras: `pipx install "honeypot-mcp[forensics] @ git+https://github.com/tohudgins/HoneyPot-MCP"` adds YARA for `sample_scan` (yara-python, or yara-x on Python 3.14), and `[postgres]` adds the PostgreSQL driver. The server reads `.env` and the default SQLite file `honeypot_mcp.db` from the directory it runs in, so with a tool install set `DATABASE_URL` to an absolute path. The wheel and sdist are built and smoke-tested on Python 3.11 to 3.14; they are not on PyPI yet (the release workflow publishes on a `vX.Y.Z` tag), so `pipx install honeypot-mcp` works only after that.
 
-**Container:**
+**Container:** build it from a clone (a published image comes with the first release):
 
 ```bash
+docker build -f docker/Dockerfile.mcp -t honeypot-mcp .
 docker run -d --name honeypot-mcp \
   -e MCP_TRANSPORT=none -e CONSOLE_HOST=0.0.0.0 \
   -p 127.0.0.1:8090:8090 -p 8888:8888 \
   -v honeypot-data:/app/data \
-  ghcr.io/tohudgins/honeypot-mcp:latest
+  honeypot-mcp
 ```
 
 **From source:**

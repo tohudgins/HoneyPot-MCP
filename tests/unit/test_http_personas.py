@@ -10,6 +10,8 @@ from collections import Counter
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -88,16 +90,6 @@ def test_render_not_found_embeds_persona_identity():
 # ── End-to-end engine integration ─────────────────────────────────────────────
 
 
-async def _free_port() -> int:
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
 async def _register_honeypot(name: str, port: int, persona_id: str | None = None) -> int:
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
@@ -124,7 +116,7 @@ async def test_engine_serves_pinned_persona_headers():
 
     from honeypot_mcp.engines.http import HTTPEngine
 
-    port = await _free_port()
+    port = free_port()
     await _register_honeypot("nginx-test", port, persona_id="nginx_stable")
 
     engine = HTTPEngine()
@@ -149,7 +141,7 @@ async def test_engine_persists_persona_when_unset():
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot
 
-    port = await _free_port()
+    port = free_port()
     await _register_honeypot("auto-test", port)  # config={} — no persona pinned
 
     engine = HTTPEngine()
@@ -171,7 +163,7 @@ async def test_engine_serves_persona_specific_404():
 
     from honeypot_mcp.engines.http import HTTPEngine
 
-    port = await _free_port()
+    port = free_port()
     await _register_honeypot("404-test", port, persona_id="apache_ubuntu")
 
     engine = HTTPEngine()

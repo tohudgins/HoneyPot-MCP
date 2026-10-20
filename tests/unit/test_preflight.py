@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from honeypot_mcp import preflight as pf  # noqa: E402
@@ -180,16 +182,14 @@ def test_ports_in_use_and_the_admin_port_lockout():
     held.bind(("0.0.0.0", 0))
     held.listen()
     busy = held.getsockname()[1]
-    with socket.socket() as probe:
-        probe.bind(("0.0.0.0", 0))
-        free_port = probe.getsockname()[1]
+    idle = free_port()
     try:
-        by_name = {c.name: c for c in pf.check_ports([busy, free_port])}
+        by_name = {c.name: c for c in pf.check_ports([busy, idle])}
         assert by_name[f"port {busy}"].status == pf.FAIL
-        assert by_name[f"port {free_port}"].status == pf.PASS
-        lockout = pf.check_ports([free_port], admin_port=free_port)
+        assert by_name[f"port {idle}"].status == pf.PASS
+        lockout = pf.check_ports([idle], admin_port=idle)
         assert lockout[0].name == "admin access" and lockout[0].status == pf.FAIL
-        assert pf.check_ports([free_port], admin_port=2222)[0].status == pf.PASS
+        assert pf.check_ports([idle], admin_port=2222)[0].status == pf.PASS
     finally:
         held.close()
 
@@ -274,11 +274,11 @@ def test_env_permissions_are_read_from_where_the_server_reads_them(tmp_path, mon
 def test_ports_are_probed_the_way_asyncio_binds_and_udp_is_probed_too():
     # A port left in TIME_WAIT by a just-stopped honeypot is bindable (asyncio sets
     # SO_REUSEADDR); a plain bind said "already in use".
+    port = free_port()
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", 0))
+    server.bind(("0.0.0.0", port))
     server.listen()
-    port = server.getsockname()[1]
     client = socket.create_connection(("127.0.0.1", port))
     accepted, _ = server.accept()
     accepted.close()  # server side closes first -> TIME_WAIT on this port
@@ -382,9 +382,7 @@ async def test_readiness_reads_the_real_readyz_endpoint():
 
     event_buffer.reset_for_tests()
     await init_db()
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = free_port()
     runner = await start_metrics_server("127.0.0.1", port)
     try:
         assert (await pf.check_readiness(f"http://127.0.0.1:{port}")).status == pf.PASS
@@ -411,9 +409,7 @@ def test_exit_status_and_rendering():
 
 
 def test_the_cli_runs_the_static_checks_and_emits_json(capsys, tmp_path):
-    with socket.socket() as probe:
-        probe.bind(("0.0.0.0", 0))
-        port = probe.getsockname()[1]
+    port = free_port()
     code = pf.main(["--json", "--ports", f"{port}", "--backup-dir", str(tmp_path)])
     checks = json.loads(capsys.readouterr().out)
     names = {c["name"] for c in checks}

@@ -12,13 +12,14 @@ import asyncio
 import os
 import re
 import shutil
-import socket
 import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 
 import pytest
+
+from tests._ports import free_port
 
 pytestmark = pytest.mark.asyncio
 
@@ -41,14 +42,6 @@ skip_docker = pytest.mark.skipif(
     or shutil.which("sshpass") is None,
     reason="needs Docker, sshpass and RUN_DOCKER_TESTS=1 (pulls the Cowrie image)",
 )
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _ssh(port: int, command: str) -> str:
@@ -98,7 +91,7 @@ async def test_real_cowrie_head_uptime_and_tracked_bait():
     await event_buffer.get_buffer().start()
 
     name = f"it-shell-{uuid.uuid4().hex[:8]}"
-    port = _free_port()
+    port = free_port()
     deployed = False
     try:
         made = await honeytoken_generate_credentials(label="bait-it", count=1, service="mysql")

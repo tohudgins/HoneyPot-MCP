@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._ports import free_port
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -38,14 +40,6 @@ skip_docker = pytest.mark.skipif(
     os.environ.get("RUN_DOCKER_TESTS") != "1" or not _docker_available(),
     reason="needs Docker and RUN_DOCKER_TESTS=1 (pulls the Cowrie image)",
 )
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _read_exact(sock: socket.socket, n: int) -> bytes:
@@ -136,7 +130,7 @@ async def test_real_cowrie_presents_the_personas_ssh_offer_and_a_linux_telnetds_
 
     suffix = uuid.uuid4().hex[:8]
     ssh_name, telnet_name = f"it-fp-ssh-{suffix}", f"it-fp-telnet-{suffix}"
-    ssh_port, telnet_port = _free_port(), _free_port()
+    ssh_port, telnet_port = free_port(), free_port()
     deployed: list[str] = []
     try:
         ssh = await honeypot_deploy(

@@ -22,16 +22,11 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from honeypot_mcp.engines import rdp_nla as nla
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
 
 
 # ── Primitives, against published vectors ───────────────────────────────────
@@ -148,7 +143,7 @@ async def _rdp(name: str = "rdp-nla"):
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name=name, type=HoneypotType.RDP, port=port))
         await session.flush()

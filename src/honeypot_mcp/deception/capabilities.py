@@ -22,6 +22,12 @@ The fields exist to answer specific questions:
   engine emits that carry analytic weight, fed through `intel.mitre` so
   coverage is derived from the real ATT&CK mappings rather than a second,
   drifting list.
+  Every event type an engine emits that `intel.mitre` maps to a technique belongs
+  here, high-volume recon included: the Grafana ATT&CK dashboard is generated
+  from this list, so an event type missing from it is counted by `attack_summary`
+  and silently absent from the dashboard (39 types, about 109k alerts, on one real
+  run). `tests/unit/test_mitre_dashboard.py` fails on a new engine event that is
+  neither listed here nor an explained exception.
 """
 
 from __future__ import annotations
@@ -97,6 +103,8 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "ssh_file_download",
             "ssh_file_upload",
             "ssh_port_forward",
+            "ssh_port_forward_data",
+            "ssh_port_forward_ja4h",
         ),
         config_options=("fake_hostname", "fake_kernel", "ssh_persona", "telnet_enabled"),
         requires_docker=True,
@@ -144,6 +152,8 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "http_active_recon",
             "http_decoy_served",
             "http_probe",
+            "http_recon_probe",
+            "http_login_success",
         ),
         config_options=("endpoints", "persona", "tls"),
         captures_credentials_as="http",
@@ -199,6 +209,8 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "dns_tunneling_suspected",
             "dns_any_query",
             "dns_version_probe",
+            "dns_query",
+            "dns_canary_callback",
         ),
         config_options=("fake_soa", "zones"),
         public_cloud_caution=_DNS_CLOUD_CAUTION,
@@ -229,6 +241,9 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "rdp_session",
             "rdp_clipboard",
             "rdp_command",
+            "rdp_nla_probe",
+            "rdp_mcs_handshake",
+            "rdp_invalid_probe",
         ),
         captures_credentials_as="rdp",
         config_options=(
@@ -290,6 +305,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "ldap_jndi_lookup",
             "ldap_anonymous_bind",
             "ldap_search",
+            "ldap_invalid_probe",
         ),
         config_options=(),
         captures_credentials_as="ldap",
@@ -312,6 +328,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "mysql_udf_rce",
             "mysql_outfile_write",
             "mysql_file_read",
+            "mysql_recon_query",
         ),
         captures_credentials_as="mysql",
         pairs_well_with=("http",),
@@ -331,6 +348,8 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "postgresql_login_attempt",
             "postgresql_copy_program_rce",
             "postgresql_file_access",
+            "postgresql_udf_rce",
+            "postgresql_recon_query",
         ),
         captures_credentials_as="postgresql",
         pairs_well_with=("http",),
@@ -376,6 +395,11 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "redis_config_set",
             "redis_eval",
             "redis_module_load",
+            "redis_key_set",
+            "redis_rogue_replica",
+            "redis_rce_dropper",
+            "redis_config_get",
+            "redis_info_probe",
         ),
         captures_credentials_as="redis",
     ),
@@ -387,7 +411,12 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
         os_family="neutral",
         roles=("database", "search"),
         summary="Unauthenticated cluster mock. Recon probes are separated from actual data-exfil queries.",
-        signature_events=("elasticsearch_data_access", "elasticsearch_query_probe"),
+        signature_events=(
+            "elasticsearch_data_access",
+            "elasticsearch_query_probe",
+            "elasticsearch_recon_probe",
+            "elasticsearch_health_probe",
+        ),
     ),
     EngineCapability(
         type="memcached",
@@ -404,6 +433,8 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "memcached_amplification_attempt",
             "memcached_flush_all",
             "memcached_stats_probe",
+            "memcached_large_set",
+            "memcached_version_probe",
         ),
         notes="Never amplifies; records the intent without joining the DDoS.",
     ),
@@ -425,6 +456,7 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "snmp_community_attempt",
             "snmp_set_request",
             "snmp_bulk_request",
+            "snmp_invalid_probe",
         ),
         captures_credentials_as="snmp",
         notes="Pairs with DNS to make a believable network-infrastructure segment.",
@@ -446,6 +478,11 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "docker_api_exec",
             "docker_api_image_pull",
             "docker_api_enumerate",
+            "docker_api_container_create",
+            "docker_api_container_start",
+            "docker_api_exec_start",
+            "docker_api_recon",
+            "docker_api_probe",
         ),
         notes="An exposed daemon is host compromise, not a foothold.",
     ),
@@ -493,6 +530,10 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "sip_register_attempt",
             "sip_extension_probe",
             "sip_scan",
+            "sip_invite",
+            "sip_options_probe",
+            "sip_request",
+            "sip_invalid_probe",
         ),
         captures_credentials_as="sip",
         notes="One of the few services where the attacker's motive is immediate revenue.",
@@ -513,6 +554,9 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "rsync_module_enumeration",
             "rsync_file_request",
             "rsync_auth_attempt",
+            "rsync_module_access",
+            "rsync_unknown_module",
+            "rsync_invalid_probe",
         ),
         captures_credentials_as="rsync",
         notes="Backup servers are the usual victim, so the exposure is the archive itself.",
@@ -533,6 +577,10 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "nfs_export_enumeration",
             "nfs_portmap_dump",
             "nfs_request",
+            "nfs_mount_probe",
+            "nfs_portmap_query",
+            "nfs_portmap_probe",
+            "nfs_unknown_program",
         ),
         notes="An export shared to * with no_root_squash is data loss and often RCE.",
     ),
@@ -578,6 +626,9 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
             "kubernetes_pod_exec",
             "kubernetes_enumerate",
             "kubernetes_rbac_enumerate",
+            "kubernetes_pod_create",
+            "kubernetes_recon",
+            "kubernetes_probe",
         ),
         pairs_well_with=("docker_api",),
         notes="Reading Secrets is usually the whole cluster, not one workload.",
@@ -585,6 +636,16 @@ _CAPABILITIES: tuple[EngineCapability, ...] = (
 )
 
 BY_TYPE: dict[str, EngineCapability] = {c.type: c for c in _CAPABILITIES}
+
+# Event-type families that belong to no one engine, so no `signature_events` can list them.
+# A planted credential or token that is replayed against any sensor re-tags the event
+# (`honeytoken_triggered_credential_via_<original event>`, `honeytoken_triggered_<token type>`,
+# `honeytoken_triggered_<token type>_via_<source>`): the names are open-ended, so the ATT&CK
+# dashboard counts them by prefix. They are deliberately NOT in any engine's `signature_events`:
+# those feed `deception_coverage` per sensor, and attributing "valid accounts" to, say, the MySQL
+# sensor would say it detects something it only relays; honeytokens are covered through
+# `coverage._TOKEN_TECHNIQUES`. Only the dashboard generator reads this.
+CROSS_ENGINE_EVENT_PREFIXES: tuple[str, ...] = ("honeytoken_triggered_",)
 
 
 def all_capabilities() -> tuple[EngineCapability, ...]:

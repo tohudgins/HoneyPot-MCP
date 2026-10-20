@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
@@ -41,6 +43,9 @@ async def setup_db(tmp_path, monkeypatch):
     buffer = event_buffer.get_buffer()
     await buffer.start()
     yield
+    from honeypot_mcp.tools.honeypot import honeypot_stop
+
+    await honeypot_stop(type="all")  # a failed assertion must not leave listeners behind
     await buffer.stop()
     await close_db()
     event_buffer.reset_for_tests()
@@ -78,18 +83,16 @@ async def _alert_count() -> int:
 # ── Bulk honeypot operations ────────────────────────────────────────────────
 
 
-# Engines are process-lifetime singletons holding real listening sockets, so a
-# port bound by one test is still bound in the next. A fresh range per deploy
-# keeps the tests independent of execution order.
-_next_port = [45500]
+# Engines are process-lifetime singletons holding real listening sockets, so a port bound by one
+# test is still bound in the next. Every deploy takes a port reserved for this process (below the
+# ephemeral range, so no client socket can hold it either); the fixture stops what a test leaves.
 
 
 async def _deploy(*types: str) -> None:
     from honeypot_mcp.tools.honeypot import honeypot_deploy
 
     for t in types:
-        _next_port[0] += 1
-        result = await honeypot_deploy(type=t, name=f"bulk-{t}", port=_next_port[0])
+        result = await honeypot_deploy(type=t, name=f"bulk-{t}", port=free_port())
         assert "error" not in result, result
 
 

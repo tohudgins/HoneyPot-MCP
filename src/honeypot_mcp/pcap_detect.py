@@ -65,6 +65,7 @@ from typing import Any, BinaryIO
 from honeypot_mcp import pcap_analysis
 from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.config import get_settings
+from honeypot_mcp.docker_errors import guard_refusal
 from honeypot_mcp.pcap_analysis import _clean, _iso, _Tally
 from honeypot_mcp.secure_io import ensure_private_dir
 
@@ -139,6 +140,15 @@ class DetectError(Exception):
         return out
 
 
+_TOOLS = "pcap_detect and detection_rules_update"
+
+
+def _refused(exc: BaseException, what: str = _TOOLS) -> DetectError | None:
+    """A `DetectError` saying the hardened Docker guard refused the request, or None."""
+    found = guard_refusal(exc, what)
+    return DetectError(found["error"], found["hint"]) if found else None
+
+
 # ── the capture ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -200,6 +210,9 @@ def _docker_client() -> Any:
         )
         client.ping()
     except Exception as e:
+        refused = _refused(e)
+        if refused is not None:
+            raise refused from None
         raise DetectError(
             f"Docker is not available ({type(e).__name__}: {str(e)[:200]}).",
             "Start Docker (Docker Desktop, or the docker service) and make sure this user can "
@@ -217,7 +230,7 @@ def _split_image(image: str) -> tuple[str, str | None]:
     return image, "latest"
 
 
-def _ensure_image(client: Any, image: str) -> bool:
+def _ensure_image(client: Any, image: str, what: str = _TOOLS) -> bool:
     """True when the image had to be pulled (a network action: only these two tools do it)."""
     import docker.errors
 
@@ -227,6 +240,9 @@ def _ensure_image(client: Any, image: str) -> bool:
     except docker.errors.ImageNotFound:
         pass
     except Exception as e:
+        refused = _refused(e, what)
+        if refused is not None:
+            raise refused from None
         raise DetectError(
             f"Docker could not look up {image} ({type(e).__name__}: {str(e)[:200]})."
         ) from None
@@ -234,6 +250,9 @@ def _ensure_image(client: Any, image: str) -> bool:
     try:
         client.images.pull(repo, tag=tag)
     except Exception as e:
+        refused = _refused(e, what)
+        if refused is not None:
+            raise refused from None
         raise DetectError(
             f"Could not pull {image} ({type(e).__name__}: {str(e)[:200]}). "
             "This usually means there is no internet access or the registry is unreachable.",
@@ -454,6 +473,11 @@ def _run_container(
 
 
 def _map_docker_error(exc: Exception, engine: str) -> DetectError:
+    refused = _refused(
+        exc, "detection_rules_update" if engine == "suricata-update" else "pcap_detect"
+    )
+    if refused is not None:
+        return refused
     text = str(exc)
     low = text.lower()
     if "mounts denied" in low or "not shared" in low or "is not shared from the host" in low:
@@ -1663,6 +1687,9 @@ async def detect(path: str, engine: str, top: int = 10) -> dict[str, Any]:
         except DetectError as e:
             return e.as_dict()
         except Exception as e:
+            refused = _refused(e, "pcap_detect")
+            if refused is not None:
+                return refused.as_dict()
             log.exception("pcap_detect failed unexpectedly")
             return {
                 "error": f"Unexpected failure running {engine} ({type(e).__name__}): {str(e)[:300]}"
@@ -1718,7 +1745,7 @@ async def _run_engine(
     max_bytes = settings.detection_max_pcap_mb * _MB
     client = await asyncio.to_thread(_docker_client)
     await asyncio.to_thread(_reap_stale, client, settings.detection_timeout_seconds * 2 + 120)
-    pulled = await asyncio.to_thread(_ensure_image, client, image)
+    pulled = await asyncio.to_thread(_ensure_image, client, image, "pcap_detect")
 
     staging = await asyncio.to_thread(_stage, fh, max_bytes)
     try:
@@ -1985,7 +2012,7 @@ def _update_blocking(client: Any, settings: Any) -> dict[str, Any]:
     image = settings.detection_suricata_image
     cache = Path(settings.detection_rules_dir)
     ensure_private_dir(cache)
-    pulled = _ensure_image(client, image)
+    pulled = _ensure_image(client, image, "detection_rules_update")
     _reap_stale(client, settings.detection_timeout_seconds * 2 + 120)
 
     root = Path(tempfile.mkdtemp(prefix="hp-detect-rules-")).resolve()
@@ -2120,6 +2147,9 @@ async def update_rules() -> dict[str, Any]:
         except DetectError as e:
             return e.as_dict()
         except Exception as e:
+            refused = _refused(e, "detection_rules_update")
+            if refused is not None:
+                return refused.as_dict()
             log.exception("detection_rules_update failed unexpectedly")
             return {
                 "error": f"Unexpected failure updating the rules ({type(e).__name__}): {str(e)[:300]}"

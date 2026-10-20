@@ -17,17 +17,13 @@ from email.message import EmailMessage
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 pytestmark = pytest.mark.asyncio
 
 HOST = "mail.corp.local"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +65,7 @@ async def mail(tmp_path, monkeypatch):
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    smtp_port, pop_port = _free_port(), _free_port()
+    smtp_port, pop_port = free_port(), free_port()
     async with get_session() as session:
         session.add(Honeypot(name="smtp-m", type=HoneypotType.SMTP, port=smtp_port))
         session.add(Honeypot(name="pop3-m", type=HoneypotType.POP3, port=pop_port))

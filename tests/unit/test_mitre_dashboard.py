@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -309,3 +310,261 @@ def test_dashboards_need_nothing_but_the_database():
                 for t in panel.get("targets", [])
             }
             assert uids <= {"honeypot-db"}, (name, panel.get("title"), uids)
+
+
+# ── Nothing the mapper counts may be missing from the dashboard ────────────
+
+# Event-type NAMES (no data) seen on a real 116-hour, 17.7M-alert run that
+# `intel.mitre` maps to a technique. `attack_summary` counts every one of them;
+# the dashboard counted only what some engine listed in `signature_events`, so
+# 39 types (about 109k alerts, 0.6%) were missing: Discovery read 8,737,549 on
+# the wall and 8,844,809 in the tool, with nothing to say which was right.
+_SEEN_BUT_ONCE_MISSING = (
+    "sip_request",
+    "sip_invite",
+    "sip_options_probe",
+    "sip_invalid_probe",
+    "nfs_unknown_program",
+    "nfs_portmap_probe",
+    "nfs_mount_probe",
+    "docker_api_probe",
+    "docker_api_recon",
+    "docker_api_container_start",
+    "docker_api_container_create",
+    "docker_api_exec_start",
+    "elasticsearch_recon_probe",
+    "elasticsearch_health_probe",
+    "ssh_port_forward_ja4h",
+    "ssh_port_forward_data",
+    "kubernetes_probe",
+    "kubernetes_recon",
+    "rdp_invalid_probe",
+    "rdp_nla_probe",
+    "rdp_mcs_handshake",
+    "mysql_recon_query",
+    "http_recon_probe",
+    "ldap_invalid_probe",
+    "redis_info_probe",
+    "redis_config_get",
+    "redis_key_set",
+    "redis_rogue_replica",
+    "redis_rce_dropper",
+    "postgresql_recon_query",
+    "snmp_invalid_probe",
+    "rsync_module_access",
+    "rsync_invalid_probe",
+    "rsync_unknown_module",
+    "memcached_version_probe",
+    "memcached_large_set",
+)
+# Planted-credential and canary trips: named after the token type and the event they re-tagged.
+_SEEN_HONEYTOKEN_TRIPS = (
+    "honeytoken_triggered_canary_url",
+    "honeytoken_triggered_credential_via_mysql_login_attempt",
+    "honeytoken_triggered_credential_via_ssh_login_success",
+)
+# The highest-volume mapped types, which were always on the dashboard and must stay there.
+_SEEN_AND_ALWAYS_COVERED = (
+    "sip_extension_probe",
+    "sip_register_attempt",
+    "sip_toll_fraud_attempt",
+    "sip_scan",
+    "telnet_command_input",
+    "telnet_login_success",
+    "telnet_login_failed",
+    "ssh_command_input",
+    "ssh_login_success",
+    "ssh_file_download",
+    "ssh_port_forward",
+    "vnc_auth_attempt",
+    "smb_negotiate",
+    "smb_ntlm_auth",
+    "smb_session_setup",
+    "mssql_login_attempt",
+    "mysql_login_attempt",
+    "rdp_connection",
+    "rdp_handshake",
+    "rdp_nla_auth",
+    "http_active_recon",
+    "http_probe",
+    "http_exploit_attempt",
+)
+_PINNED = _SEEN_BUT_ONCE_MISSING + _SEEN_HONEYTOKEN_TRIPS + _SEEN_AND_ALWAYS_COVERED
+
+_FROM_MS, _TO_MS = 0, 4_102_444_800_000  # 1970 .. 2100; every row below falls inside
+
+
+def _panel_query(panel: str) -> str:
+    dashboard = json.loads(DASHBOARD.read_text())
+    found = next(p for p in dashboard["panels"] if p.get("title") == panel)
+    return (
+        found["targets"][0]["queryText"]
+        .replace("$__from", str(_FROM_MS))
+        .replace("$__to", str(_TO_MS))
+    )
+
+
+def _expected_tactic_counts(event_types) -> dict[str, int]:
+    """{tactic: alerts} as `attack_summary` would total them, one alert per name."""
+    from honeypot_mcp.intel.mitre import map_to_attack
+
+    async def tactics_of(name: str) -> set[str]:
+        return {t["tactic"] for t in await map_to_attack([name])}
+
+    async def gather() -> dict[str, set[str]]:
+        return {name: await tactics_of(name) for name in event_types}
+
+    expected: dict[str, int] = {}
+    for name, tactics in asyncio.run(gather()).items():
+        assert tactics, f"{name} no longer maps to any technique; drop it from the pinned list"
+        for tactic in tactics:
+            expected[tactic] = expected.get(tactic, 0) + 1
+    return expected
+
+
+def _one_alert_per(event_types) -> sqlite3.Connection:
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE alerts (event_type TEXT, timestamp TEXT)")
+    con.executemany(
+        "INSERT INTO alerts VALUES (?, '2026-10-16 12:00:00.000000')", [(n,) for n in event_types]
+    )
+    return con
+
+
+def test_every_event_type_seen_on_a_real_run_is_counted_under_its_tactics():
+    """Runs the shipped SQL, so a name missing from a tactic, listed under a wrong one, or a
+    syntax slip in the honeytoken prefix match all fail here.
+
+    One alert per pinned name, no other rows: every tactic's total must equal the number of
+    pinned names the mapper files under it, in both panels.
+    """
+    from honeypot_mcp.intel.mitre import tactic_label
+
+    expected = _expected_tactic_counts(_PINNED)
+    con = _one_alert_per(_PINNED)
+
+    observed = dict(con.execute(_panel_query("Observed tactics (ATT&CK)")).fetchall())
+    assert {t: n for t, n in observed.items() if n} == {
+        tactic_label(t): n for t, n in expected.items()
+    }
+
+    timeline = con.execute(_panel_query("Tactic timeline"))
+    columns = [d[0] for d in timeline.description][1:]
+    rows = timeline.fetchall()
+    summed = {c: sum(row[i + 1] for row in rows) for i, c in enumerate(columns)}
+    assert {t: n for t, n in summed.items() if n} == expected
+
+
+def test_pinned_names_are_real_event_types():
+    """The pinned names must be ones an engine can emit, so the list cannot rot into a set of
+    names that no longer exist (which the SQL test above would still happily pass, since the
+    mapper decides what it expects). Honeytoken trips are built at run time, so only their
+    shape is checked."""
+    engines = ROOT / "src" / "honeypot_mcp" / "engines"
+    source = "\n".join(p.read_text() for p in engines.glob("*.py"))
+    for name in _SEEN_BUT_ONCE_MISSING + _SEEN_AND_ALWAYS_COVERED:
+        retagged = name.startswith("telnet_") and f'"ssh_{name.removeprefix("telnet_")}"' in source
+        assert f'"{name}"' in source or retagged, f"no engine emits {name}"
+    for name in _SEEN_HONEYTOKEN_TRIPS:
+        assert name.startswith("honeytoken_triggered_")
+
+
+# Strings that look like an event type and map to a technique but are not one: each says what it is.
+_NOT_EVENT_TYPES = {
+    "smb_version": "payload key naming the dialect (SMB1/SMB2), never an event_type",
+    "ssh_authorized_key": "label `redis._classify_payload` puts in a payload, not an event_type",
+    "mysql_native_password": "the auth plugin name in the MySQL handshake",
+}
+
+
+def _engine_event_type_literals() -> dict[str, set[str]]:
+    """{string literal: {engine files}} for every literal that is, or looks like, an event type.
+
+    Engines rarely write `event_type="..."` at the call: most return a name from a classifier
+    (`return "sip_invite", severity, extra`) or pass it positionally to a `_record` helper, so a
+    scan of only that keyword finds a handful of the ~300 names. So this takes every string
+    constant, found with `ast` (comments and docstrings are not constants of this shape), that is
+    `<engine type>_<words>`, plus every literal given as `event_type=`. F-strings are skipped:
+    a name built at run time (`honeytoken_triggered_{match}_via_...`) is covered by
+    `CROSS_ENGINE_EVENT_PREFIXES` instead.
+    """
+    import ast
+
+    from honeypot_mcp.deception.capabilities import _CAPABILITIES
+
+    prefixes = "|".join(sorted({c.type for c in _CAPABILITIES} | {"telnet"}))
+    looks_like_event = re.compile(rf"^(?:{prefixes})_[a-z0-9_]+$")
+    found: dict[str, set[str]] = {}
+    for path in sorted((ROOT / "src" / "honeypot_mcp" / "engines").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.keyword) and node.arg == "event_type":
+                value = node.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    found.setdefault(value.value, set()).add(path.name)
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and looks_like_event.match(node.value)
+            ):
+                found.setdefault(node.value, set()).add(path.name)
+    return found
+
+
+def test_the_literal_scan_actually_finds_the_engines_event_types():
+    """A scanner that matches nothing would make the next test pass forever."""
+    found = _engine_event_type_literals()
+    assert len(found) > 200
+    for name in ("sip_invite", "redis_key_set", "ssh_port_forward_data", "mssql_login_attempt"):
+        assert name in found, name
+
+
+def test_every_mapped_engine_event_type_is_on_the_dashboard():
+    """A new engine event that maps to a technique but is not in `signature_events` is counted
+    by `attack_summary` and absent from the dashboard, silently: the 39-type gap this closes.
+
+    Add it to the owning engine's `signature_events`, or, if it is not an event type, to
+    `_NOT_EVENT_TYPES` with the reason.
+    """
+    from honeypot_mcp.deception.capabilities import _CAPABILITIES, CROSS_ENGINE_EVENT_PREFIXES
+    from honeypot_mcp.intel.mitre import map_to_attack
+
+    declared = {e for cap in _CAPABILITIES for e in cap.signature_events}
+
+    async def mapped(names):
+        return {n for n in names if await map_to_attack([n])}
+
+    candidates = _engine_event_type_literals()
+    missing = sorted(
+        name
+        for name in asyncio.run(mapped(candidates))
+        if name not in declared
+        and name not in _NOT_EVENT_TYPES
+        and not name.startswith(CROSS_ENGINE_EVENT_PREFIXES)
+    )
+    assert not missing, "event types that map to ATT&CK but are on no dashboard list: " + ", ".join(
+        f"{n} ({'/'.join(sorted(candidates[n]))})" for n in missing
+    )
+
+
+def test_not_event_type_exceptions_are_still_needed():
+    """An allow-list entry that no longer matches anything hides the next real gap."""
+    found = _engine_event_type_literals()
+    from honeypot_mcp.deception.capabilities import _CAPABILITIES
+
+    declared = {e for cap in _CAPABILITIES for e in cap.signature_events}
+    for name in _NOT_EVENT_TYPES:
+        assert name in found, f"{name} is no longer in any engine; remove the exception"
+        assert name not in declared, f"{name} is declared; remove the exception"
+
+
+def test_honeytoken_trips_are_counted_by_prefix_without_inflating_sensor_coverage():
+    """Trips re-tag an event from any sensor, so no engine's `signature_events` may list one:
+    `deception_coverage` would then credit that sensor with detecting 'valid accounts'."""
+    from honeypot_mcp.deception.capabilities import _CAPABILITIES, CROSS_ENGINE_EVENT_PREFIXES
+
+    assert "honeytoken_triggered_" in CROSS_ENGINE_EVENT_PREFIXES
+    for cap in _CAPABILITIES:
+        leaked = [e for e in cap.signature_events if e.startswith(CROSS_ENGINE_EVENT_PREFIXES)]
+        assert not leaked, f"{cap.type} lists a cross-engine event type: {leaked}"
+    prefixes = asyncio.run(_generator().tactic_event_prefixes())
+    assert "honeytoken_triggered_" in prefixes["Initial Access"]

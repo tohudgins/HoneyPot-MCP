@@ -8,19 +8,12 @@ free local port and asserts the wire response shape.
 import asyncio
 import contextlib
 import os
-import socket
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture(autouse=True)
@@ -58,7 +51,7 @@ async def smtp_server():
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     # Seed a honeypot row so SMTPEngine.start() can resolve honeypot_id.
     async with get_session() as session:
         hp = Honeypot(name="smtp-fidelity-test", type=HoneypotType.SMTP, port=port)

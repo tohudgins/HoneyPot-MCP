@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -24,16 +26,6 @@ async def setup_db():
     await close_db()
 
 
-def _free_port() -> int:
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 @pytest.mark.asyncio
 async def test_reconcile_restarts_in_process_honeypot():
     """A RUNNING in-process honeypot from a 'previous process' should be
@@ -44,7 +36,7 @@ async def test_reconcile_restarts_in_process_honeypot():
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(
             Honeypot(
@@ -131,7 +123,7 @@ async def test_deploy_failure_releases_name():
 
     boom = AsyncMock(side_effect=OSError("address already in use"))
     with patch("honeypot_mcp.engines.rdp.RDPEngine.start", boom):
-        result = await honeypot_deploy(type="rdp", port=_free_port(), name="doomed")
+        result = await honeypot_deploy(type="rdp", port=free_port(), name="doomed")
 
     assert "error" in result
     async with get_session() as session:

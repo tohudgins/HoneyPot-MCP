@@ -20,6 +20,8 @@ import socket
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -38,14 +40,6 @@ async def setup():
     self_probe.reset_for_tests()
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 async def test_watchdog_probe_does_not_become_an_alert():
     """A real probe against a real engine produces no alert; an attacker does.
 
@@ -61,7 +55,7 @@ async def test_watchdog_probe_does_not_become_an_alert():
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert
 
-    port = _free_port()
+    port = free_port()
     engine = FTPEngine()
     container_id = await engine.start("probe-test", port, {})
     buf = event_buffer.get_buffer()

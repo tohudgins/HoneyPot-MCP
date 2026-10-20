@@ -4,6 +4,37 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The ATT&CK dashboard disagreed with the tool; packaging; flaky ports
+
+**Re-rendering the ATT&CK screenshots on the final data showed the Grafana dashboard and `attack_summary`
+reporting different numbers for the same tactic** (Discovery 8,737,549 against 8,844,809). The dashboard's
+SQL is generated from `intel/mitre.py`, but only for event types listed in some engine's
+`signature_events`, and 39 event types the tool maps (`sip_request`, `sip_invite`, `docker_api_probe`, the
+honeytoken trips, about 109k alerts) were not listed. They are now, honeytoken trips are matched by prefix,
+and every tactic equals the tool on the real run. A drift test inserts one alert per pinned event type name
+and runs the shipped SQL, and an `ast` scan fails the build when an engine gains a mapped event type that
+the dashboard does not count. The two stale screenshots were re-rendered with `grafana_start` and the real
+ATT&CK Navigator.
+
+- **Packaging, verified without publishing anything:** the wheel and sdist install and answer an MCP
+  handshake with 83 tools on Python 3.11 to 3.14, through `pipx`/`uv tool`-style installs too. Defects
+  found and fixed: the sdist contained 584 `.hypothesis/` files plus `.claude/` and `reports/` (hatch only
+  reads `.gitignore`; now a whitelist), no `py.typed` despite the typed classifier, a PyPI README whose 19
+  relative links and 3 images would break (rewritten to absolute URLs at build time), and a release
+  workflow that could publish to PyPI from any branch on manual dispatch. Publishing now runs only on a
+  final `vX.Y.Z` tag, through environments, with trusted publishing (no stored token). The container image
+  now exports the `forensics` extra from the hashed lock, so `sample_scan` works in it. Nothing was
+  uploaded; `honeypot-mcp` is free on PyPI.
+- **Docker-based analysis tools explain a guard refusal.** `grafana_start`, `pcap_detect` and
+  `detection_rules_update` on a host behind the hardened Docker guard used to report an unexpected
+  `APIError`; they now say the guard refused the request, that Docker itself is fine, and where to run them.
+- **Flaky ports in the test suite.** About 45 test files picked a free port by binding 0 and closing the
+  socket, so a parallel worker, or an outgoing connection (ports from 32768 on Linux), could take the number
+  before the engine bound it: one real CI failure on Python 3.11 (`test_lifecycle_gaps`, port 45504) and one
+  local (`test_tls_front`, 1 in 80 under load). All go through one reserving helper (`tests/_ports.py`: ports
+  below the ephemeral range, a disjoint slice per xdist worker, an advisory lock held until exit), and the
+  lifecycle tests now stop what they start. 0 failures in 120 concurrent runs.
+
 ## The ATT&CK mapping measured against blind labels; half the Discovery tactic was wrong
 
 **The docs said the ATT&CK mapping had never been checked, so `mapping_audit` (tool 83) checks it:** it

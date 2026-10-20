@@ -21,21 +21,14 @@ import hashlib
 import hmac
 import json
 import os
-import socket
 import uuid
 
 import httpx
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _sign(secret: str, body: bytes) -> str:
@@ -101,7 +94,7 @@ async def test_cloud_event_returns_503_when_secret_unset(monkeypatch):
     open trigger relay."""
     monkeypatch.setenv("CLOUD_EVENT_HMAC_SECRET", "")
     _reload_settings()
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         async with httpx.AsyncClient() as client:
@@ -119,7 +112,7 @@ async def test_cloud_event_returns_503_when_secret_unset(monkeypatch):
 async def test_cloud_event_returns_401_on_missing_signature(monkeypatch):
     monkeypatch.setenv("CLOUD_EVENT_HMAC_SECRET", "test-secret-12345")
     _reload_settings()
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         async with httpx.AsyncClient() as client:
@@ -137,7 +130,7 @@ async def test_cloud_event_returns_401_on_missing_signature(monkeypatch):
 async def test_cloud_event_returns_401_on_wrong_signature(monkeypatch):
     monkeypatch.setenv("CLOUD_EVENT_HMAC_SECRET", "test-secret-12345")
     _reload_settings()
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         async with httpx.AsyncClient() as client:
@@ -196,7 +189,7 @@ async def test_cloudtrail_event_triggers_aws_api_key_token(monkeypatch):
     # invalidate so the index reloads.
     token_matchers.invalidate_cache()
 
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         event = {
@@ -262,7 +255,7 @@ async def test_cloud_event_unknown_key_does_not_alert(monkeypatch):
     monkeypatch.setenv("CLOUD_EVENT_HMAC_SECRET", "test-secret-12345")
     _reload_settings()
 
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         event = {
@@ -328,7 +321,7 @@ async def test_azure_event_triggers_azure_credential_token(monkeypatch):
 
     token_matchers.invalidate_cache()
 
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         event = {
@@ -406,7 +399,7 @@ async def test_gcp_event_triggers_service_account_token(monkeypatch):
 
     token_matchers.invalidate_cache()
 
-    port = _free_port()
+    port = free_port()
     runner = await _start_canary_on(port)
     try:
         event = {

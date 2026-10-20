@@ -8,21 +8,14 @@ suite.
 import asyncio
 import contextlib
 import os
-import socket
 import ssl
 import time
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-
-
-def _free_port(kind: int = socket.SOCK_STREAM) -> int:
-    s = socket.socket(socket.AF_INET, kind)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +83,7 @@ def test_sip_parse_digest_still_reads_a_real_header():
 async def test_sip_udp_reply_is_bounded_by_the_reply_factor():
     from honeypot_mcp.engines.sip import _UDP_REPLY_FACTOR, SIPEngine
 
-    port = _free_port()
+    port = free_port()
     await _make_honeypot("sip-a2", "sip", port)
     engine = SIPEngine()
     cid = await engine.start("sip-a2", port, {})
@@ -122,7 +115,7 @@ async def test_sip_udp_reply_is_bounded_by_the_reply_factor():
 async def test_sip_tcp_blank_frame_flood_closes_connection_quickly():
     from honeypot_mcp.engines.sip import SIPEngine
 
-    port = _free_port()
+    port = free_port()
     await _make_honeypot("sip-a2-tcp", "sip", port)
     engine = SIPEngine()
     cid = await engine.start("sip-a2-tcp", port, {})
@@ -215,7 +208,7 @@ async def test_idle_connection_is_closed_by_the_central_timeout():
 async def test_stop_returns_promptly_with_an_idle_client_attached():
     from honeypot_mcp.engines.imap import IMAPEngine
 
-    port = _free_port()
+    port = free_port()
     await _make_honeypot("imap-a2", "imap", port)
     engine = IMAPEngine()
     cid = await engine.start("imap-a2", port, {})
@@ -238,7 +231,7 @@ async def test_pipelined_line_flood_closes_the_connection(module, cls, type_name
     import importlib
 
     engine = getattr(importlib.import_module(f"honeypot_mcp.engines.{module}"), cls)()
-    port = _free_port()
+    port = free_port()
     await _make_honeypot(f"{module}-a2-flood", type_name, port)
     cid = await engine.start(f"{module}-a2-flood", port, {})
     try:
@@ -262,7 +255,7 @@ async def test_pipelined_line_flood_closes_the_connection(module, cls, type_name
 async def test_ftp_pipelined_pasv_leaves_exactly_one_listener():
     from honeypot_mcp.engines.ftp import FTPEngine
 
-    port = _free_port()
+    port = free_port()
     await _make_honeypot("ftp-a2", "ftp", port)
     engine = FTPEngine()
     cid = await engine.start("ftp-a2", port, {})
@@ -311,7 +304,7 @@ async def test_ftp_data_connection_from_a_different_host_is_refused(monkeypatch)
                 self._peer = (pretend_control_peer, 1)
 
             monkeypatch.setattr(ftp._FTPProtocol, "connection_made", made)
-        port = _free_port()
+        port = free_port()
         await _make_honeypot(f"ftp-peer-{pretend_control_peer}", "ftp", port)
         engine = FTPEngine()
         cid = await engine.start(f"ftp-peer-{pretend_control_peer}", port, {})
@@ -374,7 +367,7 @@ async def test_smtp_starttls_session_releases_its_connection_slot(tmp_path, monk
     monkeypatch.chdir(tmp_path)
     from honeypot_mcp.engines.smtp import SMTPEngine
 
-    port = _free_port()
+    port = free_port()
     await _make_honeypot("smtp-a2", "smtp", port)
     engine = SMTPEngine()
     cid = await engine.start("smtp-a2", port, {"smtp_hostname": "mail.test.local"})
@@ -411,7 +404,7 @@ async def test_smtp_starttls_session_releases_its_connection_slot(tmp_path, monk
 async def test_smtp_line_flood_is_cut_off_and_data_body_is_bounded():
     from honeypot_mcp.engines.smtp import SMTPEngine
 
-    port = _free_port()
+    port = free_port()
     await _make_honeypot("smtp-a2-flood", "smtp", port)
     engine = SMTPEngine()
     cid = await engine.start("smtp-a2-flood", port, {"smtp_hostname": "mail.test.local"})

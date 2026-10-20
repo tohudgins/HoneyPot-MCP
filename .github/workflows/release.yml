@@ -1,27 +1,40 @@
 name: Release
 
-# Publishing is deliberately manual and tag-driven: pushing to PyPI cannot be
-# undone (a version number is burned forever), and a container tag is public
-# the moment it lands. Nothing here runs on a normal push to main.
+# Publishing is deliberately tag-driven: pushing to PyPI cannot be undone (a version number is
+# burned forever), and a container tag is public the moment it lands. Nothing here runs on a
+# normal push to main.
+#
+# - A push of a final-release tag (vMAJOR.MINOR.PATCH) builds, verifies and then publishes.
+# - "Run workflow" (workflow_dispatch) builds and verifies only. It can never publish: both
+#   publishing jobs require `github.ref_type == 'tag'`, and a dispatch run is on a branch.
+#
+# One-time setup the owner must do before the first tag (nothing below works without it):
+#   1. PyPI: create the project `honeypot-mcp` through a *pending trusted publisher*
+#      (pypi.org -> Your account -> Publishing): owner `tohudgins`, repository `HoneyPot-MCP`,
+#      workflow `release.yml`, environment `pypi`.
+#   2. GitHub: Settings -> Environments: create `pypi` and `ghcr`; add required reviewers to both
+#      so a tag push still waits for a human click.
+#   3. GHCR: the image is created on first push under the repository owner's account; the
+#      workflow's GITHUB_TOKEN needs "Read and write" packages permission (the job requests it),
+#      and the package is private until its visibility is set to public in the package settings.
+# No long-lived secret is stored anywhere: PyPI uses OIDC trusted publishing, GHCR uses the
+# short-lived GITHUB_TOKEN.
 on:
   push:
-    tags: ["v*"]
+    # Final releases only. A pre-release tag (v1.0.0rc1) does not match, so it cannot move the
+    # `latest` container tag or burn a PyPI version by accident.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
-    inputs:
-      publish_pypi:
-        description: "Publish to PyPI (leave off for a dry run)"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 jobs:
-  # Refuse to publish a tag that doesn't match the version in pyproject.toml —
-  # a mismatch means the artifact would be labelled differently from what the
-  # repository says it is.
+  # Refuse to publish a tag that doesn't match the version in pyproject.toml (or the one the
+  # package reports at runtime) — a mismatch means the artifact would be labelled differently
+  # from what the repository says it is.
   check-version:
-    name: tag matches pyproject version
+    name: tag matches package version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -29,9 +42,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: v
         run: |
-          VERSION=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          VERSION=$(python3 -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          RUNTIME=$(python3 -c "import re,pathlib; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', pathlib.Path('src/honeypot_mcp/__init__.py').read_text()).group(1))")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "pyproject version: $VERSION"
+          echo "pyproject version: $VERSION, __version__: $RUNTIME"
+          if [ "$RUNTIME" != "$VERSION" ]; then
+            echo "::error::__version__ $RUNTIME does not match pyproject version $VERSION"
+            exit 1
+          fi
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME#v}"
             if [ "$TAG" != "$VERSION" ]; then
@@ -51,6 +69,8 @@ jobs:
         with:
           python-version: "3.12"
 
+      # `python -m build` builds the sdist first and then the wheel *from that sdist*, so a file
+      # missing from the sdist whitelist (pyproject `targets.sdist.include`) fails here.
       - name: Build sdist + wheel
         run: |
           python -m pip install --upgrade pip build twine
@@ -59,21 +79,61 @@ jobs:
       - name: Check metadata renders on PyPI
         run: twine check --strict dist/*
 
-      # A wheel that builds but omits its data files installs cleanly and then
-      # fails at runtime — the console 500s and the bundled suppression presets
-      # vanish. Verify the installed package from outside the source tree.
-      - name: Smoke-test the wheel in a clean environment
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+
+  # A wheel that builds but omits its data files installs cleanly and then fails at runtime — the
+  # console 500s, the bundled suppression presets and YARA rules vanish, the database never
+  # migrates. Verify the *installed* package from outside the source tree, on every supported
+  # Python (yara-python covers 3.11-3.13, yara-x 3.14).
+  smoke:
+    name: wheel smoke test (python ${{ matrix.python }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install the wheel with the forensics extra into a clean venv
         run: |
           python -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install --quiet dist/*.whl
+          WHEEL=$(ls "$PWD"/dist/*.whl)
+          /tmp/smoke/bin/pip install --quiet "honeypot-mcp[forensics] @ file://$WHEEL"
+
+      - name: Packaged assets, migrations and YARA resolve from the installed wheel
+        run: |
           mkdir -p /tmp/elsewhere && cd /tmp/elsewhere
           /tmp/smoke/bin/python - <<'PY'
-          import asyncio, os
+          import asyncio, os, sqlite3
+          from importlib.resources import files
           os.environ["DATABASE_URL"] = "sqlite+aiosqlite:////tmp/elsewhere/smoke.db"
 
           async def main():
               from honeypot_mcp.storage.database import init_db, close_db
               await init_db()
+              await close_db()
+
+              # init_db() falls back to create_all() when Alembic fails, which leaves a
+              # working-looking schema with no version stamp. Require the stamp, at head.
+              from alembic.config import Config
+              from alembic.script import ScriptDirectory
+              cfg = Config()
+              cfg.set_main_option("script_location", str(files("honeypot_mcp") / "migrations"))
+              head = ScriptDirectory.from_config(cfg).get_current_head()
+              with sqlite3.connect("/tmp/elsewhere/smoke.db") as db:
+                  stamped = db.execute("select version_num from alembic_version").fetchone()
+              assert stamped == (head,), (stamped, head)
 
               from honeypot_mcp.tools.integrations import suppression_list_presets
               presets = await suppression_list_presets()
@@ -86,29 +146,63 @@ jobs:
               from honeypot_mcp import grafana
               dashboards = grafana.list_dashboards()
               assert len(dashboards) == 5 and all(d.uid for d in dashboards), dashboards
-              datasources = grafana.assets_root() / "provisioning" / "datasources" / "datasources.yml"
-              assert datasources.is_file()
+              for rel in ("datasources/datasources.yml", "dashboards/dashboards.yml"):
+                  assert (grafana.assets_root() / "provisioning" / rel).is_file(), rel
 
-              await close_db()
-              print("wheel is complete:", presets)
+              from honeypot_mcp import samples
+              ruleset = samples.load_rules(None)
+              assert len(ruleset.loaded) == 4, ruleset.loaded
+              hits = samples.evaluate(ruleset, b"xmrig --donate-level 1 stratum+tcp://pool")
+              assert any(h["rule"].startswith("Miner_") for h in hits), hits
+
+              assert (files("honeypot_mcp") / "py.typed").is_file()
+              print("wheel is complete: head", head, "presets", presets)
 
           asyncio.run(main())
           PY
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist
-          path: dist/
+      # The command a user's MCP client actually runs: initialize, then list the tools.
+      - name: Console script answers MCP initialize + tools/list over stdio
+        run: |
+          cd /tmp/elsewhere
+          /tmp/smoke/bin/python - <<'PY'
+          import asyncio
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          async def main():
+              params = StdioServerParameters(
+                  command="/tmp/smoke/bin/honeypot-mcp",
+                  env={
+                      "DATABASE_URL": "sqlite+aiosqlite:////tmp/elsewhere/stdio.db",
+                      "CONSOLE_PORT": "0",
+                      "METRICS_PORT": "0",
+                      "CANARY_CALLBACK_PORT": "0",
+                  },
+                  cwd="/tmp/elsewhere",
+              )
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      names = {t.name for t in (await session.list_tools()).tools}
+              assert len(names) >= 80, len(names)
+              assert {"soc_brief", "honeypot_deploy", "sample_scan"} <= names
+              print("tools:", len(names))
+
+          asyncio.run(main())
+          PY
 
   pypi:
     name: publish to PyPI
-    needs: build
-    if: github.event_name == 'push' || inputs.publish_pypi
+    needs: [check-version, build, smoke]
+    # Tag pushes only. A branch run (workflow_dispatch) can never publish.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/p/honeypot-mcp
     permissions:
-      # Trusted publishing — no long-lived API token stored in the repo.
-      # Configure the publisher once at https://pypi.org/manage/account/publishing/
+      # Trusted publishing (OIDC) — no long-lived API token stored in the repo.
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -119,9 +213,10 @@ jobs:
 
   container:
     name: publish container to GHCR
-    needs: check-version
-    if: github.event_name == 'push'
+    needs: [check-version, build, smoke]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    environment: ghcr
     permissions:
       contents: read
       packages: write
@@ -143,6 +238,26 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
+
+      # Check the image before anything is pushed: the YARA engine (the `forensics` extra) and the
+      # packaged assets must be inside it, or `sample_scan` answers `available: false` in the container.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.mcp
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: honeypot-mcp:smoke
+          cache-from: type=gha
+      - name: Image carries YARA and the bundled rules
+        run: |
+          docker run --rm --entrypoint python honeypot-mcp:smoke -c '
+          from honeypot_mcp import samples
+          rules = samples.load_rules(None)
+          assert samples.load_backend() is not None and len(rules.loaded) == 4, rules
+          print("image ok:", [r.name for r in rules.loaded])
+          '
 
       # arm64 as well as amd64: the cheap VPSes people actually run this on are
       # increasingly ARM, and so are most development machines.

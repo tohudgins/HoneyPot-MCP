@@ -21,6 +21,8 @@ import os
 
 import pytest
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -75,18 +77,12 @@ async def test_self_test_stopped_honeypot_returns_error():
 async def test_self_test_http_end_to_end():
     """Spin up a real HTTP engine, probe it, confirm the alert with our marker
     is found. This exercises the FULL pipeline: probe → engine → buffer → DB."""
-    # Find a free local port
-    import socket
-
     from honeypot_mcp.engines.http import HTTPEngine
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
     from honeypot_mcp.tools.honeypot import honeypot_self_test
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
+    port = free_port()
 
     # Register the honeypot in DB
     async with get_session() as session:
@@ -124,16 +120,6 @@ async def test_self_test_http_end_to_end():
         # Clean up the engine
         for cid in list(engine._runners.keys()):
             await engine.stop(cid)
-
-
-def _free_port() -> int:
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.mark.parametrize(
@@ -179,7 +165,7 @@ async def test_self_test_in_process_engines_end_to_end(engine_path, engine_cls, 
 
     engine = getattr(importlib.import_module(engine_path), engine_cls)()
     hp_type = getattr(HoneypotType, hp_type_name)
-    port = _free_port()
+    port = free_port()
     name = f"selftest-{hp_type_name.lower()}"
 
     async with get_session() as session:

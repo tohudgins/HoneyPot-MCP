@@ -19,10 +19,11 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import socket
 import subprocess
 
 import pytest
+
+from tests._ports import free_port
 
 pytestmark = pytest.mark.asyncio
 
@@ -83,12 +84,6 @@ async def isolated_db(tmp_path, monkeypatch):
     config._settings = None
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
-
-
 def _rgb(text: str) -> tuple[int, int, int]:
     match = re.search(r"srgb\((\d+),(\d+),(\d+)\)", text)
     assert match, f"unreadable pixel: {text!r}"
@@ -104,7 +99,7 @@ async def test_freerdp_gets_a_desktop_with_icons_and_a_taskbar(isolated_db):
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name="rdp-fr", type=HoneypotType.RDP, port=port))
         await session.flush()
@@ -174,7 +169,7 @@ async def test_freerdp_can_open_the_console_and_what_it_types_is_recorded(isolat
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(Honeypot(name="rdp-con", type=HoneypotType.RDP, port=port))
         await session.flush()

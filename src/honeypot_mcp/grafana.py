@@ -128,6 +128,7 @@ import yaml
 
 from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.config import _PROJECT_ROOT, get_settings
+from honeypot_mcp.docker_errors import guard_refusal
 from honeypot_mcp.secure_io import ensure_private_dir, write_private_file
 
 log = logging.getLogger(__name__)
@@ -207,6 +208,12 @@ class GrafanaError(Exception):
         if self.hint:
             out["hint"] = self.hint
         return out
+
+
+def _refused(exc: BaseException, what: str) -> GrafanaError | None:
+    """A `GrafanaError` saying the hardened Docker guard refused the request, or None."""
+    found = guard_refusal(exc, what)
+    return GrafanaError(found["error"], found["hint"]) if found else None
 
 
 # ── packaged assets ─────────────────────────────────────────────────────────────────────────
@@ -679,6 +686,9 @@ def _docker_client() -> Any:
         )
         client.ping()
     except Exception as e:
+        refused = _refused(e, "grafana_start")
+        if refused is not None:
+            raise refused from None
         raise GrafanaError(
             f"Docker is not available ({type(e).__name__}: {str(e)[:200]}).",
             "Start Docker (Docker Desktop, or the docker service) and make sure this user can "
@@ -713,6 +723,9 @@ def _ensure_image(client: Any) -> bool:
     try:
         client.images.pull(repo, tag=tag)
     except Exception as e:
+        refused = _refused(e, "grafana_start")
+        if refused is not None:
+            raise refused from None
         raise GrafanaError(
             f"Could not pull {GRAFANA_IMAGE} ({type(e).__name__}: {str(e)[:200]}). "
             "This usually means there is no internet access or the registry is unreachable.",
@@ -886,11 +899,17 @@ def _create_networks(client: Any) -> tuple[Any, Any]:
         )
         edge = client.networks.create(NETWORK_EDGE, driver="bridge", labels=labels)
     except docker.errors.APIError as e:
+        refused = _refused(e, "grafana_start")
+        if refused is not None:
+            raise refused from None
         raise GrafanaError(f"Docker could not create Grafana's networks: {str(e)[:300]}") from None
     return internal, edge
 
 
 def _map_create_error(exc: Exception, port: int) -> GrafanaError:
+    refused = _refused(exc, "grafana_start")
+    if refused is not None:
+        return refused
     text = str(exc)
     low = text.lower()
     if "port is already allocated" in low or "address already in use" in low or "bind for" in low:
@@ -1174,6 +1193,9 @@ async def start(port: int = 3000) -> dict[str, Any]:
         except GrafanaError as e:
             return e.as_dict()
         except Exception as e:
+            refused = _refused(e, "grafana_start")
+            if refused is not None:
+                return refused.as_dict()
             log.exception("grafana_start failed unexpectedly")
             return {
                 "error": f"Unexpected failure starting Grafana ({type(e).__name__}): {str(e)[:300]}"
@@ -1339,6 +1361,9 @@ async def stop() -> dict[str, Any]:
         except GrafanaError as e:
             return e.as_dict()
         except Exception as e:
+            refused = _refused(e, "grafana_stop")
+            if refused is not None:
+                return refused.as_dict()
             log.exception("grafana_stop failed unexpectedly")
             return {
                 "error": f"Unexpected failure stopping Grafana ({type(e).__name__}): {str(e)[:300]}"
@@ -1388,6 +1413,9 @@ async def status() -> dict[str, Any]:
     except GrafanaError as e:
         return {"running": None, **e.as_dict()}
     except Exception as e:
+        refused = _refused(e, "grafana_status")
+        if refused is not None:
+            return {"running": None, **refused.as_dict()}
         return {
             "running": None,
             "error": f"Could not query Docker ({type(e).__name__}): {str(e)[:200]}",

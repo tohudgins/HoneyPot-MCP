@@ -13,12 +13,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import socket
 import ssl
 import struct
 import time
 
 import pytest
+
+from tests._ports import free_port
 
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
@@ -48,21 +49,13 @@ async def setup_db():
     credential_match.invalidate_cache()
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 @pytest.fixture
 async def server():
     from honeypot_mcp.engines.mysql import MySQLEngine
     from honeypot_mcp.storage.database import get_session
     from honeypot_mcp.storage.models import Honeypot, HoneypotStatus, HoneypotType
 
-    port = _free_port()
+    port = free_port()
     async with get_session() as session:
         session.add(
             Honeypot(

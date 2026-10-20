@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import socket
 
 import pytest
+
+from tests._ports import free_port
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
@@ -38,12 +39,6 @@ async def setup_db(tmp_path, monkeypatch):
     await close_db()
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 async def _answers(port: int) -> bool:
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 2)
@@ -57,7 +52,7 @@ async def _answers(port: int) -> bool:
 async def test_pausing_an_in_process_sensor_closes_its_port_and_resuming_reopens_it():
     from honeypot_mcp.tools import honeypot as tools
 
-    port = _free_port()
+    port = free_port()
     deployed = await tools.honeypot_deploy(type="redis", port=port, name="pause-me")
     assert "error" not in deployed, deployed
     try:
@@ -79,7 +74,7 @@ async def test_a_resume_that_cannot_bind_says_so_and_leaves_the_sensor_paused(mo
     from honeypot_mcp.storage.models import HoneypotType
     from honeypot_mcp.tools import honeypot as tools
 
-    port = _free_port()
+    port = free_port()
     await tools.honeypot_deploy(type="redis", port=port, name="pause-clash")
     try:
         await tools.honeypot_pause("pause-clash")

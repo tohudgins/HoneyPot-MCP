@@ -25,6 +25,8 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from tests._ports import free_port
+
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
@@ -35,14 +37,6 @@ def _allow_loopback_destinations(monkeypatch):
     from honeypot_mcp.config import get_settings
 
     monkeypatch.setattr(get_settings(), "webhook_allow_private_destinations", True)
-
-
-def _free_port(kind: int = socket.SOCK_STREAM) -> int:
-    s = socket.socket(socket.AF_INET, kind)
-    s.bind(("0.0.0.0", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture(autouse=True)
@@ -320,7 +314,7 @@ async def test_webhook_delivery_dispatches_loki_format():
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import WebhookDelivery
 
-    port = _free_port()
+    port = free_port()
     runner, captures = await _start_http_capture(port)
     try:
         async with get_session() as session:
@@ -361,7 +355,7 @@ async def test_webhook_delivery_dispatches_datadog_format():
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import WebhookDelivery
 
-    port = _free_port()
+    port = free_port()
     runner, captures = await _start_http_capture(port)
     try:
         async with get_session() as session:
@@ -432,7 +426,7 @@ async def test_webhook_delivery_dispatches_splunk_hec_format():
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import WebhookDelivery
 
-    port = _free_port()
+    port = free_port()
     runner, captures = await _start_http_capture(port)
 
     try:
@@ -482,7 +476,7 @@ async def test_webhook_delivery_dispatches_elastic_ecs_format():
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import WebhookDelivery
 
-    port = _free_port()
+    port = free_port()
     runner, captures = await _start_http_capture(port)
     try:
         async with get_session() as session:
@@ -520,7 +514,7 @@ async def test_webhook_delivery_dispatches_cef_format():
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import WebhookDelivery
 
-    port = _free_port()
+    port = free_port()
     runner, captures = await _start_http_capture(port)
     try:
         async with get_session() as session:
@@ -557,7 +551,7 @@ async def test_webhook_delivery_dispatches_syslog_udp():
     from honeypot_mcp.storage.models import AlertSeverity, Subscription
     from honeypot_mcp.webhooks import WebhookDelivery
 
-    port = _free_port(socket.SOCK_DGRAM)
+    port = free_port()
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.bind(("127.0.0.1", port))
     udp_sock.setblocking(False)

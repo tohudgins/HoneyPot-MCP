@@ -517,7 +517,10 @@ async def test_blind_spot_recommendations_for_dns_and_smtp_carry_the_caution():
 async def test_blind_spot_recommendations_for_other_sensors_carry_no_caution():
     recs = await _recommendations(["ssh"])
 
-    assert {"kubernetes", "http", "docker_api", "nfs"} <= set(recs)
+    # nfs used to be a top-five suggestion; rdp (T1133 and T1595 via its probe events) and mysql
+    # (T1082 via its recon query) now add as many new techniques and rank ahead of it on registry
+    # order, since the sensors' recon events are on the coverage map.
+    assert {"kubernetes", "http", "docker_api", "rdp", "mysql"} <= set(recs)
     for sensor_type, rec in recs.items():
         if sensor_type not in ("dns", "smtp"):
             assert "caution" not in rec, sensor_type
