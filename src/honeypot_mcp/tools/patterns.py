@@ -1760,6 +1760,7 @@ _TRIP_ROW_CAP = 20_000
 _LEAD_SAMPLE_CAP = 2_000  # events read from the lead-up to one source's first trip
 _MAX_SOURCES_PER_TOKEN = 15
 _CHRONOLOGY_RUNS = 30
+_FIRST_RUNS = 8  # earliest runs shown per source as `first_actions`
 # Events this close to the trip belong to the very session that tripped it (a connection, a
 # handshake and the login all land within a second or two), so they are not "earlier contact".
 _SAME_SESSION_SECONDS = 120.0
@@ -1842,7 +1843,17 @@ def _collapse(rows: Sequence[tuple[datetime, str, str]], trip_at: datetime) -> l
                 "detail": detail,
             }
         )
-    return runs[-_CHRONOLOGY_RUNS:]
+    return runs
+
+
+def _describe_run(run: dict[str, Any]) -> str:
+    """One step of the lead-up as a short line: '4939.7s before: http_decoy_served /.env'."""
+    text = f"{run['seconds_before_trip']:g}s before: {run['event_type']}"
+    if run["count"] > 1:
+        text += f" x{run['count']}"
+    if run["detail"]:
+        text += f" {run['detail']}"
+    return text
 
 
 async def _source_lead_up(
@@ -1854,6 +1865,7 @@ async def _source_lead_up(
     planted_usernames: set[str],
     trip_services: set[str],
     planted: Planted,
+    detail: bool = False,
 ) -> dict[str, Any]:
     """Everything one source did before its first trip of a token."""
     window_start = trip_at - timedelta(hours=lookback_hours)
@@ -1928,8 +1940,10 @@ async def _source_lead_up(
             commands.append(_clip(planted.redact(command), 160))
         if username and username.lower() in planted_usernames:
             pair_services.add(_service_of(event_type))
-        detail = decoy or path or username or ""
-        detail_rows.append((at, event_type, _clip(planted.redact(detail), 80) if detail else ""))
+        step_detail = decoy or path or username or ""
+        detail_rows.append(
+            (at, event_type, _clip(planted.redact(step_detail), 80) if step_detail else "")
+        )
 
     first_seen = _as_utc(first_seen) if first_seen is not None else None
     seconds_since_first = (trip_at - first_seen).total_seconds() if first_seen else None
@@ -1966,6 +1980,27 @@ async def _source_lead_up(
         public = ipaddress.ip_address(ip).is_global
     except ValueError:
         public = False
+    runs = _collapse(detail_rows, trip_at)
+    lead_up: dict[str, Any] = {
+        "window_hours": lookback_hours,
+        "events_sampled": len(sample),
+        "truncated": truncated,
+        "event_types": dict(types.most_common(12 if detail else 6)),
+        "services_touched": sorted({_service_of(t) for t in types}),
+        "user_agent_rotation": len(agents) > 1,
+        # The earliest steps in the window. When `starts_at_first_contact` is true they are the
+        # source's very first actions; otherwise it was already active before the window opened (or
+        # the window was too busy to read in full) and these are only the first steps seen.
+        "first_actions": [_describe_run(r) for r in runs[:_FIRST_RUNS]],
+        "starts_at_first_contact": bool(
+            not truncated and first_seen is not None and first_seen >= window_start
+        ),
+        "chronology_runs_total": len(runs),
+    }
+    if detail:
+        lead_up["user_agents"] = [_clip(planted.redact(a), 120) for a, _ in agents.most_common(5)]
+        lead_up["commands"] = commands
+        lead_up["chronology"] = runs[-_CHRONOLOGY_RUNS:]
     return {
         "first_seen_overall": _iso(first_seen),
         "events_total": events_total,
@@ -1973,22 +2008,10 @@ async def _source_lead_up(
             round(seconds_since_first, 3) if seconds_since_first is not None else None
         ),
         "earlier_contact": earlier,
-        "earlier_contact_means": f"an event from this address more than {_SAME_SESSION_SECONDS:g}s "
-        "before the trip (shorter gaps are the tripping session's own handshake)",
         "contact_before_token_created": bool(first_seen and created_at and first_seen < created_at),
-        "decoy_fetches_before_trip": fetch_rows[:5],
+        "decoy_fetches_before_trip": fetch_rows[: 5 if detail else 2],
         "bait_file_fetched_before_trip": bool(fetched_after_creation),
-        "lead_up": {
-            "window_hours": lookback_hours,
-            "events_sampled": len(sample),
-            "truncated": truncated,
-            "event_types": dict(types.most_common(12)),
-            "services_touched": sorted({_service_of(t) for t in types}),
-            "user_agents": [_clip(planted.redact(a), 120) for a, _ in agents.most_common(5)],
-            "user_agent_rotation": len(agents) > 1,
-            "commands": commands,
-            "chronology": _collapse(detail_rows, trip_at),
-        },
+        "lead_up": lead_up,
         "pair_seen_on_services": sorted(pair_services),
         "replayed_on_other_services": len(pair_services) > 1,
         "public_address": public,
@@ -2002,15 +2025,23 @@ async def bait_trips(
     since_hours: float | None = None,
     exclude_sources: list[str] | None = None,
     lookback_hours: float = 72.0,
+    label: str | None = None,
+    limit: int = 5,
+    detail: bool = False,
 ) -> dict[str, Any]:
     """For each honeytoken that fired, who tripped it and what they did first.
 
     Answers "how did this attacker get hold of the bait": per token its creation time and the delay
     to its first trip; per tripping source its trips, whether it had any earlier contact at all (the
     "reached the bait without reading it" case: the credential was obtained somewhere else), whether it
-    fetched a decoy file such as `/.env` beforehand and how many seconds before the trip, what else it
-    touched (services, user agents, commands), and whether it replayed the planted pair on other
-    services. A short chronology of the lead-up closes each source's entry.
+    fetched a decoy file such as `/.env` beforehand and how many seconds before the trip, what it did
+    first (`first_actions`), which services it touched, and whether it replayed the planted pair on
+    other services. The default view is compact; `detail=true` adds each source's commands, user
+    agents and the last steps before the trip.
+
+    Tokens come most distinct tripping sources first, so a credential found and used by several
+    addresses leads and a single trip from one address (often your own test) comes last. Pick one
+    with `label` (a case-insensitive part of the label, for example "bait") or `token_id`.
 
     Planted honeytoken secrets are masked, not returned: tokens appear by id, label and type, and a
     planted password, key, token or callback URL quoted in a captured command, path or user agent is
@@ -2027,6 +2058,10 @@ async def bait_trips(
         since_hours: Only trips from the last N hours (default: all).
         exclude_sources: Source addresses to leave out (your own test machines, scanners you triaged).
         lookback_hours: How far before a trip to read a source's activity (default 72, at most a year).
+        label: Only tokens whose label contains this text (case-insensitive); also returned when
+            they never fired.
+        limit: Most tokens to return, most distinct sources first (default 5, at most 100).
+        detail: Add each source's commands, user agents and the last 30 steps before its trip.
     """
     since, window, error = await _window(since_hours)
     if error:
@@ -2040,13 +2075,30 @@ async def bait_trips(
         excluded.add(address.strip())
 
     planted = await load_planted()
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        return {"error": "limit must be a whole number from 1 to 100."}
+    label_text = (label or "").strip()
+    explicit = token_id is not None or bool(label_text)
     async with get_session() as session:
         stmt = select(Honeytoken)
         if token_id is not None:
             stmt = stmt.where(Honeytoken.id == token_id)
+        if label_text:
+            escaped = (
+                label_text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            stmt = stmt.where(func.lower(Honeytoken.label).like(f"%{escaped}%", escape="\\"))
         tokens = {t.id: t for t in (await session.execute(stmt)).scalars().all()}
-        if token_id is not None and not tokens:
-            return {"error": f"No honeytoken with id={token_id}."}
+        if explicit and not tokens:
+            wanted = (
+                f"id={token_id}"
+                if token_id is not None and not label_text
+                else f"label {label_text!r}"
+            )
+            return {
+                "error": f"No honeytoken with {wanted}.",
+                "hint": "honeytoken_list shows every token's id and label.",
+            }
         trip_types = [
             row[0]
             for row in await session.execute(
@@ -2117,18 +2169,24 @@ async def bait_trips(
             continue
         by_token[owner].append(trip)
 
-    out_tokens: list[dict[str, Any]] = []
-    for tid in sorted(
-        tokens,
-        key=lambda i: (
-            min((t.at for t in by_token.get(i, [])), default=datetime.max.replace(tzinfo=UTC)),
+    def _rank(i: int) -> tuple[int, int, datetime, int]:
+        trips_of = by_token.get(i, [])
+        return (
+            -len({t.source_ip for t in trips_of}),
+            -len(trips_of),
+            min((t.at for t in trips_of), default=datetime.max.replace(tzinfo=UTC)),
             i,
-        ),
-    ):
+        )
+
+    # A token tripped by many different addresses is the interesting one; a single trip from a
+    # single address (often the operator's own test) sorts last. Explicitly selected tokens are
+    # returned even when they never fired.
+    eligible = [i for i in sorted(tokens, key=_rank) if by_token.get(i) or explicit]
+    tokens_total = len(eligible)
+    out_tokens: list[dict[str, Any]] = []
+    for tid in eligible[:limit]:
         token = tokens[tid]
         trips = by_token.get(tid, [])
-        if not trips and token_id is None:
-            continue
         meta = token.token_meta or {}
         created = _as_utc(token.created_at) if token.created_at else None
         first_trip = min((t.at for t in trips), default=None)
@@ -2152,6 +2210,7 @@ async def bait_trips(
                 planted_usernames=planted_users,
                 trip_services={_service_of(t.event_type) for t in source_trips},
                 planted=planted,
+                detail=detail,
             )
             sources_out.append(
                 {
@@ -2190,23 +2249,43 @@ async def bait_trips(
 
     notes = []
     if capped:
-        notes.append(f"More than {_TRIP_ROW_CAP:,} trip alerts matched; only the oldest were read.")
+        notes.append(
+            f"More than {_TRIP_ROW_CAP:,} trip alert(s) matched; only the oldest were read."
+        )
     if any(t["sources_total"] > _MAX_SOURCES_PER_TOKEN for t in out_tokens):
         notes.append(
             f"Only the {_MAX_SOURCES_PER_TOKEN} most active sources per token are expanded."
+        )
+    if tokens_total > len(out_tokens):
+        notes.append(
+            f"Showing {len(out_tokens)} of {tokens_total} tokens (most distinct sources first); "
+            "raise `limit`, or pick one with `token_id` or `label`."
         )
     if unattributed:
         notes.append(
             f"{sum(unattributed.values())} trip alert(s) could not be tied to a token "
             "(see unattributed_trips); honeytoken_status lists a token's own trail."
         )
-    if not out_tokens and token_id is None:
+    if out_tokens and not detail:
+        notes.append(
+            "Compact view: `first_actions` is each source's earliest steps. Pass detail=true for "
+            "its commands, user agents and the last steps before the trip."
+        )
+    if not out_tokens and not explicit:
         notes.append("No honeytoken trips in this window.")
     return mark_untrusted(
         {
             "count": len(out_tokens),
+            "tokens_total": tokens_total,
             "window": window,
             "trips_total": sum(t["trips"] for t in out_tokens),
+            "ordering": "distinct tripping sources, then trips, then earliest first trip",
+            "earlier_contact_meaning": (
+                f"`earlier_contact` is an event from the same address more than "
+                f"{_SAME_SESSION_SECONDS:g}s before the trip (shorter gaps are the tripping "
+                "session's own handshake)."
+            ),
+            "detail": detail,
             "tokens": out_tokens,
             "decoy_fetch_meaning": (
                 "A decoy fetch is any request a file-serving decoy answered ("

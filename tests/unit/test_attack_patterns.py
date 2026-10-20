@@ -986,7 +986,7 @@ async def test_bait_trips_chronology_for_the_read_then_replay_chain():
     ]
     await _seed(rows)
 
-    out = await _call_bait()
+    out = await _call_bait(detail=True)
     blob = json.dumps(out)
 
     assert PLANTED_PASSWORD not in blob, "the planted secret must never be returned"
@@ -1158,3 +1158,113 @@ async def test_bait_trips_link_canary_and_history_only_trips_and_report_the_rest
     assert by_id[history_token]["sources"][0]["source_ip"] == "192.0.2.31"
     assert out["unattributed_trips"] == {"honeytoken_triggered_ssh_key_via_ssh_pubkey_attempt": 1}
     assert "could not be tied" in out["note"]
+
+
+def _cred_meta(user: str) -> dict[str, Any]:
+    return {
+        "service": "ssh",
+        "credentials": [{"username": user, "password": f"pw-{user}-x", "service": "ssh"}],
+    }
+
+
+_TRIP = "honeytoken_triggered_credential_via_ssh_login_success"
+
+
+async def _seed_two_tokens() -> tuple[int, int]:
+    """`solo`: four trips from one address, the earliest in time. `crowd`: three addresses, later."""
+    base = _now() - timedelta(hours=6)
+    solo = await _token(
+        label="Field-Solo", created_at=base - timedelta(hours=1), meta=_cred_meta("solo_user")
+    )
+    crowd = await _token(
+        label="public-crowd", created_at=base - timedelta(hours=1), meta=_cred_meta("crowd_user")
+    )
+    # Four trips from one address: more trips than the crowd's three, so only the number of distinct
+    # sources (not the trip count) can put `crowd` first.
+    rows: list[tuple[str, str, dict[str, Any], datetime | None]] = [
+        (_TRIP, "192.0.2.50", _login("solo_user", "pw-solo_user-x"), base + timedelta(minutes=i))
+        for i in range(4)
+    ]
+    for i, ip in enumerate(("198.51.100.1", "198.51.100.2", "198.51.100.3")):
+        rows.append(
+            (_TRIP, ip, _login("crowd_user", "pw-crowd_user-x"), base + timedelta(minutes=10 + i))
+        )
+    await _seed(rows)
+    return solo, crowd
+
+
+async def test_bait_trips_lists_the_token_with_the_most_distinct_sources_first_and_says_what_it_cut():
+    """A credential used by several addresses leads; a token tripped repeatedly by one address
+    (often the operator's own test) comes after it even with more trips and an earlier first trip."""
+    solo, crowd = await _seed_two_tokens()
+
+    out = await _call_bait()
+    assert [t["token_id"] for t in out["tokens"]] == [crowd, solo]
+    assert out["tokens_total"] == 2 and "Showing" not in (out["note"] or "")
+
+    cut = await _call_bait(limit=1)
+    assert [t["token_id"] for t in cut["tokens"]] == [crowd]
+    assert (cut["count"], cut["tokens_total"]) == (1, 2)
+    assert "Showing 1 of 2 tokens" in cut["note"]
+
+    for bad in (0, 101, True, 2.5):
+        assert "limit" in (await _call_bait(limit=bad))["error"]  # type: ignore[arg-type]
+
+
+async def test_bait_trips_picks_a_token_by_label_text_case_insensitively():
+    solo, crowd = await _seed_two_tokens()
+
+    only = await _call_bait(label="CROWD")
+    assert [t["token_id"] for t in only["tokens"]] == [crowd]
+
+    quiet = await _token(label="quiet_one", meta=_cred_meta("quiet_user"))
+    asked = await _call_bait(label="quiet")
+    assert [t["token_id"] for t in asked["tokens"]] == [quiet]
+    assert asked["tokens"][0]["trips"] == 0, "a selected token is returned even if it never fired"
+
+    missing = await _call_bait(label="no-such-label")
+    assert "No honeytoken" in missing["error"] and "honeytoken_list" in missing["hint"]
+    # LIKE wildcards in the text are literal characters, not patterns.
+    assert "No honeytoken" in (await _call_bait(label="%"))["error"]
+    assert "No honeytoken" in (await _call_bait(label="pub_ic"))["error"]
+
+
+async def test_bait_trips_compact_view_keeps_what_the_source_did_first_in_a_long_lead_up():
+    """The chronology keeps the newest 30 runs, so with a long lead-up the source's first actions
+    (here the `/.env` read) fell off the end: exactly the answer to 'what did they do first'."""
+    trip_at = _now() - timedelta(hours=2)
+    await _token(
+        label="long-lead", created_at=trip_at - timedelta(hours=5), meta=_cred_meta("lead_user")
+    )
+    start = trip_at - timedelta(minutes=90)
+    rows: list[tuple[str, str, dict[str, Any], datetime | None]] = [
+        ("http_decoy_served", "192.0.2.77", _http("/.env", "curl/8.4", decoy_target="/.env"), start)
+    ]
+    for i in range(1, 41):
+        at = start + timedelta(seconds=i * 20)
+        if i % 2:
+            rows.append(("http_probe", "192.0.2.77", _http(f"/p{i}", "curl/8.4"), at))
+        else:
+            rows.append(("ssh_session_connect", "192.0.2.77", {"session": f"s{i}"}, at))
+    rows.append((_TRIP, "192.0.2.77", _login("lead_user", "pw-lead_user-x"), trip_at))
+    await _seed(rows)
+
+    compact_out = await _call_bait()
+    lead = compact_out["tokens"][0]["sources"][0]["lead_up"]
+    assert lead["first_actions"][0].endswith("before: http_decoy_served /.env")
+    assert all(isinstance(step, str) for step in lead["first_actions"])
+    assert "earlier_contact_means" not in compact_out["tokens"][0]["sources"][0]
+    assert "same address more than" in compact_out["earlier_contact_meaning"]
+    assert len(lead["first_actions"]) == 8
+    assert lead["starts_at_first_contact"] is True
+    assert lead["chronology_runs_total"] == 41
+    assert not {"commands", "user_agents", "chronology"} & set(lead)
+    assert compact_out["detail"] is False and "Compact view" in compact_out["note"]
+
+    full_out = await _call_bait(detail=True)
+    full = full_out["tokens"][0]["sources"][0]["lead_up"]
+    assert len(full["chronology"]) == 30
+    assert full["chronology"][0]["event_type"] != "http_decoy_served", "the tail drops the start"
+    assert full["first_actions"] == lead["first_actions"]
+    assert {"commands", "user_agents"} <= set(full)
+    assert len(json.dumps(compact_out)) < len(json.dumps(full_out))

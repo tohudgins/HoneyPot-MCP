@@ -4,6 +4,28 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## "Who used the planted credential?" returned a wall of text, and dropped the first thing the attacker did
+
+**Asked in natural language on the registered server, `bait_trips` returned about 46 KB for ten tokens,
+most of them the operator's own field-test tokens, each with a 30-line chronology; the harness cut it off
+in the middle.** A first-time user asking this exact question would have had to know the token id and
+then read through noise to find it. Fixed without naming any token or address:
+
+- **Compact by default.** Each source now carries its verdict, delay, decoy fetches, services and a
+  `first_actions` list (the earliest steps, one short line each); commands, user agents and the last 30
+  steps are behind `detail=true`. The default call is 15 KB for five tokens, a focused one 6 KB.
+- **Tokens are ranked by how many different addresses tripped them,** then by trips, so a credential that
+  several addresses used leads and a token tripped repeatedly by one address (often your own test) does
+  not, whatever its position in time. `limit` (default 5) says how many are shown and the note says how
+  many were cut; `label` picks a token by part of its label, case-insensitively with wildcards taken
+  literally, so "the planted credential" no longer needs an id.
+- **A real bug in "what did they do first".** The chronology kept the newest 30 runs of a source's
+  lead-up, so with a long lead-up its first actions fell off the end: on the real run the bait reader's
+  first request, the `/.env` read that started everything, was missing from its chronology and survived only
+  in the decoy-fetch list. `first_actions` is taken from the start and says whether it begins at the
+  source's first contact (`starts_at_first_contact`).
+- The repeated explanation of "earlier contact" moved to one top-level field.
+
 ## The handover could not tell your own testing from attackers, and only named HIGH floods
 
 **The third pass at the same shift handover** found that an example of the queue was the operator's
