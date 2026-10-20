@@ -324,6 +324,11 @@ class Settings(BaseSettings):
     # de-duplicated in the database, so the whole of a multi-million-row run normally fits; when it
     # does not, the scan reads the newest events first and the result says how far back it got.
     ioc_scan_seconds: float = Field(default=25.0, ge=1, le=300)
+    # Addresses and CIDR ranges `soc_brief` sets aside from its urgent queue on every call, comma or
+    # space separated (for example the operator's own scanner or monitoring host). Empty by default:
+    # whether a loopback or private source is noise or the signal depends on the deployment, so
+    # nothing is assumed. `soc_brief` always reports what was excluded and how many alerts it hid.
+    soc_exclude_sources: str = ""
     # Wall-clock budget `sample_scan` spends looking its files' hashes up among the captured file
     # events. Each database pass reads every file event once, so many hashes on a multi-million-row
     # run can take minutes; the budget is checked between passes, and the result says how many

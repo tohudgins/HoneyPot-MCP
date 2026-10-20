@@ -24,6 +24,7 @@ from typing import Any, Literal
 from sqlalchemy import select
 
 from honeypot_mcp import instance_lock
+from honeypot_mcp.config import get_settings
 from honeypot_mcp.deception.capabilities import BY_TYPE, all_capabilities, all_profiles
 from honeypot_mcp.deception.coverage import build_coverage
 from honeypot_mcp.deception.planner import build_plan
@@ -42,6 +43,12 @@ from honeypot_mcp.storage.models import (
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import digest_payload
+from honeypot_mcp.tools._sources import (
+    make_matcher,
+    parse_source_filters,
+    source_scope,
+    split_setting,
+)
 from honeypot_mcp.tools._window import annotate_window, window_bounds
 
 
@@ -360,16 +367,17 @@ def _type_totals(entry: dict[str, Any] | None) -> dict[str, Any]:
     return {"event_type_alerts": entry["alerts"], "event_type_sources": entry["sources"]}
 
 
-def _flood_line(ranked: list[dict[str, Any]]) -> str | None:
-    """Say so when a few event types are nearly the whole urgent queue.
+def _flood_line(group: list[dict[str, Any]], label: str) -> str | None:
+    """Say so when a few event types are nearly the whole of one severity's queue.
 
     HIGH is the severity of every successful Telnet login and SIP REGISTER, which a public host
-    sees by the million, so "7.8M untriaged HIGH alerts" is a fact about floods, not a queue. The
-    line names the types that make it up and how much is left once they are set aside."""
-    total = sum(t["alerts"] for t in ranked)
-    if total <= 0 or len(ranked) <= _FLOOD_TYPES_MAX:
+    sees by the million, so "7.8M untriaged HIGH alerts" is a fact about floods, not a queue; the
+    CRITICAL queue can be just as lopsided. Share-based, with no event type named in advance: the
+    line names whichever types make up the bulk and how much is left once they are set aside."""
+    total = sum(t["alerts"] for t in group)
+    if total <= 0 or len(group) <= _FLOOD_TYPES_MAX:
         return None
-    biggest = sorted(ranked, key=lambda t: -t["alerts"])
+    biggest = sorted(group, key=lambda t: -t["alerts"])
     head: list[dict[str, Any]] = []
     running = 0
     for entry in biggest:
@@ -382,14 +390,29 @@ def _flood_line(ranked: list[dict[str, Any]]) -> str | None:
     rest = total - running
     names = ", ".join(f"{t['event_type']} ({t['alerts']:,})" for t in head)
     return (
-        f"{running / total:.0%} of the CRITICAL/HIGH queue is {len(head)} event type(s): {names}. "
-        f"Set them aside and {rest:,} alert(s) across {len(ranked) - len(head)} other event "
-        "type(s) remain: see `needs_attention` and `urgent_by_event_type`."
+        f"{running / total:.0%} of the {label} queue is {len(head)} event type(s): {names}. "
+        f"Set them aside and {rest:,} alert(s) across {len(group) - len(head)} other event "
+        "type(s) remain: see `urgent_by_event_type`."
     )
 
 
+def _flood_lines(ranked: list[dict[str, Any]]) -> list[str]:
+    """One flood line per severity that needs one, CRITICAL first."""
+    lines = []
+    for severity in ("critical", "high"):
+        group = [t for t in ranked if t["severity"] == severity]
+        line = _flood_line(group, severity.upper())
+        if line:
+            lines.append(line)
+    return lines
+
+
 @mcp.tool(**hints("soc_brief"))
-async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[str, Any]:
+async def soc_brief(
+    since_hours: float = 12.0,
+    max_highlights: int = 8,
+    exclude_sources: list[str] | None = None,
+) -> dict[str, Any]:
     """Shift handover: what happened, what needs a human, what was noise.
 
     The everyday entry point — use it for "what happened overnight?", "anything
@@ -401,7 +424,24 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
     Args:
         since_hours: Window to summarise. 12 covers a shift, 24 a day.
         max_highlights: Cap on individual items returned in `needs_attention`.
+        exclude_sources: Addresses or CIDR ranges to set aside from the urgent queue for this call
+              (your own scanner or monitoring host, a test machine), added to the
+              SOC_EXCLUDE_SOURCES setting. Nothing is assumed: on an internet-facing honeypot
+              loopback and private sources are often your own testing, on an internal network
+              they can be the signal, so each example is labelled with its `source_scope` and the
+              result states what was excluded and how many alerts that hid.
     """
+    requested, bad = parse_source_filters(exclude_sources)
+    configured, bad_configured = parse_source_filters(
+        split_setting(get_settings().soc_exclude_sources)
+    )
+    if bad or bad_configured:
+        return {
+            "error": "; ".join(bad + [f"SOC_EXCLUDE_SOURCES: {e}" for e in bad_configured]),
+            "hint": "exclude_sources takes IP addresses and CIDR ranges, for example 203.0.113.7 "
+            "or 198.51.100.0/24.",
+        }
+    exclude = make_matcher(requested + configured) if (requested or configured) else None
     cutoff, window_to = await window_bounds(since_hours)
 
     async with get_session() as session:
@@ -409,12 +449,18 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         totals = [(AlertSeverity(name), n) for name, n in stats["by_severity"].items()]
         unique_ips = stats["unique_source_ips"]
 
-        # What the urgent queue is made of, by event type. A handful of flood types (successful
-        # Telnet logins, SIP REGISTERs) are "high" by design and can be millions of rows, so the
-        # newest-first sample the brief used to show was always one of them and the rare,
-        # interesting types never appeared. Highlights are now one example per event type, CRITICAL
-        # before HIGH, and within a severity the rarest type first.
-        urgent_types = await rollups.urgent_by_type(session, cutoff, now=window_to)
+        # What the urgent queue is made of, by event type. A handful of flood types are "high" by
+        # design and can be millions of rows, so a newest-first sample is always one of them and
+        # the rare, interesting types never appear. Highlights are one example per event type,
+        # CRITICAL before HIGH, and within a severity the rarest type first.
+        excluded_result = None
+        if exclude is not None:
+            excluded_result = await rollups.urgent_by_type_excluding(
+                session, exclude, cutoff, now=window_to
+            )
+            urgent_types = excluded_result["types"]
+        else:
+            urgent_types = await rollups.urgent_by_type(session, cutoff, now=window_to)
         ranked = sorted(
             urgent_types,
             key=lambda t: (0 if t["severity"] == "critical" else 1, t["alerts"], t["event_type"]),
@@ -425,6 +471,9 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                 break
             severity = AlertSeverity(entry["severity"])
             hour = entry["newest_hour"]
+            # With sources set aside, only the kept ones may supply the example.
+            kept = entry.get("example_sources")
+            source_clause = [Alert.source_ip.in_(kept)] if kept else []
             # One hour of the alerts table (the newest hour this type was seen in), so a rare type
             # is found without scanning the flood in front of it.
             example = (
@@ -436,6 +485,7 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                         Alert.acknowledged.is_(False),
                         Alert.timestamp >= hour,
                         Alert.timestamp < hour + timedelta(hours=1),
+                        *source_clause,
                     )
                     .order_by(Alert.timestamp.desc())
                     .limit(1)
@@ -452,6 +502,7 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                             Alert.event_type == entry["event_type"],
                             Alert.acknowledged.is_(False),
                             Alert.timestamp >= cutoff,
+                            *source_clause,
                         )
                         .order_by(Alert.timestamp.desc())
                         .limit(1)
@@ -488,10 +539,18 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         # were the total — "8 untriaged high-severity alerts" when there are
         # 841 — which is the worst possible error in a shift handover.
         urgent_counts: dict[AlertSeverity, int] = {}
-        for severity in (AlertSeverity.CRITICAL, AlertSeverity.HIGH):
-            open_count = stats["by_severity"].get(severity.value, 0) - acked.get(severity.value, 0)
-            if open_count > 0:
-                urgent_counts[severity] = open_count
+        if excluded_result is not None:
+            # Counted from the kept sources, at hour resolution, like the per-type list.
+            for sev, n in excluded_result["open_by_severity"].items():
+                if n > 0:
+                    urgent_counts[AlertSeverity(sev)] = n
+        else:
+            for severity in (AlertSeverity.CRITICAL, AlertSeverity.HIGH):
+                open_count = stats["by_severity"].get(severity.value, 0) - acked.get(
+                    severity.value, 0
+                )
+                if open_count > 0:
+                    urgent_counts[severity] = open_count
 
     counts = {severity.value: n for severity, n in totals}
     total_events = sum(counts.values())
@@ -509,6 +568,7 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
             "source_ip": alert.source_ip,
             "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
             "payload": digest_payload(alert.payload or {}),
+            "source_scope": source_scope(alert.source_ip),
         }
         for alert in urgent
     ]
@@ -522,7 +582,30 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         {**item, **_type_totals(by_key.get((item["severity"], item["event_type"])))}
         for item in needs_attention
     ]
-    flood_line = _flood_line(ranked)
+    flood_lines = _flood_lines(ranked)
+    scopes: list[str] = [str(item["source_scope"]) for item in needs_attention]
+    non_public = sorted({s for s in scopes if s != "public"})
+    non_public_count = sum(1 for s in scopes if s != "public")
+    non_public_note = (
+        f"{non_public_count} example(s) come from non-public addresses ({', '.join(non_public)}): "
+        "on an internet-facing host that is usually your own testing or monitoring, on an internal "
+        "network it can be the whole signal. Pass `exclude_sources` (or set SOC_EXCLUDE_SOURCES) to "
+        "set addresses or ranges aside. "
+        if non_public_count
+        else ""
+    )
+    excluded_info = None
+    if excluded_result is not None:
+        excluded_info = {
+            "requested": [str(n) for n in requested],
+            "configured": [str(n) for n in configured],
+            "alerts_excluded": excluded_result["excluded_open_alerts"],
+            "sources_excluded": excluded_result["excluded_sources"],
+            "applies_to": (
+                "the urgent queue: headline counts, needs_attention, urgent_by_event_type "
+                "(hour resolution); volume and busiest_sources are unfiltered"
+            ),
+        }
 
     headline: list[str] = []
     if unhealthy:
@@ -538,8 +621,14 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         headline.append(f"{untriaged_critical} untriaged CRITICAL alert(s) — triage these first.")
     if untriaged_high:
         headline.append(f"{untriaged_high} untriaged HIGH alert(s).")
-    if flood_line:
-        headline.append(flood_line)
+    for line in flood_lines:
+        headline.append(line)
+    if excluded_info is not None:
+        headline.append(
+            f"{excluded_info['alerts_excluded']:,} open CRITICAL/HIGH alert(s) from "
+            f"{excluded_info['sources_excluded']:,} excluded source(s) are left out of the queue "
+            "above (see `excluded`)."
+        )
     if not headline:
         headline.append(
             f"Nothing needs a decision. {total_events} events from {unique_ips} addresses, "
@@ -570,6 +659,8 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
             for t in ranked[:_MAX_URGENT_TYPES]
         ],
         "urgent_event_types_total": len(ranked),
+        "excluded": excluded_info,
+        "non_public_examples": non_public_count,
         "triggered_tokens": [
             {
                 "id": t.id,
@@ -598,6 +689,7 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
                 if len(ranked) > len(needs_attention)
                 else ". "
             )
+            + non_public_note
             + "Use `alerts_get` for the full payload of any item, `analyze_attacker` to "
             "profile a source, and `alerts_acknowledge` to record a disposition once handled."
         ),

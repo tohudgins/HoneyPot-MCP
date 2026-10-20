@@ -24,6 +24,8 @@ from sqlalchemy.orm import Session
 from honeypot_mcp.storage.models import Alert, AlertRollup, AlertSeverity
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy import Table
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -301,6 +303,105 @@ async def urgent_by_type(
             }
         )
     return out
+
+
+_EXAMPLE_SOURCES = 200
+
+
+async def urgent_by_type_excluding(
+    session: AsyncSession,
+    exclude: Callable[[str], bool],
+    since: datetime | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """`urgent_by_type` with sources set aside, for callers that name sources to ignore.
+
+    Groups by source as well, so each source is judged by the caller's predicate once and the
+    per-type counts, source counts and newest hour cover only the sources that were kept. Costs
+    one row per (type, source) pair among CRITICAL/HIGH alerts instead of one per type, which is why
+    the plain function stays the default. Each type also carries `example_sources`, the kept
+    sources with the newest activity (capped), so an example can be looked up without scanning.
+
+    Returns {"types": [...], "open_by_severity": {...}, "excluded_open_alerts": n,
+    "excluded_sources": n}; excluded counts are open alerts and distinct sources set aside."""
+    severities = (AlertSeverity.CRITICAL, AlertSeverity.HIGH)
+    q = (
+        select(
+            AlertRollup.severity,
+            AlertRollup.event_type,
+            AlertRollup.source_ip,
+            func.sum(AlertRollup.count),
+            func.max(AlertRollup.bucket),
+        )
+        .where(AlertRollup.severity.in_(severities))
+        .group_by(AlertRollup.severity, AlertRollup.event_type, AlertRollup.source_ip)
+    )
+    if since is not None:
+        q = q.where(AlertRollup.bucket >= hour_floor(since))
+    if now is not None:
+        q = q.where(AlertRollup.bucket <= now)
+    rows = (await session.execute(q)).all()
+    ack_q = (
+        select(Alert.severity, Alert.event_type, Alert.source_ip, func.count())
+        .where(Alert.acknowledged.is_(True), Alert.severity.in_(severities))
+        .group_by(Alert.severity, Alert.event_type, Alert.source_ip)
+    )
+    if since is not None:
+        ack_q = ack_q.where(Alert.timestamp >= since)
+    acked = {
+        (getattr(r[0], "value", str(r[0])), str(r[1]), str(r[2])): int(r[3])
+        for r in (await session.execute(ack_q)).all()
+    }
+
+    types: dict[tuple[str, str], dict[str, Any]] = {}
+    excluded_open = 0
+    excluded_sources: set[str] = set()
+    for severity, event_type, source_ip, alerts, newest in rows:
+        sev = getattr(severity, "value", str(severity))
+        source = str(source_ip)
+        done = acked.get((sev, str(event_type), source), 0)
+        open_alerts = int(alerts) - done
+        if exclude(source):
+            if open_alerts > 0:
+                excluded_open += open_alerts
+            excluded_sources.add(source)
+            continue
+        bucket = newest if newest.tzinfo else newest.replace(tzinfo=UTC)
+        entry = types.setdefault(
+            (sev, str(event_type)),
+            {
+                "severity": sev,
+                "event_type": str(event_type),
+                "alerts": 0,
+                "acknowledged": 0,
+                "sources": 0,
+                "newest_hour": bucket,
+                "_by_source": [],
+            },
+        )
+        entry["alerts"] += max(open_alerts, 0)
+        entry["acknowledged"] += min(done, int(alerts))
+        entry["sources"] += 1
+        entry["newest_hour"] = max(entry["newest_hour"], bucket)
+        entry["_by_source"].append((bucket, source))
+
+    out = []
+    open_by_severity: dict[str, int] = {}
+    for entry in types.values():
+        if entry["alerts"] <= 0:
+            continue
+        by_source = sorted(entry.pop("_by_source"), reverse=True)
+        entry["example_sources"] = [s for _b, s in by_source[:_EXAMPLE_SOURCES]]
+        open_by_severity[entry["severity"]] = (
+            open_by_severity.get(entry["severity"], 0) + entry["alerts"]
+        )
+        out.append(entry)
+    return {
+        "types": out,
+        "open_by_severity": open_by_severity,
+        "excluded_open_alerts": excluded_open,
+        "excluded_sources": len(excluded_sources),
+    }
 
 
 async def hit_counts(

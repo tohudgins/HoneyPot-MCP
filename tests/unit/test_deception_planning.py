@@ -475,6 +475,9 @@ async def _seed_flood_and_rare(rare_age: timedelta) -> None:
             ("postgresql_copy_program_rce", AlertSeverity.HIGH),
             ("ldap_jndi_lookup", AlertSeverity.HIGH),
             ("kubernetes_pod_exec", AlertSeverity.HIGH),
+            ("probe_kind_a", AlertSeverity.HIGH),
+            ("probe_kind_b", AlertSeverity.HIGH),
+            ("probe_kind_c", AlertSeverity.HIGH),
         ):
             session.add(
                 Alert(
@@ -493,19 +496,12 @@ async def test_brief_shows_rare_event_types_not_just_the_newest_flood():
     from honeypot_mcp.tools.deception import soc_brief
 
     await _seed_flood_and_rare(timedelta(hours=5))
-    brief = await soc_brief(since_hours=12, max_highlights=6)
+    brief = await soc_brief(since_hours=12, max_highlights=20)
 
     shown = [a["event_type"] for a in brief["needs_attention"]]
     assert shown[:2] == ["docker_api_container_escape", "mysql_udf_rce"], "CRITICAL first"
-    assert "telnet_login_success" not in shown, "the flood is the last thing to list"
-    assert set(shown) == {
-        "docker_api_container_escape",
-        "mysql_udf_rce",
-        "redis_rogue_replica",
-        "postgresql_copy_program_rce",
-        "ldap_jndi_lookup",
-        "kubernetes_pod_exec",
-    }
+    assert shown[-1] == "telnet_login_success", "the flood is the last thing to list"
+    assert len(shown) == 10
     by_type = {t["event_type"]: t for t in brief["urgent_by_event_type"]}
     assert by_type["telnet_login_success"]["alerts"] == 400
     assert brief["needs_attention"][0]["event_type_alerts"] == 1
@@ -517,10 +513,139 @@ async def test_brief_says_when_a_few_event_types_are_nearly_the_whole_queue():
     await _seed_flood_and_rare(timedelta(hours=5))
     brief = await soc_brief(since_hours=12, max_highlights=3)
 
-    flood = [line for line in brief["headline"] if "of the CRITICAL/HIGH queue" in line]
+    flood = [line for line in brief["headline"] if "of the HIGH queue" in line]
     assert len(flood) == 1
     assert "telnet_login_success (400)" in flood[0]
-    assert "6 alert(s) across 6 other event type(s)" in flood[0]
+    assert "7 alert(s) across 7 other event type(s)" in flood[0]
+    # The two CRITICAL types are too few for a flood line of their own.
+    assert not [line for line in brief["headline"] if "of the CRITICAL queue" in line]
+
+
+async def test_brief_calls_out_a_dominant_critical_type_without_knowing_its_name():
+    """The flood line is share-based per severity, so it works for whatever dominates."""
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.deception import soc_brief
+
+    now = datetime.now(UTC) - timedelta(minutes=20)
+    async with get_session() as session:
+        for i in range(300):
+            session.add(
+                Alert(
+                    source_ip=f"203.0.113.{i % 40}",
+                    event_type="zeta_widget_abuse",
+                    payload={},
+                    severity=AlertSeverity.CRITICAL,
+                    timestamp=now - timedelta(seconds=i),
+                )
+            )
+        for k in range(6):
+            session.add(
+                Alert(
+                    source_ip="198.51.100.9",
+                    event_type=f"rare_kind_{k}",
+                    payload={},
+                    severity=AlertSeverity.CRITICAL,
+                    timestamp=now,
+                )
+            )
+    brief = await soc_brief(since_hours=12, max_highlights=3)
+    (line,) = [x for x in brief["headline"] if "of the CRITICAL queue" in x]
+    assert "zeta_widget_abuse (300)" in line and "6 alert(s) across 6 other" in line
+
+
+async def _seed_two_scopes() -> None:
+    """A rare critical type from a loopback source, one from a public address, and a type seen
+    from both."""
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    now = datetime.now(UTC) - timedelta(minutes=10)
+    rows = (
+        ("127.0.0.1", "only_from_loopback", 2),
+        ("8.8.8.8", "only_from_public", 3),
+        ("127.0.0.1", "seen_from_both", 4),
+        ("8.8.8.8", "seen_from_both", 1),
+    )
+    async with get_session() as session:
+        for source, event_type, n in rows:
+            for i in range(n):
+                session.add(
+                    Alert(
+                        source_ip=source,
+                        event_type=event_type,
+                        payload={},
+                        severity=AlertSeverity.CRITICAL,
+                        timestamp=now - timedelta(seconds=i),
+                    )
+                )
+
+
+async def test_brief_labels_each_example_with_its_address_scope_and_says_what_it_means():
+    from honeypot_mcp.tools.deception import soc_brief
+
+    await _seed_two_scopes()
+    brief = await soc_brief(since_hours=12, max_highlights=10)
+
+    scopes = {a["event_type"]: a["source_scope"] for a in brief["needs_attention"]}
+    assert scopes["only_from_loopback"] == "loopback"
+    assert scopes["only_from_public"] == "public"
+    assert brief["non_public_examples"] >= 1
+    assert "non-public addresses (loopback)" in brief["note"]
+    assert "exclude_sources" in brief["note"]
+    assert brief["excluded"] is None, "nothing is excluded unless the caller asks"
+    assert brief["needs_attention_total"] == 10
+
+
+async def test_brief_sets_named_sources_aside_and_says_how_much_it_hid():
+    from honeypot_mcp.tools.deception import soc_brief
+
+    await _seed_two_scopes()
+    brief = await soc_brief(since_hours=12, max_highlights=10, exclude_sources=["127.0.0.0/8"])
+
+    shown = {a["event_type"] for a in brief["needs_attention"]}
+    assert shown == {"only_from_public", "seen_from_both"}
+    assert all(a["source_scope"] == "public" for a in brief["needs_attention"])
+    by_type = {t["event_type"]: t for t in brief["urgent_by_event_type"]}
+    assert by_type["seen_from_both"]["alerts"] == 1, "only the kept source counts"
+    assert by_type["seen_from_both"]["sources"] == 1
+    assert brief["needs_attention_total"] == 4  # 3 + 1; the 6 loopback alerts are set aside
+    excluded = brief["excluded"]
+    assert excluded["requested"] == ["127.0.0.0/8"] and excluded["alerts_excluded"] == 6
+    assert excluded["sources_excluded"] == 1
+    assert any(
+        "6 open CRITICAL/HIGH alert(s) from 1 excluded source(s)" in x for x in brief["headline"]
+    )
+    assert brief["non_public_examples"] == 0
+
+
+async def test_brief_applies_the_configured_exclusions_too_and_reports_them_as_configured(
+    monkeypatch,
+):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.deception import soc_brief
+
+    await _seed_two_scopes()
+    monkeypatch.setattr(get_settings(), "soc_exclude_sources", "8.8.8.8, ::1")
+    brief = await soc_brief(since_hours=12, max_highlights=10)
+
+    assert {a["event_type"] for a in brief["needs_attention"]} == {
+        "only_from_loopback",
+        "seen_from_both",
+    }
+    assert brief["excluded"]["configured"] == ["8.8.8.8/32", "::1/128"]
+    assert brief["excluded"]["requested"] == []
+
+
+async def test_brief_rejects_a_malformed_exclusion_instead_of_silently_excluding_nothing():
+    from honeypot_mcp.tools.deception import soc_brief
+
+    result = await soc_brief(since_hours=12, exclude_sources=["203.0.113.9", "not-an-address"])
+    assert "error" in result and "not-an-address" in result["error"]
 
 
 async def test_brief_leaves_fully_acknowledged_event_types_out_of_the_queue():

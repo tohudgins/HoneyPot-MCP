@@ -4,6 +4,29 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The handover could not tell your own testing from attackers, and only named HIGH floods
+
+**The third pass at the same shift handover** found that an example of the queue was the operator's
+own loopback canary test, ranked second, and that the CRITICAL queue (24,241 of 26,080 alerts one event
+type) was never called out while the HIGH queue was. Both were fixed without naming anything in advance,
+because what is noise differs per deployment: a loopback or private source is the operator's own test on
+an internet-facing honeypot and the entire signal on a LAN tripwire or when a hostile process runs on the
+host, so the tool never guesses.
+
+- **The user states what to set aside:** `exclude_sources` (addresses and CIDR ranges, validated: a typo
+  is an error, not an empty filter) per call, and the `SOC_EXCLUDE_SOURCES` setting for good. The result
+  always carries an `excluded` block (what was requested and configured, how many open alerts and sources
+  it hid) and a headline line, so a filter cannot hide alerts silently; counts, `needs_attention` and
+  `urgent_by_event_type` follow the filter, while volume and busiest sources do not (said in the block).
+- **Every example says what kind of address it came from** (`source_scope`: public, private, loopback,
+  link_local, multicast, other_non_public), derived from the standard `ipaddress` properties, and the note
+  says when examples come from non-public addresses and what that can mean either way. On the real run the
+  one loopback example is flagged, and setting that range and the operator's field-test address aside
+  removed 384 open alerts from 2 sources.
+- **The flood line is per severity and share-based:** "93% of the CRITICAL queue is 1 event type(s):
+  sip_toll_fraud_attempt (24,241) ... 1,839 alert(s) across 21 other event type(s) remain" next to the
+  equivalent HIGH line, for whatever event types dominate.
+
 ## `soc_brief` reported a flood as a queue
 
 **First natural-language dogfooding of the registered server: "give me a shift handover for the whole run"

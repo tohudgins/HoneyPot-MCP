@@ -191,7 +191,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `deception_deploy_plan` | Bring a plan up atomically, rolling back everything on failure |
 | `deception_coverage` | What the live deployment detects per ATT&CK tactic, and the ranked blind spots |
 | `deception_profiles` | Environment profiles (a Windows domain, a Linux web app, a container platform) and every deployable sensor type; call before `deception_plan` |
-| `soc_brief` | Shift handover: what needs a human, separated from the background radiation. The urgent queue is shown by event type (`urgent_by_event_type`), with one example per type, CRITICAL first and the rarest type first, and the headline names the few flood types (successful Telnet logins, SIP REGISTERs) when they are nearly all of it |
+| `soc_brief` | Shift handover: what needs a human, separated from the background radiation. The urgent queue is shown by event type (`urgent_by_event_type`), with one example per type, CRITICAL first and the rarest type first, and one headline line per severity names the few event types that are nearly all of it. Each example carries a `source_scope` (public, private, loopback, link_local, ...) and the note says when examples come from non-public addresses. `exclude_sources` (addresses and CIDR ranges) and the `SOC_EXCLUDE_SOURCES` setting set sources aside, for example your own scanner; nothing is assumed, and the result states what was excluded and how many alerts it hid |
 | `honeypot_deploy` | Deploy any of the 25 engine types |
 | `honeypot_stop` | Stop one, several by name, or every honeypot matching a type or status filter |
 | `honeypot_list` / `honeypot_status` | List all / detail and recent events for one |
