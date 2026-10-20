@@ -18,6 +18,7 @@ thinner way to call an API:
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any, Literal
 
 from sqlalchemy import select
@@ -345,6 +346,48 @@ async def deception_coverage(include_recommendations: bool = True) -> dict[str, 
     return await build_coverage(deployed, tokens, include_recommendations=include_recommendations)
 
 
+# How many event types `soc_brief` lists in `urgent_by_event_type` (the full count is reported).
+_MAX_URGENT_TYPES = 30
+# A few event types holding this share of the urgent queue is called out in the headline.
+_FLOOD_SHARE = 0.9
+_FLOOD_TYPES_MAX = 5
+
+
+def _type_totals(entry: dict[str, Any] | None) -> dict[str, Any]:
+    """Per-example context: how big the event type behind this example is."""
+    if entry is None:
+        return {}
+    return {"event_type_alerts": entry["alerts"], "event_type_sources": entry["sources"]}
+
+
+def _flood_line(ranked: list[dict[str, Any]]) -> str | None:
+    """Say so when a few event types are nearly the whole urgent queue.
+
+    HIGH is the severity of every successful Telnet login and SIP REGISTER, which a public host
+    sees by the million, so "7.8M untriaged HIGH alerts" is a fact about floods, not a queue. The
+    line names the types that make it up and how much is left once they are set aside."""
+    total = sum(t["alerts"] for t in ranked)
+    if total <= 0 or len(ranked) <= _FLOOD_TYPES_MAX:
+        return None
+    biggest = sorted(ranked, key=lambda t: -t["alerts"])
+    head: list[dict[str, Any]] = []
+    running = 0
+    for entry in biggest:
+        if len(head) >= _FLOOD_TYPES_MAX or running >= _FLOOD_SHARE * total:
+            break
+        head.append(entry)
+        running += entry["alerts"]
+    if running < _FLOOD_SHARE * total:
+        return None
+    rest = total - running
+    names = ", ".join(f"{t['event_type']} ({t['alerts']:,})" for t in head)
+    return (
+        f"{running / total:.0%} of the CRITICAL/HIGH queue is {len(head)} event type(s): {names}. "
+        f"Set them aside and {rest:,} alert(s) across {len(ranked) - len(head)} other event "
+        "type(s) remain: see `needs_attention` and `urgent_by_event_type`."
+    )
+
+
 @mcp.tool(**hints("soc_brief"))
 async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[str, Any]:
     """Shift handover: what happened, what needs a human, what was noise.
@@ -366,30 +409,40 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         totals = [(AlertSeverity(name), n) for name, n in stats["by_severity"].items()]
         unique_ips = stats["unique_source_ips"]
 
-        # Most severe first, newest first within a severity. Sorting on the stored severity text
-        # put "high" before "critical" (alphabetical), so the brief led with the lesser alerts. Each
-        # query is a seek into ix_alerts_urgent, a partial index holding only CRITICAL/HIGH rows.
+        # What the urgent queue is made of, by event type. A handful of flood types (successful
+        # Telnet logins, SIP REGISTERs) are "high" by design and can be millions of rows, so the
+        # newest-first sample the brief used to show was always one of them and the rare,
+        # interesting types never appeared. Highlights are now one example per event type, CRITICAL
+        # before HIGH, and within a severity the rarest type first.
+        urgent_types = await rollups.urgent_by_type(session, cutoff, now=window_to)
+        ranked = sorted(
+            urgent_types,
+            key=lambda t: (0 if t["severity"] == "critical" else 1, t["alerts"], t["event_type"]),
+        )
         urgent: list[Alert] = []
-        for severity in (AlertSeverity.CRITICAL, AlertSeverity.HIGH):
-            room = max_highlights - len(urgent)
-            if room <= 0:
+        for entry in ranked:
+            if len(urgent) >= max_highlights:
                 break
-            urgent.extend(
-                (
-                    await session.execute(
-                        select(Alert)
-                        .where(
-                            Alert.severity == severity,
-                            Alert.acknowledged.is_(False),
-                            Alert.timestamp >= cutoff,
-                        )
-                        .order_by(Alert.timestamp.desc())
-                        .limit(room)
+            severity = AlertSeverity(entry["severity"])
+            hour = entry["newest_hour"]
+            # One hour of the alerts table (the newest hour this type was seen in), so a rare type
+            # is found without scanning the flood in front of it.
+            example = (
+                await session.execute(
+                    select(Alert)
+                    .where(
+                        Alert.severity == severity,
+                        Alert.event_type == entry["event_type"],
+                        Alert.acknowledged.is_(False),
+                        Alert.timestamp >= hour,
+                        Alert.timestamp < hour + timedelta(hours=1),
                     )
+                    .order_by(Alert.timestamp.desc())
+                    .limit(1)
                 )
-                .scalars()
-                .all()
-            )
+            ).scalar_one_or_none()
+            if example is not None:
+                urgent.append(example)
 
         token_trips = (
             (
@@ -448,6 +501,13 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
     untriaged_high = urgent_counts.get(AlertSeverity.HIGH, 0)
     urgent_total = untriaged_critical + untriaged_high
 
+    by_key = {(t["severity"], t["event_type"]): t for t in ranked}
+    needs_attention = [
+        {**item, **_type_totals(by_key.get((item["severity"], item["event_type"])))}
+        for item in needs_attention
+    ]
+    flood_line = _flood_line(ranked)
+
     headline: list[str] = []
     if unhealthy:
         headline.append(f"{len(unhealthy)} sensor(s) in ERROR — collection may be interrupted.")
@@ -462,6 +522,8 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         headline.append(f"{untriaged_critical} untriaged CRITICAL alert(s) — triage these first.")
     if untriaged_high:
         headline.append(f"{untriaged_high} untriaged HIGH alert(s).")
+    if flood_line:
+        headline.append(flood_line)
     if not headline:
         headline.append(
             f"Nothing needs a decision. {total_events} events from {unique_ips} addresses, "
@@ -483,6 +545,14 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         "needs_attention_total": urgent_total,
         "needs_attention_showing": len(needs_attention),
         "untriaged_by_severity": {"critical": untriaged_critical, "high": untriaged_high},
+        # The whole urgent queue by event type, rarest first within a severity, so the shape of
+        # the queue is visible: a few flood types usually hold nearly all of it. Counts are every
+        # CRITICAL/HIGH alert in the window (acknowledged ones included).
+        "urgent_by_event_type": [
+            {k: t[k] for k in ("severity", "event_type", "alerts", "sources")}
+            for t in ranked[:_MAX_URGENT_TYPES]
+        ],
+        "urgent_event_types_total": len(ranked),
         "triggered_tokens": [
             {
                 "id": t.id,
@@ -502,11 +572,13 @@ async def soc_brief(since_hours: float = 12.0, max_highlights: int = 8) -> dict[
         },
         "busiest_sources": [{"source_ip": ip, "events": n} for ip, n in busiest],
         "note": (
-            f"`needs_attention` is untriaged CRITICAL/HIGH only, showing "
-            f"{len(needs_attention)} of {urgent_total}"
+            f"`needs_attention` is one example per event type from the untriaged CRITICAL/HIGH "
+            f"queue (CRITICAL first, rarest type first), showing {len(needs_attention)} of "
+            f"{len(ranked)} event types and {urgent_total} alerts"
             + (
-                " — raise `max_highlights` or use `alerts_search` to work the rest. "
-                if urgent_total > len(needs_attention)
+                " — raise `max_highlights`, read `urgent_by_event_type`, or use `alerts_search` "
+                "to work the rest. "
+                if len(ranked) > len(needs_attention)
                 else ". "
             )
             + "Use `alerts_get` for the full payload of any item, `analyze_attacker` to "

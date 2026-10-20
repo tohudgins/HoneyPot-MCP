@@ -14,6 +14,7 @@ could never fire.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
 
@@ -414,7 +415,7 @@ async def test_brief_headline_reports_real_totals_not_the_display_cap():
             session.add(
                 Alert(
                     source_ip=f"203.0.113.{i}",
-                    event_type="ssh_login_failed",
+                    event_type=f"ssh_probe_{i % 6}",
                     payload={},
                     severity=AlertSeverity.HIGH,
                     acknowledged=False,
@@ -435,7 +436,9 @@ async def test_brief_headline_reports_real_totals_not_the_display_cap():
 
     brief = await soc_brief(since_hours=12, max_highlights=5)
 
+    # One example per event type: 5 shown of 7 types, but the totals are the real queue.
     assert brief["needs_attention_showing"] == 5
+    assert brief["urgent_event_types_total"] == 7
     assert brief["needs_attention_total"] == 33
     assert brief["untriaged_by_severity"] == {"critical": 3, "high": 30}
 
@@ -443,7 +446,104 @@ async def test_brief_headline_reports_real_totals_not_the_display_cap():
     assert "3 untriaged CRITICAL" in joined, "CRITICAL must be called out on its own"
     assert "30 untriaged HIGH" in joined, "the headline must state the real total"
     assert "5 untriaged" not in joined, "the display cap must never be reported as the total"
-    assert "showing 5 of 33" in brief["note"]
+    assert "showing 5 of 7 event types and 33 alerts" in brief["note"]
+
+
+async def _seed_flood_and_rare(rare_age: timedelta) -> None:
+    """A flood of one HIGH type (the newest rows) plus a few rare types further back."""
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    now = datetime.now(UTC)
+    async with get_session() as session:
+        for i in range(400):
+            session.add(
+                Alert(
+                    source_ip=f"203.0.113.{i % 50}",
+                    event_type="telnet_login_success",
+                    payload={},
+                    severity=AlertSeverity.HIGH,
+                    timestamp=now - timedelta(seconds=i),
+                )
+            )
+        for name, severity in (
+            ("docker_api_container_escape", AlertSeverity.CRITICAL),
+            ("mysql_udf_rce", AlertSeverity.CRITICAL),
+            ("redis_rogue_replica", AlertSeverity.HIGH),
+            ("postgresql_copy_program_rce", AlertSeverity.HIGH),
+            ("ldap_jndi_lookup", AlertSeverity.HIGH),
+            ("kubernetes_pod_exec", AlertSeverity.HIGH),
+        ):
+            session.add(
+                Alert(
+                    source_ip="198.51.100.7",
+                    event_type=name,
+                    payload={},
+                    severity=severity,
+                    timestamp=now - rare_age,
+                )
+            )
+
+
+async def test_brief_shows_rare_event_types_not_just_the_newest_flood():
+    """On a public host the newest HIGH rows are always a flood (successful Telnet logins), so a
+    newest-first sample never showed the container escape or the RCE attempt."""
+    from honeypot_mcp.tools.deception import soc_brief
+
+    await _seed_flood_and_rare(timedelta(hours=5))
+    brief = await soc_brief(since_hours=12, max_highlights=6)
+
+    shown = [a["event_type"] for a in brief["needs_attention"]]
+    assert shown[:2] == ["docker_api_container_escape", "mysql_udf_rce"], "CRITICAL first"
+    assert "telnet_login_success" not in shown, "the flood is the last thing to list"
+    assert set(shown) == {
+        "docker_api_container_escape",
+        "mysql_udf_rce",
+        "redis_rogue_replica",
+        "postgresql_copy_program_rce",
+        "ldap_jndi_lookup",
+        "kubernetes_pod_exec",
+    }
+    by_type = {t["event_type"]: t for t in brief["urgent_by_event_type"]}
+    assert by_type["telnet_login_success"]["alerts"] == 400
+    assert brief["needs_attention"][0]["event_type_alerts"] == 1
+
+
+async def test_brief_says_when_a_few_event_types_are_nearly_the_whole_queue():
+    from honeypot_mcp.tools.deception import soc_brief
+
+    await _seed_flood_and_rare(timedelta(hours=5))
+    brief = await soc_brief(since_hours=12, max_highlights=3)
+
+    flood = [line for line in brief["headline"] if "of the CRITICAL/HIGH queue" in line]
+    assert len(flood) == 1
+    assert "telnet_login_success (400)" in flood[0]
+    assert "6 alert(s) across 6 other event type(s)" in flood[0]
+
+
+async def test_brief_stays_quiet_about_floods_when_the_queue_is_small_or_varied():
+    from datetime import UTC, datetime
+
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.deception import soc_brief
+
+    now = datetime.now(UTC)
+    async with get_session() as session:
+        for i in range(12):
+            session.add(
+                Alert(
+                    source_ip="203.0.113.9",
+                    event_type=f"probe_{i}",
+                    payload={},
+                    severity=AlertSeverity.HIGH,
+                    timestamp=now - timedelta(minutes=i),
+                )
+            )
+    brief = await soc_brief(since_hours=12, max_highlights=3)
+    assert not [line for line in brief["headline"] if "of the CRITICAL/HIGH queue" in line]
 
 
 async def test_brief_note_does_not_claim_truncation_when_nothing_was_cut():

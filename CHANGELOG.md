@@ -4,6 +4,21 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## `soc_brief` reported a flood as a queue
+
+**First natural-language dogfooding of the registered server: "give me a shift handover for the whole run"
+returned "7,796,236 untriaged HIGH alerts" and a highlights list with one toll-fraud alert.** HIGH is the
+severity of every successful Telnet login and SIP REGISTER, which a public host sees by the million, and the
+highlights were the newest unacknowledged rows, so they were always a flood type and the container escapes
+and RCE attempts never appeared; no new user could have acted on it. Highlights are now one example per
+event type (CRITICAL first, rarest type first, found through the hourly rollups so a rare type is one
+hour-wide query, not a scan of the flood in front of it), the result carries `urgent_by_event_type` (the
+queue by type with sources), each example says how big its event type is, and the headline names the types
+that are nearly all of the queue ("93% of the CRITICAL/HIGH queue is 2 event type(s): sip_register_attempt
+(4,517,777), telnet_command_input (2,792,024). Set them aside and 514,260 alert(s) across 77 other event
+type(s) remain"). On the real run it answers in 0.4 s. The totals are unchanged and are still the real queue,
+never the display cap.
+
 ## The ATT&CK dashboard disagreed with the tool; packaging; flaky ports
 
 **Re-rendering the ATT&CK screenshots on the final data showed the Grafana dashboard and `attack_summary`

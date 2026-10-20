@@ -21,7 +21,7 @@ from sqlalchemy import event, func, literal_column, select, text, union_all
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
-from honeypot_mcp.storage.models import Alert, AlertRollup
+from honeypot_mcp.storage.models import Alert, AlertRollup, AlertSeverity
 
 if TYPE_CHECKING:
     from sqlalchemy import Table
@@ -242,6 +242,46 @@ async def campaign_rows(
         (r[0], str(r[1]), str(r[2]), int(r[3]), int(r[4]), getattr(r[5], "value", str(r[5])))
         for r in rows.all()
     ]
+
+
+async def urgent_by_type(
+    session: AsyncSession, since: datetime | None = None, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """CRITICAL and HIGH alerts per (severity, event type): alerts, distinct sources, newest hour.
+
+    Exact at hour resolution (a rollup row is written with every alert, so the current hour is
+    included) and it does not subtract acknowledged alerts: it says what happened, not what is
+    still open. This is what lets a brief tell a handful of flood types from the rare ones."""
+    severities = (AlertSeverity.CRITICAL, AlertSeverity.HIGH)
+    q = (
+        select(
+            AlertRollup.severity,
+            AlertRollup.event_type,
+            func.sum(AlertRollup.count),
+            func.count(func.distinct(AlertRollup.source_ip)),
+            func.max(AlertRollup.bucket),
+        )
+        .where(AlertRollup.severity.in_(severities))
+        .group_by(AlertRollup.severity, AlertRollup.event_type)
+    )
+    if since is not None:
+        q = q.where(AlertRollup.bucket >= hour_floor(since))
+    if now is not None:
+        q = q.where(AlertRollup.bucket <= now)
+    rows = (await session.execute(q)).all()
+    out = []
+    for severity, event_type, alerts, sources, newest in rows:
+        bucket = newest if newest.tzinfo else newest.replace(tzinfo=UTC)
+        out.append(
+            {
+                "severity": getattr(severity, "value", str(severity)),
+                "event_type": str(event_type),
+                "alerts": int(alerts),
+                "sources": int(sources),
+                "newest_hour": bucket,
+            }
+        )
+    return out
 
 
 async def hit_counts(
