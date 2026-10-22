@@ -53,6 +53,21 @@ from honeypot_mcp.tools._format import write_artifact
 
 log = logging.getLogger(__name__)
 
+
+async def _gather(*work: Awaitable[Any]) -> list[Any]:
+    """Run the parts of the analysis together, except on an in-memory database.
+
+    A file database gives every session its own connection, so independent reads overlap and a
+    run on a large database takes the time of its slowest part. The in-memory database used by
+    tests is one shared connection: a commit from one part while another still has a cursor open
+    fails with "cannot commit transaction - SQL statements in progress", so there the parts run
+    one after another.
+    """
+    if ":memory:" in get_settings().database_url:
+        return [await item for item in work]
+    return list(await asyncio.gather(*work))
+
+
 _TOP_SOURCES = 5
 _CAMPAIGNS_IN_DIGEST = 3
 _CLUSTERS_IN_DIGEST = 3
@@ -241,7 +256,7 @@ async def _profile_source(
 ) -> dict[str, Any]:
     """One busy source: risk, a one-line journey and a Markdown report file. Parts fail separately."""
     row: dict[str, Any] = {"ip": ip, "alerts": alerts}
-    profile, journey, report = await asyncio.gather(
+    profile, journey, report = await _gather(
         run.step(f"analyze_attacker({ip})", _analysis_tools.analyze_attacker(ip)),
         run.step(
             f"analyze_attacker_journey({ip})",
@@ -331,7 +346,7 @@ async def run_analysis(hours: int = 168) -> dict[str, Any]:
         full_report,
         stix,
         blocklist,
-    ) = await asyncio.gather(
+    ) = await _gather(
         run.step("alerts_stats", _alerts_tools.alerts_stats()),
         run.step(
             "soc_brief",
@@ -400,7 +415,7 @@ async def run_analysis(hours: int = 168) -> dict[str, Any]:
     if not busiest and brief:
         busiest = [{"ip": b["source_ip"], "count": b["events"]} for b in brief["busiest_sources"]]
     sources = list(
-        await asyncio.gather(
+        await _gather(
             *(
                 _profile_source(run, source["ip"], source["count"], effective, stamp)
                 for source in busiest[:top]

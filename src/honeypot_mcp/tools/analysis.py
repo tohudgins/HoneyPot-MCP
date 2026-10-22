@@ -1652,11 +1652,12 @@ async def threat_timeline(
     for ts, source, event_type, severity, hp_id in reversed(rows):
         sev = severity.value if hasattr(severity, "value") else str(severity)
         last = entries[-1] if entries else None
+        honeypot = names.get(hp_id) if hp_id is not None else None
         if (
             last is not None
             and last["source_ip"] == source
             and last["event_type"] == event_type
-            and last["honeypot"] == names.get(hp_id)
+            and last["honeypot"] == honeypot
         ):
             last["repeated"] += 1
             last["until"] = ts.isoformat()
@@ -1669,7 +1670,7 @@ async def threat_timeline(
                 "source_ip": source,
                 "event_type": event_type,
                 "severity": sev,
-                "honeypot": names.get(hp_id),
+                "honeypot": honeypot,
                 "repeated": 1,
             }
         )
