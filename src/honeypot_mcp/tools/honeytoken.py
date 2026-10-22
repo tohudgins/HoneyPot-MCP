@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from honeypot_mcp.rbac import require_role, role_at_least
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.storage.models import Honeytoken, HoneytokenStatus, HoneytokenType
+from honeypot_mcp.storage.models import (
+    AttackerEvent,
+    Honeytoken,
+    HoneytokenStatus,
+    HoneytokenType,
+)
 from honeypot_mcp.tokens import get_provider
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
+from honeypot_mcp.tools._format import digest_payload, mark_untrusted
+from honeypot_mcp.tools._planted import Planted, load_planted
 
 
 def _invalidate_matcher_caches(token_type: HoneytokenType | None = None) -> None:
@@ -46,53 +56,52 @@ async def honeytoken_create(
         "azure_credential",
         "gcp_service_account",
     ],
-    label: str,
+    label: str | None = None,
     metadata: dict[str, Any] | None = None,
     planted_at: str | None = None,
 ) -> dict[str, Any]:
     """Create a honeytoken: a fake credential, key, link or document that raises a CRITICAL alert
-    the moment anyone uses it. `type` selects the kind (canary_url, file, credential, ssh_key,
-    api_key, jwt, db_row, kubeconfig, slack_webhook, azure_credential, gcp_service_account).
-    Afterwards call `honeytoken_export` for planting instructions. A token only fires when the
-    attacker uses it where this deployment can see it: a canary URL being fetched, a planted
-    credential being tried against one of your honeypots, or (cloud keys) a forwarder you set up.
-    Prefer `honeytoken_generate_credentials` / `honeytoken_generate_aws` for those common cases.
+    when someone uses it. Returns the secret once, with instructions for planting it.
+
+    Use it for "make me a fake SSH key / Kubernetes config / Slack webhook / canary link". For a fake
+    AWS key or fake passwords use `honeytoken_generate_aws` / `honeytoken_generate_credentials`;
+    for a PDF or DOCX, `honeytoken_embed_file`. It only fires where this server can see it used (a
+    canary URL fetched, a credential tried on its honeypots, a cloud key through a forwarder).
 
     Args:
-        type: Token type. Options:
-              - api_key: AWS credentials. Generated ones are lookalikes that leave no CloudTrail
-                trail; pass a real decoy IAM user's access_key_id + secret_access_key in
-                `metadata` to adopt it (see examples/cloud-forwarders/aws)
-              - canary_url: unique URL that fires on HTTP GET
-              - credential: fake username/password pair (auto-matched on any honeypot)
-              - file: PDF/DOCX with embedded tracker
-              - ssh_key: planted SSH private key (fingerprint match on SSH auth)
-              - jwt: signed JWT (jti match on HTTP Authorization header)
-              - db_row: canary database row with unique email (match on SMTP RCPT TO)
-              - kubeconfig: cluster credentials for a decoy API server
-              - slack_webhook: incoming-webhook URL that fires when posted to
-              - azure_credential: service-principal client id/secret pair (adopt a real decoy
-                with metadata client_id, client_secret, tenant_id)
-              - gcp_service_account: service-account JSON key (adopt a real decoy key with
-                metadata service_account_json)
-        label: Human-readable label to identify this token (e.g. 'prod-server .env backup').
-        metadata: Optional type-specific settings (e.g. {'service': 'aws', 'region': 'us-east-1'}).
-        planted_at: Where this token is being placed — "the finance file share",
-                    "wiki page IT-114", "~/.aws/credentials on the build server".
-                    Strongly recommended. When a token fires months later the
-                    alert says *which* token, and this is what says which system
-                    the attacker actually reached; without it a CRITICAL arrives
-                    with no location and triage starts from nothing.
+        type: What to create: api_key (AWS-style), canary_url (fires when fetched), credential
+            (username/password), file (PDF/DOCX), ssh_key, jwt, db_row (canary e-mail), or a cloud
+            type.
+        label: A name the user will recognise ("backup server .env"). Defaults to the type.
+        metadata: Type-specific settings, normally omitted. Cloud types adopt a real decoy identity
+            when given its keys (api_key: access_key_id + secret_access_key; azure_credential:
+            client_id, client_secret, tenant_id; gcp_service_account: service_account_json).
+        planted_at: Where it is placed ("finance share", "~/.aws/credentials on the build server");
+            when it fires, this says which system was reached.
     """
+    label = _label(label, type)
     try:
         created = await _create_token(type, label, metadata, planted_at)
     except ValueError as e:
-        return {"error": str(e)}
+        return {
+            "error": str(e),
+            "hint": f"Check `metadata` for type '{type}', or leave it out to have the values "
+            "generated.",
+        }
     except IntegrityError:
         # Deliberately not the driver's message: it quotes the bound parameters, i.e. the secret.
-        return {"error": "A honeytoken with this value already exists."}
+        return {
+            "error": "A honeytoken with this value already exists.",
+            "hint": "Leave `metadata` out so a fresh value is generated, or use honeytoken_list to "
+            "find the existing token.",
+        }
     await _audit_creation("honeytoken_create", created, metadata, planted_at)
     return created
+
+
+def _label(label: str | None, kind: str) -> str:
+    """The label given, or one made from what is being created."""
+    return label.strip() if label and label.strip() else kind.replace("_", " ")
 
 
 async def _audit_creation(
@@ -169,6 +178,8 @@ async def _create_token(
     planted_at: str | None,
 ) -> dict[str, Any]:
     """Create and persist a token. Unaudited — every caller records its own action."""
+    if type == "credential":
+        _check_credential_service((metadata or {}).get("service", "ssh"))
     provider = get_provider(HoneytokenType(type))
     token_value, extra_meta = await provider.create(metadata or {})
     await _refuse_duplicate_identity(extra_meta)
@@ -210,63 +221,193 @@ async def _create_token(
     }
 
 
+_LIST_ROWS = 40
+_TRAIL_ROWS = 10
+# A trigger is recorded when the token's alert is flushed, a moment after the event's own time.
+_TRAIL_BEFORE = timedelta(seconds=120)
+_TRAIL_AFTER = timedelta(seconds=10)
+
+
+def _check_credential_service(service: Any) -> None:
+    """Raise ValueError unless `service` is one a planted credential can be matched on: any other
+    value makes a token that no honeypot will ever recognise, and nothing says so."""
+    from honeypot_mcp.credential_match import _SERVICE_PREFIXES
+
+    valid = sorted({*_SERVICE_PREFIXES.values(), "any"})
+    if service not in valid:
+        raise ValueError(
+            f"Unknown service {service!r}: a credential for it would never match a login. "
+            f"Use one of: {', '.join(valid)}."
+        )
+
+
 @mcp.tool(**hints("honeytoken_list"))
 async def honeytoken_list(
     status: Literal["active", "triggered", "revoked"] | None = None,
-) -> list[dict[str, Any]]:
-    """List honeytokens with their type, label and status (active, triggered, revoked), optionally
-    filtered by status. Use `honeytoken_status` for who triggered one and when.
+    label: str | None = None,
+) -> dict[str, Any]:
+    """List the honeytokens: id, type, label, where planted and whether each has fired.
+
+    Use it for "what bait have I planted?", "which tokens have been triggered?" or to find the id
+    of "the backup server token" for the other honeytoken tools.
 
     Args:
-        status: Filter by status (active, triggered, revoked). Omit for all.
+        status: Only active, triggered (fired) or revoked tokens; leave out for all.
+        label: Part of a token's name, when the user names it (case-insensitive).
     """
     ht_status = HoneytokenStatus(status) if status else None
     async with get_session() as session:
         tokens = await queries.list_honeytokens(session, status=ht_status)
+    wanted = (label or "").strip().lower()
+    if wanted:
+        tokens = [t for t in tokens if wanted in (t.label or "").lower()]
 
-    return [
-        {
-            "id": t.id,
-            "type": t.type.value,
-            "label": t.label,
-            "status": t.status.value,
-            "created_at": t.created_at.isoformat() if t.created_at else None,
-            "triggered_at": t.triggered_at.isoformat() if t.triggered_at else None,
-        }
-        for t in tokens
-    ]
+    by_status = Counter(t.status.value for t in tokens)
+    # Live bait first (fired, then waiting), retired tokens last; newest first within each.
+    rank = {HoneytokenStatus.TRIGGERED: 0, HoneytokenStatus.ACTIVE: 1, HoneytokenStatus.REVOKED: 2}
+    tokens = sorted(tokens, key=lambda t: rank[t.status])
+    shown = tokens[:_LIST_ROWS]
+    notes = []
+    if not tokens:
+        notes.append(
+            "No honeytokens match."
+            if (status or wanted)
+            else "No honeytokens yet. honeytoken_generate_credentials, honeytoken_generate_aws or "
+            "honeytoken_create plant one."
+        )
+    if len(tokens) > len(shown):
+        notes.append(
+            f"Showing {len(shown)} of {len(tokens)} (triggered, then active, then revoked; newest "
+            "first); ask for only active, triggered or revoked tokens, or name one, to narrow it."
+        )
+    return {
+        "count": len(shown),
+        "total": len(tokens),
+        "by_status": dict(by_status),
+        "tokens": [
+            {
+                "id": t.id,
+                "type": t.type.value,
+                "label": t.label,
+                "status": t.status.value,
+                "planted_at": (t.token_meta or {}).get("planted_at"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "triggered_at": t.triggered_at.isoformat() if t.triggered_at else None,
+            }
+            for t in shown
+        ],
+        "note": " ".join(notes) or None,
+    }
+
+
+async def _trail(token_id: int, triggers: list[Any], triggered_at: datetime | None) -> list[Any]:
+    """The newest events linked to a token, found around its recorded triggers.
+
+    `attacker_events.honeytoken_id` has no index, and an older database still holds a copy of
+    every event ever captured there (millions of rows), so filtering on it alone reads the whole
+    table. Each trigger carries the time it fired, and `timestamp` is indexed, so only a narrow
+    window around each of the newest triggers is read."""
+    moments: list[datetime] = []
+    for entry in reversed(triggers):
+        at = entry.get("at") if isinstance(entry, dict) else None
+        try:
+            moments.append(datetime.fromisoformat(str(at)))
+        except ValueError:
+            continue
+        if len(moments) == _TRAIL_ROWS:
+            break
+    if not moments and triggered_at is not None:
+        moments.append(triggered_at)
+    found: dict[int, AttackerEvent] = {}
+    async with get_session() as session:
+        for moment in moments:
+            moment = moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+            rows = (
+                await session.execute(
+                    select(AttackerEvent).where(
+                        AttackerEvent.honeytoken_id == token_id,
+                        AttackerEvent.timestamp >= moment - _TRAIL_BEFORE,
+                        AttackerEvent.timestamp <= moment + _TRAIL_AFTER,
+                    )
+                )
+            ).scalars()
+            found.update({e.id: e for e in rows})
+    newest = sorted(found.values(), key=lambda e: e.timestamp, reverse=True)
+    return newest[:_TRAIL_ROWS]
 
 
 @mcp.tool(**hints("honeytoken_status"))
-async def honeytoken_status(token_id: int) -> dict[str, Any]:
-    """Details for one honeytoken: its type, label, status and trigger history (which attacker IP
-    used it, when, and through what).
+async def honeytoken_status(
+    token_id: int | None = None, label: str | None = None
+) -> dict[str, Any]:
+    """Show one honeytoken: type, label, status and its trail (which address used it, when, and
+    through which service).
+
+    Use it for "has the backup server token fired?" or "who used token 21?". Give the id, or part
+    of its name; if several tokens match you get their ids to choose from.
 
     Args:
-        token_id: The numeric honeytoken ID.
+        token_id: The honeytoken's id (honeytoken_list shows them).
+        label: Part of the token's name, when the user names it instead of giving an id.
     """
-    from sqlalchemy import select
-
+    if token_id is None and not (label or "").strip():
+        return {
+            "error": "Say which honeytoken: give its id or part of its name.",
+            "hint": "honeytoken_list shows every token's id and label.",
+        }
     async with get_session() as session:
-        result = await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
-        token = result.scalar_one_or_none()
-        if not token:
-            return {"error": f"No honeytoken with id={token_id}."}
+        stmt = select(Honeytoken)
+        if token_id is not None:
+            stmt = stmt.where(Honeytoken.id == token_id)
+        matches = list((await session.execute(stmt.order_by(Honeytoken.id.desc()))).scalars())
+    wanted = (label or "").strip().lower()
+    if wanted:
+        matches = [t for t in matches if wanted in (t.label or "").lower()]
+    if not matches:
+        which = f"id={token_id}" if token_id is not None else f"a name containing {label!r}"
+        return {
+            "error": f"No honeytoken with {which}.",
+            "hint": "honeytoken_list shows every token's id and label.",
+        }
+    if len(matches) > 1:
+        return {
+            "count": len(matches),
+            "matches": [
+                {"id": t.id, "label": t.label, "type": t.type.value, "status": t.status.value}
+                for t in matches[:_LIST_ROWS]
+            ],
+            "note": "Several honeytokens match; ask about one by id.",
+        }
+    token = matches[0]
 
-        from sqlalchemy import select as sa_select
-
-        from honeypot_mcp.storage.models import AttackerEvent
-
-        ev_result = await session.execute(
-            sa_select(AttackerEvent)
-            .where(AttackerEvent.honeytoken_id == token_id)
-            .order_by(AttackerEvent.timestamp.desc())
-            .limit(20)
-        )
-        token_events = list(ev_result.scalars().all())
+    meta = dict(token.token_meta or {})
+    triggers = meta.pop("triggers", None)
+    triggers = triggers if isinstance(triggers, list) else []
+    planted = await load_planted()
+    trail = await _trail(token.id, triggers, token.triggered_at)
+    if trail:
+        trail_out = [
+            {
+                "at": e.timestamp.isoformat(),
+                "source_ip": e.ip,
+                "event_type": e.event_type,
+                "detail": _redacted(digest_payload(e.extra), planted),
+            }
+            for e in trail
+        ]
+    else:
+        trail_out = [
+            {
+                "at": t.get("at"),
+                "source_ip": t.get("trigger_ip"),
+                "event_type": t.get("trigger_event_type"),
+            }
+            for t in reversed(triggers[-_TRAIL_ROWS:])
+            if isinstance(t, dict)
+        ]
 
     token_value = token.token_value
-    metadata: dict[str, Any] | None = token.token_meta
+    metadata: dict[str, Any] | None = meta
     if not role_at_least("operator"):
         # A viewer can see that a token exists and whether it fired, but not
         # the planted secret: the viewer tier is read-only and a full value
@@ -274,64 +415,69 @@ async def honeytoken_status(token_id: int) -> dict[str, Any]:
         token_value = f"{token_value[:4]}…" if token_value else token_value
         metadata = {"redacted": True}
 
-    return {
-        "id": token.id,
-        "type": token.type.value,
-        "label": token.label,
-        "token_value": token_value,
-        "status": token.status.value,
-        "metadata": metadata,
-        "created_at": token.created_at.isoformat() if token.created_at else None,
-        "triggered_at": token.triggered_at.isoformat() if token.triggered_at else None,
-        "trigger_metadata": token.trigger_metadata,
-        "trigger_events": [
-            {
-                "ip": e.ip,
-                "event_type": e.event_type,
-                "timestamp": e.timestamp.isoformat(),
-                "extra": e.extra,
-            }
-            for e in token_events
-        ],
-    }
+    notes = []
+    if token.status is HoneytokenStatus.ACTIVE and not trail_out:
+        notes.append("Not triggered: nothing has used this token yet.")
+    if len(triggers) >= queries._MAX_TRIGGER_HISTORY:
+        notes.append(
+            f"The token has fired at least {len(triggers)} times; its record keeps the last "
+            f"{queries._MAX_TRIGGER_HISTORY}. bait_trips shows who used it and what they did first."
+        )
+    return mark_untrusted(
+        {
+            "id": token.id,
+            "type": token.type.value,
+            "label": token.label,
+            "token_value": token_value,
+            "status": token.status.value,
+            "metadata": metadata,
+            "created_at": token.created_at.isoformat() if token.created_at else None,
+            "triggered_at": token.triggered_at.isoformat() if token.triggered_at else None,
+            "times_triggered": len(triggers),
+            "trail": trail_out,
+            "note": " ".join(notes) or None,
+        }
+    )
+
+
+def _redacted(value: Any, planted: Planted) -> Any:
+    """`value` with every planted secret in its strings masked."""
+    if isinstance(value, str):
+        return planted.redact(value)
+    if isinstance(value, dict):
+        return {k: _redacted(v, planted) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redacted(v, planted) for v in value]
+    return value
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeytoken_rotate"))
 async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dict[str, Any]:
-    """Replace a honeytoken with a fresh one, keeping its identity and history.
+    """Replace a honeytoken with a fresh secret, keeping its label, type and history.
 
-    Rotation is routine: a token fires and has to be replaced, or a planted
-    secret has simply been in place long enough. Doing it as revoke-then-create
-    loses the thread — the new token is unrelated to the old one, so "this
-    credential has now fired three times over eight months" becomes three
-    unconnected incidents, and the old value stops being attributable.
-
-    This keeps both. The old token is marked REVOKED and stays in the database,
-    so historical triggers still resolve to it; the new one carries the same
-    label, type and metadata and records `rotated_from`, with the old one
-    recording `rotated_to`. Where it is planted carries over unless you give a
-    new location.
-
-    The new secret is different, so the planted copy has to be replaced
-    wherever it lives — `plant_instructions` in the response says how.
+    Use it for "rotate the bait credential" or "that token fired, issue a new one". The old token
+    is revoked but kept, so past triggers still resolve to it, and the two are linked
+    (`rotated_from` / `rotated_to`). The planted copy has to be replaced with the new secret;
+    `plant_instructions` in the response says how.
 
     Args:
-        token_id: The honeytoken to rotate.
-        planted_at: New location, if it is moving. Defaults to the old one.
+        token_id: The honeytoken to rotate (honeytoken_list shows ids).
+        planted_at: New location if it is moving; defaults to the old one.
     """
-    from sqlalchemy import select
-
-    from honeypot_mcp.storage.models import Honeytoken
-
     async with get_session() as session:
         old = (
             await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
         ).scalar_one_or_none()
         if old is None:
-            return {"error": f"No honeytoken with id={token_id}."}
+            return {
+                "error": f"No honeytoken with id={token_id}.",
+                "hint": "honeytoken_list shows every token's id and label.",
+            }
         if old.status is HoneytokenStatus.REVOKED:
             return {
-                "error": f"Honeytoken {token_id} is already revoked — create a new one instead.",
+                "error": f"Honeytoken {token_id} is already revoked.",
+                "hint": "Create a new one with honeytoken_create, or rotate the token that "
+                "replaced it (honeytoken_status shows `rotated_to`).",
             }
         old_type = old.type
         old_label = old.label
@@ -341,9 +487,10 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
             "error": (
                 f"Honeytoken {token_id} is a real identity from your cloud account, so it "
                 "cannot be rotated here: a generated replacement would not exist in the cloud "
-                "and would silently stop detecting. Issue a new key in the cloud, create a new "
-                "token from it, then revoke this one."
-            )
+                "and would silently stop detecting."
+            ),
+            "hint": "Issue a new key in the cloud, create a token from it with honeytoken_create "
+            "(metadata = the new keys), then honeytoken_revoke this one.",
         }
 
     # Anything the provider generated is regenerated; only the operator's
@@ -378,14 +525,15 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
     }
     carried = {k: v for k, v in old_meta.items() if k not in _GENERATED}
 
-    created = await _create_token(
-        type=old_type.value,
-        label=old_label,
-        metadata=carried,
-        planted_at=planted_at or old_meta.get("planted_at"),
-    )
-    if "error" in created:
-        return created
+    try:
+        created = await _create_token(
+            type=old_type.value,
+            label=old_label,
+            metadata=carried,
+            planted_at=planted_at or old_meta.get("planted_at"),
+        )
+    except ValueError as e:
+        return {"error": str(e), "hint": "Create a replacement with honeytoken_create instead."}
 
     async with get_session() as session:
         new_token = (
@@ -420,24 +568,30 @@ async def honeytoken_rotate(token_id: int, planted_at: str | None = None) -> dic
 
 @mcp.tool(auth=require_role("operator"), **hints("honeytoken_revoke"))
 async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
-    """Deactivate a honeytoken so it no longer alerts. There is no un-revoke: create a new token
-    (or use `honeytoken_rotate`, which keeps the history and issues a fresh secret) if you still want one.
+    """Stop a honeytoken from alerting. It cannot be undone, but the token and its history stay.
+
+    Use it for "retire the bait credential" or "that token leaked, turn it off". To keep watching
+    with a fresh secret, use `honeytoken_rotate` instead.
 
     Args:
-        token_id: The numeric honeytoken ID.
+        token_id: The honeytoken to revoke (honeytoken_list shows ids and labels).
     """
-    from sqlalchemy import update
-
-    from honeypot_mcp.storage.models import Honeytoken
-
     async with get_session() as session:
-        result = await session.execute(
-            update(Honeytoken)
-            .where(Honeytoken.id == token_id)
-            .values(status=HoneytokenStatus.REVOKED)
-        )
-        if result.rowcount == 0:  # type: ignore[attr-defined]
-            return {"error": f"No honeytoken with id={token_id}."}
+        token = (
+            await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
+        ).scalar_one_or_none()
+        if token is None:
+            return {
+                "error": f"No honeytoken with id={token_id}.",
+                "hint": "honeytoken_list shows every token's id and label.",
+            }
+        if token.status is HoneytokenStatus.REVOKED:
+            return {
+                "token_id": token_id,
+                "status": "revoked",
+                "note": "It was already revoked; nothing changed.",
+            }
+        token.status = HoneytokenStatus.REVOKED
 
     _invalidate_matcher_caches()
 
@@ -447,83 +601,112 @@ async def honeytoken_revoke(token_id: int) -> dict[str, Any]:
         arguments={"token_id": token_id},
         target=str(token_id),
     )
-    return {"token_id": token_id, "status": "revoked"}
+    return {
+        "token_id": token_id,
+        "status": "revoked",
+        "note": "It will no longer match or alert. honeytoken_rotate issues a fresh replacement.",
+    }
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeytoken_generate_aws"))
 async def honeytoken_generate_aws(
-    label: str,
+    label: str | None = None,
     region: str = "us-east-1",
-    service_prefix: str = "AKIA",
     access_key_id: str | None = None,
     secret_access_key: str | None = None,
 ) -> dict[str, Any]:
-    """Create an AWS access-key honeytoken. With no key given it is a lookalike that does NOT
-    exist in AWS, so using it leaves no CloudTrail event: it is only bait for scanners that grep
-    for AKIA strings. For real detection create a decoy IAM user (Terraform in
-    `examples/cloud-forwarders/aws/terraform/decoy_user.tf`), deploy the forwarder, and pass that
-    user's `access_key_id` and `secret_access_key` here: its use is then logged by CloudTrail,
-    forwarded, and raises a CRITICAL alert with the attacker's source IP.
+    """Make a fake AWS access key (ID and secret) to plant as bait, e.g. for "a fake AWS key for the
+    backup server".
+
+    Alone it is a lookalike that does not exist in AWS, so using it leaves no CloudTrail event: it
+    only catches scanners that grep for AKIA strings. For real detection, pass the keys of a decoy
+    IAM user you created (examples/cloud-forwarders/aws): CloudTrail then logs its use and the
+    forwarder raises a CRITICAL alert with the attacker's address.
 
     Args:
-        label: Human-readable label (e.g. 'leaked-in-github-repo').
-        region: AWS region to embed in the credentials file.
-        service_prefix: AKIA (long-term) or ASIA (temporary); ignored when adopting a key.
-        access_key_id: A real decoy user's access key ID (adopt it instead of generating one).
-        secret_access_key: The matching secret. Required with access_key_id.
+        label: What the key is for ("backup server", "leaked in the GitHub repo"). Optional.
+        region: AWS region written into the credentials file (default us-east-1).
+        access_key_id: Access key ID of the real decoy user, to adopt it instead of generating one.
+        secret_access_key: Its secret; required together with access_key_id.
     """
-    metadata: dict[str, Any] = {"service": "aws", "region": region, "prefix": service_prefix}
+    label = _label(label, "AWS key")
+    metadata: dict[str, Any] = {"service": "aws", "region": region}
     if access_key_id is not None or secret_access_key is not None:
         metadata["access_key_id"] = access_key_id
         metadata["secret_access_key"] = secret_access_key
     try:
         created = await _create_token("api_key", label, metadata, None)
     except ValueError as e:
-        return {"error": str(e)}
+        return {
+            "error": str(e),
+            "hint": "To adopt a real decoy key give both access_key_id (AKIA/ASIA + 16 characters) "
+            "and secret_access_key (40 characters); leave both out to generate a lookalike.",
+        }
     except IntegrityError:
         # Deliberately not the driver's message: it quotes the bound parameters, i.e. the secret.
-        return {"error": "A honeytoken with this value already exists."}
+        return {
+            "error": "A honeytoken with this value already exists.",
+            "hint": "honeytoken_list shows the existing token.",
+        }
     await _audit_creation("honeytoken_generate_aws", created, metadata, None)
     return created
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeytoken_generate_credentials"))
 async def honeytoken_generate_credentials(
-    label: str,
+    label: str | None = None,
     count: int = 5,
     service: str = "ssh",
 ) -> dict[str, Any]:
-    """Generate believable fake username/password pairs for a service (ssh, ftp, http, smtp, rdp, ...)
-    and store them as honeytokens. They fire when an attacker tries them against one of your own
-    honeypots for that service, with a CRITICAL alert naming the token. Returned once: plant them.
+    """Make believable fake username/password pairs to plant as bait, e.g. "fake MySQL logins for
+    the .env file". They fire a CRITICAL alert when an attacker tries one on your honeypot for that
+    service. The passwords are returned once: plant them.
 
     Args:
-        label: Label for this credential set.
-        count: Number of credential pairs to generate (default 5).
-        service: Target service context (ssh, mysql, ftp, admin).
+        label: What the logins are for ("db backup script"). Optional.
+        count: How many pairs, 1 to 20 (default 5).
+        service: Which honeypot service they are for (default ssh): telnet, ftp, mysql, postgresql,
+            mssql, redis, rdp, smb, http, smtp, imap, pop3, ldap, snmp, vnc, sip, rsync, memcached,
+            or any.
     """
+    service = (service or "ssh").strip().lower()
+    label = _label(label, f"{service} credentials")
+    if not isinstance(count, int) or not 1 <= count <= 20:
+        return {
+            "error": f"count must be between 1 and 20, got {count!r}.",
+            "hint": "Ask for fewer pairs, or call again for another set.",
+        }
     metadata: dict[str, Any] = {"service": service, "count": count}
-    created = await _create_token("credential", label, metadata, None)
+    try:
+        created = await _create_token("credential", label, metadata, None)
+    except ValueError as e:
+        return {"error": str(e), "hint": "Pick the service of the honeypot they should catch."}
     await _audit_creation("honeytoken_generate_credentials", created, metadata, None)
     return created
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeytoken_embed_file"))
 async def honeytoken_embed_file(
-    label: str,
+    label: str | None = None,
     file_type: Literal["pdf", "docx"] = "pdf",
     document_title: str = "Confidential Report",
 ) -> dict[str, Any]:
-    """Create a document (PDF or DOCX) with an embedded tracking token.
-    The document phones home via a DNS request when opened.
+    """Make a PDF or Word document that raises an alert when someone opens it (it phones home).
+
+    Use it for "a decoy document to leave on the finance share". The response gives the file's
+    path and how to plant it.
 
     Args:
-        label: Label for this file token.
-        file_type: Document format — pdf or docx.
-        document_title: Title shown in the document.
+        label: What the document is for ("finance share decoy"). Optional.
+        file_type: pdf (default) or docx.
+        document_title: Title printed in the document (default "Confidential Report").
     """
+    label = _label(label, f"{file_type} document")
     metadata: dict[str, Any] = {"file_type": file_type, "document_title": document_title}
-    created = await _create_token("file", label, metadata, None)
+    try:
+        created = await _create_token("file", label, metadata, None)
+    except ValueError as e:
+        return {"error": str(e), "hint": "file_type is pdf or docx."}
     await _audit_creation("honeytoken_embed_file", created, metadata, None)
     return created
 
@@ -531,42 +714,71 @@ async def honeytoken_embed_file(
 @mcp.tool(auth=require_role("operator"), **hints("honeytoken_export"))
 async def honeytoken_export(
     token_id: int, context: Literal["env_file", "aws_credentials", "bash", "json"] = "json"
-) -> str:
-    """Format an existing honeytoken for planting in a given context (env file, config snippet,
-    authorized_keys, ...). The output contains the secret value, so treat it as sensitive.
+) -> dict[str, Any]:
+    """Format an existing honeytoken for planting: the text to paste into a file, plus where to put it.
+
+    Use it for "give me that key as a .env file" or "as ~/.aws/credentials". The result contains
+    the secret, so treat it as sensitive.
 
     Args:
-        token_id: The honeytoken ID to export.
-        context: Output format — env_file (.env format), aws_credentials (~/.aws/credentials),
-                 bash (export statements), or json (raw JSON).
+        token_id: The honeytoken to export (honeytoken_list shows ids).
+        context: env_file (.env lines), aws_credentials (~/.aws/credentials), bash (export
+            statements) or json (default). The first three apply to AWS keys only.
     """
-    from sqlalchemy import select
-
     async with get_session() as session:
-        result = await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
-        token = result.scalar_one_or_none()
-        if not token:
-            return f"Error: No honeytoken with id={token_id}."
+        token = (
+            await session.execute(select(Honeytoken).where(Honeytoken.id == token_id))
+        ).scalar_one_or_none()
+    if token is None:
+        return {
+            "error": f"No honeytoken with id={token_id}.",
+            "hint": "honeytoken_list shows every token's id and label.",
+        }
+    if token.status is HoneytokenStatus.REVOKED:
+        return {
+            "error": f"Honeytoken {token_id} is revoked: planting it would catch nothing.",
+            "hint": "honeytoken_create makes a new one, or find its replacement with "
+            "honeytoken_status (`rotated_to`).",
+        }
 
     meta = token.token_meta or {}
     val = token.token_value
-
-    if context == "json":
-        return json.dumps(
-            {"label": token.label, "type": token.type.value, "value": val, "metadata": meta},
-            indent=2,
-        )
-
+    note = "Contains the secret; keep it out of logs and chat history."
+    content: str | None = None
     if token.type == HoneytokenType.API_KEY and meta.get("service") == "aws":
         key_id = meta.get("access_key_id", val[:20])
         secret = meta.get("secret_access_key", val[20:])
         region = meta.get("region", "us-east-1")
-
         if context == "aws_credentials":
-            return f"[default]\naws_access_key_id = {key_id}\naws_secret_access_key = {secret}\nregion = {region}\n"
-        if context == "env_file":
-            return f"AWS_ACCESS_KEY_ID={key_id}\nAWS_SECRET_ACCESS_KEY={secret}\nAWS_DEFAULT_REGION={region}\n"
-        if context == "bash":
-            return f'export AWS_ACCESS_KEY_ID="{key_id}"\nexport AWS_SECRET_ACCESS_KEY="{secret}"\nexport AWS_DEFAULT_REGION="{region}"\n'
-
-    return json.dumps({"label": token.label, "type": token.type.value, "value": val}, indent=2)
+            content = (
+                f"[default]\naws_access_key_id = {key_id}\n"
+                f"aws_secret_access_key = {secret}\nregion = {region}\n"
+            )
+        elif context == "env_file":
+            content = (
+                f"AWS_ACCESS_KEY_ID={key_id}\nAWS_SECRET_ACCESS_KEY={secret}\n"
+                f"AWS_DEFAULT_REGION={region}\n"
+            )
+        elif context == "bash":
+            content = (
+                f'export AWS_ACCESS_KEY_ID="{key_id}"\nexport AWS_SECRET_ACCESS_KEY="{secret}"\n'
+                f'export AWS_DEFAULT_REGION="{region}"\n'
+            )
+    elif context != "json":
+        note += f" `{context}` only applies to AWS keys, so the JSON form is returned."
+    if content is None:
+        context = "json"
+        content = json.dumps(
+            {"label": token.label, "type": token.type.value, "value": val, "metadata": meta},
+            indent=2,
+        )
+    provider = get_provider(token.type)
+    return {
+        "token_id": token.id,
+        "label": token.label,
+        "type": token.type.value,
+        "context": context,
+        "content": content,
+        "plant_instructions": provider.plant_instructions(val, meta),
+        "note": note,
+    }

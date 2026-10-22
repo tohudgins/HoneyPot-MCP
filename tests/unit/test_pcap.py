@@ -299,7 +299,8 @@ async def test_pcap_control_rejects_an_unknown_action():
     from honeypot_mcp.tools.pcap import pcap_control
 
     result = await pcap_control("bogus")
-    assert result == {"error": "action must be start, stop or restart (got 'bogus')"}
+    assert result["error"] == "action must be start, stop or restart (got 'bogus')."
+    assert "start" in result["hint"] and "stop" in result["hint"]
 
 
 @pytest.mark.asyncio

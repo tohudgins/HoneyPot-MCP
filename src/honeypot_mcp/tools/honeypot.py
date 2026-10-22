@@ -5,16 +5,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import difflib
+import errno
 import logging
 import secrets
+import socket
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
 from sqlalchemy import delete, update
 
 from honeypot_mcp import instance_lock
-from honeypot_mcp.deception.capabilities import BY_TYPE
+from honeypot_mcp.deception.capabilities import BY_TYPE, resolve_type, suggest_types
+from honeypot_mcp.deception.planner import reserved_ports
 from honeypot_mcp.engines import get_engine
+from honeypot_mcp.engines.http_personas import all_persona_ids as _http_persona_ids
+from honeypot_mcp.engines.ssh_personas import all_persona_ids as _ssh_persona_ids
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
 from honeypot_mcp.storage import queries, rollups
@@ -22,133 +28,241 @@ from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
-from honeypot_mcp.tools._format import validate_honeypot_name
+from honeypot_mcp.tools._format import mark_untrusted, validate_honeypot_name
 
 log = logging.getLogger(__name__)
+_SELF_TEST_SECONDS = 10
+_SELF_TEST_DOCKER_SECONDS = 30
 
 # Upper bound on one engine's stop. An in-process engine's server.wait_closed()
 # can wait on a lingering attacker connection indefinitely, and retiring a
 # sensor must not depend on the attacker hanging up.
 _ENGINE_STOP_TIMEOUT_SECONDS = 15.0
 
+# What a person might say a sensor is in the middle of: used to read a status word and to cap what
+# a list tool puts in front of a model.
+_STATUS_NAMES = ", ".join(s.value for s in HoneypotStatus)
+_NAME_LIST_CAP = 30
+_LIST_CAP = 100
+_PORT_SCAN_SPAN = 200
+_LOG_LINE_CHARS = 240
+_LOG_TOTAL_CHARS = 8000
+_TRANSPORT_LABEL = {"tcp": "tcp", "udp": "udp", "both": "tcp+udp"}
+
+
+def _type_error(value: Any, *, extra: str = "") -> dict[str, Any]:
+    """The error for a sensor type nobody offers, with the closest valid ones and all of them."""
+    near = suggest_types(value) if isinstance(value, str) else []
+    return {
+        "error": f"Unknown honeypot type '{value}'.",
+        "hint": (f"Did you mean {', '.join(near)}? " if near else "")
+        + f"Valid types: {', '.join(BY_TYPE)}{extra}. `honeypot_templates` says what each captures.",
+    }
+
+
+def _parse_status(value: Any) -> tuple[HoneypotStatus | None, dict[str, Any] | None]:
+    if value is None or value == "":
+        return None, None
+    try:
+        return HoneypotStatus(str(value).strip().lower()), None
+    except ValueError:
+        return None, {
+            "error": f"Unknown status '{value}'.",
+            "hint": f"Use one of: {_STATUS_NAMES}.",
+        }
+
+
+def _port_is_free(port: int, transport: str) -> bool:
+    """Whether this host can listen on `port` right now (every interface, as the engines do)."""
+    kinds = {"tcp": (socket.SOCK_STREAM,), "udp": (socket.SOCK_DGRAM,)}.get(
+        transport, (socket.SOCK_STREAM, socket.SOCK_DGRAM)
+    )
+    for kind in kinds:
+        with socket.socket(socket.AF_INET, kind) as probe:
+            try:
+                probe.bind(("0.0.0.0", port))  # noqa: S104 - the engines bind the same way
+            except OSError:
+                return False
+    return True
+
+
+def _free_port(start: int, transport: str, taken: set[int]) -> int | None:
+    """The first port from `start` that nothing here uses or listens on, or None."""
+    candidates = list(range(max(start, 1), min(start + _PORT_SCAN_SPAN, 65535) + 1))
+    if start < 1024:  # privileged ports usually cannot be bound; fall back to a high range
+        candidates += range(20000, 20000 + _PORT_SCAN_SPAN)
+    reserved = reserved_ports()
+    for port in candidates:
+        if port not in taken and port not in reserved and _port_is_free(port, transport):
+            return port
+    return None
+
+
+def _auto_name(hp_type: str, port: int, taken: set[str]) -> str:
+    """`ftp-2121`: the kind and where it listens, which is how a person refers to a sensor."""
+    base = f"{hp_type}-{port}"
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    return name
+
+
+def _bind_problem(exc: BaseException) -> str | None:
+    """`in_use` or `privileged` when a start failure is about the port, else None."""
+    text = str(exc).lower()
+    code = getattr(exc, "errno", None)
+    if code == errno.EADDRINUSE or "address already in use" in text or "already allocated" in text:
+        return "in_use"
+    if code in (errno.EACCES, errno.EPERM) or "permission denied" in text:
+        return "privileged"
+    return None
+
+
+async def _find_sensor(session: Any, name: Any) -> tuple[Honeypot | None, dict[str, Any] | None]:
+    """The sensor a person meant: its exact name, the same ignoring case, or a type or port that
+    only one sensor has ("the ftp one", "2121"). An error object, with what exists, otherwise."""
+    wanted = str(name).strip() if name is not None else ""
+    hp = await queries.get_honeypot_by_name(session, wanted) if wanted else None
+    if hp is not None:
+        return hp, None
+    sensors = await queries.list_honeypots(session)
+    lowered = wanted.lower()
+    matches = [h for h in sensors if h.name.lower() == lowered]
+    if not matches and wanted:
+        kind = resolve_type(wanted)
+        if kind is not None:
+            matches = [
+                h
+                for h in sensors
+                if h.type.value == kind and h.status is not HoneypotStatus.STOPPED
+            ]
+        elif wanted.isdigit():
+            matches = [h for h in sensors if h.port == int(wanted)]
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, {
+            "error": f"'{wanted}' matches {len(matches)} honeypots: {', '.join(h.name for h in matches)}.",
+            "hint": "Say which one, by its exact name.",
+        }
+    names = [h.name for h in sensors]
+    if not names:
+        return None, {
+            "error": f"No honeypot named '{wanted}': none are deployed.",
+            "hint": "Deploy one with `honeypot_deploy`, or a whole environment with `deception_plan`.",
+        }
+    near = difflib.get_close_matches(wanted, names, n=3, cutoff=0.5)
+    shown = ", ".join(names[:_NAME_LIST_CAP]) + (" ..." if len(names) > _NAME_LIST_CAP else "")
+    return None, {
+        "error": f"No honeypot named '{wanted}'.",
+        "hint": (f"Did you mean {', '.join(near)}? " if near else "")
+        + f"Deployed: {shown}. `honeypot_list` shows them all.",
+    }
+
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_deploy"))
 async def honeypot_deploy(
-    type: Literal[
-        "ssh",
-        "http",
-        "smtp",
-        "ftp",
-        "dns",
-        "rdp",
-        "vnc",
-        "redis",
-        "mysql",
-        "elasticsearch",
-        "smb",
-        "postgresql",
-        "mongodb",
-        "mssql",
-        "telnet",
-        "memcached",
-        "snmp",
-        "ldap",
-        "docker_api",
-        "imap",
-        "sip",
-        "rsync",
-        "nfs",
-        "pop3",
-        "kubernetes",
-    ],
+    type: str,
     port: int | None = None,
     name: str | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Deploy a honeypot (a decoy network service) and start capturing attacks against it.
-    Choose `type` from `honeypot_templates` (25 kinds: ssh, http, smtp, ftp, rdp, redis, mysql, ...);
-    it listens on that type's default port unless you pass `port`. Returns the honeypot's name,
-    port and status. For several sensors that must look like one coherent environment, use
-    `deception_plan` then `deception_deploy_plan` instead: they pick consistent identities and free
-    ports. SSH and Telnet run Cowrie in Docker; every other type runs inside this server. Fails with
-    a hint if the port is in use or (SSH/Telnet) Docker is unavailable.
+
+    Use it for "deploy an SSH honeypot", "put a fake Redis on the network", "open a decoy MySQL".
+    Only `type` is needed: a free port (the type's usual one when free) and a readable name are
+    chosen, and the result says where it listens. Check it with `honeypot_self_test`. For several
+    decoys that should look like one environment, use `deception_plan` instead.
 
     Args:
-        type: Protocol type — ssh, telnet, http, smtp, ftp, dns, rdp, vnc,
-              redis, mysql, elasticsearch, smb, postgresql, mongodb, mssql,
-              memcached, snmp, ldap, docker_api, imap, sip, rsync, nfs, pop3, or kubernetes.
-        port: Host port to bind (defaults to the configured default for each type).
-        name: Unique name for this honeypot (auto-generated if omitted).
-        config: Optional engine-specific overrides (e.g. fake_hostname, endpoints).
+        type: ssh, telnet, http, smtp, ftp, dns, rdp, vnc, redis, mysql, elasticsearch, smb,
+            postgresql, mongodb, mssql, memcached, snmp, ldap, docker_api, imap, sip, rsync, nfs,
+            pop3 or kubernetes ("postgres", "k8s" work). ssh and telnet need Docker.
+        port: Only if the user names a port ("on 8080"); otherwise leave out.
+        name: Only if the user names it; otherwise something like `ftp-2121` is used.
+        config: Rarely needed settings for this type; `honeypot_templates` with the type lists them.
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
     from honeypot_mcp.config import get_settings
 
-    settings = get_settings()
-    default_ports = {
-        "ssh": settings.default_ssh_port,
-        "http": settings.default_http_port,
-        "ftp": settings.default_ftp_port,
-        "smtp": settings.default_smtp_port,
-        "dns": settings.default_dns_port,
-        "rdp": settings.default_rdp_port,
-        "vnc": settings.default_vnc_port,
-        "redis": settings.default_redis_port,
-        "mysql": settings.default_mysql_port,
-        "elasticsearch": settings.default_elasticsearch_port,
-        "smb": settings.default_smb_port,
-        "postgresql": settings.default_postgresql_port,
-        "mongodb": settings.default_mongodb_port,
-        "mssql": settings.default_mssql_port,
-        "telnet": settings.default_telnet_port,
-        "memcached": settings.default_memcached_port,
-        "snmp": settings.default_snmp_port,
-        "ldap": settings.default_ldap_port,
-        "docker_api": settings.default_docker_api_port,
-        "imap": settings.default_imap_port,
-        "sip": settings.default_sip_port,
-        "rsync": settings.default_rsync_port,
-        "nfs": settings.default_nfs_port,
-        "pop3": settings.default_pop3_port,
-        "kubernetes": settings.default_kubernetes_port,
-    }
-    resolved_port = port or default_ports[type]
-    resolved_name = name or f"{type}-{secrets.token_hex(4)}"
-    resolved_config = config or {}
+    resolved_type = resolve_type(type)
+    if resolved_type is None:
+        return _type_error(type)
+    type = resolved_type
+    capability = BY_TYPE[type]
+    resolved_config = {} if config is None else config
     # The same allow-list and value checks `honeypot_configure` applies: deploy,
     # deception_deploy_plan and clone all store this dict verbatim and hand it to
     # the engine, so a CR/LF in a banner or an unread key slipped in here.
     if not isinstance(resolved_config, dict):
-        return {"error": "config must be a JSON object."}
+        return {"error": "config must be a JSON object.", "hint": _config_hint(type)}
     if err := _validate_config(type, resolved_config):
+        return {"error": err, "hint": _config_hint(type)}
+    if name and (err := validate_honeypot_name(name)):
         return {"error": err}
-
-    if err := validate_honeypot_name(resolved_name):
-        return {"error": err}
-
-    if not 1 <= resolved_port <= 65535:
-        return {"error": f"Port {resolved_port} is out of range — must be between 1 and 65535."}
+    if port is not None and not 1 <= port <= 65535:
+        return {
+            "error": f"Port {port} is out of range.",
+            "hint": "Ports run from 1 to 65535; leave `port` out to have a free one chosen.",
+        }
 
     hp_type = HoneypotType(type)
     engine = get_engine(hp_type)
+    default_port = getattr(get_settings(), f"default_{type}_port", None)
+    default_port = default_port or capability.default_port
 
     async with get_session() as session:
-        existing = await queries.get_honeypot_by_name(session, resolved_name)
-        if existing:
-            return {"error": f"Honeypot named '{resolved_name}' already exists (id={existing.id})."}
-        # A port collision with one of our own honeypots is the most common
-        # deploy failure. Catching it here names the conflicting honeypot,
-        # instead of surfacing a bind error from deep inside the engine.
-        conflict = await queries.get_honeypot_by_port(session, resolved_port)
-        if conflict and conflict.status == HoneypotStatus.RUNNING:
+        rows = await queries.list_honeypots(session)
+        taken_names = {h.name for h in rows}
+        # A stopped sensor no longer holds its port; a paused one will want it back on resume.
+        taken_ports = {
+            h.port: h for h in rows if h.status in (HoneypotStatus.RUNNING, HoneypotStatus.PAUSED)
+        }
+        if name and name in taken_names:
+            existing = next(h for h in rows if h.name == name)
             return {
-                "error": (
-                    f"Port {resolved_port} is already used by honeypot "
-                    f"'{conflict.name}' ({conflict.type.value}, id={conflict.id})."
+                "error": f"A honeypot named '{name}' already exists (id={existing.id}, "
+                f"status={existing.status.value}).",
+                "hint": "Leave `name` out for a fresh one"
+                + (
+                    f", or remove it first with honeypot_stop(name='{name}', remove=true)."
+                    if existing.status is HoneypotStatus.STOPPED
+                    else "."
                 ),
-                "hint": "Pick a different port, or stop that honeypot first.",
             }
+        moved_from: int | None = None
+        if port is None:
+            resolved_port = _free_port(default_port, capability.transport, set(taken_ports))
+            if resolved_port is None:
+                return {
+                    "error": f"No free port found at or after {default_port}.",
+                    "hint": "Name a port that is free on this host with `port`.",
+                }
+            if resolved_port != default_port:
+                moved_from = default_port
+        else:
+            resolved_port = port
+            # A port collision with one of our own honeypots is the most common
+            # deploy failure. Catching it here names the conflicting honeypot,
+            # instead of surfacing a bind error from deep inside the engine.
+            if conflict := taken_ports.get(port):
+                alt = _free_port(port + 1, capability.transport, set(taken_ports))
+                return {
+                    "error": (
+                        f"Port {port} is already used by honeypot "
+                        f"'{conflict.name}' ({conflict.type.value}, id={conflict.id})."
+                    ),
+                    "hint": (
+                        f"Use port {alt}, leave `port` out to have a free one chosen, "
+                        f"or stop '{conflict.name}' first."
+                        if alt
+                        else f"Stop '{conflict.name}' first, or pick another port."
+                    ),
+                    **({"suggested_port": alt} if alt else {}),
+                }
+        resolved_name = name or _auto_name(type, resolved_port, taken_names)
 
         hp = Honeypot(
             name=resolved_name,
@@ -178,10 +292,34 @@ async def honeypot_deploy(
             outcome="error",
             error=str(e),
         )
-        return {
-            "error": f"Failed to start {type} honeypot on port {resolved_port}: {e}",
-            "hint": "Common causes: port already in use, or Docker not running (ssh type).",
+        problem = _bind_problem(e)
+        failure: dict[str, Any] = {
+            "error": f"Failed to start {type} honeypot on port {resolved_port}: {e}"
         }
+        if problem is not None:
+            alt = _free_port(resolved_port + 1, capability.transport, set(taken_ports))
+            failure["error"] = (
+                f"Port {resolved_port} is already in use by another program on this host."
+                if problem == "in_use"
+                else f"Port {resolved_port} cannot be opened here (ports below 1024 need root)."
+            )
+            failure["hint"] = (
+                f"Retry with port={alt}, or leave `port` out and a free one is chosen."
+                if alt
+                else "Pick another port with `port`."
+            )
+            if alt:
+                failure["suggested_port"] = alt
+        elif capability.requires_docker:
+            failure["hint"] = (
+                f"{type} runs in a Docker container: check Docker is running and this user can "
+                "reach it, then retry."
+            )
+        else:
+            failure["hint"] = (
+                "`honeypot_list` shows what is deployed; `honeypot_logs` may say more."
+            )
+        return failure
 
     async with get_session() as session:
         hp_refresh = await queries.get_honeypot_by_id(session, hp_id)
@@ -201,33 +339,56 @@ async def honeypot_deploy(
     from honeypot_mcp.pcap import refresh_capture
 
     await refresh_capture()
-    return {
+    result: dict[str, Any] = {
         "id": hp_id,
         "name": resolved_name,
         "type": type,
         "port": resolved_port,
         "status": "running",
-        "container_id": container_id,
+        "listening_on": f"0.0.0.0:{resolved_port}/{_TRANSPORT_LABEL.get(capability.transport, 'tcp')}",
+        "next_step": f"Verify it captures: honeypot_self_test(name='{resolved_name}').",
     }
+    if capability.requires_docker:
+        result["container_id"] = container_id
+    if moved_from is not None:
+        result["note"] = f"The usual port {moved_from} was taken, so it listens on {resolved_port}."
+    if capability.public_cloud_caution:
+        result["caution"] = capability.public_cloud_caution
+    return result
 
 
 @mcp.tool(**hints("honeypot_list"))
-async def honeypot_list(
-    status: Literal["running", "stopped", "paused", "error"] | None = None,
-) -> list[dict[str, Any]]:
-    """List every honeypot with its type, port, status (running, paused, stopped, error) and
-    alert count. Start here to see what is deployed. Use `honeypot_health` to confirm the sensors
-    actually answer on their ports, and `honeypot_status` for one sensor's recent events.
+async def honeypot_list(status: str | None = None, type: str | None = None) -> dict[str, Any]:
+    """Which honeypots are deployed, and how busy is each?
+
+    Use it for "what is running?", "list the sensors", "which ssh honeypots do I have?". One row
+    per honeypot: name, type, port, status and the number of alerts it has captured. Use
+    `honeypot_health` to confirm they actually answer, `honeypot_status` for one in detail.
 
     Args:
-        status: Filter by status (running, stopped, paused, error). Omit for all.
+        status: Only honeypots in this state: running, paused, stopped or error. Omit for all.
+        type: Only this kind (ssh, http, redis, ...). Omit for all.
     """
-    hp_status = HoneypotStatus(status) if status else None
+    hp_status, bad = _parse_status(status)
+    if bad:
+        return bad
+    kind: str | None = None
+    if type:
+        kind = resolve_type(type)
+        if kind is None:
+            return _type_error(type)
     async with get_session() as session:
         honeypots = await queries.list_honeypots(session, status=hp_status)
-        ids = [hp.id for hp in honeypots]
+        if kind:
+            honeypots = [h for h in honeypots if h.type.value == kind]
+        total = len(honeypots)
+        by_status: dict[str, int] = {}
+        for hp in honeypots:
+            by_status[hp.status.value] = by_status.get(hp.status.value, 0) + 1
+        shown = honeypots[:_LIST_CAP]
+        ids = [hp.id for hp in shown]
         counts = await queries.get_hit_counts(session, ids) if ids else {}
-        result = [
+        rows = [
             {
                 "id": hp.id,
                 "name": hp.name,
@@ -235,12 +396,22 @@ async def honeypot_list(
                 "port": hp.port,
                 "status": hp.status.value,
                 "hits": counts.get(hp.id, 0),
-                "container_id": hp.container_id,
                 "created_at": hp.created_at.isoformat() if hp.created_at else None,
             }
-            for hp in honeypots
+            for hp in shown
         ]
-    return result
+    if not rows:
+        note = (
+            "No honeypots match that filter. Omit it to see everything."
+            if hp_status or kind
+            else "No honeypots are deployed. Use `honeypot_deploy` for one, or `deception_plan` "
+            "to design a whole environment."
+        )
+    elif total > len(rows):
+        note = f"Showing {len(rows)} of {total}; ask for one status or type to narrow it."
+    else:
+        note = "`hits` is the number of alerts each captured, lifetime."
+    return {"count": total, "by_status": by_status, "honeypots": rows, "note": note}
 
 
 def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
@@ -268,26 +439,37 @@ def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
 
 @mcp.tool(**hints("honeypot_status"))
 async def honeypot_status(name: str) -> dict[str, Any]:
-    """Details for one honeypot, by name: its configuration, status and most recent events.
-    Use `honeypot_list` first if you do not know the name.
+    """How is one honeypot doing: its settings, whether it is alive and what it captured lately?
+
+    Use it for "how is the ftp honeypot doing?", "what is hp-ssh configured as?". Use
+    `honeypot_list` to see all of them.
 
     Args:
-        name: The honeypot name.
+        name: The honeypot's name; its type ("ftp") or port also work when only one matches.
     """
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}' found."}
+        hp, problem = await _find_sensor(session, name)
+        if hp is None:
+            return problem or {"error": f"No honeypot named '{name}'."}
 
         hits = await queries.get_honeypot_hit_count(session, hp.id)
         recent = await queries.get_recent_alerts(session, limit=10, honeypot_id=hp.id)
 
         engine = get_engine(hp.type)
-        engine_status = {}
+        engine_status: dict[str, Any] = {}
         if foreign := _owned_elsewhere(hp):
             engine_status = foreign
         elif hp.container_id:
-            engine_status = await engine.status(hp.container_id)
+            try:
+                engine_status = await engine.status(hp.container_id)
+            except Exception as e:  # noqa: BLE001 - report it rather than fail the whole answer
+                engine_status = {"error": f"Could not read the engine's state: {e}"}
+
+        config = dict(hp.config or {})
+        endpoints = config.get("endpoints")
+        if isinstance(endpoints, list) and len(endpoints) > 10:
+            config["endpoints"] = endpoints[:10]
+            config["endpoints_note"] = f"first 10 of {len(endpoints)}"
 
         return {
             "id": hp.id,
@@ -297,7 +479,7 @@ async def honeypot_status(name: str) -> dict[str, Any]:
             "status": hp.status.value,
             "container_id": hp.container_id,
             "total_hits": hits,
-            "config": hp.config,
+            "config": config,
             "created_at": hp.created_at.isoformat() if hp.created_at else None,
             "engine_status": engine_status,
             "recent_alerts": [
@@ -310,6 +492,11 @@ async def honeypot_status(name: str) -> dict[str, Any]:
                 }
                 for a in recent
             ],
+            "note": (
+                "The newest 10 alerts are listed; use `alerts_recent` or `alerts_search` for more."
+                if hits > len(recent)
+                else "All of this honeypot's alerts are listed."
+            ),
         }
 
 
@@ -318,65 +505,76 @@ async def honeypot_stop(
     name: str | None = None,
     names: list[str] | None = None,
     type: str | None = None,
-    status: Literal["running", "paused", "error"] | None = None,
+    status: str | None = None,
     remove: bool = False,
 ) -> dict[str, Any]:
-    """Stop one honeypot, several by name, or every honeypot matching a filter.
+    """Stop honeypots for good: one, several by name, or every one of a kind or state.
 
-    A deployment is 20+ sensors, so stopping them one call at a time is not a
-    workflow — "shut down the Windows decoys" or "stop everything" has to be a
-    single operation. Give exactly one of:
-
-    * `name` — a single honeypot.
-    * `names` — an explicit list.
-    * `type` and/or `status` — every honeypot matching. `type="all"` selects
-      every type, which is how you stop the whole estate.
-
-    A call with none of these is rejected rather than interpreted, because the
-    natural default would be "everything" and silently stopping an entire
-    deployment is not recoverable — collection simply ends.
+    Use it for "stop the ftp honeypot", "shut down the Windows decoys", "stop everything". Collection
+    ends and a stopped honeypot cannot be resumed (`honeypot_pause` is the reversible one); its
+    alerts are kept. It never guesses: name what to stop, or pass type="all" for the whole estate.
 
     Args:
-        name: Single honeypot name.
-        names: Several honeypot names.
-        type: Filter by protocol type, or "all" for every type.
-        status: Filter by current status.
-        remove: Also delete the container and the DB record.
+        name: One honeypot's name.
+        names: Several names.
+        type: Every honeypot of this kind ("smb", "redis", ...), or "all" for every kind.
+        status: Every honeypot in this state: running, paused, error (or stopped, with remove).
+        remove: True when the user says remove or delete: also deletes the honeypot's record and
+            container so its name can be reused (past alerts stay).
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
-    if not name and not names and not type and not status:
+    wanted: list[str] = []
+    if isinstance(names, str):
+        wanted.append(names)
+    elif names:
+        wanted.extend(str(n) for n in names)
+    if name:
+        wanted.append(name)
+    type_filter = type.strip() if isinstance(type, str) else None
+    if not wanted and not type_filter and not status:
         return {
-            "error": (
-                "Refusing to guess. Pass `name`, `names`, or a `type`/`status` filter "
-                '— use type="all" to stop every honeypot.'
-            )
+            "error": "Nothing says which honeypots to stop.",
+            "hint": "Give `name` or `names`, or filter with `type` and/or `status`, or pass "
+            "type='all' to stop every honeypot. This is never guessed: stopping everything "
+            "ends collection.",
         }
+    status_filter, bad = _parse_status(status)
+    if bad:
+        return bad
+    wanted_type: str | None = None
+    if type_filter and type_filter.lower() != "all":
+        wanted_type = resolve_type(type_filter)
+        if wanted_type is None:
+            return _type_error(type_filter, extra=" or 'all'")
 
+    already_stopped: list[str] = []
     async with get_session() as session:
         targets: list[Honeypot] = []
-        if name or names:
-            wanted = list(names or [])
-            if name:
-                wanted.append(name)
+        if wanted:
             for candidate in wanted:
-                hp = await queries.get_honeypot_by_name(session, candidate)
+                hp, problem = await _find_sensor(session, candidate)
                 if hp is None:
-                    return {"error": f"No honeypot named '{candidate}' found."}
-                targets.append(hp)
+                    return problem or {"error": f"No honeypot named '{candidate}'."}
+                if all(t.id != hp.id for t in targets):
+                    targets.append(hp)
         else:
-            all_honeypots = await queries.list_honeypots(session)
-            for hp in all_honeypots:
-                if type and type != "all" and hp.type.value != type:
+            for hp in await queries.list_honeypots(session):
+                if wanted_type and hp.type.value != wanted_type:
                     continue
-                if status and hp.status.value != status:
+                if status_filter and hp.status is not status_filter:
                     continue
                 if hp.status is HoneypotStatus.STOPPED and not remove:
                     continue
                 targets.append(hp)
 
         if not targets:
-            return {"stopped": [], "note": "Nothing matched — no honeypot was changed."}
+            return {
+                "stopped": [],
+                "count": 0,
+                "note": "Nothing matched, so no honeypot was changed. `honeypot_list` shows what "
+                "is deployed.",
+            }
 
         stopped: list[str] = []
         failed: list[dict[str, str]] = []
@@ -387,6 +585,7 @@ async def honeypot_stop(
             # used to `continue` unconditionally, so a stopped sensor could never be removed and
             # its row and name stayed reserved forever, with `stopped: []` as the only answer.
             if was_stopped and not remove:
+                already_stopped.append(hp.name)
                 continue
             try:
                 engine = get_engine(hp.type)
@@ -447,11 +646,24 @@ async def honeypot_stop(
         "count": len(stopped),
         "failed": failed,
         "status": "ok" if not failed else "partial",
+        "note": (
+            "Collection has ended for these; their alerts are kept but no longer tied to a "
+            "honeypot."
+            if remove
+            else "Collection has ended for these and their alerts are kept. They cannot be "
+            "resumed: deploy again (remove the old one first to reuse its name)."
+        )
+        if stopped
+        else "Nothing was stopped.",
     }
+    if already_stopped:
+        result["already_stopped"] = already_stopped
+    if failed:
+        result["hint"] = "Failures are listed under `failed`; `honeypot_health` shows the state."
     if timed_out:
         result["timed_out"] = timed_out
-        result["note"] = (
-            f"Engine teardown exceeded {_ENGINE_STOP_TIMEOUT_SECONDS:g}s for "
+        result["note"] += (
+            f" Engine teardown exceeded {_ENGINE_STOP_TIMEOUT_SECONDS:g}s for "
             f"{', '.join(timed_out)}; marked stopped anyway."
         )
     return result
@@ -459,21 +671,26 @@ async def honeypot_stop(
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_pause"))
 async def honeypot_pause(name: str) -> dict[str, Any]:
-    """Suspend collection on a running honeypot without deleting it; `honeypot_resume` brings it
-    back with its configuration and history intact. Prefer this to `honeypot_stop` when the sensor
-    should come back. Only a running honeypot can be paused.
+    """Pause a running honeypot so it stops capturing, keeping its settings and history.
+
+    Use it for "pause the ssh honeypot for now". `honeypot_resume` brings it back; use
+    `honeypot_stop` when it should not return.
 
     Args:
-        name: The honeypot name.
+        name: The honeypot's name (its type or port also work when only one matches).
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}' found."}
+        hp, problem = await _find_sensor(session, name)
+        if hp is None:
+            return problem or {"error": f"No honeypot named '{name}'."}
         if hp.status != HoneypotStatus.RUNNING:
-            return {"error": f"Honeypot '{name}' is not running (status={hp.status.value})."}
+            return {
+                "error": f"Honeypot '{hp.name}' is not running (status={hp.status.value}).",
+                "hint": "Only a running honeypot can be paused; `honeypot_resume` restarts a "
+                "paused one and `honeypot_health` says why one is in error.",
+            }
 
         engine = get_engine(hp.type)
         if hp.container_id:
@@ -485,32 +702,43 @@ async def honeypot_pause(name: str) -> dict[str, Any]:
                 # closes the listener, so the status is true; resume starts a fresh one.
                 await engine.stop(hp.container_id)
         hp.status = HoneypotStatus.PAUSED
+        resolved = hp.name
 
     await record_action(
         "honeypot_pause",
-        summary=f"paused honeypot '{name}' — collection suspended",
+        summary=f"paused honeypot '{resolved}' — collection suspended",
         arguments={"name": name},
-        target=name,
+        target=resolved,
     )
-    return {"name": name, "status": "paused"}
+    return {
+        "name": resolved,
+        "status": "paused",
+        "note": f"'{resolved}' is not capturing. `honeypot_resume` brings it back.",
+    }
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_resume"))
 async def honeypot_resume(name: str) -> dict[str, Any]:
-    """Resume a paused honeypot so it captures again, with its configuration and history intact.
+    """Resume a paused honeypot so it captures again, with its settings and history intact.
 
+    Use it for "resume the ssh honeypot", "bring it back". Settings changed with
+    `honeypot_configure` take effect here for in-process types.
 
     Args:
-        name: The honeypot name.
+        name: The honeypot's name (its type or port also work when only one matches).
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}' found."}
+        hp, problem = await _find_sensor(session, name)
+        if hp is None:
+            return problem or {"error": f"No honeypot named '{name}'."}
         if hp.status != HoneypotStatus.PAUSED:
-            return {"error": f"Honeypot '{name}' is not paused (status={hp.status.value})."}
+            return {
+                "error": f"Honeypot '{hp.name}' is not paused (status={hp.status.value}).",
+                "hint": "Only a paused honeypot can be resumed. A stopped one is deployed again "
+                "with `honeypot_deploy`; `honeypot_list` shows each one's status.",
+            }
 
         engine = get_engine(hp.type)
         if engine.native_pause:
@@ -521,39 +749,52 @@ async def honeypot_resume(name: str) -> dict[str, Any]:
                 hp.container_id = await engine.start(hp.name, hp.port, dict(hp.config or {}))
             except Exception as e:  # noqa: BLE001 - report it, leave the sensor paused
                 return {
-                    "error": f"Could not resume '{name}' on port {hp.port}: {e}. It stays paused."
+                    "error": f"Could not resume '{hp.name}' on port {hp.port}: {e}. It stays paused.",
+                    "hint": "If something else took the port, stop it and resume again, or "
+                    "remove this honeypot and deploy a new one on a free port.",
                 }
         hp.status = HoneypotStatus.RUNNING
+        resolved = hp.name
 
     await record_action(
         "honeypot_resume",
-        summary=f"resumed honeypot '{name}'",
+        summary=f"resumed honeypot '{resolved}'",
         arguments={"name": name},
-        target=name,
+        target=resolved,
     )
-    return {"name": name, "status": "running"}
+    return {
+        "name": resolved,
+        "status": "running",
+        "next_step": f"Verify it: honeypot_self_test(name='{resolved}').",
+    }
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_configure"))
 async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any]:
-    """Update the configuration for an existing honeypot.
-    Changes take effect after the next stop/start cycle.
+    """Change a honeypot's settings (its banner, hostname, web persona, ...).
+
+    Use it for "make the ftp honeypot announce itself as ...". The keys differ per type and a
+    wrong key or value is refused with the valid ones; `honeypot_templates` with the type lists
+    them too. Settings are merged into the current ones and apply the next time it starts.
 
     Args:
-        name: The honeypot name.
-        config: Key-value pairs to merge into the current config.
+        name: The honeypot's name (its type or port also work when only one matches).
+        config: Key/value pairs, e.g. {"fake_banner": "220 FTP ready"} for ftp.
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
     if not isinstance(config, dict):
-        return {"error": "config must be an object of key/value pairs."}
+        return {
+            "error": "config must be an object of key/value pairs.",
+            "hint": 'For example {"fake_banner": "220 FTP ready"}.',
+        }
 
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}' found."}
+        hp, problem = await _find_sensor(session, name)
+        if hp is None:
+            return problem or {"error": f"No honeypot named '{name}'."}
         if err := _validate_config(hp.type.value, config):
-            return {"error": err}
+            return {"error": err, "hint": _config_hint(hp.type.value)}
         if "telnet_port" in config:
             telnet_port = config["telnet_port"]
             if telnet_port == hp.port:
@@ -561,7 +802,8 @@ async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any
                     "error": (
                         f"telnet_port {telnet_port} is this honeypot's own port — "
                         "pick a different one."
-                    )
+                    ),
+                    "hint": "Choose a port that nothing else uses.",
                 }
             conflict = await queries.get_honeypot_by_port(session, telnet_port)
             if conflict and conflict.id != hp.id and conflict.status == HoneypotStatus.RUNNING:
@@ -574,14 +816,27 @@ async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any
                 }
         hp.config = {**hp.config, **config}
         new_config = hp.config
+        resolved = hp.name
+        restart = (
+            "stop it with remove=true and deploy it again"
+            if get_engine(hp.type).native_pause
+            else "`honeypot_pause` then `honeypot_resume`"
+        )
+        running = hp.status is HoneypotStatus.RUNNING
 
     await record_action(
         "honeypot_configure",
-        summary=f"reconfigured honeypot '{name}' ({', '.join(sorted(config)) or 'no keys'})",
+        summary=f"reconfigured honeypot '{resolved}' ({', '.join(sorted(config)) or 'no keys'})",
         arguments={"name": name, "config": config},
-        target=name,
+        target=resolved,
     )
-    return {"name": name, "config": new_config, "note": "Restart honeypot to apply changes."}
+    return {
+        "name": resolved,
+        "config": new_config,
+        "note": f"Saved. To apply it to the running honeypot, {restart}."
+        if running
+        else "Saved. It applies the next time this honeypot starts.",
+    }
 
 
 def _is_text(value: Any, max_len: int = 255) -> bool:
@@ -612,13 +867,19 @@ def _is_endpoints(value: Any) -> bool:
 
 
 _CHECKS: dict[str, tuple[Any, str]] = {
-    "ssh_persona": (_is_text, "a persona id string"),
+    "ssh_persona": (
+        lambda v: v in _ssh_persona_ids(),
+        f"one of: {', '.join(_ssh_persona_ids())}",
+    ),
     "ssh_hostname": (_is_text, "a single-line string"),
     "fake_hostname": (_is_text, "a single-line string"),
     "fake_kernel": (_is_text, "a single-line string"),
     "telnet_enabled": (lambda v: isinstance(v, bool), "true or false"),
     "telnet_port": (_is_port, "an integer port between 1 and 65535"),
-    "persona": (_is_text, "a persona id string"),
+    "persona": (
+        lambda v: v in _http_persona_ids(),
+        f"one of: {', '.join(_http_persona_ids())}",
+    ),
     "tls": (lambda v: isinstance(v, bool), "true or false"),
     "endpoints": (_is_endpoints, 'a list of {"path": "/...", "template": "..."} objects'),
     "fake_banner": (_is_text, "a single-line string"),
@@ -657,131 +918,208 @@ def _validate_config(hp_type: str, config: dict[str, Any]) -> str | None:
     return None
 
 
+def _config_hint(hp_type: str) -> str:
+    """What a honeypot of this type accepts, for the error a bad `config` returns."""
+    keys = sorted(_CONFIG_KEYS.get(hp_type, ()))
+    if not keys:
+        return f"{hp_type} honeypots take no settings: leave `config` out."
+    return f"{hp_type} accepts: " + "; ".join(f"{k} ({_CHECKS[k][1]})" for k in keys) + "."
+
+
 @mcp.tool(**hints("honeypot_logs"))
-async def honeypot_logs(name: str, lines: int = 50) -> dict[str, Any]:
-    """Raw log lines from a honeypot's container or process. For debugging a sensor, not for
-    triage: use `alerts_recent` or `alerts_search` to look at attack events.
+async def honeypot_logs(name: str, lines: int = 30) -> dict[str, Any]:
+    """Show a honeypot's own log lines, for working out why a sensor misbehaves.
+
+    Use it for "show the ssh honeypot's log", "why is hp-ftp failing?". It is not where attacks
+    are read: use `alerts_recent` or `alerts_search` for those.
 
     Args:
-        name: The honeypot name.
-        lines: Number of log lines to return (default 50, max 1000).
+        name: The honeypot's name (its type or port also work when only one matches).
+        lines: How many of the newest lines (default 30, at most 1000); long ones are clipped.
     """
     # Raw container logs are unbounded; an uncapped `lines` would put an
     # arbitrary slice of Cowrie's JSON log into the response.
-    lines = max(1, min(lines, 1000))
+    lines = max(1, min(int(lines), 1000))
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}' found."}
+        hp, problem = await _find_sensor(session, name)
+        if hp is None:
+            return problem or {"error": f"No honeypot named '{name}'."}
         if not hp.container_id:
-            return {"error": f"Honeypot '{name}' has no running container."}
+            return {
+                "error": f"Honeypot '{hp.name}' is not running (status={hp.status.value}), so it "
+                "has no log.",
+                "hint": "`honeypot_resume` restarts a paused one, `honeypot_deploy` a stopped one.",
+            }
 
         if foreign := _owned_elsewhere(hp):
-            return {"name": name, "lines": lines, "logs": [], **foreign}
+            return {"name": hp.name, "count": 0, "logs": [], **foreign}
         engine = get_engine(hp.type)
         log_data = await engine.get_logs(hp.container_id, lines=lines)
+        resolved = hp.name
 
-    return {"name": name, "lines": lines, "logs": log_data}
+    # Cowrie's JSON lines run to hundreds of characters: clip each and keep the newest within a
+    # budget, so a default call stays small however chatty the sensor is.
+    clipped = [
+        line if len(line) <= _LOG_LINE_CHARS else line[:_LOG_LINE_CHARS] + "..."
+        for line in log_data
+    ]
+    kept: list[str] = []
+    used = 0
+    for line in reversed(clipped):
+        if kept and used + len(line) > _LOG_TOTAL_CHARS:
+            break
+        kept.append(line)
+        used += len(line)
+    kept.reverse()
+    result: dict[str, Any] = {"name": resolved, "count": len(kept), "logs": kept}
+    if not kept:
+        result["note"] = "The log is empty."
+    elif len(kept) < len(log_data):
+        result["note"] = (
+            f"Showing the newest {len(kept)} of {len(log_data)} lines; ask for fewer lines "
+            "to see them in full."
+        )
+    elif len(clipped) != len(log_data) or any(
+        c != o for c, o in zip(clipped, log_data, strict=True)
+    ):
+        result["note"] = "Long lines are clipped."
+    return mark_untrusted(result)
+
+
+def _first_sentence(text: str, limit: int = 110) -> str:
+    sentence = text.strip().split(". ")[0].rstrip(".")
+    if len(sentence) <= limit:
+        return sentence
+    return sentence[: limit - 1].rsplit(" ", 1)[0] + "…"
 
 
 @mcp.tool(**hints("honeypot_templates"))
-async def honeypot_templates() -> list[dict[str, Any]]:
-    """List every deployable sensor type with its default port and what it captures.
+async def honeypot_templates(type: str | None = None) -> dict[str, Any]:
+    """What kinds of honeypot can be deployed, and what does each one catch?
 
-    Call this before `honeypot_deploy` to pick the right protocol, or to check a
-    default port. For designing a whole environment rather than picking one
-    sensor, use `deception_plan` instead.
+    Use it for "what honeypots can I run?", "what does the redis honeypot capture?". With no
+    argument it lists every type in one line each; with a type it gives everything about that one,
+    including the settings it accepts. `honeypot_deploy` runs one; `deception_plan` designs a set.
 
-    Reads from the engine capability registry, so it cannot drift from what is
-    actually deployable — this list previously described fourteen types after
-    five more had shipped, and nothing errored.
+    Args:
+        type: One kind (ssh, postgres, k8s, ...) for its full details. Omit for the short list.
     """
     from honeypot_mcp.deception.capabilities import all_capabilities
 
-    return [
-        {
+    if type:
+        kind = resolve_type(type)
+        if kind is None:
+            return _type_error(type)
+        c = BY_TYPE[kind]
+        return {
             "type": c.type,
-            "display_name": c.display_name,
-            "description": c.summary,
+            "name": c.display_name,
+            "what_it_captures": c.summary,
             "default_port": c.default_port,
             "real_world_port": c.real_world_port,
+            "transport": c.transport,
             "os_family": c.os_family,
             "roles": list(c.roles),
-            "config_options": list(c.config_options),
-            "requires_docker": c.requires_docker,
-            "captures_credentials_as": c.captures_credentials_as,
+            "needs_docker": c.requires_docker,
+            "credentials_recorded_as": c.captures_credentials_as,
+            "detects": list(c.signature_events),
+            "settings": {k: _CHECKS[k][1] for k in sorted(_CONFIG_KEYS.get(c.type, ()))},
+            "pairs_well_with": list(c.pairs_well_with),
+            **({"caution": c.public_cloud_caution} if c.public_cloud_caution else {}),
+            "note": f"Deploy it with honeypot_deploy(type='{c.type}'). Settings go in `config`.",
+        }
+    rows = [
+        {
+            "type": c.type,
+            "port": c.default_port,
+            "what": _first_sentence(c.summary),
+            **({"needs_docker": True} if c.requires_docker else {}),
         }
         for c in all_capabilities()
     ]
+    return {
+        "count": len(rows),
+        "types": rows,
+        "note": "`port` is the default; a free one is chosen if it is taken. Ask with `type` for "
+        "one kind's detail and settings; `honeypot_deploy` runs one.",
+    }
+
+
+async def _probe_health(hp: Honeypot) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "name": hp.name,
+        "type": hp.type.value,
+        "port": hp.port,
+        "status": hp.status.value,
+    }
+    if hp.container_id is None:
+        entry.update({"alive": False, "detail": "Not started (no container or listener)."})
+    elif foreign := _owned_elsewhere(hp):
+        entry.update(foreign)
+    else:
+        try:
+            entry.update(await get_engine(hp.type).health_check(hp.container_id, hp.port))
+        except Exception as e:
+            entry.update({"alive": False, "detail": f"Health check error: {e}", "method": "error"})
+    return entry
 
 
 @mcp.tool(**hints("honeypot_health"))
-async def honeypot_health(name: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
-    """Check whether honeypots are actually responding (port probe + container status).
+async def honeypot_health(name: str | None = None) -> dict[str, Any]:
+    """Are the honeypots actually answering on their ports?
 
-    A honeypot whose process or container has died will still appear 'running'
-    in `honeypot_list` because the DB row says so. This tool actually probes the
-    port and (for SSH) the Docker container, surfacing silent failures.
+    Use it for "are all the sensors up?", "is hp-ssh alive?". A honeypot can show as running in
+    `honeypot_list` after its process or container died; this probes the port (and the Docker
+    container for ssh/telnet). `honeypot_self_test` goes further and proves it records attacks.
 
     Args:
-        name: Specific honeypot to check. Omit to check all running honeypots.
+        name: One honeypot (its type or port also work when only one matches). Omit to check every
+            running one.
     """
     async with get_session() as session:
         if name:
-            hp = await queries.get_honeypot_by_name(session, name)
-            if not hp:
-                return {"error": f"No honeypot named '{name}'."}
+            hp, problem = await _find_sensor(session, name)
+            if hp is None:
+                return problem or {"error": f"No honeypot named '{name}'."}
             honeypots = [hp]
         else:
             honeypots = await queries.list_honeypots(session, status=HoneypotStatus.RUNNING)
 
-    results: list[dict[str, Any]] = []
-    for hp in honeypots:
-        entry: dict[str, Any] = {
-            "name": hp.name,
-            "type": hp.type.value,
-            "port": hp.port,
-            "status": hp.status.value,
-        }
-        if hp.container_id is None:
-            entry.update(
-                {"alive": False, "detail": "No container_id — never started?", "method": "none"}
-            )
-        elif foreign := _owned_elsewhere(hp):
-            entry.update(foreign)
-        else:
-            try:
-                engine = get_engine(hp.type)
-                health = await engine.health_check(hp.container_id, hp.port)
-                entry.update(health)
-            except Exception as e:
-                entry.update(
-                    {"alive": False, "detail": f"Health check error: {e}", "method": "error"}
-                )
-        results.append(entry)
-
-    if name and len(results) == 1:
-        return results[0]
-    return results
+    results = list(await asyncio.gather(*(_probe_health(hp) for hp in honeypots)))
+    down = [r["name"] for r in results if r.get("alive") is False]
+    unknown = [r["name"] for r in results if r.get("alive") is None]
+    up = len(results) - len(down) - len(unknown)
+    if not results:
+        note = "No honeypot is running. `honeypot_list` shows what is deployed."
+    elif down:
+        note = (
+            f"{len(down)} of {len(results)} not answering: {', '.join(down)}. "
+            "`honeypot_logs` or `honeypot_status` says more; stop and redeploy one that stays down."
+        )
+    elif unknown:
+        note = f"{up} answering; {len(unknown)} could not be probed from this session."
+    else:
+        note = f"All {len(results)} answering."
+    return {
+        "count": len(results),
+        "answering": up,
+        "not_answering": down,
+        "honeypots": results,
+        "note": note,
+    }
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_self_test"))
-async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, Any]:
-    """End-to-end smoke test: send a synthetic probe to the honeypot's port and
-    confirm an alert with our unique marker shows up in the DB. Catches subtle
-    pipeline breakage that `honeypot_health` can miss — e.g. event buffer dead,
-    suppression eating events, or an engine that accepts connections but never
-    logs them.
+async def honeypot_self_test(name: str) -> dict[str, Any]:
+    """Prove a honeypot really records attacks: send it a probe and check an alert appears.
 
-    The probe is protocol-appropriate (SSH banner / HTTP request / SMTP AUTH /
-    FTP USER / DNS query / …) and embeds a random marker in a field that
-    lands in the alert payload. We then poll for an alert containing that
-    marker. All 25 deployable types have a matching probe.
+    Use it for "test the new honeypot", "does hp-http actually log?". It catches what
+    `honeypot_health` misses (an engine that accepts connections but never logs, suppression
+    dropping events, a stalled event buffer). The probe is harmless and speaks the sensor's own
+    protocol; its alert is marked as a self-test. Takes a few seconds (up to 30 for ssh/telnet).
 
     Args:
-        name: The honeypot name to probe.
-        timeout_seconds: How long to wait for the probe alert to appear
-                         (default 15 — SSH needs ~5-10s due to Cowrie log polling).
+        name: The honeypot's name (its type or port also work when only one matches).
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
@@ -790,11 +1128,16 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
     from honeypot_mcp.storage.models import Alert
 
     async with get_session() as session:
-        hp = await queries.get_honeypot_by_name(session, name)
-        if not hp:
-            return {"error": f"No honeypot named '{name}'."}
+        hp, problem = await _find_sensor(session, name)
+        if hp is None:
+            return problem or {"error": f"No honeypot named '{name}'."}
         if hp.status != HoneypotStatus.RUNNING:
-            return {"error": f"Honeypot '{name}' is not running (status={hp.status.value})."}
+            return {
+                "error": f"Honeypot '{hp.name}' is not running (status={hp.status.value}).",
+                "hint": "`honeypot_resume` restarts a paused one; `honeypot_health` says why one "
+                "is in error.",
+            }
+        name = hp.name
         hp_id = hp.id
         hp_type = hp.type.value
         hp_port = hp.port
@@ -810,10 +1153,14 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
             "probe_sent": False,
             "alert_received": False,
             "detail": send_detail,
+            "hint": "`honeypot_health` shows whether the honeypot answers at all.",
         }
 
-    deadline_loops = max(1, timeout_seconds)
-    for _ in range(deadline_loops):
+    # Cowrie's log is polled, so ssh and telnet take longer to show their alert.
+    timeout_seconds = (
+        _SELF_TEST_DOCKER_SECONDS if BY_TYPE[hp_type].requires_docker else _SELF_TEST_SECONDS
+    )
+    for _ in range(timeout_seconds):
         await asyncio.sleep(1)
         async with get_session() as session:
             result = await session.execute(
@@ -853,6 +1200,8 @@ async def honeypot_self_test(name: str, timeout_seconds: int = 15) -> dict[str, 
             "Possible causes: honeypot crashed (run honeypot_health), suppression "
             "rule is dropping the event, or the event buffer flusher has stalled."
         ),
+        "hint": "Run `honeypot_health`, check `suppression_list` for a rule matching "
+        "127.0.0.1, and `honeypot_logs` for the honeypot's own errors.",
     }
 
 
@@ -1418,29 +1767,38 @@ _PROBES: dict[str, Any] = {
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_clone"))
 async def honeypot_clone(
-    source_name: str, new_port: int, new_name: str | None = None
+    source_name: str, new_port: int | None = None, new_name: str | None = None
 ) -> dict[str, Any]:
-    """Create a new honeypot with an existing one's type and configuration on a different port,
-    optionally under a new name. Useful for running the same decoy on several ports.
+    """Run another copy of an existing honeypot (same type and settings) on a different port.
+
+    Use it for "run the same ssh honeypot on a second port", "duplicate hp-http". The clone's
+    name and port are chosen for you unless you say them.
 
     Args:
-        source_name: Name of the honeypot to clone.
-        new_port: Port for the cloned honeypot.
-        new_name: Name for the clone (auto-generated if omitted).
+        source_name: The honeypot to copy (its type or port also work when only one matches).
+        new_port: Only if the user names a port; otherwise the next free one is used.
+        new_name: Only if the user names the copy; otherwise something like `http-8081`.
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
     async with get_session() as session:
-        source = await queries.get_honeypot_by_name(session, source_name)
-        if not source:
-            return {"error": f"No honeypot named '{source_name}' found."}
-        clone_name = new_name or f"{source.type.value}-{secrets.token_hex(4)}"
+        source, problem = await _find_sensor(session, source_name)
+        if source is None:
+            return problem or {"error": f"No honeypot named '{source_name}'."}
         clone_config = dict(source.config)
         clone_type = source.type.value
+        port = new_port
+        if port is None:
+            taken = {
+                h.port
+                for h in await queries.list_honeypots(session)
+                if h.status in (HoneypotStatus.RUNNING, HoneypotStatus.PAUSED)
+            }
+            port = _free_port(source.port + 1, BY_TYPE[clone_type].transport, taken)
+            if port is None:
+                return {
+                    "error": f"No free port found after {source.port}.",
+                    "hint": "Name a free port with `new_port`.",
+                }
 
-    return await honeypot_deploy(
-        type=clone_type,  # type: ignore[arg-type]
-        port=new_port,
-        name=clone_name,
-        config=clone_config,
-    )
+    return await honeypot_deploy(type=clone_type, port=port, name=new_name, config=clone_config)

@@ -243,7 +243,7 @@ async def test_an_exhausted_budget_says_which_part_was_read(monkeypatch):
     assert {f"http://t{i}.example.com/p" for i in range(6)} <= values
     assert not values & {f"http://t{i}.example.com/p" for i in (6, 7, 8)}
     assert {"http://dl0.example.com/p", "http://dl1.example.com/p"} <= values
-    assert "telnet_command_input" in out["note"] and "ioc_scan_seconds" in out["note"]
+    assert "telnet_command_input" in out["note"] and "since_hours" in out["note"]
     assert "read 6 of 9" in out["note"]
 
 

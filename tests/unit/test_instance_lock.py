@@ -145,7 +145,7 @@ async def test_read_only_processes_still_serve_reads_and_say_what_they_are():
         assert (await ping())["role"] == "owner"
         instance_lock.set_ownership(False, instance_lock.Holder(pid=1))
         assert (await ping())["role"] == "read-only"
-        assert await honeypot_list() == []
+        assert (await honeypot_list())["honeypots"] == []
     finally:
         await close_db()
         event_buffer.reset_for_tests()
@@ -179,8 +179,10 @@ async def test_a_read_only_process_never_probes_or_inspects_in_process_sensors()
                 )
             )
         instance_lock.set_ownership(False, instance_lock.Holder(pid=4242))
-        health = await honeypot_health("r1")
+        result = await honeypot_health("r1")
+        health = result["honeypots"][0]
         assert health["method"] == "not-probed" and health["alive"] is None
+        assert result["answering"] == 0 and result["not_answering"] == []
         status = await honeypot_status("r1")
         assert status["engine_status"]["method"] == "not-probed"
         async with get_session() as session:

@@ -30,46 +30,40 @@ from honeypot_mcp.tools._audit import record_action
 _LABEL_RE = re.compile(r"[A-Za-z0-9_.@ -]{1,64}")
 
 
+def _error(message: str, hint: str) -> dict[str, Any]:
+    return {"error": message, "hint": hint}
+
+
 @mcp.tool(auth=require_role("admin"), **hints("api_key_create"))
 async def api_key_create(
     label: str,
-    role: Literal["viewer", "operator", "admin"],
+    role: Literal["viewer", "operator", "admin"] = "viewer",
     expires_in_days: int | None = None,
 ) -> dict[str, Any]:
-    """Issue a new API key for a team member or automation.
+    """Give a person or automation their own login for this server.
 
-    Takes effect within 30 seconds on every server process, no restart
-    needed — unlike adding a token to MCP_AUTH_TOKENS.
-
-    The plaintext token is returned exactly once, in this response. Only its
-    SHA-256 digest is stored; if it's lost, revoke it (api_key_revoke) and
-    issue a new one — there is no way to retrieve the original.
+    Use it for "make a read-only key for alice", "an operator key for the CI job for 30 days". Live within 30 seconds, no restart. The token is shown once and cannot be recovered; if it is lost, revoke the key and make another.
 
     Args:
-        label: Human-readable identity, e.g. "alice" or "ci-pipeline". This
-              is what shows up as the actor on audit_log_search entries this
-              key makes, so pick something that identifies a real person or
-              system, not "key1".
-        role: viewer, operator, or admin — see rbac.py for exactly what each
-              can do. Prefer the lowest role that covers what this person
-              actually needs to do.
-        expires_in_days: Optional — the key stops working after this many
-              days, checked on every use. Omit for a key valid until
-              explicitly revoked.
+        label: Who or what it is for ("alice", "ci-pipeline"); shown as the actor in the audit log. Letters, digits, space and ._@- only.
+        role: "viewer" (default: read only), "operator" (also deploy, stop, triage), or "admin" (also keys, firewall pushes, pruning). Use the lowest that fits.
+        expires_in_days: Days until the key stops working ("for a month" is 30). Omit for none.
     """
     label = label.strip()
     if not label:
-        return {"error": "label must not be empty."}
+        return _error("label must not be empty.", "Say who the key is for, e.g. label='alice'.")
     if not _LABEL_RE.fullmatch(label):
-        return {
-            "error": (
-                "label may only contain letters, digits, space and ._@- (max 64 characters) — "
-                "it is written into the audit log as the actor, and a label with parentheses "
-                "or control characters could impersonate another actor there."
-            )
-        }
+        return _error(
+            "label may only contain letters, digits, space and ._@- (max 64 characters): it is "
+            "written into the audit log as the actor, and a label with parentheses or control "
+            "characters could impersonate another actor there.",
+            "Use a plain name such as 'alice' or 'ci-pipeline'.",
+        )
     if expires_in_days is not None and expires_in_days <= 0:
-        return {"error": "expires_in_days must be greater than 0."}
+        return _error(
+            "expires_in_days must be greater than 0.",
+            "Omit it for a key that lasts until revoked; a month is 30, a year 365.",
+        )
 
     from sqlalchemy import select
 
@@ -80,13 +74,12 @@ async def api_key_create(
             )
         ).first()
     if taken is not None:
-        return {
-            "error": (
-                f"An active API key labelled {label!r} already exists. Labels identify the "
-                "actor in the audit log, so they must be unique among non-revoked keys — "
-                "pick another label or revoke the existing key first."
-            )
-        }
+        return _error(
+            f"An active API key labelled {label!r} already exists. Labels identify the actor in "
+            "the audit log, so they must be unique among non-revoked keys.",
+            "Pick another label, or revoke the existing key first (api_key_list shows its id; "
+            "api_key_revoke removes it).",
+        )
 
     token = secrets.token_hex(32)
     expires_at = datetime.now(UTC) + timedelta(days=expires_in_days) if expires_in_days else None
@@ -119,25 +112,20 @@ async def api_key_create(
         "token": token,
         "expires_at": expires_at.isoformat() if expires_at else None,
         "warning": (
-            "Save this token now — it cannot be retrieved again. "
-            "If it's lost, revoke this key and create a new one."
+            "Save this token now: it cannot be retrieved again. If it is lost, revoke this key "
+            "and create a new one. The holder sends it as `Authorization: Bearer <token>`."
         ),
     }
 
 
 @mcp.tool(auth=require_role("admin"), **hints("api_key_revoke"))
 async def api_key_revoke(key_id: int) -> dict[str, Any]:
-    """Revoke a live-provisioned API key. Takes effect within 30 seconds on
-    every server process, no restart needed.
+    """Take a person's or automation's login away.
 
-    Does not touch MCP_AUTH_TOKEN/MCP_AUTH_TOKENS — those are static,
-    restart-only credentials, not ApiKey rows, and this tool has no way to
-    reach them (removing the last one would also remove the ability to
-    manage keys at all, since api_key_create/revoke are themselves
-    admin-gated).
+    Use it for "revoke alice's key". It stops working within 30 seconds, no restart. Keys set in the server's own environment (MCP_AUTH_TOKEN/MCP_AUTH_TOKENS) are not listed and cannot be revoked here.
 
     Args:
-        key_id: The numeric id from api_key_create or api_key_list.
+        key_id: The key's id, from api_key_list (or api_key_create).
     """
     from sqlalchemy import select
 
@@ -145,31 +133,37 @@ async def api_key_revoke(key_id: int) -> dict[str, Any]:
         result = await session.execute(select(ApiKey).where(ApiKey.id == key_id))
         key = result.scalar_one_or_none()
         if not key:
-            return {"error": f"No API key with id={key_id}."}
+            return _error(
+                f"No API key with id={key_id}.",
+                "Call api_key_list (it shows each key's id and label).",
+            )
         if key.revoked_at is not None:
-            return {
-                "error": (
-                    f"API key {key_id} ('{key.label}') was already revoked "
-                    f"at {key.revoked_at.isoformat()}."
-                )
-            }
+            return _error(
+                f"API key {key_id} ('{key.label}') was already revoked at "
+                f"{key.revoked_at.isoformat()}.",
+                "Nothing to do; api_key_list(include_revoked=true) shows the history.",
+            )
         key.revoked_at = datetime.now(UTC)
         label = key.label
 
     invalidate_api_key_cache()
     await record_action("api_key_revoke", f"revoked {label}'s API key", target=label)
-    return {"id": key_id, "label": label, "status": "revoked"}
+    return {
+        "id": key_id,
+        "label": label,
+        "status": "revoked",
+        "note": "The key stops working within 30 seconds.",
+    }
 
 
 @mcp.tool(auth=require_role("admin"), **hints("api_key_list"))
-async def api_key_list(include_revoked: bool = False) -> list[dict[str, Any]]:
-    """List live-provisioned API keys — metadata only, never the tokens
-    themselves (only their hash is ever stored, and this doesn't return
-    that either).
+async def api_key_list(include_revoked: bool = False) -> dict[str, Any]:
+    """Who has a login to this server, and with what role?
+
+    Use it for "who has access?", "which keys expire soon?". Shows labels, roles and dates only, never tokens.
 
     Args:
-        include_revoked: Include revoked keys too, for a historical view of
-              who has ever had access. Off by default.
+        include_revoked: Also show revoked keys, for the history of who ever had access.
     """
     from sqlalchemy import select
 
@@ -178,9 +172,10 @@ async def api_key_list(include_revoked: bool = False) -> list[dict[str, Any]]:
         q = q.where(ApiKey.revoked_at.is_(None))
 
     async with get_session() as session:
-        rows = (await session.execute(q.order_by(ApiKey.created_at.desc()))).scalars().all()
+        found = (await session.execute(q.order_by(ApiKey.created_at.desc()))).scalars().all()
 
-    return [
+    now = datetime.now(UTC)
+    rows = [
         {
             "id": r.id,
             "label": r.label,
@@ -188,7 +183,18 @@ async def api_key_list(include_revoked: bool = False) -> list[dict[str, Any]]:
             "created_by": r.created_by,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+            "expired": bool(r.expires_at and r.expires_at <= now),
             "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
         }
-        for r in rows
+        for r in found
     ]
+    return {
+        "count": len(rows),
+        "keys": rows,
+        "note": (
+            f"{len(rows)} key(s). Keys configured through MCP_AUTH_TOKEN(S) in the server's "
+            "environment are not listed here."
+            if rows
+            else "No API keys have been created. Make one with api_key_create(label=...)."
+        ),
+    }

@@ -668,7 +668,7 @@ async def test_busy_port_is_a_clear_error_before_anything_is_created(
     result = await grafana_start(port=3300)
 
     assert "Port 3300 is already in use" in result["error"]
-    assert "free port" in result["hint"]
+    assert "different port" in result["hint"]
     assert docker_client.created == []
     assert not (tmp_path / "grafana").exists()
 

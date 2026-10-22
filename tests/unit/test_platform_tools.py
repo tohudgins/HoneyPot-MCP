@@ -7,6 +7,7 @@ Format-stability tests: any downstream tool consuming `export_blocklist` or
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -65,10 +66,10 @@ async def test_export_blocklist_plain_format(reports_dir):
     await _seed_alerts("8.8.8.8", count=10)
     await _seed_alerts("9.9.9.9", count=2)  # Below threshold
 
-    dest = reports_dir / "bl.txt"
-    result = await export_blocklist(format="plain", hours=24, min_hits=5, output_path="bl.txt")
+    result = await export_blocklist(format="plain", hours=24, min_hits=5)
     assert result["ip_count"] == 1
-    assert result["path"] == str(dest)
+    dest = Path(result["path"])
+    assert dest.parent == reports_dir.resolve() and dest.name.startswith("blocklist-")
 
     written = dest.read_text()
     assert "8.8.8.8" in written
@@ -80,9 +81,8 @@ async def test_export_blocklist_iptables_format(reports_dir):
     from honeypot_mcp.tools.analysis import export_blocklist
 
     await _seed_alerts("1.2.3.4", count=10)
-    dest = reports_dir / "bl.rules"
-    await export_blocklist(format="iptables", hours=24, min_hits=5, output_path="bl.rules")
-    assert "iptables -A INPUT -s 1.2.3.4 -j DROP" in dest.read_text()
+    result = await export_blocklist(format="iptables", hours=24, min_hits=5)
+    assert "iptables -A INPUT -s 1.2.3.4 -j DROP" in Path(result["path"]).read_text()
 
 
 @pytest.mark.asyncio
@@ -92,10 +92,10 @@ async def test_export_stix_emits_valid_bundle(reports_dir):
     from honeypot_mcp.tools.analysis import export_stix
 
     await _seed_alerts("4.4.4.4", count=3)
-    dest = reports_dir / "stix.json"
-    result = await export_stix(hours=24, min_hits=1, output_path="stix.json")
+    result = await export_stix(hours=24, min_hits=1)
     assert result["indicator_count"] >= 1
-    assert result["path"] == str(dest)
+    dest = Path(result["path"])
+    assert dest.parent == reports_dir.resolve() and dest.name.startswith("stix-")
     bundle = json.loads(dest.read_text())
 
     assert bundle["type"] == "bundle"

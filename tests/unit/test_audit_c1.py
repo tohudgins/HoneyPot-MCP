@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -140,11 +141,12 @@ def test_short_static_token_refused_on_network_but_fine_on_stdio():
 
 @pytest.mark.asyncio
 async def test_generate_report_never_overwrites_a_caller_named_file(reports_dir):
-    from honeypot_mcp.tools.analysis import generate_report
+    # `generate_report` has no path argument; the writer behind it still guards a named file.
+    from honeypot_mcp.tools.analysis import write_report
 
     await _seed("8.8.8.8", 2)
     (reports_dir / "r.md").write_text("ORIGINAL")
-    result = await generate_report(format="markdown", output_path="r.md")
+    result = await write_report(None, None, "markdown", None, output_path="r.md")
 
     assert "error" in result
     assert (reports_dir / "r.md").read_text() == "ORIGINAL"
@@ -152,9 +154,9 @@ async def test_generate_report_never_overwrites_a_caller_named_file(reports_dir)
 
 @pytest.mark.asyncio
 async def test_generate_report_extension_must_match_format(reports_dir):
-    from honeypot_mcp.tools.analysis import generate_report
+    from honeypot_mcp.tools.analysis import write_report
 
-    result = await generate_report(format="markdown", output_path="r.html")
+    result = await write_report(None, None, "markdown", None, output_path="r.html")
     assert "error" in result
     assert not (reports_dir / "r.html").exists()
 
@@ -175,8 +177,8 @@ async def test_export_blocklist_drops_non_global_and_uses_v6_syntax(reports_dir)
     await _seed("10.0.0.5", 6)
     await _seed("2606:4700::1111", 6)
     await _seed("8.8.8.8", 6)
-    result = await export_blocklist(format="iptables", min_hits=5, output_path="bl.rules")
-    text = (reports_dir / "bl.rules").read_text()
+    result = await export_blocklist(format="iptables", min_hits=5)
+    text = Path(result["path"]).read_text()
 
     assert result["ip_count"] == 2
     assert "10.0.0.5" not in text
@@ -190,8 +192,8 @@ async def test_export_stix_types_ipv6_indicators_correctly(reports_dir):
     from honeypot_mcp.tools.analysis import export_stix
 
     await _seed("2606:4700::1111", 2)
-    await export_stix(min_hits=1, output_path="s.json")
-    patterns = [o["pattern"] for o in json.loads((reports_dir / "s.json").read_text())["objects"]]
+    result = await export_stix(min_hits=1)
+    patterns = [o["pattern"] for o in json.loads(Path(result["path"]).read_text())["objects"]]
 
     assert patterns == ["[ipv6-addr:value = '2606:4700::1111']"]
 

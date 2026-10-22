@@ -9,7 +9,7 @@ Everything an analyst does after a run used to live in two places an MCP user co
   numbers come from the rollups, the busiest sources get a one-line journey each, and everything
   bulky (reports, STIX, blocklist, the markdown write-up) goes to `reports_dir`. Each part runs
   on its own: one failing sub-tool is reported under `failed` and the rest still lands.
-* `database_backup` uses SQLite's online backup API from a read-only connection, in one step, so
+* `database_backup` (no arguments: automatic timestamped folder, always integrity-checked) uses SQLite's online backup API from a read-only connection, in one step, so
   the copy is a single consistent snapshot of a WAL database taken without blocking the server
   (a file copy would silently miss recent transactions, and a stepwise backup restarts whenever
   the server writes between steps). The copy is written under a temporary name inside a confined
@@ -53,8 +53,11 @@ from honeypot_mcp.tools._format import write_artifact
 
 log = logging.getLogger(__name__)
 
-_MAX_TOP = 25
-_TECHNIQUES_PER_TACTIC_IN_DIGEST = 5
+_TOP_SOURCES = 5
+_CAMPAIGNS_IN_DIGEST = 3
+_CLUSTERS_IN_DIGEST = 3
+_JOURNEY_CHARS = 300
+_TECHNIQUES_PER_TACTIC_IN_DIGEST = 3
 _MIN_HITS_FOR_EXPORTS = 50
 _SUMMARY_NAME = "analysis-summary.md"
 
@@ -224,7 +227,7 @@ def _render_summary(d: dict[str, Any], attack: dict[str, Any] | None) -> str:
     lines += ["", "## Files", ""]
     files = d.get("files") or {}
     if not files:
-        lines.append("_Exports were not requested._")
+        lines.append("_No files were written (see the failed parts below)._")
     for label, info in files.items():
         lines.append(f"- {label}: `{info}`")
     if d["failed"]:
@@ -233,35 +236,61 @@ def _render_summary(d: dict[str, Any], attack: dict[str, Any] | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-@mcp.tool(auth=require_role("operator"), **hints("run_analysis"))
-async def run_analysis(
-    top: int = 5, hours: int = 168, write_exports: bool = True
+async def _profile_source(
+    run: _Run, ip: str, alerts: int, effective: int, stamp: str
 ) -> dict[str, Any]:
-    """Analyse the whole run in one call: the post-run workflow, as a digest plus files.
+    """One busy source: risk, a one-line journey and a Markdown report file. Parts fail separately."""
+    row: dict[str, Any] = {"ip": ip, "alerts": alerts}
+    profile, journey, report = await asyncio.gather(
+        run.step(f"analyze_attacker({ip})", _analysis_tools.analyze_attacker(ip)),
+        run.step(
+            f"analyze_attacker_journey({ip})",
+            _analysis_tools.analyze_attacker_journey(ip, hours=effective),
+        ),
+        run.step(
+            f"generate_report({ip})",
+            _analysis_tools.write_report(
+                f"Source {ip}",
+                ip,
+                "markdown",
+                float(effective),
+                output_path=f"analysis-{stamp}-source-{ip.replace(':', '-')}.md",
+            ),
+        ),
+    )
+    if profile:
+        row["risk_level"] = profile.get("risk_level")
+        row["risk_score"] = profile.get("risk_score")
+    if journey:
+        row["journey"] = _one_line(journey.get("summary", ""), _JOURNEY_CHARS)
+    if report:
+        row["report"] = Path(report["path"]).name
+    return row
 
-    Use it for "analyse this run", "what happened while I was away", or on a restored backup
-    (ANALYSIS_MODE). It assembles the headline numbers and severity split, what needs triage,
-    triggered honeytokens, the ATT&CK techniques the captured event types map to (by tactic,
-    with the unmapped remainder), a profile and journey for each of the busiest sources,
-    campaigns, SSH-client fingerprint clusters and sensor coverage. With `write_exports` it also
-    writes a full report, a STIX bundle, a blocklist, a Markdown report per busy source and
-    `analysis-summary.md` into the reports directory. Each part runs on its own: if one fails,
-    it is listed under `failed` and everything else is still produced.
 
-    Totals and the ATT&CK table are exact (rollups, whole run). The window-bound parts (triage
-    counts, journeys, fingerprint clusters, exports) cover the last `hours` of *data*: the window
-    ends at the newest alert, not at the wall clock, so analysing a backup taken last week still
-    looks at its final `hours` rather than an empty present. `window` says what was used.
+@mcp.tool(auth=require_role("operator"), **hints("run_analysis"))
+async def run_analysis(hours: int = 168) -> dict[str, Any]:
+    """Analyse the whole run in one call: what happened, who did it, what to do first.
+
+    Use it for "analyse this run", "what happened while I was away", "give me the full picture",
+    or on a restored backup in analysis mode. Assembles headline numbers, triage, triggered
+    honeytokens, ATT&CK tactics seen, the five busiest sources (risk and a one-line story each),
+    campaigns, shared SSH-client fingerprints and sensor coverage, and writes the details to the
+    reports directory: `analysis-summary.md` (path in `summary_file`), an HTML report, a STIX bundle,
+    a blocklist and one report per busy source. A failing part is listed under `failed`; the rest
+    still lands. Totals and ATT&CK cover the whole run; the rest covers the last `hours`, counted
+    back from the newest alert (an old backup is not analysed as empty).
 
     Args:
-        top: How many of the busiest sources to profile (0-25).
-        hours: Window for triage counts, journeys, fingerprint clusters and exports (>= 1).
-        write_exports: Write the report/STIX/blocklist/summary files. False returns the same
-              digest, plus the summary as `summary_markdown`, and writes nothing.
+        hours: How far back the recent-activity parts look: "today" is 24, "this week" 168 (the
+               default).
     """
-    if hours < 1:
-        return {"error": "hours must be at least 1."}
-    top = max(0, min(top, _MAX_TOP))
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours < 1:
+        return {
+            "error": f"hours must be a whole number of at least 1 (got {hours!r}).",
+            "hint": "Say how far back to look: 24 for today, 168 for this week (the default).",
+        }
+    top = _TOP_SOURCES
     run = _Run()
     started = time.monotonic()
 
@@ -289,12 +318,50 @@ async def run_analysis(
             f"from it ({effective} h from now). Totals and the ATT&CK table cover the whole run."
         )
 
-    # ── headline + triage ─────────────────────────────────────────────────────────────────────
-    stats = await run.step("alerts_stats", _alerts_tools.alerts_stats())
-    brief = await run.step(
-        "soc_brief", _deception_tools.soc_brief(since_hours=float(effective), max_highlights=1)
+    # ── everything that does not depend on another part runs at once ─────────────────────────
+    # Per-source names are explicit (a model-chosen name is never overwritten), so make them unique per run.
+    stamp = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(2)}"
+    (
+        stats,
+        brief,
+        attack,
+        campaigns,
+        clusters,
+        coverage,
+        full_report,
+        stix,
+        blocklist,
+    ) = await asyncio.gather(
+        run.step("alerts_stats", _alerts_tools.alerts_stats()),
+        run.step(
+            "soc_brief",
+            _deception_tools.soc_brief(since_hours=float(effective), max_highlights=1),
+        ),
+        run.step("attack_summary", _analysis_tools.attack_summary()),
+        run.step(
+            "analyze_campaign",
+            _analysis_tools.analyze_campaign(min_sources=3),
+        ),
+        run.step(
+            "fingerprint_clusters",
+            _analysis_tools.fingerprint_clusters(hours=effective, min_sources=2),
+        ),
+        run.step("deception_coverage", _deception_tools.deception_coverage()),
+        run.step(
+            "generate_report(full)",
+            _analysis_tools.write_report("Run summary", None, "html", float(effective)),
+        ),
+        run.step(
+            "export_stix",
+            _analysis_tools.export_stix(hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS),
+        ),
+        run.step(
+            "export_blocklist",
+            _analysis_tools.export_blocklist(
+                format="plain", hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS
+            ),
+        ),
     )
-    attack = await run.step("attack_summary", _analysis_tools.attack_summary())
 
     digest: dict[str, Any] = {"window": window}
     if stats:
@@ -306,19 +373,22 @@ async def run_analysis(
         }
     if brief:
         digest["soc"] = {
-            "headline": brief["headline"],
-            "volume": brief["volume"],
-            "untriaged_by_severity": brief["untriaged_by_severity"],
+            "headline": [_one_line(h, 300) for h in brief["headline"]],
             "needs_attention_total": brief["needs_attention_total"],
-            "triggered_tokens": brief["triggered_tokens"],
-            "sensors": brief["sensors"],
+            "untriaged_by_severity": brief["untriaged_by_severity"],
+            "triggered_tokens": [
+                {"label": t.get("label"), "type": t.get("type")}
+                for t in brief["triggered_tokens"][:5]
+            ],
+            "sensors": {k: v for k, v in brief["sensors"].items() if k in ("total", "running")}
+            | {"unhealthy": len(brief["sensors"].get("unhealthy", []))},
         }
     if attack:
         digest["attack"] = {
             "event_types_seen": attack["event_types_seen"],
             "mapped_share": attack["mapped_share"],
             "tactics": _tactic_digest(attack),
-            "unmapped": attack["unmapped"][:8],
+            "unmapped": attack["unmapped"][:5],
             "note": (
                 f"Top {_TECHNIQUES_PER_TACTIC_IN_DIGEST} techniques per tactic shown; the full "
                 f"table is in {_SUMMARY_NAME}."
@@ -326,48 +396,23 @@ async def run_analysis(
         }
 
     # ── the busiest sources ───────────────────────────────────────────────────────────────────
-    # Per-source names are explicit (a model-chosen name is never overwritten), so make them unique per run.
-    stamp = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(2)}"
-    sources: list[dict[str, Any]] = []
     busiest = (stats or {}).get("top_source_ips", [])
     if not busiest and brief:
         busiest = [{"ip": b["source_ip"], "count": b["events"]} for b in brief["busiest_sources"]]
-    for source in busiest[:top]:
-        ip = source["ip"]
-        row: dict[str, Any] = {"ip": ip, "alerts": source["count"]}
-        profile = await run.step(f"analyze_attacker({ip})", _analysis_tools.analyze_attacker(ip))
-        if profile:
-            row["risk_level"] = profile.get("risk_level")
-            row["risk_score"] = profile.get("risk_score")
-        journey = await run.step(
-            f"analyze_attacker_journey({ip})",
-            _analysis_tools.analyze_attacker_journey(ip, hours=effective),
-        )
-        if journey:
-            row["journey"] = _one_line(journey.get("summary", ""), 400)
-        if write_exports:
-            report = await run.step(
-                f"generate_report({ip})",
-                _analysis_tools.generate_report(
-                    title=f"Source {ip}",
-                    ip=ip,
-                    format="markdown",
-                    since_hours=float(effective),
-                    output_path=f"analysis-{stamp}-source-{ip.replace(':', '-')}.md",
-                ),
+    sources = list(
+        await asyncio.gather(
+            *(
+                _profile_source(run, source["ip"], source["count"], effective, stamp)
+                for source in busiest[:top]
             )
-            if report:
-                row["report"] = Path(report["path"]).name
-        sources.append(row)
+        )
+    )
     digest["top_sources"] = sources
     digest["top_sources_count"] = len(sources)
 
     # ── campaigns, shared tooling, coverage ───────────────────────────────────────────────────
-    campaigns = await run.step(
-        "analyze_campaign", _analysis_tools.analyze_campaign(window_minutes=60, min_sources=3)
-    )
     if campaigns:
-        shown = campaigns["campaigns"][:5]
+        shown = campaigns["campaigns"][:_CAMPAIGNS_IN_DIGEST]
         digest["campaigns"] = {
             "total": campaigns["campaigns_total"],
             "count": len(shown),
@@ -389,12 +434,8 @@ async def run_analysis(
                 else None
             ),
         }
-    clusters = await run.step(
-        "fingerprint_clusters",
-        _analysis_tools.fingerprint_clusters(hours=effective, min_sources=2, limit=10),
-    )
     if clusters:
-        shown_c = clusters["clusters"][:5]
+        shown_c = clusters["clusters"][:_CLUSTERS_IN_DIGEST]
         digest["fingerprint_clusters"] = {
             "matching": clusters["clusters_matching"],
             "count": len(shown_c),
@@ -418,77 +459,68 @@ async def run_analysis(
                 )
             ),
         }
-    coverage = await run.step("deception_coverage", _deception_tools.deception_coverage())
     if coverage:
         digest["coverage"] = {
             "techniques_covered": coverage.get("techniques_covered"),
             "coverage": coverage.get("coverage"),
         }
 
-    # ── exports ───────────────────────────────────────────────────────────────────────────────
+    # ── files ─────────────────────────────────────────────────────────────────────────────────
     files: dict[str, str] = {}
-    if write_exports:
-        exports = (
-            (
-                "full report",
-                "generate_report(full)",
-                _analysis_tools.generate_report(
-                    title="Run summary", format="html", since_hours=float(effective)
-                ),
-            ),
-            (
-                "STIX bundle",
-                "export_stix",
-                _analysis_tools.export_stix(hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS),
-            ),
-            (
-                "blocklist",
-                "export_blocklist",
-                _analysis_tools.export_blocklist(
-                    format="plain", hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS
-                ),
-            ),
-        )
-        for label, part, work in exports:
-            out = await run.step(part, work)
-            if not out:
-                continue
-            if "path" in out:
-                files[label] = Path(out["path"]).name
-            else:
-                files[label] = _one_line(out.get("note", "nothing written"), 200)
-        for row in sources:
-            if row.get("report"):
-                files[f"source report {row['ip']}"] = row["report"]
+    for label, out in (
+        ("full report", full_report),
+        ("STIX bundle", stix),
+        ("blocklist", blocklist),
+    ):
+        if not out:
+            continue
+        if "path" in out:
+            files[label] = Path(out["path"]).name
+        else:
+            files[label] = _one_line(out.get("note", "nothing written"), 200)
+    for row in sources:
+        if row.get("report"):
+            files[f"source report {row['ip']}"] = row["report"]
     digest["files"] = files
 
     digest["failed"] = run.failed
     digest["complete"] = not run.failed
-    digest["timings_seconds"] = run.timings
-    markdown = _render_summary(digest, attack)
-    if write_exports:
-        written = write_artifact(
-            markdown,
-            prefix="analysis-summary",
-            extension="md",
-            output_path=_SUMMARY_NAME,
-            overwrite=True,  # a name this tool fixes itself, regenerated on every run
-        )
-        if "error" in written:
-            run.failed.append({"part": "summary_file", "error": str(written["error"])[:300]})
-            digest["complete"] = False
-        else:
-            digest["summary_file"] = written
-        await _audit.record_action(
-            "run_analysis",
-            summary=f"analysed the run (top {top}, {hours} h), {len(files)} file(s) written",
-            arguments={"top": top, "hours": hours, "write_exports": write_exports},
-            target=_SUMMARY_NAME,
-            outcome="ok" if digest["complete"] else "error",
-            error=None if digest["complete"] else f"{len(run.failed)} part(s) failed",
-        )
+    markdown = _render_summary({**digest, "soc": brief} if brief else digest, attack)
+    written = write_artifact(
+        markdown,
+        prefix="analysis-summary",
+        extension="md",
+        output_path=_SUMMARY_NAME,
+        overwrite=True,  # a name this tool fixes itself, regenerated on every run
+    )
+    if "error" in written:
+        run.failed.append({"part": "summary_file", "error": str(written["error"])[:300]})
+        digest["complete"] = False
     else:
-        digest["summary_markdown"] = markdown
+        digest["summary_file"] = written
+    digest["summary"] = (
+        (
+            f"Analysis of {digest['headline']['total_alerts']:,} alerts from "
+            f"{digest['headline']['unique_source_ips']:,} sources. "
+            if "headline" in digest
+            else "Analysis finished. "
+        )
+        + (
+            f"The write-up is in {written['path']}; "
+            if "path" in written
+            else "The write-up could not be saved; "
+        )
+        + f"{len(files)} more file(s) are in the reports directory"
+        + (f"; {len(run.failed)} part(s) failed (see `failed`)." if run.failed else ".")
+    )
+    await _audit.record_action(
+        "run_analysis",
+        summary=f"analysed the run ({hours} h), {len(files)} file(s) written",
+        arguments={"hours": hours},
+        target=_SUMMARY_NAME,
+        outcome="ok" if digest["complete"] else "error",
+        error=None if digest["complete"] else f"{len(run.failed)} part(s) failed",
+    )
     digest["seconds"] = round(time.monotonic() - started, 1)
     return digest
 
@@ -502,7 +534,11 @@ _PROGRESS_SECONDS = 10.0
 
 
 class _BackupError(Exception):
-    """A refusal or failure with a message meant for the caller."""
+    """A refusal or failure with a message (and what to do about it) meant for the caller."""
+
+    def __init__(self, message: str, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 def _sqlite_source(url: str) -> Path:
@@ -510,47 +546,34 @@ def _sqlite_source(url: str) -> Path:
     if not url.startswith(_SQLITE_PREFIXES):
         scheme = url.split(":", 1)[0].split("+", 1)[0]
         raise _BackupError(
-            f"database_backup only supports SQLite; this server uses {scheme!r}. Back a PostgreSQL "
-            "database up with pg_dump (see scripts/backup.sh, which runs it with the password kept "
-            "out of the process list)."
+            f"database_backup only supports SQLite; this server uses {scheme!r}.",
+            "Back a PostgreSQL database up with pg_dump (scripts/backup.sh runs it with the "
+            "password kept out of the process list).",
         )
     path = url.split(":///", 1)[1].split("?", 1)[0]
     if not path or ":memory:" in path:
-        raise _BackupError("The database is in memory, so there is no file to back up.")
+        raise _BackupError(
+            "The database is in memory, so there is no file to back up.",
+            "Point DATABASE_URL at a SQLite file to keep data between runs.",
+        )
     source = Path(path)
     if not source.is_file():
-        raise _BackupError("The database file does not exist yet (nothing has been written).")
+        raise _BackupError(
+            "The database file does not exist yet (nothing has been written).",
+            "Back up after the server has captured something.",
+        )
     return source
 
 
-def _resolve_backup_destination(destination: str | None, root: Path) -> Path:
-    """The new backup directory, confined to `root` (a `_BackupError` if it escapes or exists).
-
-    Same boundary as report artifacts: the argument can come from a model that has read
-    attacker-authored data, so it may only name a not-yet-existing directory below `backup_dir`.
-    """
-    if not destination:
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        final = root / f"honeypot-{stamp}"
-    else:
-        try:
-            candidate = Path(destination).expanduser()
-            final = (candidate if candidate.is_absolute() else root / candidate).resolve()
-        except Exception as e:  # embedded NUL, unknown ~user: a refusal, not a crash
-            raise _BackupError(f"{destination!r} is not a usable path: {e}") from e
-        if root not in final.parents:
-            raise _BackupError(
-                f"Refusing to write outside the backups directory ({root}). Pass a new "
-                f"directory name (or a path inside it) instead of {destination!r}."
-            )
-    if final.name.endswith(".partial") or any(
-        p.startswith(".") for p in final.relative_to(root).parts
-    ):
-        raise _BackupError("Backup directory names may not start with '.' or end in '.partial'.")
-    if final.exists():
-        raise _BackupError(
-            f"{final.name!r} already exists in the backups directory; refusing to overwrite it."
-        )
+def _new_backup_dir(root: Path) -> Path:
+    """The not-yet-existing `honeypot-<UTC timestamp>` directory inside `root` (a numeric suffix
+    when two backups start in the same second)."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    final = root / f"honeypot-{stamp}"
+    suffix = 1
+    while final.exists():
+        suffix += 1
+        final = root / f"honeypot-{stamp}-{suffix}"
     return final
 
 
@@ -659,7 +682,7 @@ def _progress_logger(target: Path, expected: int, stop: threading.Event) -> None
             )
 
 
-def _backup_into(source: Path, work_dir: Path, verify: bool, expected: int) -> dict[str, Any]:
+def _backup_into(source: Path, work_dir: Path, expected: int) -> dict[str, Any]:
     """Blocking: copy, check and describe. Runs in a worker thread. Raises on any failure."""
     target = work_dir / _DB_NAME
     # Created 0600 by us, so the file is never readable by others, even briefly.
@@ -689,16 +712,14 @@ def _backup_into(source: Path, work_dir: Path, verify: bool, expected: int) -> d
 
     check = _open_readonly(target)
     try:
-        integrity = "not run"
-        if verify:
-            log.info("database_backup: running PRAGMA integrity_check")
-            rows = [r[0] for r in check.execute("PRAGMA integrity_check").fetchall()]
-            integrity = rows[0] if rows == ["ok"] else "; ".join(map(str, rows[:5]))
-            if rows != ["ok"]:
-                raise _BackupError(
-                    f"The copy failed PRAGMA integrity_check ({integrity}), so it was not kept. "
-                    "The source database may be damaged."
-                )
+        log.info("database_backup: running PRAGMA integrity_check")
+        rows = [r[0] for r in check.execute("PRAGMA integrity_check").fetchall()]
+        integrity = rows[0] if rows == ["ok"] else "; ".join(map(str, rows[:5]))
+        if rows != ["ok"]:
+            raise _BackupError(
+                f"The copy failed PRAGMA integrity_check ({integrity}), so it was not kept. "
+                "The source database may be damaged."
+            )
         log.info("database_backup: reading headline counts")
         facts = _database_facts(check)
     finally:
@@ -710,23 +731,21 @@ def _backup_into(source: Path, work_dir: Path, verify: bool, expected: int) -> d
         "source_file": source.name,
         "database": _DB_NAME,
         "size_bytes": target.stat().st_size,
-        "verified": verify,
+        "verified": True,
         "integrity_check": integrity,
-        "sha256": _sha256_file(target) if verify else None,
+        "sha256": _sha256_file(target),
         **facts,
     }
     write_private_file(work_dir / _MANIFEST_NAME, json.dumps(manifest, indent=2) + "\n")
     return manifest
 
 
-async def _audited(
-    result: dict[str, Any], arguments: dict[str, Any], summary: str, target: str | None
-) -> dict[str, Any]:
+async def _audited(result: dict[str, Any], summary: str, target: str | None) -> dict[str, Any]:
     failed = "error" in result
     await _audit.record_action(
         "database_backup",
         summary=summary,
-        arguments=arguments,
+        arguments={},
         target=target,
         outcome="error" if failed else "ok",
         error=str(result["error"]) if failed else None,
@@ -735,39 +754,27 @@ async def _audited(
 
 
 @mcp.tool(auth=require_role("admin"), **hints("database_backup"))
-async def database_backup(destination: str | None = None, verify: bool = True) -> dict[str, Any]:
-    """Take a consistent, verified snapshot of the SQLite database, safe on a running server.
+async def database_backup() -> dict[str, Any]:
+    """Back up the database now and check the copy; safe while the server is running.
 
-    Use it for "back up the database and verify it", before an upgrade, or before pruning. It
-    writes `honeypot_mcp.db` and a `MANIFEST.json` (counts, window, size, SHA-256) into a new
-    directory below the backups directory (`BACKUP_DIR`, default `./backups`), mode 0600, built
-    under a temporary name and renamed only once it checked out: a failed run leaves nothing
-    behind. It refuses to overwrite an existing backup, and refuses when the disk cannot hold the
-    copy (the message gives the numbers). The copy runs in a worker thread, so sensors keep
-    serving. **The file contains secrets** (honeytoken values, API-key digests, captured
-    credentials): store it like the `.env`.
-
-    This covers the database only. TLS certificates, generated reports, `.env`, remote fetch and
-    malware samples remain the job of `scripts/backup.sh` / `scripts/fetch_backup.sh`. PostgreSQL
-    deployments are not supported here; use `pg_dump`.
-
-    Args:
-        destination: A new directory name (or path) inside the backups directory. Omit for
-              `honeypot-<UTC timestamp>`. Anything resolving outside it is refused.
-        verify: Run `PRAGMA integrity_check` on the copy and record its SHA-256. False skips both
-              (the headline counts are always read, which also proves the copy opens).
+    Use it for "back up the database", before an upgrade or before pruning. Takes no arguments: it
+    writes `honeypot_mcp.db` plus a `MANIFEST.json` (counts, span, size, SHA-256) into a new
+    timestamped, owner-only folder in the backups directory and always integrity-checks the copy.
+    A failed run leaves nothing behind and an existing backup is never replaced. A big database
+    takes a minute or more; sensors keep serving. The file holds secrets (honeytoken values,
+    captured credentials): store it like the `.env`. SQLite only (`pg_dump` for PostgreSQL);
+    certificates, reports, `.env` and samples are covered by `scripts/backup.sh`.
     """
     async with _backup_lock.get():
-        return await _database_backup(destination, verify)
+        return await _database_backup()
 
 
-async def _database_backup(destination: str | None, verify: bool) -> dict[str, Any]:
-    arguments = {"destination": destination, "verify": verify}
+async def _database_backup() -> dict[str, Any]:
     settings = get_settings()
     root = settings.backup_dir.resolve()
     try:
         source = _sqlite_source(settings.database_url)
-        final = _resolve_backup_destination(destination, root)
+        final = _new_backup_dir(root)
         wal = source.with_name(source.name + "-wal")
         needed = source.stat().st_size + (wal.stat().st_size if wal.exists() else 0)
         reserve = settings.min_free_disk_mb * 1024 * 1024
@@ -776,15 +783,18 @@ async def _database_backup(destination: str | None, verify: bool) -> dict[str, A
             raise _BackupError(
                 f"Not enough free disk space: the backup needs up to {_fmt_bytes(needed)} "
                 f"({needed:,} bytes) plus a {_fmt_bytes(reserve)} reserve, and only "
-                f"{_fmt_bytes(free)} ({free:,} bytes) is free where backups are written. Free "
-                "space or point BACKUP_DIR at a larger volume."
+                f"{_fmt_bytes(free)} ({free:,} bytes) is free where backups are written.",
+                "Free some space, or point BACKUP_DIR at a larger volume.",
             )
     except _BackupError as e:
-        return await _audited({"error": str(e)}, arguments, "database backup refused", None)
+        failure = {"error": str(e), **({"hint": e.hint} if e.hint else {})}
+        return await _audited(failure, "database backup refused", None)
     except OSError as e:
         return await _audited(
-            {"error": f"Could not prepare the backup: {e}"},
-            arguments,
+            {
+                "error": f"Could not prepare the backup: {e}",
+                "hint": "Check that the backups directory exists and is writable.",
+            },
             "database backup failed",
             None,
         )
@@ -793,26 +803,34 @@ async def _database_backup(destination: str | None, verify: bool) -> dict[str, A
     try:
         _make_private_tree(final.parent)
         work_dir.mkdir(mode=0o700)
-        manifest = await asyncio.to_thread(_backup_into, source, work_dir, verify, needed)
+        manifest = await asyncio.to_thread(_backup_into, source, work_dir, needed)
         if final.exists():  # lost a race with another backup of the same name
             raise _BackupError(
-                f"{final.name!r} appeared while the backup ran; refusing to replace it."
+                f"{final.name!r} appeared while the backup ran; refusing to replace it.",
+                "Run the backup again.",
             )
         os.rename(work_dir, final)
     except (_BackupError, OSError, sqlite3.Error) as e:
         shutil.rmtree(work_dir, ignore_errors=True)
-        return await _audited(
-            {"error": str(e) if isinstance(e, _BackupError) else f"Backup failed: {e}"},
-            arguments,
-            "database backup failed",
-            final.name,
-        )
+        failure = {"error": str(e) if isinstance(e, _BackupError) else f"Backup failed: {e}"}
+        if isinstance(e, _BackupError) and e.hint:
+            failure["hint"] = e.hint
+        elif not isinstance(e, _BackupError):
+            failure["hint"] = (
+                "Nothing was kept. Check free disk space and that the database file is readable, then retry."
+            )
+        return await _audited(failure, "database backup failed", final.name)
     except BaseException:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
     log.info("database_backup: wrote %s", final.name)
+    size = _fmt_bytes(manifest["size_bytes"])
     result = {
+        "summary": (
+            f"Backed up {manifest['alerts']:,} alerts ({size}) from {manifest['distinct_sources']:,} "
+            f"sources to {final}. The copy passed an integrity check."
+        ),
         "path": str(final),
         "database": str(final / _DB_NAME),
         "manifest": str(final / _MANIFEST_NAME),
@@ -825,7 +843,6 @@ async def _database_backup(destination: str | None, verify: bool) -> dict[str, A
     }
     return await _audited(
         result,
-        arguments,
-        f"backed up the database: {manifest['alerts']:,} alerts, {_fmt_bytes(manifest['size_bytes'])}",
+        f"backed up the database: {manifest['alerts']:,} alerts, {size}",
         final.name,
     )

@@ -3,7 +3,7 @@
 On the real 116-hour run the tool returned 2,070 campaigns sorted by source count and showed 50:
 mostly three sources sweeping one service in the same hour, with the ones that mattered (commands
 run, exploit attempts, planted credentials) buried. These tests pin that the order is by an
-explainable score that puts behaviour first, that `rank_by` reorders, and that every term of the
+explainable score that puts behaviour first, and that every term of the
 score is reported.
 """
 
@@ -18,7 +18,6 @@ import pytest
 os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 from honeypot_mcp.analysis.correlator import (  # noqa: E402
-    RANK_BY_VALUES,
     classify_kind,
     detect_campaigns,
 )
@@ -104,26 +103,17 @@ async def test_a_small_behavioural_campaign_outranks_a_big_connection_sweep_by_d
 
 
 @pytest.mark.asyncio
-async def test_rank_by_changes_the_order():
+async def test_filters_apply_after_scoring_and_never_change_the_score():
     alerts = _mixed()
-    orders = {
-        rank_by: _order(await detect_campaigns(alerts, window_minutes=60, rank_by=rank_by))
-        for rank_by in RANK_BY_VALUES
-    }
+    everything = {c["event_type"]: c for c in await detect_campaigns(alerts, window_minutes=60)}
 
-    assert orders["score"] == ["smb_ntlm_auth", "ssh_command_input", "telnet_session_connect"]
-    assert orders["sources"] == ["telnet_session_connect", "smb_ntlm_auth", "ssh_command_input"]
-    assert orders["events"] == ["telnet_session_connect", "ssh_command_input", "smb_ntlm_auth"]
-    assert orders["recent"] == ["telnet_session_connect", "smb_ntlm_auth", "ssh_command_input"]
-    assert len({tuple(o) for o in orders.values()}) == 3
-    # score is the default
-    assert _order(await detect_campaigns(alerts, window_minutes=60)) == orders["score"]
+    only_ssh = await detect_campaigns(alerts, window_minutes=60, event_type_contains="SSH")
+    assert _order(only_ssh) == ["ssh_command_input"]
+    assert only_ssh[0]["score"] == everything["ssh_command_input"]["score"]
 
-
-@pytest.mark.asyncio
-async def test_an_unknown_rank_by_is_rejected():
-    with pytest.raises(ValueError, match="rank_by"):
-        await detect_campaigns(_mixed(), rank_by="largest")  # type: ignore[arg-type]
+    one_source = await detect_campaigns(alerts, window_minutes=60, involving_ip="203.0.113.1")
+    assert _order(one_source) == ["telnet_session_connect"]
+    assert await detect_campaigns(alerts, window_minutes=60, involving_ip="10.9.9.9") == []
 
 
 @pytest.mark.asyncio
@@ -281,9 +271,7 @@ async def test_the_same_sources_returning_every_hour_are_one_campaign():
     alerts = _hourly(ips, "telnet_command_input", range(5), weight=10, rotate="192.0.2")
 
     merged = await detect_campaigns(alerts, window_minutes=0, min_sources=3)
-    windows = await detect_campaigns(alerts, window_minutes=0, min_sources=3, merge_recurring=False)
 
-    assert len(windows) == 5 and all(w["occurrences"] == 1 for w in windows)
     assert len(merged) == 1
     c = merged[0]
     assert c["occurrences"] == 5
@@ -301,16 +289,14 @@ async def test_the_same_sources_returning_every_hour_are_one_campaign():
 
 
 @pytest.mark.asyncio
-async def test_merging_keeps_the_events_and_hours_the_unmerged_dedup_dropped():
-    """Five identical windows: the unmerged list keeps one (the others are subsets of it) and its
-    event total, hours and recurrence are those of one hour. Merged, nothing is lost."""
+async def test_merging_keeps_the_events_and_hours_of_identical_windows():
+    """Five identical windows: nothing is dropped as a subset; events, hours and recurrence all
+    count."""
     ips = [f"192.0.2.{n}" for n in range(1, 5)]
     alerts = _hourly(ips, "telnet_command_input", range(5), weight=10)
 
-    unmerged = await detect_campaigns(alerts, window_minutes=0, merge_recurring=False)
     merged = await detect_campaigns(alerts, window_minutes=0)
 
-    assert len(unmerged) == 1 and unmerged[0]["total_events"] == 40
     assert len(merged) == 1 and merged[0]["occurrences"] == 5 and merged[0]["total_events"] == 200
 
 
@@ -376,7 +362,7 @@ async def test_a_single_window_lists_at_most_twenty_sources_too():
         [f"198.51.100.{n}" for n in range(1, 41)], "vnc_connection", [0], severity="low"
     )
 
-    found = await detect_campaigns(alerts, window_minutes=0, min_sources=3, merge_recurring=False)
+    found = await detect_campaigns(alerts, window_minutes=0, min_sources=3)
 
     assert found[0]["unique_source_ips"] == 40 and len(found[0]["source_ips"]) == 20
 
@@ -389,9 +375,8 @@ async def test_recurrence_term_is_capped_and_one_botnet_no_longer_fills_the_top(
     alerts += _hourly(["203.0.113.1", "203.0.113.2", "203.0.113.3"], "ssh_login_success", [7])
 
     merged = await detect_campaigns(alerts, window_minutes=0, min_sources=3)
-    raw = await detect_campaigns(alerts, window_minutes=0, min_sources=3, merge_recurring=False)
 
-    assert len(raw) == 32 and len(merged) == 3
+    assert len(merged) == 3
     assert {c["event_type"] for c in merged[:3]} == {
         "telnet_command_input",
         "redis_config_set",
@@ -401,8 +386,7 @@ async def test_recurrence_term_is_capped_and_one_botnet_no_longer_fills_the_top(
     assert top["occurrences"] == 30 and top["score_breakdown"]["recurrence"] == 6.0
     assert top["score_breakdown"]["duration"] == 4.0
     assert sum(c["occurrences"] for c in merged) == 32
-    top3_unmerged = sorted(raw, key=lambda c: -c["score"])[:3]
-    assert len({c["event_type"] for c in top3_unmerged}) == 1, "unmerged, the top is one botnet"
+    # the recurrence term is capped, so one botnet's 30 windows do not outscore the rest by volume
 
 
 # ── through the tool, on a real database ─────────────────────────────────────
@@ -456,35 +440,22 @@ def _scenario() -> list[tuple[str, str, str, datetime, int]]:
 
 
 @pytest.mark.asyncio
-async def test_the_tool_puts_behaviour_first_and_rank_by_reorders(db):
+async def test_the_tool_puts_behaviour_first(db):
     from honeypot_mcp.tools.analysis import analyze_campaign
 
     await _seed(_scenario())
 
     default = await analyze_campaign()
-    by_sources = await analyze_campaign(rank_by="sources")
-    recent = await analyze_campaign(rank_by="recent")
 
-    assert default["rank_by"] == "score"
     assert _order(default["campaigns"]) == [
         "smb_ntlm_auth",
         "ssh_command_input",
         "telnet_session_connect",
     ]
-    assert _order(by_sources["campaigns"]) == [
-        "telnet_session_connect",
-        "smb_ntlm_auth",
-        "ssh_command_input",
-    ]
-    assert _order(recent["campaigns"]) == [
-        "telnet_session_connect",
-        "smb_ntlm_auth",
-        "ssh_command_input",
-    ]
     top = default["campaigns"][0]
     assert top["kind"] == "behavioural" and top["severity"] == "high"
     assert top["unique_source_ips"] == 6 and top["total_events"] == 12
-    for key in ("window", "resolution", "campaigns_total", "count"):
+    for key in ("window", "campaigns_total", "count"):
         assert key in default
     assert default["campaigns_total"] == default["count"] == 3
     assert "note" not in default
@@ -506,24 +477,35 @@ async def test_the_severity_comes_from_the_rollups_of_the_campaign_hours(db):
 
 
 @pytest.mark.asyncio
-async def test_the_note_says_what_the_cut_off_list_is_ordered_by(db):
+async def test_the_note_says_the_list_is_cut_to_the_top_by_score(db):
+    from honeypot_mcp.tools import analysis
+    from honeypot_mcp.tools.analysis import analyze_campaign
+
+    await _seed(_scenario())
+    original = analysis._CAMPAIGNS_SHOWN
+    analysis._CAMPAIGNS_SHOWN = 1
+    try:
+        out = await analyze_campaign()
+    finally:
+        analysis._CAMPAIGNS_SHOWN = original
+
+    assert out["campaigns_total"] == 3 and out["count"] == 1 and len(out["campaigns"]) == 1
+    assert "top 1 of 3" in out["note"] and "by score" in out["note"]
+    assert out["campaigns"][0]["event_type"] == "smb_ntlm_auth"
+
+
+@pytest.mark.asyncio
+async def test_the_tool_filters_by_event_type_and_by_source(db):
     from honeypot_mcp.tools.analysis import analyze_campaign
 
     await _seed(_scenario())
 
-    out = await analyze_campaign(limit=1, rank_by="events")
-
-    assert out["campaigns_total"] == 3 and out["count"] == 1 and len(out["campaigns"]) == 1
-    assert "top 1 of 3" in out["note"] and "events" in out["note"]
-
-
-@pytest.mark.asyncio
-async def test_the_tool_rejects_an_unknown_rank_by(db):
-    from honeypot_mcp.tools.analysis import analyze_campaign
-
-    out = await analyze_campaign(rank_by="biggest")  # type: ignore[arg-type]
-
-    assert "error" in out and "rank_by" in out["error"]
+    by_type = await analyze_campaign(event_type="SSH")
+    assert _order(by_type["campaigns"]) == ["ssh_command_input"]
+    by_ip = await analyze_campaign(ip="192.0.2.1")
+    assert _order(by_ip["campaigns"]) == ["smb_ntlm_auth"]
+    none = await analyze_campaign(event_type="no_such_type")
+    assert none["campaigns"] == [] and "note" in none
 
 
 @pytest.mark.asyncio
@@ -560,14 +542,11 @@ async def test_the_tool_merges_recurring_windows_and_counts_both(db):
     await _seed(rows)
 
     out = await analyze_campaign()
-    raw = await analyze_campaign(merge_recurring=False, limit=100)
 
-    assert out["campaigns_total"] == 2 and out["windows_total"] == 7
-    assert out["count"] == 2 and out["merge_recurring"] is True
+    assert out["campaigns_total"] == 2 and out["count"] == 2
     telnet = next(c for c in out["campaigns"] if c["event_type"] == "telnet_command_input")
     assert telnet["occurrences"] == 6 and telnet["unique_source_ips"] == 10
-    assert telnet["sources_per_window"] == 5
     assert telnet["total_events"] == 6 * 5 * 2
-    assert telnet["source_ips_shown"] == 10 and len(telnet["source_ips"]) == 10
-    assert raw["campaigns_total"] == 7 == raw["windows_total"]
-    assert all(c["occurrences"] == 1 for c in raw["campaigns"])
+    assert len(telnet["source_ips"]) == 10
+    # every window is in exactly one campaign
+    assert sum(c["occurrences"] for c in out["campaigns"]) == 7

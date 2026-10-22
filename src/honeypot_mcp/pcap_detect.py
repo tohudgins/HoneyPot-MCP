@@ -1679,7 +1679,7 @@ def _empty_result(engine: str, scan: CaptureScan, size: int) -> dict[str, Any]:
     }
 
 
-async def detect(path: str, engine: str, top: int = 10) -> dict[str, Any]:
+async def detect(path: str | None, engine: str, top: int = 10) -> dict[str, Any]:
     """Replay a capture through `engine` and return a digest. Never raises."""
     async with _lock.get():
         try:
@@ -1696,9 +1696,12 @@ async def detect(path: str, engine: str, top: int = 10) -> dict[str, Any]:
             }
 
 
-async def _detect(path: str, engine: str, top: int) -> dict[str, Any]:
+async def _detect(path: str | None, engine: str, top: int) -> dict[str, Any]:
     if engine not in ENGINES:
-        raise DetectError(f"Unknown engine {engine!r}.", "Use engine='suricata' or engine='zeek'.")
+        raise DetectError(
+            f"Unknown engine {engine!r}.",
+            "Say Suricata (signature alerts, the default) or Zeek (protocol logs).",
+        )
     top = max(1, min(int(top), 50))
     settings = get_settings()
     roots = [
@@ -1706,12 +1709,17 @@ async def _detect(path: str, engine: str, top: int) -> dict[str, Any]:
         ("ring", Path(settings.pcap_dir).expanduser()),
     ]
     max_bytes = settings.detection_max_pcap_mb * _MB
+    chosen, how, problem = await asyncio.to_thread(pcap_analysis.choose_capture, path, roots)
+    if problem is not None or chosen is None:
+        return problem or {"error": "No capture file to read."}
     try:
         # The size cap is checked below against the settings of this tool, not the analyser's.
-        fh, resolved, kind, size = pcap_analysis.open_capture(path, roots, 1 << 62)
+        fh, resolved, kind, size = pcap_analysis.open_capture(chosen, roots, 1 << 62)
     except pcap_analysis.CaptureAccessError as exc:
-        return {"error": str(exc)}
+        return await asyncio.to_thread(pcap_analysis.access_error, exc, chosen, roots)
     file_info = {"name": resolved.name, "kind": kind, "bytes": size}
+    if how:
+        file_info["chosen"] = pcap_analysis.describe_choice(how, resolved.name)
     try:
         if size > max_bytes:
             return {

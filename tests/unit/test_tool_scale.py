@@ -64,7 +64,8 @@ async def test_a_small_history_is_returned_in_full_and_exact():
     await _seed(30)
     out = await analyze_attacker_journey(IP)
     assert out["total_alerts"] == 30 and out["sampled"] is False
-    assert "note" not in out
+    # The only note a small history may carry is the per-phase listing cap; counts stay exact.
+    assert "Counts are exact" in out.get("note", "") and "by_event_type" not in out
     assert sum(p["event_count"] for p in out["phases"]) == 30
 
 

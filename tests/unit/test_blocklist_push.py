@@ -154,7 +154,14 @@ def _fast_cloudflare_polling(monkeypatch):
 async def _push_cf(stub: _CloudflareListStub, **kwargs):
     from honeypot_mcp.tools import blocklist_push
 
-    params = {"account_id": "acct", "list_id": "list", "api_token": "tok", "min_hits": 5, **kwargs}
+    params = {
+        "account_id": "acct",
+        "list_id": "list",
+        "api_token": "tok",
+        "min_hits": 5,
+        "dry_run": False,  # the tool previews by default; these tests exercise the real push
+        **kwargs,
+    }
     with patch("honeypot_mcp.tools.blocklist_push.httpx.AsyncClient", stub.client_factory()):
         return await blocklist_push.blocklist_push_cloudflare(**params)
 
@@ -166,7 +173,13 @@ async def test_cloudflare_push_adds_only_new_ips_and_reports_them_once_on_the_li
 
     result = await _push_cf(stub)
 
-    assert result == {"added": ["2.2.2.2"], "skipped": ["1.1.1.1"], "failed": [], "dry_run": False}
+    assert {k: result[k] for k in ("added", "skipped", "failed", "dry_run")} == {
+        "added": ["2.2.2.2"],
+        "skipped": ["1.1.1.1"],
+        "failed": [],
+        "dry_run": False,
+    }
+    assert (result["added_count"], result["skipped_count"], result["failed_count"]) == (1, 1, 0)
     assert stub.items == ["1.1.1.1", "2.2.2.2"], "added must mean actually on the list"
 
 
@@ -243,7 +256,13 @@ async def test_cloudflare_push_empty_offenders_no_op():
 
     result = await _push_cf(_CloudflareListStub())
 
-    assert result == {"added": [], "skipped": [], "failed": [], "dry_run": False}
+    assert {k: result[k] for k in ("added", "skipped", "failed", "dry_run")} == {
+        "added": [],
+        "skipped": [],
+        "failed": [],
+        "dry_run": False,
+    }
+    assert "Nothing to push" in result["note"]
 
 
 @pytest.mark.asyncio
@@ -344,6 +363,7 @@ async def _push_pf(stub: _PfRestStub, **kwargs):
         "api_key": "key",
         "alias_name": "honeypot_block",
         "min_hits": 5,
+        "dry_run": False,  # the tool previews by default; these tests exercise the real push
         **kwargs,
     }
     with patch("honeypot_mcp.tools.blocklist_push.httpx.AsyncClient", stub.client_factory()):
@@ -415,7 +435,11 @@ async def test_pfsense_push_a_wrong_key_is_a_clean_failure():
     stub = _PfRestStub()
     with patch("honeypot_mcp.tools.blocklist_push.httpx.AsyncClient", stub.client_factory()):
         result = await blocklist_push.blocklist_push_pfsense(
-            base_url="https://pf.local", api_key="wrong", alias_name="honeypot_block", min_hits=5
+            base_url="https://pf.local",
+            api_key="wrong",
+            alias_name="honeypot_block",
+            min_hits=5,
+            dry_run=False,
         )
 
     assert result["added"] == []
@@ -434,7 +458,11 @@ async def test_pfsense_push_verifies_tls_by_default():
         "honeypot_mcp.tools.blocklist_push.httpx.AsyncClient", _PfRestStub().client_factory(seen)
     ):
         await blocklist_push.blocklist_push_pfsense(
-            base_url="https://pf.local", api_key="key", alias_name="honeypot_block", min_hits=5
+            base_url="https://pf.local",
+            api_key="key",
+            alias_name="honeypot_block",
+            min_hits=5,
+            dry_run=False,
         )
 
     assert seen["verify"] is True
@@ -455,6 +483,7 @@ async def test_pfsense_push_verify_tls_false_is_an_explicit_opt_in():
             alias_name="honeypot_block",
             min_hits=5,
             verify_tls=False,
+            dry_run=False,
         )
 
     assert seen["verify"] is False
@@ -517,6 +546,7 @@ async def test_waf_push_converts_bare_ip_to_cidr_and_unions():
             ip_set_name="honeypot-blocklist",
             region="us-east-1",
             min_hits=5,
+            dry_run=False,
         )
 
     assert sorted(result["added"]) == ["2.2.2.2/32"]
@@ -568,6 +598,7 @@ async def test_waf_push_does_not_block_the_event_loop():
                 ip_set_name="honeypot-blocklist",
                 region="us-east-1",
                 min_hits=5,
+                dry_run=False,
             )
         finally:
             ticker_task.cancel()
@@ -592,6 +623,7 @@ async def test_waf_push_records_get_failure():
             ip_set_name="x",
             region="us-east-1",
             min_hits=5,
+            dry_run=False,
         )
 
     assert result["added"] == []
@@ -637,9 +669,16 @@ async def test_waf_push_empty_offenders_no_op():
             ip_set_name="x",
             region="us-east-1",
             min_hits=5,
+            dry_run=False,
         )
 
-    assert result == {"added": [], "skipped": [], "failed": [], "dry_run": False}
+    assert {k: result[k] for k in ("added", "skipped", "failed", "dry_run")} == {
+        "added": [],
+        "skipped": [],
+        "failed": [],
+        "dry_run": False,
+    }
+    assert "Nothing to push" in result["note"]
     # No API calls if no offenders
     boto_client.get_ip_set.assert_not_called()
 
@@ -696,6 +735,7 @@ async def test_waf_push_makes_calls_the_real_wafv2_api_accepts_and_keeps_the_des
                 scope="REGIONAL",
                 region="us-east-1",
                 min_hits=5,
+                dry_run=False,
             )
         stub.assert_no_pending_responses()
 

@@ -1185,8 +1185,11 @@ def _dashboards_result(port: int) -> dict[str, Any]:
     }
 
 
-async def start(port: int = 3000) -> dict[str, Any]:
-    """Run Grafana on the configured database. Returns a result dict; never raises."""
+async def start(port: int | None = None) -> dict[str, Any]:
+    """Run Grafana on the configured database. Returns a result dict; never raises.
+
+    `port=None` picks one: the previous instance's port on a restart, else the first free port from
+    3000."""
     async with _lock.get():
         try:
             return await _start(port)
@@ -1202,9 +1205,29 @@ async def start(port: int = 3000) -> dict[str, Any]:
             }
 
 
-async def _start(port: int) -> dict[str, Any]:
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        raise GrafanaError(f"port must be an integer from 1 to 65535 (got {port!r}).")
+_AUTO_PORT_FIRST = 3000
+_AUTO_PORT_COUNT = 100
+
+
+def _choose_port(previous_ports: set[int | None]) -> int | None:
+    """The port to publish on when none was asked for: reuse the previous instance's (it is freed
+    when that instance goes), else the first free one from `_AUTO_PORT_FIRST`."""
+    for reused in sorted(p for p in previous_ports if p):
+        return reused
+    for candidate in range(_AUTO_PORT_FIRST, _AUTO_PORT_FIRST + _AUTO_PORT_COUNT):
+        if _port_free(candidate):
+            return candidate
+    return None
+
+
+async def _start(port: int | None) -> dict[str, Any]:
+    if port is not None and (
+        isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+    ):
+        raise GrafanaError(
+            f"port must be a number from 1 to 65535 (got {port!r}).",
+            "Leave the port out and a free one is chosen for you.",
+        )
     settings = get_settings()
     # The database comes first: refusing a non-SQLite URL needs no Docker at all. So does an
     # unusable GRAFANA_DIR: nothing is removed or pulled for a start that cannot work.
@@ -1213,11 +1236,21 @@ async def _start(port: int) -> dict[str, Any]:
     client = await asyncio.to_thread(_docker_client)
 
     previous = await asyncio.to_thread(_ours, client)
+    previous_ports = {_published_port(c) for c in previous}
+    chosen_automatically = port is None
+    if port is None:
+        port = await asyncio.to_thread(_choose_port, previous_ports)
+        if port is None:
+            raise GrafanaError(
+                f"No free port from {_AUTO_PORT_FIRST} to {_AUTO_PORT_FIRST + _AUTO_PORT_COUNT - 1} "
+                "on this machine.",
+                "Name a free port yourself, for example 3301.",
+            )
     # A restart is allowed to reuse its own port: it is freed when the old container goes.
-    if port not in {_published_port(c) for c in previous} and not _port_free(port):
+    elif port not in previous_ports and not _port_free(port):
         raise GrafanaError(
             f"Port {port} is already in use on this machine.",
-            "Pass a different, free port, e.g. grafana_start(port=3301).",
+            "Name a different port, or leave the port out and a free one is chosen.",
         )
     for name in (CONTAINER_NAME, PROXY_NAME):
         try:
@@ -1314,6 +1347,11 @@ async def _start(port: int) -> dict[str, Any]:
     )
     result: dict[str, Any] = {
         "running": True,
+        "summary": (
+            f"Grafana is running at http://127.0.0.1:{port}/ "
+            + ("(a free port was chosen) " if chosen_automatically else "")
+            + f"as user '{ADMIN_USER}'; the password is in {prep.password_file}."
+        ),
         "url": f"http://127.0.0.1:{port}/",
         "port": port,
         "username": ADMIN_USER,

@@ -8,137 +8,203 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from honeypot_mcp import retention
+from honeypot_mcp import rbac, retention
 from honeypot_mcp.rbac import require_role
 from honeypot_mcp.server import mcp
-from honeypot_mcp.storage import queries
+from honeypot_mcp.storage import queries, rollups
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.storage.models import AlertDisposition, AlertSeverity
+from honeypot_mcp.storage.models import Alert, AlertDisposition, AlertSeverity
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import (
     digest_payload,
     mark_untrusted,
     truncate_payload,
+    validate_ip,
     write_artifact,
 )
-from honeypot_mcp.tools._window import annotate_window, window_bounds
+from honeypot_mcp.tools._window import annotate_window, window_bounds, window_end
+
+# An MCP reply lands in a model's context, so a list is cut to what fits and says so. The rows get
+# this many bytes of JSON; the envelope and notes bring a reply to about 12 KB at most.
+_ROWS_BUDGET = 10_000
+_MAX_LIMIT = 100
+# Alerts one filtered `alerts_acknowledge` call may triage: an over-broad filter must not clear the
+# whole board in one go. The reply says when more still match.
+_TRIAGE_CAP = 500
+_SINCE_HINT = (
+    "Use a number of hours, e.g. 1 for 'the last hour', 24 for 'today', 168 for 'this week'."
+)
+
+
+def _fit(rows: list[dict[str, Any]], budget: int = _ROWS_BUDGET) -> list[dict[str, Any]]:
+    """The leading rows whose JSON fits `budget` (always at least one)."""
+    used = 0
+    shown: list[dict[str, Any]] = []
+    for row in rows:
+        size = len(json.dumps(row, default=str)) + 2
+        if shown and used + size > budget:
+            break
+        used += size
+        shown.append(row)
+    return shown
+
+
+def _alert_row(a: Alert, names: dict[int, str]) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": a.id,
+        "source_ip": a.source_ip,
+        "event_type": a.event_type,
+        "severity": a.severity.value,
+        "honeypot": names.get(a.honeypot_id) if a.honeypot_id else None,
+        "timestamp": a.timestamp.isoformat(),
+    }
+    if a.acknowledged:
+        row["acknowledged"] = True
+        # Surfacing the verdict is what lets a shift skip what the previous one resolved.
+        if a.disposition is not None:
+            row["disposition"] = a.disposition.value
+    if digest := digest_payload(a.payload):
+        row["digest"] = digest
+    return row
+
+
+async def _since(since_hours: float | None) -> tuple[Any, Any, dict[str, Any] | None]:
+    """`(since, window_end, error)` for an optional `since_hours`."""
+    if since_hours is None:
+        return None, None, None
+    if since_hours <= 0:
+        return None, None, {"error": "since_hours must be greater than 0.", "hint": _SINCE_HINT}
+    since, end = await window_bounds(since_hours)
+    return since, end, None
 
 
 @mcp.tool(**hints("alerts_recent"))
 async def alerts_recent(
-    limit: int = 25,
+    limit: int = 20,
     since_hours: float | None = None,
     source_ip: str | None = None,
     severity: Literal["low", "medium", "high", "critical"] | None = None,
     honeypot_name: str | None = None,
     event_type: str | None = None,
-    include_payload: bool = False,
 ) -> dict[str, Any]:
-    """Triage recent honeypot alerts, newest first.
+    """What are the latest alerts, newest first, optionally from one address, sensor, severity or type?
 
-    The primary triage tool. Each alert comes back with a compact `digest` of
-    the fields that matter for triage — credentials tried, path requested,
-    command run, exploit category matched, country/ASN — rather than the full
-    capture. Use `alerts_get(alert_id)` to pull everything on one alert, or
-    `alerts_search` to find alerts by payload content.
+    Use it for "what just happened", "anything critical today", "alerts from 203.0.113.7". Each
+    alert has a short `digest` (credentials, path, command, exploit, country); `alerts_get` gives
+    one alert in full, `alerts_search` finds alerts by what the attacker sent. The reply says how
+    many alerts match in total.
 
     Args:
-        limit: Maximum alerts to return (default 25, max 200).
-        since_hours: Only alerts from the last N hours (e.g. 1 for "the last
-              hour", 24 for "today"). Omit for no time limit.
-        source_ip: Filter to one attacker IP.
-        severity: Filter by severity — low, medium, high, or critical.
-        honeypot_name: Filter to alerts from one honeypot.
-        event_type: Filter by exact event type (e.g. ssh_login_failed).
-        include_payload: Return each alert's complete captured payload instead
-              of the digest. Off by default because honeypot payloads carry
-              full request headers and up to 64 KB of body per alert — enabling
-              this on a large limit returns megabytes.
+        limit: How many alerts to show (default 20; the reply is cut to a readable size).
+        since_hours: Only the last N hours: "the last hour" is 1, "today" 24, "this week" 168.
+        source_ip: Only alerts from this attacker address.
+        severity: Only low, medium, high or critical alerts.
+        honeypot_name: Only alerts from this sensor (names are in honeypot_list).
+        event_type: Only this exact event type, e.g. ssh_login_failed.
     """
-    limit = max(1, min(limit, 200))
-    sev = AlertSeverity(severity) if severity else None
+    limit = max(1, min(limit, _MAX_LIMIT))
+    if source_ip and (bad := validate_ip(source_ip)):
+        return {"error": bad, "hint": "Pass one attacker address, e.g. 203.0.113.7."}
+    since, window_to, err = await _since(since_hours)
+    if err:
+        return err
 
     honeypot_id: int | None = None
-    if honeypot_name:
-        async with get_session() as session:
-            hp = await queries.get_honeypot_by_name(session, honeypot_name)
-            if not hp:
-                return {"error": f"No honeypot named '{honeypot_name}' found."}
-            honeypot_id = hp.id
-
-    since = window_to = None
-    if since_hours is not None:
-        if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
-        since, window_to = await window_bounds(since_hours)
-
     async with get_session() as session:
+        names = await queries.get_honeypot_names(session)
+        if honeypot_name:
+            honeypot_id = next((i for i, n in names.items() if n == honeypot_name), None)
+            if honeypot_id is None:
+                return {
+                    "error": f"No honeypot named '{honeypot_name}'.",
+                    "hint": "Use one of: "
+                    + (", ".join(sorted(names.values())) or "(none deployed)"),
+                }
+        sev = AlertSeverity(severity) if severity else None
         alerts = await queries.get_recent_alerts(
             session,
             limit=limit,
-            source_ip=source_ip,
+            source_ip=source_ip.strip() if source_ip else None,
             severity=sev,
             honeypot_id=honeypot_id,
             event_type=event_type,
             since=since,
         )
-        names = await queries.get_honeypot_names(session)
+        total = await queries.count_alerts(
+            session,
+            since=since,
+            now=window_to,
+            source_ip=source_ip.strip() if source_ip else None,
+            severity=sev,
+            honeypot_id=honeypot_id,
+            event_type=event_type,
+        )
+        types_here = (
+            await rollups.event_type_counts(session, since, now=window_to)
+            if event_type and not alerts
+            else {}
+        )
 
-    rows: list[dict[str, Any]] = []
-    for a in alerts:
-        row: dict[str, Any] = {
-            "id": a.id,
-            "source_ip": a.source_ip,
-            "event_type": a.event_type,
-            "severity": a.severity.value,
-            "honeypot": names.get(a.honeypot_id) if a.honeypot_id else None,
-            "timestamp": a.timestamp.isoformat(),
-        }
-        if a.acknowledged:
-            row["acknowledged"] = True
-            # Surfacing the verdict here is what lets a shift skip what the
-            # previous one already resolved.
-            if a.disposition is not None:
-                row["disposition"] = a.disposition.value
-        if include_payload:
-            row["payload"] = truncate_payload(a.payload)
-        elif digest := digest_payload(a.payload):
-            row["digest"] = digest
-        rows.append(row)
-
-    result: dict[str, Any] = {"count": len(rows), "alerts": rows}
+    rows = _fit([_alert_row(a, names) for a in alerts])
+    result: dict[str, Any] = {"count": len(rows), "total_matching": max(total, len(rows))}
+    result["alerts"] = rows
     if since is not None:
         result["window"] = f"last {since_hours}h (since {since.isoformat()})"
         await annotate_window(result)
-    if len(rows) == limit:
+    filtered = any((source_ip, severity, honeypot_name, event_type, since_hours is not None))
+    if not rows:
+        if event_type and types_here:
+            top = sorted(types_here, key=lambda t: -types_here[t])[:10]
+            result["note"] = (
+                f"No alerts of type '{event_type}'. Event types seen in this window: "
+                + ", ".join(top)
+                + "."
+            )
+        elif filtered:
+            result["note"] = (
+                "No alerts match these filters. Try a longer time window or drop a filter."
+            )
+        else:
+            result["note"] = "No alerts have been recorded yet."
+    elif len(rows) < result["total_matching"]:
         result["note"] = (
-            f"Hit the limit of {limit} — there may be more. Narrow with "
-            f"since_hours/severity/source_ip, or raise limit (max 200)."
+            f"Showing the newest {len(rows)} of {result['total_matching']:,} matching alerts. "
+            "To see others, narrow by time ('last 24 hours'), source address, severity, "
+            "event type or sensor."
         )
     return mark_untrusted(result)
 
 
 @mcp.tool(**hints("alerts_get"))
 async def alerts_get(alert_id: int) -> dict[str, Any]:
-    """Get the complete captured payload for one alert.
+    """Show everything captured for one alert: "what exactly did alert 4312 contain?"
 
-    The drill-down companion to `alerts_recent` — returns everything the engine
-    captured (full request headers, decoded bodies, command input, enrichment),
-    with only individually oversized values clipped.
+    The drill-down for an id from `alerts_recent` or `alerts_search`: full request headers, decoded
+    bodies, command input, enrichment and triage state; only single oversized values are clipped.
 
     Args:
-        alert_id: The numeric alert ID, as returned by alerts_recent or alerts_search.
+        alert_id: The numeric alert id (the `id` field of an alert in alerts_recent or alerts_search).
     """
-    from sqlalchemy import select
-
-    from honeypot_mcp.storage.models import Alert
+    from sqlalchemy import func, select
 
     async with get_session() as session:
-        result = await session.execute(select(Alert).where(Alert.id == alert_id))
-        alert = result.scalar_one_or_none()
-        if not alert:
-            return {"error": f"No alert with id={alert_id}."}
+        alert = (
+            await session.execute(select(Alert).where(Alert.id == alert_id))
+        ).scalar_one_or_none()
+        if alert is None:
+            low, high = (
+                await session.execute(select(func.min(Alert.id), func.max(Alert.id)))
+            ).one()
+            where = (
+                f"Alert ids currently run from {low} to {high}; some may have been pruned. "
+                if low is not None
+                else "There are no alerts yet. "
+            )
+            return {
+                "error": f"No alert with id {alert_id}.",
+                "hint": where + "Find ids with alerts_recent or alerts_search (the `id` field).",
+            }
         names = await queries.get_honeypot_names(session)
 
         return mark_untrusted(
@@ -164,79 +230,85 @@ async def alerts_get(alert_id: int) -> dict[str, Any]:
 @mcp.tool(**hints("alerts_search"))
 async def alerts_search(
     query: str,
-    limit: int = 50,
+    limit: int = 20,
     since_hours: float | None = None,
 ) -> dict[str, Any]:
-    """Search alerts by content — including inside captured payloads.
+    """Find alerts by what the attacker sent: "who ran wget", "who tried the password admin123".
 
-    Substring-matches the attacker IP, the event type, AND the serialised
-    payload, so this finds alerts by what the attacker actually sent: a
-    command (`wget`), a username (`root`), a URL path (`/.env`), a
-    User-Agent, an uploaded filename, or a hash. Use this when you know what
-    you're looking for; use `alerts_recent` to browse by time and severity.
+    Case-sensitive substring match over the attacker address, event type and the whole captured
+    payload (commands, usernames, passwords, paths, user agents, file names, hashes), newest
+    first. On a large capture a rare term takes a while: the search stops after a few seconds and
+    says how far back it read. Use `alerts_recent` to browse by time or severity.
 
     Args:
-        query: Substring to look for anywhere in the IP, event type, or payload.
-        limit: Maximum results (default 50, max 200).
-        since_hours: Only search alerts from the last N hours. Omit for all time.
+        query: The text to look for, e.g. "wget", "/.env", "root", a file hash.
+        limit: How many matches to show (default 20; the reply is cut to a readable size).
+        since_hours: Only search the last N hours: "today" is 24, "this week" 168.
     """
-    limit = max(1, min(limit, 200))
-    since = window_to = None
-    if since_hours is not None:
-        if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
-        since, window_to = await window_bounds(since_hours)
+    if not query or not query.strip():
+        return {
+            "error": "query is empty.",
+            "hint": "Say what to look for, e.g. query='wget' or query='/.env' (a literal text).",
+        }
+    limit = max(1, min(limit, _MAX_LIMIT))
+    since, _end, err = await _since(since_hours)
+    if err:
+        return err
 
     async with get_session() as session:
-        alerts = await queries.search_alerts(session, query=query, limit=limit, since=since)
+        found = await queries.search_alerts(session, query=query, limit=limit, since=since)
         names = await queries.get_honeypot_names(session)
 
-    rows = [
-        {
-            "id": a.id,
-            "source_ip": a.source_ip,
-            "event_type": a.event_type,
-            "severity": a.severity.value,
-            "honeypot": names.get(a.honeypot_id) if a.honeypot_id else None,
-            "timestamp": a.timestamp.isoformat(),
-            **({"digest": d} if (d := digest_payload(a.payload)) else {}),
-        }
-        for a in alerts
-    ]
+    rows = _fit([_alert_row(a, names) for a in found.alerts])
     result: dict[str, Any] = {"query": query, "count": len(rows), "alerts": rows}
     if since is not None:
         result["window"] = f"last {since_hours}h (since {since.isoformat()})"
         await annotate_window(result)
-    if not rows:
-        result["note"] = (
-            "No matches. The search is a literal substring match — try a shorter "
-            "or more distinctive fragment."
+    notes: list[str] = []
+    if len(rows) < len(found.alerts) or found.more:
+        notes.append(
+            f"Showing the newest {len(rows)} matches; there are more. To see others, narrow by "
+            "time ('last 24 hours'), or search a more specific phrase, or use alerts_recent "
+            "with a source address."
         )
+    if not found.complete:
+        back = found.searched_back_to.isoformat() if found.searched_back_to else "an earlier time"
+        notes.append(
+            f"The search stopped after a few seconds and read alerts back to {back}; older "
+            "alerts were NOT searched. Restrict it with a time window (since_hours) to cover "
+            "them."
+        )
+    if not rows and found.complete:
+        notes.append(
+            "No matches. The search is a literal, case-sensitive substring: try a shorter or more "
+            "distinctive fragment, or check the spelling."
+        )
+    if notes:
+        result["note"] = " ".join(notes)
     return mark_untrusted(result)
 
 
 @mcp.tool(**hints("alerts_stats"))
 async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
-    """Aggregate alert statistics: totals by severity, top attacker IPs, top event types.
+    """What is the overall picture: alert totals, severities, top attackers and event types?
 
-    The fastest way to answer "what's the current picture?" without pulling
-    individual alerts.
+    The quickest answer to "how busy are we", "who are the top attackers today". No individual
+    alerts; use `alerts_recent` for those.
 
     Args:
-        since_hours: Restrict the stats to the last N hours (e.g. 24 for today's
-              activity). Omit for all-time totals.
+        since_hours: Only the last N hours ("today" is 24, "this week" 168). Omit for all time.
     """
-    since = window_to = None
-    if since_hours is not None:
-        if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
-        since, window_to = await window_bounds(since_hours)
+    since, window_to, err = await _since(since_hours)
+    if err:
+        return err
 
     async with get_session() as session:
         stats = await queries.get_alert_stats(session, since=since, now=window_to)
     if since is not None:
         stats["window"] = f"last {since_hours}h (since {since.isoformat()})"
         await annotate_window(stats)
+    if not stats.get("total_alerts"):
+        stats["note"] = "No alerts in this period." if since is not None else "No alerts recorded."
     return stats
 
 
@@ -245,68 +317,55 @@ async def alerts_acknowledge(
     alert_ids: list[int] | None = None,
     disposition: Literal["true_positive", "false_positive", "benign", "duplicate"] | None = None,
     note: str | None = None,
-    analyst: str | None = None,
     source_ip: str | None = None,
     event_type: str | None = None,
     severity: Literal["low", "medium", "high", "critical"] | None = None,
     since_hours: float | None = None,
-    max_alerts: int = 500,
 ) -> dict[str, Any]:
-    """Triage alerts — acknowledge them, individually or in bulk, with a verdict.
+    """Mark alerts as handled, with a verdict: "mark all alerts from 203.0.113.7 as false positive".
 
-    Either pass explicit `alert_ids`, or describe a set with the filters and
-    every matching alert is triaged at once ("mark today's Shodan scanner hits
-    as benign"). One-at-a-time acknowledgement does not survive contact with a
-    scanner sweep, which produces hundreds of alerts in minutes.
-
-    Recording a `disposition` is what makes triage useful later: it separates
-    "nobody has looked at this" from "we looked and it was nothing", and lets
-    you ask what is being dismissed and whether it should be suppressed instead.
+    Name `alert_ids` (from alerts_recent), or describe a set with source_ip / event_type /
+    severity / since_hours and every matching untriaged alert is triaged at once (up to 500 per
+    call; the reply says if more remain). Alerts already triaged are skipped when selecting by
+    filter; name their ids to change a verdict. At least one selector is required, so nothing is
+    ever triaged by accident. Recorded under the caller's identity.
 
     Args:
-        alert_ids: Explicit alert IDs to triage. Omit to use the filters below.
-        disposition: The verdict — `true_positive` (a real attack),
-              `false_positive` (the detection was wrong), `benign` (fired
-              correctly on authorised activity, e.g. your own pentest), or
-              `duplicate`.
-        note: Why. Free text, shown to whoever reviews this later.
-        analyst: Who triaged it. Defaults to "mcp-client".
-        source_ip: Triage every alert from this IP (filter mode).
-        event_type: Triage every alert of this exact event type (filter mode).
-        severity: Triage every alert at this severity (filter mode).
-        since_hours: Restrict the filters to the last N hours.
-        max_alerts: Safety cap on how many a single filtered call may triage
-              (default 500). Prevents an over-broad filter clearing the board.
+        alert_ids: Alert ids to triage, as shown by alerts_recent.
+        disposition: The verdict: true_positive (a real attack), false_positive (detection wrong),
+              benign (expected activity, e.g. our own pentest) or duplicate.
+        note: Why; shown to whoever reviews this later.
+        source_ip: Triage every untriaged alert from this address.
+        event_type: Triage every untriaged alert of this exact event type.
+        severity: Triage every untriaged alert at this severity.
+        since_hours: Only alerts from the last N hours ("today" is 24).
     """
+    if source_ip and (bad := validate_ip(source_ip)):
+        return {"error": bad, "hint": "Pass one attacker address, e.g. 203.0.113.7."}
+    if alert_ids is not None and any(i < 1 for i in alert_ids):
+        return {
+            "error": "alert_ids must be positive whole numbers.",
+            "hint": "Take ids from the `id` field of alerts_recent or alerts_search.",
+        }
     has_filters = any((source_ip, event_type, severity, since_hours is not None))
     if not alert_ids and not has_filters:
         return {
-            "error": (
-                "Nothing selected. Pass alert_ids, or at least one of "
-                "source_ip / event_type / severity / since_hours."
-            )
+            "error": "Nothing selected: say which alerts to triage.",
+            "hint": (
+                "Pass alert_ids (from alerts_recent), or at least one of source_ip, event_type, "
+                "severity or since_hours to triage every matching untriaged alert."
+            ),
         }
 
+    since, _end, err = await _since(since_hours)
+    if err:
+        return err
     disp = AlertDisposition(disposition) if disposition else None
     sev = AlertSeverity(severity) if severity else None
-    since = window_to = None
-    if since_hours is not None:
-        if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
-        since, window_to = await window_bounds(since_hours)
-
-    # `triaged_by` is shown on shift handover and by alerts_get, so it must be who
-    # actually made the call. A networked caller is identified by its token; the
-    # free-text `analyst` argument can only name someone else (or be set by an
-    # injected instruction) and is kept as a display note instead. A local stdio
-    # session has one operator, so there the name they give is used.
-    from honeypot_mcp.rbac import current_actor
-
-    actor = current_actor()
-    triaged_by = (analyst or "mcp-client") if actor == "stdio" else actor
-    if analyst and actor != "stdio" and analyst != actor:
-        note = f"{note or ''} [analyst: {analyst}]".strip()
-    triaged_by = triaged_by[:128]  # String(128): longer raises on PostgreSQL
+    # `triaged_by` is shown on shift handover and by alerts_get, so it is who actually made the
+    # call: the caller's token label, or "stdio" for a local session. A name typed into a
+    # parameter could only name someone else (or be set by an injected instruction).
+    triaged_by = rbac.current_actor()[:128]  # String(128): longer raises on PostgreSQL
 
     async with get_session() as session:
         result = await queries.triage_alerts(
@@ -314,12 +373,12 @@ async def alerts_acknowledge(
             alert_ids=alert_ids,
             disposition=disp,
             note=note,
-            analyst=triaged_by,
-            source_ip=source_ip,
+            triaged_by=triaged_by,
+            source_ip=source_ip.strip() if source_ip else None,
             event_type=event_type,
             severity=sev,
             since=since,
-            max_alerts=max(1, min(max_alerts, 10_000)),
+            max_alerts=_TRIAGE_CAP,
         )
 
     await record_action(
@@ -340,12 +399,18 @@ async def alerts_acknowledge(
     )
 
     if result["acknowledged"] == 0:
-        result["note"] = "No alerts matched — nothing was changed."
+        result["note"] = "No alerts matched, nothing was changed. " + (
+            "Those ids do not exist (check alerts_recent)."
+            if alert_ids
+            else "Alerts that are already triaged are skipped when selecting by filter."
+        )
     elif result.get("capped"):
         result["note"] = (
-            f"Stopped at max_alerts={max_alerts}; more alerts still match. "
-            f"Re-run to continue, or narrow the filters."
+            f"Triaged the newest {_TRIAGE_CAP}; more alerts still match. "
+            "Run the same request again to continue, or narrow it."
         )
+    elif result.get("not_matched_ids"):
+        result["note"] = "Some ids were not found or did not match the other filters."
     return result
 
 
@@ -355,27 +420,25 @@ async def alerts_prune(
     archive: bool = True,
     archive_path: str | None = None,
 ) -> dict[str, Any]:
-    """Delete alerts and attacker_events older than the cutoff, archiving first.
+    """Delete old alerts to free space: "delete alerts older than 3 months" (keeps a copy first).
 
-    Deletion here is unrecoverable and it destroys evidence: a campaign that
-    began eleven months ago is gone, and so is anything a future investigation
-    or a compliance request would have needed. So `archive` defaults to True —
-    matching alerts are written to a JSON Lines file (full payloads, one object
-    per line) before anything is removed, and if that write fails nothing is
-    deleted.
-
-    Pass `archive=False` only when you genuinely want the data destroyed.
+    Deleting alerts is permanent and destroys evidence, so by default every alert about to go is
+    first written to a JSON Lines file (full payloads) and nothing is deleted if that write fails.
+    Lifetime statistics are unaffected. Use `archive=False` only when the user explicitly wants
+    the data destroyed without a copy.
 
     Args:
-        older_than_days: Cutoff age in days (default 90).
-        archive: Write the matching alerts to disk before deleting (default True).
-        archive_path: Filename for the archive, inside the reports directory.
-                      Auto-named if omitted.
+        older_than_days: Delete alerts older than this many days (default 90; "3 months" is 90,
+              "a year" 365).
+        archive: Keep a copy before deleting (default True).
+        archive_path: Optional file name for the copy, a plain name inside the reports directory.
+              Named automatically if omitted.
     """
-    from datetime import datetime, timedelta
-
     if older_than_days < 1:
-        return {"error": "older_than_days must be at least 1 to avoid deleting current data."}
+        return {
+            "error": "older_than_days must be at least 1, so that current data is never deleted.",
+            "hint": "Pass a whole number of days, e.g. 90 for alerts older than three months.",
+        }
 
     cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
 
@@ -404,8 +467,13 @@ async def alerts_prune(
                 error=str(e),
             )
             return {
-                "error": f"Archive failed, so nothing was deleted: {e}",
-                "hint": "Fix the archive destination, or pass archive=False to delete regardless.",
+                "error": f"The archive could not be written, so nothing was deleted: {e}",
+                "hint": (
+                    "Check that archive_path is a plain file name (no folders) that does not "
+                    "exist yet, and that the reports directory has free space. Do not retry with "
+                    "archive=False unless the user explicitly wants the alerts destroyed "
+                    "without a copy."
+                ),
             }
 
     alerts_deleted, events_deleted = await retention.delete_before(cutoff, max_id)
@@ -413,8 +481,8 @@ async def alerts_prune(
     await record_action(
         "alerts_prune",
         summary=(
-            f"deleted {result.get('alerts_deleted', 0)} alert(s) and "
-            f"{result.get('attacker_events_deleted', 0)} event(s) older than "
+            f"deleted {alerts_deleted} alert(s) and "
+            f"{events_deleted} event(s) older than "
             f"{older_than_days}d"
             + (f", archived to {archive_info['path']}" if archive_info else ", NOT archived")
         ),
@@ -424,13 +492,16 @@ async def alerts_prune(
             "archived": bool(archive_info),
         },
     )
-    return {
+    out: dict[str, Any] = {
         "older_than_days": older_than_days,
         "cutoff": cutoff.isoformat(),
         "archive": archive_info
         or ("nothing matched the cutoff" if archive else "skipped (archive=False)"),
         **result,
     }
+    if not alerts_deleted and not events_deleted:
+        out["note"] = f"No alerts were older than {older_than_days} days; nothing was deleted."
+    return out
 
 
 @mcp.tool(auth=require_role("operator"), **hints("alerts_export"))
@@ -439,33 +510,40 @@ async def alerts_export(
     limit: int = 1000,
     since_hours: float | None = None,
     severity: Literal["low", "medium", "high", "critical"] | None = None,
+    source_ip: str | None = None,
     output_path: str | None = None,
 ) -> dict[str, Any]:
-    """Export full alert records to a file for SIEM ingestion or offline analysis.
+    """Save alerts to a file for a SIEM or spreadsheet: "export today's critical alerts as CSV".
 
-    Writes to disk and returns the path plus a preview — exports include
-    complete payloads, so returning the content inline would flood the
-    conversation (5,000 alerts of real HTTP capture is tens of megabytes).
-    For reading alerts in conversation use `alerts_recent` or `alerts_search`.
+    Writes complete records (payloads included) to a new file in the reports directory and returns
+    its path, size and a five-row preview, never the content. Newest alerts first. To read alerts
+    in the conversation use `alerts_recent` or `alerts_search`.
 
     Args:
-        format: Output format — json or csv.
-        limit: Maximum alerts to export (default 1000, max 50000).
-        since_hours: Only export alerts from the last N hours. Omit for all.
-        severity: Only export alerts at this severity.
-        output_path: Where to write. Defaults to
-              `reports/alerts-<timestamp>.<format>` under the project root.
+        format: "json" (default) or "csv".
+        limit: How many alerts to export (default 1000, at most 50000).
+        since_hours: Only the last N hours ("today" is 24, "this week" 168).
+        severity: Only low, medium, high or critical alerts.
+        source_ip: Only alerts from this attacker address.
+        output_path: File name for the export, a plain name inside the reports directory
+              (never overwrites). Named automatically if omitted.
     """
     limit = max(1, min(limit, 50_000))
+    if source_ip and (bad := validate_ip(source_ip)):
+        return {"error": bad, "hint": "Pass one attacker address, e.g. 203.0.113.7."}
     sev = AlertSeverity(severity) if severity else None
-    since = window_to = None
-    if since_hours is not None:
-        if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
-        since, window_to = await window_bounds(since_hours)
+    since, _end, err = await _since(since_hours)
+    if err:
+        return err
 
     async with get_session() as session:
-        alerts = await queries.get_recent_alerts(session, limit=limit, severity=sev, since=since)
+        alerts = await queries.get_recent_alerts(
+            session,
+            limit=limit,
+            severity=sev,
+            since=since,
+            source_ip=source_ip.strip() if source_ip else None,
+        )
 
     rows = [
         {
@@ -481,19 +559,29 @@ async def alerts_export(
         }
         for a in alerts
     ]
+    if not rows:
+        return {
+            "alerts_exported": 0,
+            "note": "No alerts matched, so no file was written. Try a longer time window or "
+            "fewer filters.",
+        }
 
     if format == "json":
         content = json.dumps(rows, indent=2)
     else:
         buf = io.StringIO()
-        if rows:
-            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
+        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
         content = buf.getvalue()
 
     written = write_artifact(content, prefix="alerts", extension=format, output_path=output_path)
     if "error" in written:
+        written.setdefault(
+            "hint",
+            "Use a plain file name inside the reports directory that does not exist yet, or "
+            "leave output_path out to have it named automatically.",
+        )
         return written
 
     exported: dict[str, Any] = {
@@ -506,6 +594,11 @@ async def alerts_export(
             for r in rows[:5]
         ],
     }
+    if len(rows) == limit:
+        exported["note"] = (
+            f"Exported the newest {limit} matching alerts; there may be more. "
+            "Narrow by time or severity, or ask for a larger limit."
+        )
     if since is not None:
         await annotate_window(exported)
     return exported
@@ -518,61 +611,66 @@ async def audit_log_search(
     actor: str | None = None,
     since_hours: float | None = None,
     outcome: Literal["ok", "error"] | None = None,
-    limit: int = 50,
+    limit: int = 25,
 ) -> dict[str, Any]:
-    """Review what the control plane did — every honeypot deployed or stopped,
-    every prune, every token revoked, and who did it.
+    """What did the control plane do, and who did it: "who stopped that honeypot", "any failed actions?"
 
-    This server's control plane is driven by a language model, so "what did the
-    agent actually do, and when?" is a question you will eventually need
-    answered — after an unexpected gap in collection, or when alerts you
-    expected to find have been pruned. The log is append-only and is not
-    touched by the retention sweep.
+    The append-only record of every state-changing call (deploy, stop, prune, triage, token and key
+    changes), newest first.
 
     Args:
-        tool: Filter to one tool name (e.g. alerts_prune, honeypot_stop).
-        target: Filter to what was acted on — a honeypot name, IP, or token id.
-        actor: Filter to who did it — an ApiKey label, a bare role
-              (e.g. "admin") for a legacy MCP_AUTH_TOKEN, or "stdio" for a
-              local chat session. Substring match, so "alice" matches
-              "alice (operator)". Rows written before actor tracking existed
-              have no actor recorded and are excluded by this filter.
-        since_hours: Only actions from the last N hours.
-        outcome: Filter to successful (`ok`) or failed (`error`) actions.
-        limit: Maximum entries to return (default 50, max 500).
+        tool: Only this tool, e.g. alerts_prune or honeypot_stop.
+        target: Only actions on this honeypot name, address or token id.
+        actor: Only actions by this person or role (substring, so "alice" matches "alice (operator)").
+        since_hours: Only the last N hours ("today" is 24, "this week" 168).
+        outcome: "ok" for successful actions, "error" for failed ones.
+        limit: How many entries to show (default 25; cut to a readable size).
     """
-    from sqlalchemy import desc, select
+    from sqlalchemy import desc, func, select
 
     from honeypot_mcp.storage.models import AuditLog
 
-    limit = max(1, min(limit, 500))
-    since = None
+    limit = max(1, min(limit, 200))
+    cutoff = None
     if since_hours is not None:
         if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
-        since = datetime.now(UTC) - timedelta(hours=since_hours)
+            return {"error": "since_hours must be greater than 0.", "hint": _SINCE_HINT}
+        cutoff = await window_end() - timedelta(hours=since_hours)
 
-    q = select(AuditLog)
+    filters = []
     if tool:
-        q = q.where(AuditLog.tool == tool)
+        filters.append(AuditLog.tool == tool)
     if target:
-        q = q.where(AuditLog.target == target)
+        filters.append(AuditLog.target == target)
     if actor:
-        q = q.where(AuditLog.actor.contains(actor))
+        filters.append(AuditLog.actor.contains(actor, autoescape=True))
     if outcome:
-        q = q.where(AuditLog.outcome == outcome)
-    if since is not None:
-        q = q.where(AuditLog.timestamp >= since)
+        filters.append(AuditLog.outcome == outcome)
+    if cutoff is not None:
+        filters.append(AuditLog.timestamp >= cutoff)
 
     async with get_session() as session:
         rows = (
-            (await session.execute(q.order_by(desc(AuditLog.timestamp)).limit(limit)))
+            (
+                await session.execute(
+                    select(AuditLog).where(*filters).order_by(desc(AuditLog.timestamp)).limit(limit)
+                )
+            )
             .scalars()
             .all()
         )
+        total = (
+            await session.execute(select(func.count()).select_from(AuditLog).where(*filters))
+        ).scalar_one()
+        known_tools = (
+            [r[0] for r in (await session.execute(select(AuditLog.tool).distinct())).all()]
+            if not rows
+            else []
+        )
 
-    entries = [
-        {
+    entries: list[dict[str, Any]] = []
+    for r in rows:
+        entry: dict[str, Any] = {
             "id": r.id,
             "timestamp": r.timestamp.isoformat(),
             "tool": r.tool,
@@ -580,15 +678,30 @@ async def audit_log_search(
             "summary": r.summary,
             "target": r.target,
             "outcome": r.outcome,
-            **({"error": r.error} if r.error else {}),
-            **({"arguments": r.arguments} if r.arguments else {}),
         }
-        for r in rows
-    ]
-    result: dict[str, Any] = {"count": len(entries), "actions": entries}
-    if not entries:
+        if r.error:
+            entry["error"] = r.error[:300]
+        if r.arguments:
+            text = json.dumps(r.arguments, default=str)
+            entry["arguments"] = r.arguments if len(text) <= 300 else text[:300] + "…"
+        entries.append(entry)
+    shown = _fit(entries)
+    result: dict[str, Any] = {"count": len(shown), "total_matching": total, "actions": shown}
+    if not shown:
+        if filters and known_tools:
+            result["note"] = (
+                "No control-plane actions match these filters. Tools with recorded actions: "
+                + ", ".join(sorted(known_tools))
+                + "."
+            )
+        else:
+            result["note"] = (
+                "No control-plane actions recorded. Only state-changing calls are logged; reads "
+                "such as alerts_recent are not."
+            )
+    elif len(shown) < total:
         result["note"] = (
-            "No matching control-plane actions. Note that auditing records "
-            "state-changing calls only — reads like alerts_recent are not logged."
+            f"Showing the newest {len(shown)} of {total:,} matching actions. Narrow by tool, "
+            "actor, target or time ('last 24 hours') to see others."
         )
-    return result
+    return mark_untrusted(result)

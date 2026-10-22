@@ -1040,21 +1040,22 @@ def dirs(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pcap_analyze_tool_reads_an_extract_and_hides_absolute_paths(dirs):
-    from honeypot_mcp.tools.pcap import pcap_analyze
+    from honeypot_mcp.tools.pcap import _ANALYZE_SAMPLES, pcap_analyze
 
     reports, _ring = dirs
     frames = [
         eth(ipv4(CLIENT, SERVER, 17, udp(5060, 5060, sip_invite("0042123456", branch=str(i)))))
-        for i in range(3)
+        for i in range(8)
     ]
     write(reports / f"pcap-{CLIENT}-20261012T030753Z.pcap", pcap_bytes(frames, linktype=1))
-    result = await pcap_analyze(
-        f"pcap-{CLIENT}-20261012T030753Z.pcap", top=3, samples_per_service=2
-    )
+    result = await pcap_analyze(f"pcap-{CLIENT}-20261012T030753Z.pcap")
     assert result["file"]["kind"] == "extract"
-    assert result["services"]["sip"]["requests"] == {"INVITE": 3}
+    assert "note" not in result  # the user named the file: nothing was chosen for them
+    assert result["services"]["sip"]["requests"] == {"INVITE": 8}
     assert str(reports) not in repr(result)
-    assert len(result["payload_samples"]["sip"]["samples"]) <= 2
+    # the tool sizes the samples itself: bounded, and not empty
+    samples = result["payload_samples"]["sip"]["samples"]
+    assert 0 < len(samples) <= _ANALYZE_SAMPLES
 
 
 @pytest.mark.asyncio
@@ -1106,16 +1107,88 @@ async def test_pcap_files_lists_ring_and_extracts_with_packet_counts(dirs):
     assert by_name["pcap-a.pcap"]["kind"] == "extract" and by_name["pcap-a.pcap"]["packets"] == 2
     assert by_name["pcap-empty.pcap"]["packets"] == 0
     assert by_name["ng.pcapng"]["packets"] == 3
-    # Existing fields are intact.
-    for key in ("count", "files", "total_bytes", "capture_reaches_back_to", "note"):
+    # Existing fields are intact (`total_bytes` was dropped: the two parts are reported separately).
+    for key in ("count", "files", "ring_bytes", "extract_bytes", "capture_reaches_back_to", "note"):
         assert key in result
+    assert "total_bytes" not in result
     row = by_name["pcap-a.pcap"]
     assert {"name", "bytes", "modified", "age_minutes"} <= set(row)
     assert result["ring_count"] == 1 and result["extract_count"] == 3
     assert result["capture_reaches_back_to"].startswith("2026-")
-    assert result["total_bytes"] == result["ring_bytes"] + result["extract_bytes"]
-    # Ring first, then extracts.
-    assert [r["kind"] for r in result["files"]][0] == "ring"
+    assert result["ring_bytes"] == by_name["honeypot.pcap0"]["bytes"]
+    assert result["extract_bytes"] == sum(
+        r["bytes"] for r in result["files"] if r["kind"] == "extract"
+    )
+    # Extracts first (what a user wants is nearly always the latest), then the ring.
+    assert [r["kind"] for r in result["files"]] == ["extract"] * 3 + ["ring"]
+
+
+@pytest.mark.asyncio
+async def test_pcap_files_filters_by_attacker_address_and_shows_only_the_newest(dirs):
+    from honeypot_mcp.tools.pcap import _EXTRACTS_LISTED, pcap_files
+
+    reports, _ring = dirs
+    frames = [eth(ipv4(CLIENT, SERVER, 17, udp(40000, 53, dns_query("x.example.test"))))]
+    for n in range(_EXTRACTS_LISTED + 4):
+        path = reports / f"pcap-198.51.100.7-202610{1 + n // 24:02d}T{n % 24:02d}0000Z.pcap"
+        write(path, pcap_bytes(frames))
+        os.utime(path, (BASE_TS + n, BASE_TS + n))
+    write(reports / "pcap-2001_db8__1-20261012T030753Z.pcap", pcap_bytes(frames))
+
+    everything = await pcap_files()
+    assert everything["extract_count"] == _EXTRACTS_LISTED + 5
+    assert everything["count"] == _EXTRACTS_LISTED
+    assert "Showing the newest" in everything["note"]
+
+    mine = await pcap_files(source_ip="198.51.100.7")
+    assert mine["extract_count"] == _EXTRACTS_LISTED + 4
+    assert all("198.51.100.7" in r["name"] for r in mine["files"])
+
+    v6 = await pcap_files(source_ip="2001:db8::1")
+    assert [r["name"] for r in v6["files"]] == ["pcap-2001_db8__1-20261012T030753Z.pcap"]
+
+    none = await pcap_files(source_ip="203.0.113.99")
+    assert none["files"] == [] and "No extract exists for 203.0.113.99" in none["note"]
+    assert "error" in await pcap_files(source_ip="not-an-ip")
+
+
+@pytest.mark.asyncio
+async def test_pcap_analyze_chooses_the_capture_the_way_a_user_names_one(dirs):
+    from honeypot_mcp.tools.pcap import pcap_analyze
+
+    reports, _ring = dirs
+    sip = [eth(ipv4(CLIENT, SERVER, 17, udp(5060, 5060, sip_invite("0042123456"))))]
+    dns = [eth(ipv4(CLIENT, SERVER, 17, udp(40000, 53, dns_query("x.example.test"))))]
+    mine = reports / f"pcap-{CLIENT}-20261012T030753Z.pcap"
+    newer = reports / "pcap-198.51.100.5-20261013T000000Z.pcap"
+    write(mine, pcap_bytes(sip, linktype=1))
+    write(newer, pcap_bytes(dns, linktype=1))
+    os.utime(mine, (BASE_TS, BASE_TS))
+    os.utime(newer, (BASE_TS + 100, BASE_TS + 100))
+
+    latest = await pcap_analyze()
+    assert latest["file"]["name"] == newer.name and "newest capture was used" in latest["note"]
+
+    by_ip = await pcap_analyze(CLIENT)
+    assert by_ip["file"]["name"] == mine.name and f"newest for {CLIENT}" in by_ip["note"]
+
+    nobody = await pcap_analyze("203.0.113.99")
+    assert "No capture extract exists for 203.0.113.99" in nobody["error"]
+    assert CLIENT in nobody["hint"] and "198.51.100.5" in nobody["hint"]
+
+    typo = await pcap_analyze(mine.name.replace("030753", "030754"))
+    assert "No capture file named" in typo["error"]
+    assert set(typo["available"]) == {mine.name, newer.name}
+    assert mine.name in typo["hint"]  # "Did you mean ...?"
+
+
+@pytest.mark.asyncio
+async def test_pcap_analyze_with_no_captures_says_how_to_make_one(dirs):
+    from honeypot_mcp.tools.pcap import pcap_analyze
+
+    result = await pcap_analyze()
+    assert "No capture file to read" in result["error"]
+    assert "pcap_extract" in result["hint"]
 
 
 @pytest.mark.asyncio

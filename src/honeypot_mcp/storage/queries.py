@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy import String, cast, desc, func, select, update
@@ -106,25 +108,110 @@ async def get_honeypot_names(session: AsyncSession) -> dict[int, str]:
     return {row[0]: row[1] for row in result.all()}
 
 
+# Ids per slice of the alert table a search reads, and how long a search may keep slicing. A
+# substring over payload JSON cannot use an index, so a term that matches nothing reads every row:
+# 33 s on 17.7M rows. Slicing newest-first stops as soon as enough matches are found and gives up
+# with an honest "searched back to <time>" once the budget is spent.
+SEARCH_SLICE_IDS = 250_000
+SEARCH_SECONDS = 8.0
+
+
+@dataclass
+class AlertSearch:
+    alerts: list[Alert] = field(default_factory=list)
+    more: bool = False  # more matches exist than were returned
+    complete: bool = True  # the whole range was read (False: stopped at the time budget)
+    searched_back_to: datetime | None = None  # when incomplete: the oldest time actually read
+
+
 async def search_alerts(
     session: AsyncSession,
     query: str,
-    limit: int = 50,
+    limit: int = 20,
     since: datetime | None = None,
-) -> list[Alert]:
-    """Substring search across IP, event type, AND payload contents.
-    Payload search uses TEXT cast — works on SQLite (JSON-as-TEXT) and
-    Postgres (JSON-cast-to-text). Matches anywhere in the serialised JSON,
-    so an analyst can search for commands, usernames, passwords, headers, etc."""
-    q = select(Alert).where(
-        Alert.source_ip.contains(query)
-        | Alert.event_type.contains(query)
-        | cast(Alert.payload, String).contains(query)
+    seconds: float | None = None,
+) -> AlertSearch:
+    """Substring search across IP, event type, AND payload contents, newest first.
+
+    Payload search uses a TEXT cast, which works on SQLite (JSON-as-TEXT) and PostgreSQL, so it
+    finds commands, usernames, passwords, headers and so on. Read in id slices from the newest
+    alert backwards (ids rise with time): it returns once `limit` matches are found, and stops
+    at `seconds` (default `SEARCH_SECONDS`) with `complete=False` and how far back it got.
+    """
+    budget = SEARCH_SECONDS if seconds is None else seconds
+    top = (await session.execute(select(func.max(Alert.id)))).scalar_one()
+    if top is None:
+        return AlertSearch()
+    if since is not None:
+        # First alert inside the window, by index seek: ids rise with time, so it bounds the scan.
+        floor = (
+            await session.execute(
+                select(Alert.id).where(Alert.timestamp >= since).order_by(Alert.timestamp).limit(1)
+            )
+        ).scalar_one_or_none()
+        if floor is None:
+            return AlertSearch()
+    else:
+        floor = (await session.execute(select(func.min(Alert.id)))).scalar_one()
+    match = (
+        Alert.source_ip.contains(query, autoescape=True)
+        | Alert.event_type.contains(query, autoescape=True)
+        | cast(Alert.payload, String).contains(query, autoescape=True)
     )
     if since is not None:
-        q = q.where(Alert.timestamp >= since)
-    result = await session.execute(q.order_by(desc(Alert.timestamp)).limit(limit))
-    return list(result.scalars().all())
+        match = match & (Alert.timestamp >= since)
+
+    out = AlertSearch()
+    deadline = time.monotonic() + budget
+    high = top + 1
+    while high > floor:
+        low = max(floor, high - SEARCH_SLICE_IDS)
+        rows = (
+            await session.execute(
+                select(Alert)
+                .where(match, Alert.id >= low, Alert.id < high)
+                .order_by(desc(Alert.id))
+                .limit(limit + 1 - len(out.alerts))
+            )
+        ).scalars()
+        out.alerts.extend(rows)
+        if len(out.alerts) > limit:
+            out.alerts = out.alerts[:limit]
+            out.more = True
+            return out
+        high = low
+        if high > floor and time.monotonic() > deadline:
+            out.complete = False
+            out.searched_back_to = (
+                await session.execute(
+                    select(Alert.timestamp).where(Alert.id >= high).order_by(Alert.id).limit(1)
+                )
+            ).scalar_one_or_none()
+            return out
+    return out
+
+
+async def count_alerts(
+    session: AsyncSession,
+    *,
+    since: datetime | None = None,
+    now: datetime | None = None,
+    source_ip: str | None = None,
+    severity: AlertSeverity | None = None,
+    honeypot_id: int | None = None,
+    event_type: str | None = None,
+) -> int:
+    """How many alerts match, from the hourly rollups (exact, and a small read however large the
+    alert table is). Counts what was recorded, including alerts since pruned from the table."""
+    w = rollups.window(since, source_ip, now)
+    q = select(func.coalesce(func.sum(w.c.n), 0))
+    if severity is not None:
+        q = q.where(w.c.severity == severity)
+    if honeypot_id is not None:
+        q = q.where(w.c.honeypot_id == honeypot_id)
+    if event_type:
+        q = q.where(w.c.event_type == event_type)
+    return int((await session.execute(q)).scalar_one())
 
 
 async def triage_alerts(
@@ -133,7 +220,7 @@ async def triage_alerts(
     alert_ids: list[int] | None = None,
     disposition: AlertDisposition | None = None,
     note: str | None = None,
-    analyst: str = "mcp-client",
+    triaged_by: str = "stdio",
     source_ip: str | None = None,
     event_type: str | None = None,
     severity: AlertSeverity | None = None,
@@ -172,12 +259,23 @@ async def triage_alerts(
     capped = len(matched) > max_alerts
     matched = matched[:max_alerts]
 
+    found = set(matched)
+    not_matched = (
+        [i for i in dict.fromkeys(alert_ids) if i not in found][:20]
+        if alert_ids and not capped
+        else []
+    )
     if not matched:
-        return {"acknowledged": 0, "alert_ids": [], "capped": False}
+        return {
+            "acknowledged": 0,
+            "alert_ids": [],
+            "capped": False,
+            **({"not_matched_ids": not_matched} if not_matched else {}),
+        }
 
     values: dict = {
         "acknowledged": True,
-        "triaged_by": analyst,
+        "triaged_by": triaged_by,
         "triaged_at": datetime.now(UTC),
     }
     if disposition is not None:
@@ -186,13 +284,15 @@ async def triage_alerts(
         values["triage_note"] = note
 
     await session.execute(update(Alert).where(Alert.id.in_(matched)).values(**values))
-    return {
+    result: dict = {
         "acknowledged": len(matched),
         "alert_ids": matched[:50],
         "disposition": disposition.value if disposition else None,
-        "analyst": analyst,
+        "triaged_by": triaged_by,
         "capped": capped,
+        **({"not_matched_ids": not_matched} if not_matched else {}),
     }
+    return result
 
 
 async def acknowledge_alert(session: AsyncSession, alert_id: int) -> bool:

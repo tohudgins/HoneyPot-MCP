@@ -85,9 +85,7 @@ async def test_a_malformed_aws_key_is_refused_not_turned_into_a_token_that_can_n
 
     out = await honeytoken_generate_aws("typo", **bad)
     assert "error" in out
-    assert (await honeytoken_list()) == [] or all(
-        t["label"] != "typo" for t in await honeytoken_list()
-    )
+    assert all(t["label"] != "typo" for t in (await honeytoken_list())["tokens"])
 
 
 async def test_the_audit_log_event_for_the_decoy_key_triggers_its_token():

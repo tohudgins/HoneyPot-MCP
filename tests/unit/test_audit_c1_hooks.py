@@ -84,8 +84,8 @@ async def test_subscription_list_redacts_destination_credentials(monkeypatch):
         format="slack",
     )
     listed = await alert_subscriptions_list()
-    assert listed
-    assert listed[0]["url"] == "https://127.0.0.1:8443"
+    assert listed["count"] == 1
+    assert listed["subscriptions"][0]["url"] == "https://127.0.0.1:8443"
     assert "SECRETTOKEN" not in str(listed)
 
 
@@ -214,14 +214,12 @@ async def test_suppression_match_all_needs_explicit_confirmation():
     [
         {"ip_pattern": "not-an-ip"},
         {"ip_pattern": "300.1.1.1"},
-        {"event_type_pattern": "ssh_*", "action": "explode"},
-        {
-            "event_type_pattern": "ssh_*",
-            "action": "rate_limit",
-            "rate_limit_count": 0,
-            "rate_limit_window_seconds": 60,
-        },
-        {"event_type_pattern": "ssh_*", "action": "rate_limit", "rate_limit_count": 5},
+        # `action` is no longer a parameter: a count makes the rule a rate limit, none drops.
+        {"event_type_pattern": "ssh_*", "rate_limit_count": 0, "rate_limit_window_seconds": 60},
+        {"event_type_pattern": "ssh_*", "rate_limit_count": -3},
+        # a window with no count would silently become a drop-everything rule
+        {"event_type_pattern": "ssh_*", "rate_limit_window_seconds": 60},
+        {"event_type_pattern": "ssh_*", "expires_in_hours": 0},
     ],
 )
 async def test_suppression_rejects_unparseable_or_invalid_rules(kwargs):

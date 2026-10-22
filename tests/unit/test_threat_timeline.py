@@ -48,8 +48,8 @@ async def _add_alert(ip, minutes_ago, event_type="ssh_login_failed"):
 async def test_timeline_wraps_results_with_count_and_window():
     from honeypot_mcp.tools.analysis import threat_timeline
 
-    await _add_alert("1.2.3.4", minutes_ago=5)
-    await _add_alert("1.2.3.4", minutes_ago=10)
+    await _add_alert("1.2.3.4", minutes_ago=5, event_type="ssh_login_failed")
+    await _add_alert("1.2.3.4", minutes_ago=10, event_type="ssh_command_input")
 
     out = await threat_timeline(ip="1.2.3.4", hours=24)
     assert out["count"] == 2
@@ -59,17 +59,21 @@ async def test_timeline_wraps_results_with_count_and_window():
 
 
 @pytest.mark.asyncio
-async def test_timeline_truncation_keeps_the_most_recent_events():
+async def test_timeline_truncation_keeps_the_most_recent_events(monkeypatch):
+    from honeypot_mcp.tools import analysis
     from honeypot_mcp.tools.analysis import threat_timeline
 
+    monkeypatch.setattr(analysis, "_TIMELINE_ENTRIES", 10)
     ip = "9.9.9.9"
     # 30 events spread over the window; cap at 10 should keep the 10 most
-    # recent (minutes_ago 0..9), not the 10 oldest (minutes_ago 20..29).
+    # recent (minutes_ago 0..9), not the 10 oldest (minutes_ago 20..29). Event types alternate
+    # so consecutive events are not collapsed into one line.
     for minutes_ago in range(30):
-        await _add_alert(ip, minutes_ago=minutes_ago)
+        await _add_alert(ip, minutes_ago=minutes_ago, event_type=f"ssh_event_{minutes_ago % 2}")
 
-    out = await threat_timeline(ip=ip, hours=24, limit=10)
+    out = await threat_timeline(ip=ip, hours=24)
     assert out["count"] == 10
+    assert out["events_in_window"] == 30
     assert "note" in out
 
     timestamps = [e["timestamp"] for e in out["events"]]
@@ -83,3 +87,16 @@ async def test_timeline_truncation_keeps_the_most_recent_events():
         f"newest events instead of the oldest ({out['events'][0]})"
     )
     assert kept_range_start > oldest_dropped - timedelta(seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_timeline_collapses_consecutive_repeats_into_one_counted_line():
+    from honeypot_mcp.tools.analysis import threat_timeline
+
+    for minutes_ago in (10, 5, 1):
+        await _add_alert("7.7.7.7", minutes_ago=minutes_ago)
+
+    out = await threat_timeline(ip="7.7.7.7", hours=24)
+    assert out["count"] == 1 and out["events_in_window"] == 3
+    assert out["events"][0]["repeated"] == 3
+    assert "note" not in out

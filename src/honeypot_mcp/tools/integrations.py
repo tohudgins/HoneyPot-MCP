@@ -1,8 +1,8 @@
 """SOC platform tools: outbound webhook subscriptions and event suppression.
 
 These are the integration points other SOC tooling plugs into:
-- `alert_subscribe` — register a URL to receive real-time alerts (Slack, SIEM, PagerDuty, custom).
-- `suppression_add` — drop or rate-limit noisy sources (known scanners, your own scans).
+- `alert_subscribe` — send alerts to Slack, Teams, email, a SIEM or a webhook.
+- `suppression_add` / `suppression_load_preset` — drop or rate-limit noisy sources.
 
 Subscriptions and rules are stored in the DB and survive restarts.
 """
@@ -87,13 +87,43 @@ def _validate_rule(
 
 # ── Subscriptions ─────────────────────────────────────────────────────────────
 
+_HUMAN_FORMATS = ("slack", "teams", "email")
+_TEAMS_HOST_SUFFIXES = ("office.com", "office365.com", "logic.azure.com", "powerplatform.com")
+
+
+def _infer_format(url: str) -> str:
+    """The delivery format a URL is most plausibly meant for; `json` when nothing fits."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if scheme in ("udp", "tcp"):
+        return "syslog"
+    if scheme in ("smtp", "smtps"):
+        return "email"
+    if host == "slack.com" or host.endswith(".slack.com"):
+        return "slack"
+    if any(host == s or host.endswith("." + s) for s in _TEAMS_HOST_SUFFIXES):
+        return "teams"
+    if path.startswith("/services/collector"):
+        return "splunk_hec"
+    if path.endswith("/loki/api/v1/push"):
+        return "loki"
+    if "datadoghq" in host or "datadog" in host:
+        return "datadog"
+    return "json"
+
+
+def _error(message: str, hint: str) -> dict[str, Any]:
+    return {"error": message, "hint": hint}
+
 
 @mcp.tool(auth=require_role("admin"), **hints("alert_subscribe"))
 async def alert_subscribe(
     url: str,
-    label: str,
-    severity_threshold: Literal["low", "medium", "high", "critical"] = "medium",
-    hmac_secret: str | None = None,
+    label: str | None = None,
+    severity_threshold: Literal["low", "medium", "high", "critical"] | None = None,
+    secret: str | None = None,
     format: Literal[
         "json",
         "splunk_hec",
@@ -105,71 +135,31 @@ async def alert_subscribe(
         "slack",
         "teams",
         "email",
-    ] = "json",
+    ]
+    | None = None,
 ) -> dict[str, Any]:
-    """Register a URL to receive real-time alert deliveries in a SIEM-native format.
+    """Send new alerts to Slack, Teams, email, a SIEM or any webhook as they happen.
 
-    The `format` argument picks the body shape and auth scheme:
-
-    * `json` (default) — raw JSON envelope, optionally HMAC-signed via
-      `X-HoneyPot-Signature: sha256=<hex>` (set `hmac_secret`). Works with
-      Slack/Discord/PagerDuty/generic webhook consumers.
-    * `splunk_hec` — Splunk HTTP Event Collector. URL ends in
-      `/services/collector/event`. Pass your Splunk HEC token via
-      `hmac_secret` — it's sent as `Authorization: Splunk <token>`.
-    * `elastic_ecs` — Elastic Common Schema field re-mapping (source.ip,
-      event.action, event.severity, @timestamp). POST as JSON; works with
-      Elastic Bulk API receivers and Filebeat HTTP input.
-    * `cef` — ArcSight CEF pipe-delimited text. Compatible with QRadar
-      Universal CEF Connector as well.
-    * `syslog` — RFC 5424 framed message. URL scheme picks the transport:
-      `udp://host:514` for UDP datagrams, `tcp://host:514` for TCP.
-    * `loki` — Grafana Loki push API. URL ends in `/loki/api/v1/push`. If
-      `hmac_secret` is set, it rides as `Authorization: Basic <secret>`
-      (Grafana Cloud expects `<userid>:<token>` pre-encoded — encode that
-      yourself and pass the result).
-    * `datadog` — Datadog Logs API v2. URL is
-      `https://http-intake.logs.datadoghq.com/api/v2/logs` (or your
-      regional equivalent). Pass your DD API key via `hmac_secret` — it's
-      sent as `DD-API-KEY: <key>`.
-
-    Human-facing channels, which notify a person rather than fill an index:
-
-    * `slack` — Slack incoming webhook (`https://hooks.slack.com/services/...`).
-      Formatted Block Kit message: severity-coloured, source IP and captured
-      credentials/command/path up front, honeytoken trips called out.
-    * `teams` — Microsoft Teams incoming webhook. MessageCard, which renders
-      on both the classic Office 365 connector and the newer Workflows path.
-    * `email` — SMTP. The URL carries everything:
-      `smtp://user:pass@smtp.example.com:587/?from=honeypot@example.com&to=soc@example.com`
-      Comma-separate multiple recipients. `smtps://` for implicit TLS (465);
-      `smtp://` upgrades via STARTTLS unless you add `&tls=none` for a local
-      relay that has none.
-
-    These three are **coalesced**: the same (event_type, source_ip) notifies at
-    most once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed
-    count carried on the next message. CRITICAL bypasses that window (capped
-    per event type per minute). One
-    scanner produces thousands of events an hour, and a channel that relays
-    them one-to-one gets muted — which is worse than no integration, because
-    everyone then believes they are covered. Set `severity_threshold="high"`
-    or `"critical"` for these unless you want a busy channel.
+    Use it for "alert me in Slack", "send critical alerts to Splunk", "email the SOC when a bait credential is used". Only `url` is needed: the format is recognised from the address (Slack, Teams, Splunk HEC, Loki, Datadog, `smtp://` email, `udp://`/`tcp://` syslog, anything else a signed JSON webhook). Slack, Teams and email default to high and critical alerts and are throttled (repeats merged, critical always sent); other formats default to medium and up.
 
     Args:
-        url: Webhook URL (`udp://`/`tcp://` for syslog, `smtp://` for email).
-        label: Human-readable label (e.g. 'splunk-prod', 'qradar-cef').
-        severity_threshold: Minimum severity to deliver — events below are skipped.
-        hmac_secret: Auth secret. JSON: HMAC key. Splunk HEC: HEC token.
-                     Loki: pre-encoded basic-auth. Datadog: API key. Pass
-                     empty string ("") to generate a random 32-byte secret.
-        format: Output format — see above.
+        url: Where to send. Email: `smtp://user:pass@host:587/?from=a@x.org&to=b@x.org` (`smtps://` for port 465, `&tls=none` for a plain relay).
+        label: A name for it (default: from the format and host).
+        severity_threshold: Lowest severity to send ("only critical" is critical; "everything" is low).
+        secret: What the receiver needs: Splunk HEC token, Datadog API key, Loki basic-auth value. Plain JSON webhooks get a generated HMAC key, returned once.
+        format: Only to override the guess from the url.
     """
-    # Validate the URL up front — a malformed or wrong-scheme URL otherwise
-    # sits in the DB silently failing every delivery. syslog uses udp://tcp://;
-    # every other format is HTTP(S).
-    parsed = urlparse(url)
+    parsed = urlparse(url.strip())
+    url = url.strip()
     if not parsed.hostname:
-        return {"error": f"URL {url!r} has no host."}
+        return _error(
+            f"URL {url!r} has no host.",
+            "Give the full address, e.g. https://hooks.slack.com/services/..., "
+            "smtp://host:587/?from=...&to=..., or udp://siem.example.com:514.",
+        )
+    inferred = format is None
+    format = format or _infer_format(url)  # type: ignore[assignment]
+    assert format is not None
     if format == "syslog":
         allowed_schemes = {"udp", "tcp"}
     elif format == "email":
@@ -177,33 +167,36 @@ async def alert_subscribe(
     else:
         allowed_schemes = {"http", "https"}
     if parsed.scheme.lower() not in allowed_schemes:
-        return {
-            "error": (
-                f"format={format} requires a URL scheme in {sorted(allowed_schemes)}, "
-                f"got {parsed.scheme!r}."
-            )
-        }
+        return _error(
+            f"format={format} requires a URL scheme in {sorted(allowed_schemes)}, "
+            f"got {parsed.scheme!r}.",
+            "Fix the scheme of the address, or pass format= to match it "
+            "(syslog uses udp:// or tcp://, email smtp:// or smtps://, the rest http(s)://).",
+        )
     if format == "email":
-        # Parse now rather than at first delivery. An address typo that only
-        # surfaces as a silently failing subscription is exactly how people end
-        # up believing they have alerting when they do not.
+        # Parse now rather than at first delivery: a typo that only surfaces as a
+        # silently failing subscription is how people end up believing they are covered.
         from honeypot_mcp.webhooks import _parse_smtp_url
 
         try:
             _parse_smtp_url(url)
         except ValueError as e:
-            return {"error": str(e)}
+            return _error(
+                str(e), "Email URLs look like smtp://user:pass@host:587/?from=a@x.org&to=b@x.org"
+            )
 
-    # Destination policy: this tool sends captured attack data to an address
-    # of the caller's choosing, so it must not reach cloud metadata, loopback
-    # or internal ranges (unless the operator opted in). Checked again before
-    # every delivery; this is the fail-fast copy.
+    if label is None or not label.strip():
+        label = f"{format} {parsed.hostname}"[:128]
+    label = label.strip()[:128]
+
+    # This tool sends captured attack data to an address of the caller's choosing, so it must
+    # not reach cloud metadata, loopback or internal ranges (unless the operator opted in).
+    # Checked again before every delivery; this is the fail-fast copy.
     from honeypot_mcp.webhooks import check_destination, redact_url
 
     refusal, _addresses = await check_destination(url, format)
-    # A name that does not resolve *right now* is not a policy violation (DNS
-    # can be briefly down, and the delivery-time check records it in
-    # `last_error`); only an address captured data must not go to is refused.
+    # A name that does not resolve *right now* is not a policy violation (the delivery-time
+    # check records it in `last_error`); only an address captured data must not go to is refused.
     if refusal and refusal.startswith("destination refused"):
         await record_action(
             "alert_subscribe",
@@ -213,17 +206,26 @@ async def alert_subscribe(
             outcome="error",
             error=refusal,
         )
-        return {"error": refusal}
+        return _error(
+            refusal,
+            "Use a publicly reachable address. Internal destinations are refused unless the "
+            "operator sets WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true on the server.",
+        )
 
-    if hmac_secret == "":
-        hmac_secret = secrets.token_urlsafe(32)
+    threshold = severity_threshold or ("high" if format in _HUMAN_FORMATS else "medium")
+    generated_secret = None
+    if not secret and format == "json":
+        generated_secret = secrets.token_urlsafe(32)
+        secret = generated_secret
+    elif not secret:
+        secret = None
 
     async with get_session() as session:
         sub = Subscription(
             label=label,
             url=url,
-            severity_threshold=AlertSeverity(severity_threshold),
-            hmac_secret=hmac_secret,
+            severity_threshold=AlertSeverity(threshold),
+            hmac_secret=secret,
             active=True,
             format=format,
         )
@@ -241,38 +243,51 @@ async def alert_subscribe(
         arguments={
             "label": label,
             "format": format,
-            "severity_threshold": severity_threshold,
+            "severity_threshold": threshold,
             "destination": redact_url(url),
         },
         target=redact_url(url),
     )
-    return {
+    out: dict[str, Any] = {
         "id": sub_id,
         "label": label,
-        "url": url,
-        "severity_threshold": severity_threshold,
-        "hmac_secret": hmac_secret,
+        "url": redact_url(url),
         "format": format,
+        "format_guessed_from_url": inferred,
+        "severity_threshold": threshold,
         "active": True,
+        "note": (
+            f"Alerts of {threshold} severity and above will be sent to {redact_url(url)} as "
+            f"{format}. Stop with alert_unsubscribe(subscription_id={sub_id})."
+        ),
     }
+    if generated_secret:
+        out["secret"] = generated_secret
+        out["secret_note"] = (
+            "Shown once. Verify deliveries with HMAC-SHA256 of the body in the "
+            "`X-HoneyPot-Signature: sha256=<hex>` header."
+        )
+    return out
 
 
 @mcp.tool(auth=require_role("admin"), **hints("alert_unsubscribe"))
 async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
-    """Deactivate a webhook subscription. Existing rows are kept for audit; only
-    `active=False` is set so deliveries stop.
+    """Stop sending alerts to a subscription (the row is kept for audit).
 
-    Admin-only, like `alert_subscribe`: it changes where captured data flows.
+    Use it for "stop the Slack alerts". Find the id with `alert_subscriptions_list`.
 
     Args:
-        subscription_id: The subscription ID returned by alert_subscribe.
+        subscription_id: The subscription's id (from alert_subscribe or alert_subscriptions_list).
     """
     async with get_session() as session:
         result = await session.execute(
             update(Subscription).where(Subscription.id == subscription_id).values(active=False)
         )
         if result.rowcount == 0:  # type: ignore[attr-defined]
-            return {"error": f"No subscription with id={subscription_id}."}
+            return _error(
+                f"No subscription with id={subscription_id}.",
+                "Call alert_subscriptions_list (active_only=false for old ones) to see the ids.",
+            )
 
     from honeypot_mcp.webhooks import invalidate_subscription_cache
 
@@ -283,19 +298,21 @@ async def alert_unsubscribe(subscription_id: int) -> dict[str, Any]:
         arguments={"subscription_id": subscription_id},
         target=str(subscription_id),
     )
-    return {"id": subscription_id, "active": False}
+    return {
+        "id": subscription_id,
+        "active": False,
+        "note": "Deliveries to this subscription have stopped.",
+    }
 
 
 @mcp.tool(**hints("alert_subscriptions_list"))
-async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, Any]]:
-    """List webhook subscriptions with their delivery health stats.
+async def alert_subscriptions_list(active_only: bool = True) -> dict[str, Any]:
+    """Where are alerts being sent, and are the deliveries working?
 
-    This is viewer-tier, so destinations are redacted to `scheme://host[:port]`:
-    webhook URLs carry their credential in the path or userinfo, and SMTP URLs
-    carry recipient addresses. Secrets are never returned.
+    Use it for "who gets alerted?", "is the Slack channel still receiving?". Destinations show as `scheme://host` only; secrets are never returned.
 
     Args:
-        active_only: If True (default), only return active subscriptions.
+        active_only: True (default) hides subscriptions that were stopped; set False to include them.
     """
     from honeypot_mcp.webhooks import redact_url
 
@@ -306,7 +323,7 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
         result = await session.execute(q.order_by(Subscription.created_at.desc()))
         subs = list(result.scalars().all())
 
-    return [
+    rows = [
         {
             "id": s.id,
             "label": s.label,
@@ -323,48 +340,85 @@ async def alert_subscriptions_list(active_only: bool = True) -> list[dict[str, A
         }
         for s in subs
     ]
+    if not rows:
+        note = (
+            "Nobody is subscribed, so alerts are only stored: a CRITICAL waits until someone "
+            "looks. Add a channel with alert_subscribe(url=...)."
+            if active_only
+            else "No subscription has ever been created."
+        )
+    else:
+        failing = [r["label"] for r in rows if r["active"] and r["last_error"]]
+        note = (
+            f"{len(failing)} subscription(s) recorded a delivery error: {failing}."
+            if failing
+            else f"{len(rows)} subscription(s)."
+        )
+    return {"count": len(rows), "subscriptions": rows, "note": note}
 
 
 # ── Suppression rules ─────────────────────────────────────────────────────────
 
+_MAX_LISTED_RULES = 100
+
+
+def _rule_label(ip_pattern: str | None, event_type_pattern: str | None, action: str) -> str:
+    what = " ".join(p for p in (ip_pattern, event_type_pattern) if p)
+    return f"{action} {what}"[:128]
+
 
 @mcp.tool(auth=require_role("operator"), **hints("suppression_add"))
 async def suppression_add(
-    label: str,
     ip_pattern: str | None = None,
     event_type_pattern: str | None = None,
-    action: Literal["drop", "rate_limit"] = "drop",
+    label: str | None = None,
     rate_limit_count: int | None = None,
     rate_limit_window_seconds: int | None = None,
     expires_in_hours: int | None = None,
     confirm_match_all: bool = False,
 ) -> dict[str, Any]:
-    """Add a suppression rule. Matched events are dropped or rate-limited
-    BEFORE they enter the alert pipeline (no DB write, no webhook delivery).
+    """Stop recording noisy events before they become alerts (nothing is stored or delivered).
 
-    Patterns:
-        ip_pattern: exact IP, CIDR (e.g. '10.0.0.0/8'), or empty for any.
-        event_type_pattern: exact name or glob ('ssh_*'), or empty for any.
-
-    For rate_limit, set both `rate_limit_count` and `rate_limit_window_seconds`
-    — e.g. (3, 60) means allow up to 3 matching events per minute, drop the rest.
+    Use it for "ignore my scanner 203.0.113.7", "drop SSH noise from 203.0.113.0/24 for a day", "keep only 3 a minute of http_request from this IP". For well-known scanners such as Shodan or Censys use `suppression_load_preset` instead. Give an address, an event type, or both. A rule that would match everything is refused.
 
     Args:
-        label: Human-readable label (e.g. 'censys-scanner').
-        ip_pattern: IP address or CIDR. Empty = match any IP.
-        event_type_pattern: Event type name or glob. Empty = match any event type.
-        action: 'drop' (silently discard) or 'rate_limit' (keep N per window).
-        rate_limit_count: Max events allowed per window (rate_limit only).
-        rate_limit_window_seconds: Window length in seconds (rate_limit only).
-        expires_in_hours: Auto-deactivate the rule after this many hours.
-        confirm_match_all: A rule that would match EVERY event (a wildcard-only
-            event pattern, a /0 CIDR) silently ends all collection; it is refused
-            unless this is explicitly True.
+        ip_pattern: One IP or one CIDR range (`203.0.113.0/24`). One rule per address; omit to match any address.
+        event_type_pattern: An event type or a glob (`ssh_*`, `http_request`); omit to match any type.
+        label: A name for the rule (default: made from the patterns).
+        rate_limit_count: Instead of dropping everything, keep only this many matches per window.
+        rate_limit_window_seconds: Length of that window; 60 (a minute) when only a count is given.
+        expires_in_hours: Switch the rule off by itself after this long: "for a day" is 24, "a week" 168.
+        confirm_match_all: Only when the person explicitly wants to stop ALL collection.
     """
+    ip_pattern = ip_pattern.strip() if ip_pattern else None
+    event_type_pattern = event_type_pattern.strip() if event_type_pattern else None
     if not ip_pattern and not event_type_pattern:
-        return {
-            "error": "Specify ip_pattern, event_type_pattern, or both — empty rules would match every event."
-        }
+        return _error(
+            "Give an ip_pattern, an event_type_pattern, or both: a rule with neither would "
+            "match every event.",
+            "For Shodan, Censys or private ranges use suppression_load_preset "
+            "(suppression_list_presets shows them); otherwise name the address or event type.",
+        )
+    if ip_pattern and ("," in ip_pattern or " " in ip_pattern):
+        return _error(
+            f"ip_pattern {ip_pattern!r} holds more than one address.",
+            "Make one rule per address or use a CIDR range that covers them all.",
+        )
+    if rate_limit_window_seconds is not None and rate_limit_count is None:
+        return _error(
+            "rate_limit_window_seconds needs rate_limit_count.",
+            "Say how many events to keep per window, or drop the window to discard every match.",
+        )
+    action = "drop"
+    if rate_limit_count is not None:
+        action = "rate_limit"
+        if rate_limit_window_seconds is None:
+            rate_limit_window_seconds = 60
+    if expires_in_hours is not None and expires_in_hours <= 0:
+        return _error(
+            "expires_in_hours must be greater than 0.",
+            "Leave it out for a rule that lasts until suppression_remove; a day is 24, a week 168.",
+        )
 
     problem = _validate_rule(
         ip_pattern,
@@ -375,8 +429,14 @@ async def suppression_add(
         confirm_match_all=confirm_match_all,
     )
     if problem:
-        return {"error": problem}
+        return _error(
+            problem,
+            "ip_pattern is an address or CIDR like 203.0.113.0/24; event_type_pattern is a "
+            "name or glob like ssh_*; counts and windows are whole numbers above 0. "
+            "confirm_match_all is only for a deliberate stop of all collection.",
+        )
 
+    label = (label or "").strip()[:128] or _rule_label(ip_pattern, event_type_pattern, action)
     expires_at = None
     if expires_in_hours is not None:
         expires_at = datetime.now(UTC) + timedelta(hours=expires_in_hours)
@@ -384,8 +444,8 @@ async def suppression_add(
     async with get_session() as session:
         rule = SuppressionRule(
             label=label,
-            ip_pattern=ip_pattern or None,
-            event_type_pattern=event_type_pattern or None,
+            ip_pattern=ip_pattern,
+            event_type_pattern=event_type_pattern,
             action=action,
             rate_limit_count=rate_limit_count,
             rate_limit_window_seconds=rate_limit_window_seconds,
@@ -423,23 +483,37 @@ async def suppression_add(
         "rate_limit_window_seconds": rate_limit_window_seconds,
         "expires_at": expires_at.isoformat() if expires_at else None,
         "active": True,
+        "note": (
+            "Matching events are no longer recorded"
+            + (
+                f" except {rate_limit_count} per {rate_limit_window_seconds}s"
+                if rate_limit_count
+                else ""
+            )
+            + (f", until {expires_at:%Y-%m-%d %H:%M} UTC" if expires_at else "")
+            + f". Undo with suppression_remove(rule_id={rule_id})."
+        ),
     }
 
 
 @mcp.tool(auth=require_role("operator"), **hints("suppression_remove"))
 async def suppression_remove(rule_id: int) -> dict[str, Any]:
-    """Deactivate a suppression rule so the events it was dropping are recorded again. Find rule
-    ids with `suppression_list`.
+    """Switch a suppression rule off so its events are recorded again.
+
+    Use it for "stop ignoring that scanner". Find ids with `suppression_list`.
 
     Args:
-        rule_id: The rule ID returned by suppression_add.
+        rule_id: The rule's id (from suppression_add or suppression_list).
     """
     async with get_session() as session:
         result = await session.execute(
             update(SuppressionRule).where(SuppressionRule.id == rule_id).values(active=False)
         )
         if result.rowcount == 0:  # type: ignore[attr-defined]
-            return {"error": f"No suppression rule with id={rule_id}."}
+            return _error(
+                f"No suppression rule with id={rule_id}.",
+                "Call suppression_list to see the rule ids.",
+            )
 
     from honeypot_mcp.suppression import invalidate_rule_cache
 
@@ -450,16 +524,21 @@ async def suppression_remove(rule_id: int) -> dict[str, Any]:
         arguments={"rule_id": rule_id},
         target=str(rule_id),
     )
-    return {"id": rule_id, "active": False}
+    return {
+        "id": rule_id,
+        "active": False,
+        "note": "Events this rule matched are recorded again.",
+    }
 
 
 @mcp.tool(**hints("suppression_list"))
-async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
-    """List suppression rules (the filters that drop or rate-limit noisy events such as known
-    scanners) with their ids and how many events each has matched.
+async def suppression_list(active_only: bool = True) -> dict[str, Any]:
+    """Which events are currently being ignored, and how many has each rule hidden?
+
+    Use it for "what are we suppressing?", "is the Shodan rule loaded?".
 
     Args:
-        active_only: If True (default), only return active rules.
+        active_only: True (default) shows only rules in effect; set False to include removed and expired ones.
     """
     async with get_session() as session:
         q = select(SuppressionRule)
@@ -468,7 +547,12 @@ async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
         result = await session.execute(q.order_by(SuppressionRule.created_at.desc()))
         rules = list(result.scalars().all())
 
-    return [
+    now = datetime.now(UTC)
+    if active_only:
+        rules = [r for r in rules if r.expires_at is None or r.expires_at > now]
+    total = len(rules)
+    shown = rules[:_MAX_LISTED_RULES]
+    rows = [
         {
             "id": r.id,
             "label": r.label,
@@ -477,49 +561,67 @@ async def suppression_list(active_only: bool = True) -> list[dict[str, Any]]:
             "action": r.action,
             "rate_limit_count": r.rate_limit_count,
             "rate_limit_window_seconds": r.rate_limit_window_seconds,
-            "active": r.active,
+            "active": r.active and (r.expires_at is None or r.expires_at > now),
             "suppressed_count": r.suppressed_count,
             "expires_at": r.expires_at.isoformat() if r.expires_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
-        for r in rules
+        for r in shown
     ]
+    if not total:
+        note = (
+            "No suppression rules are in effect: every event is recorded. Add one with "
+            "suppression_add, or load a known-scanner list with suppression_load_preset."
+        )
+    elif total > len(rows):
+        note = f"Showing the newest {len(rows)} of {total} rules."
+    else:
+        note = f"{total} rule(s)."
+    return {"count": total, "shown": len(rows), "rules": rows, "note": note}
 
 
 @mcp.tool(auth=require_role("operator"), **hints("suppression_load_preset"))
 async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
-    """Apply a bundled suppression preset (e.g. 'shodan', 'censys',
-    'internal-rfc1918').
+    """Stop alerting on a known group of noisy sources in one step.
 
-    Bundled presets ship inside the package; a matching file under
-    `config/suppression_presets/<name>.yaml` overrides one. Each bundles a set
-    of suppression rules for known-noise sources so the operator doesn't have
-    to build the same `suppression_add` chain on every deployment.
+    Use it for "stop alerting on Shodan", "ignore Censys", "ignore my internal network". Names come from `suppression_list_presets` (shodan, censys, internal-rfc1918). Loading again re-enables rules that were removed.
 
     Args:
-        preset_name: Filename stem of the preset (without `.yaml`).
+        preset_name: The preset's name, e.g. "shodan".
     """
     import yaml
 
+    available = _list_available_presets()
     if not _PRESET_NAME_RE.fullmatch(preset_name):
-        return {"error": "Preset names are letters, digits, '_' and '-' only (max 64)."}
+        return _error(
+            "Preset names are letters, digits, '_' and '-' only (max 64).",
+            f"Available presets: {available}.",
+        )
     preset_text = _read_preset(preset_name)
     if preset_text is None:
-        return {
-            "error": (f"Preset '{preset_name}' not found. Available: {_list_available_presets()}")
-        }
+        return _error(
+            f"Preset '{preset_name}' not found.",
+            f"Available presets: {available}. suppression_list_presets describes each.",
+        )
 
     try:
         raw = yaml.safe_load(preset_text)
     except yaml.YAMLError as e:
-        return {"error": f"Preset '{preset_name}' is not valid YAML: {e}"[:300]}
+        return _error(
+            f"Preset '{preset_name}' is not valid YAML: {e}"[:300],
+            "Fix the preset file under config/suppression_presets/ or remove it to use the bundled one.",
+        )
     if not isinstance(raw, dict) or not isinstance(raw.get("rules"), list):
-        return {"error": f"Preset '{preset_name}' must be a mapping with a list of `rules`."}
+        return _error(
+            f"Preset '{preset_name}' must be a mapping with a list of `rules`.",
+            "See the bundled presets for the format.",
+        )
     preset_rules = raw["rules"]
     if not preset_rules:
-        return {"error": f"Preset '{preset_name}' contains no rules."}
+        return _error(f"Preset '{preset_name}' contains no rules.", "Add rules to it first.")
 
     applied: list[dict[str, Any]] = []
+    reactivated: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
     async with get_session() as session:
@@ -544,13 +646,26 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
             if problem:
                 skipped.append({"label": label, "reason": problem})
                 continue
-            # Avoid duplicate: if a rule with this label already exists and is
-            # active, skip rather than re-creating.
             existing = (
-                await session.execute(select(SuppressionRule).where(SuppressionRule.label == label))
-            ).scalar_one_or_none()
+                (
+                    await session.execute(
+                        select(SuppressionRule)
+                        .where(SuppressionRule.label == label)
+                        .order_by(SuppressionRule.active.desc(), SuppressionRule.id.desc())
+                    )
+                )
+                .scalars()
+                .first()
+            )
             if existing is not None:
-                skipped.append({"label": label, "reason": "already exists"})
+                if existing.active and (
+                    existing.expires_at is None or existing.expires_at > datetime.now(UTC)
+                ):
+                    skipped.append({"label": label, "reason": "already in effect"})
+                else:  # removed or expired earlier: loading the preset again means "back on"
+                    existing.active = True
+                    existing.expires_at = None
+                    reactivated.append({"id": existing.id, "label": label})
                 continue
 
             rule = SuppressionRule(
@@ -566,14 +681,15 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
             await session.flush()
             applied.append({"id": rule.id, "label": label, "ip_pattern": rule.ip_pattern})
 
-    if applied:
+    if applied or reactivated:
         from honeypot_mcp.suppression import invalidate_rule_cache
 
         invalidate_rule_cache()
 
+    summary = f"{len(applied)} added, {len(reactivated)} switched back on, {len(skipped)} skipped"
     await record_action(
         "suppression_load_preset",
-        f"Loaded suppression preset {preset_name!r}: {len(applied)} applied, {len(skipped)} skipped",
+        f"Loaded suppression preset {preset_name!r}: {summary}",
         arguments={"preset_name": preset_name},
         target=preset_name,
     )
@@ -581,8 +697,13 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
         "preset": preset_name,
         "description": raw.get("description", ""),
         "applied": applied,
+        "reactivated": reactivated,
         "skipped": skipped,
-        "summary": f"{len(applied)} applied, {len(skipped)} skipped",
+        "summary": summary,
+        "note": (
+            f"{preset_name}: {summary}. Undo each rule with suppression_remove; "
+            "suppression_list shows the ids."
+        ),
     }
 
 
@@ -637,12 +758,33 @@ def _list_available_presets() -> list[str]:
 
 
 @mcp.tool(**hints("suppression_list_presets"))
-async def suppression_list_presets() -> list[str]:
-    """List bundled suppression presets available to `suppression_load_preset`.
+async def suppression_list_presets() -> dict[str, Any]:
+    """Which known-noise lists can be switched on in one step?
 
-    Presets are curated rule sets for known-benign noise sources — internet
-    scanning services (shodan, censys) and internal RFC1918 ranges — so their
-    traffic stops drowning out real attacks. Worth loading before exposing a
-    honeypot to the internet.
+    Use it before `suppression_load_preset`, e.g. for "can we ignore Shodan?". Worth loading before exposing a honeypot to the internet.
     """
-    return _list_available_presets()
+    import yaml
+
+    presets: list[dict[str, Any]] = []
+    for name in _list_available_presets():
+        description, rules = "", None
+        text = _read_preset(name)
+        if text is not None:
+            try:
+                raw = yaml.safe_load(text)
+            except yaml.YAMLError:
+                raw = None
+            if isinstance(raw, dict):
+                description = str(raw.get("description") or "")[:200]
+                if isinstance(raw.get("rules"), list):
+                    rules = len(raw["rules"])
+        presets.append({"name": name, "description": description, "rules": rules})
+    return {
+        "count": len(presets),
+        "presets": presets,
+        "note": (
+            "Load one with suppression_load_preset(preset_name=...)."
+            if presets
+            else "No presets are installed; use suppression_add for a single address or event type."
+        ),
+    }

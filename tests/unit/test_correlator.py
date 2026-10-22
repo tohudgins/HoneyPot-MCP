@@ -149,10 +149,10 @@ async def test_a_campaign_is_found_even_after_a_flood_buries_it_in_the_latest_al
     assert len(redis) == 1
     assert redis[0]["unique_source_ips"] == 4 and redis[0]["total_events"] == 8
     assert redis[0]["source_ips"] == [f"203.0.113.{n}" for n in range(1, 5)]
-    assert out["window"] == "whole run" and "hourly" in out["resolution"]
+    assert out["window"] == "whole capture"
 
 
-async def test_the_window_spans_whole_hours_and_since_hours_narrows_the_run(db):
+async def test_hourly_windows_and_since_hours_narrows_the_run(db):
     from honeypot_mcp.tools.analysis import analyze_campaign
 
     rows = [
@@ -161,28 +161,35 @@ async def test_the_window_spans_whole_hours_and_since_hours_narrows_the_run(db):
         ("203.0.113.3", "ssh_login_failed", _hours_ago(5), 3),
         ("203.0.113.4", "ssh_login_failed", _hours_ago(5), 3),
     ]
+    rows += [(f"198.51.100.{n}", "ssh_login_failed", _hours_ago(1), 3) for n in range(1, 4)]
     await _seed(rows)
 
-    one_hour = await analyze_campaign(window_minutes=60, min_sources=3)
-    two_hours = await analyze_campaign(window_minutes=120, min_sources=3)
-    recent = await analyze_campaign(window_minutes=120, min_sources=3, since_hours=3)
+    default = await analyze_campaign()
+    wide = await analyze_campaign(min_sources=2)
+    recent = await analyze_campaign(since_hours=3)
 
-    assert one_hour["campaigns_total"] == 0, "two sources an hour is not a campaign at min 3"
-    assert two_hours["campaigns_total"] == 1 and two_hours["campaigns"][0]["unique_source_ips"] == 4
-    assert two_hours["campaigns"][0]["total_events"] == 12
-    assert recent["campaigns_total"] == 0, "the campaign is older than the window"
+    # Windows are one hour: two sources an hour is not a campaign at min 3, only the busy hour is.
+    assert default["campaigns_total"] == 1
+    assert default["campaigns"][0]["unique_source_ips"] == 3
+    assert wide["campaigns_total"] == 3
+    assert recent["campaigns_total"] == 1 and recent["window"] == "last 3h"
+    old_cut = await analyze_campaign(since_hours=3, min_sources=2)
+    assert old_cut["campaigns_total"] == 1, "the two older two-source campaigns fall outside"
 
 
-async def test_the_result_says_when_it_returns_fewer_campaigns_than_exist(db):
+async def test_the_result_says_when_it_returns_fewer_campaigns_than_exist(db, monkeypatch):
+    from honeypot_mcp.tools import analysis
     from honeypot_mcp.tools.analysis import analyze_campaign
 
+    monkeypatch.setattr(analysis, "_CAMPAIGNS_SHOWN", 2)
     rows = []
     for n in range(4):
         for ip in range(3):
             rows.append((f"203.0.113.{ip + 1}", f"event_{n}", _hours_ago(3), 1))
     await _seed(rows)
 
-    out = await analyze_campaign(limit=2)
+    out = await analyze_campaign()
 
     assert out["campaigns_total"] == 4 and out["count"] == 2 and len(out["campaigns"]) == 2
+    assert "top 2 of 4" in out["note"]
     assert "error" in await analyze_campaign(since_hours=0)

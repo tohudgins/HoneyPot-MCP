@@ -63,7 +63,7 @@ async def test_pausing_an_in_process_sensor_closes_its_port_and_resuming_reopens
 
         assert (await tools.honeypot_resume("pause-me"))["status"] == "running"
         assert await _answers(port), "resuming must start listening again on the same port"
-        listed = {h["name"]: h for h in await tools.honeypot_list()}
+        listed = {h["name"]: h for h in (await tools.honeypot_list())["honeypots"]}
         assert listed["pause-me"]["status"] == "running" and listed["pause-me"]["port"] == port
     finally:
         await tools.honeypot_stop(name="pause-me", remove=True)
@@ -87,7 +87,7 @@ async def test_a_resume_that_cannot_bind_says_so_and_leaves_the_sensor_paused(mo
         monkeypatch.setattr(engine, "start", _port_taken)  # something took the port meanwhile
         result = await tools.honeypot_resume("pause-clash")
         assert "stays paused" in result["error"] and "Address already in use" in result["error"]
-        listed = {h["name"]: h for h in await tools.honeypot_list()}
+        listed = {h["name"]: h for h in (await tools.honeypot_list())["honeypots"]}
         assert listed["pause-clash"]["status"] == "paused"
 
         monkeypatch.setattr(engine, "start", real_start)  # the port is free again

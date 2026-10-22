@@ -5,7 +5,7 @@
 server prints rested on the author's own reading of each event type. This tool turns that into a
 measurement, in two steps that happen days apart and are done by different people:
 
-`action="sample"` draws a seeded, stratified sample of alerts and writes two files into `reports_dir`:
+`mapping_audit()` (no labels file) draws a seeded, stratified sample of alerts and writes two files into `reports_dir`:
 
 * a **blind** file (JSON Lines): a README record explaining the task and the label format, then one
   record per item carrying only what an independent analyst needs: an opaque item id, the sensor's own
@@ -16,7 +16,10 @@ measurement, in two steps that happen days apart and are done by different peopl
   population, sample size), then item id -> the project's mapped techniques and tactics, event type,
   stratum and weight.
 
-`action="score"` takes one (or two) labels files and the key file and reports agreement.
+`mapping_audit(labels_file=...)` takes one (or two) labels files, finds the key file they answer (the
+recent key with the most of their item ids) and reports agreement. The seed is derived from the data
+(event types, counts, id range) so redrawing the same data gives the same sample; the sample size,
+per-type floor, interval draws and list lengths are fixed.
 
 Design of the sample
 --------------------
@@ -25,7 +28,7 @@ Design of the sample
   the event type, so a stratum has one mapping, and the strata fall in three kinds: `mapped` (maps to at
   least one technique), `unmapped_bookkeeping` (maps to nothing, and is connection/session bookkeeping by
   name) and `unmapped_other` (maps to nothing, is not bookkeeping: the candidates for a missed technique).
-* **Allocation**: `min(per_type_min, N_h)` per stratum so every type, rare ones included, is
+* **Allocation**: `min(per_type_min, N_h)` (one) per stratum so every type, rare ones included, is
   represented; then the rest of the budget is spread **in proportion to the stratum population**
   (capped at the population, overflow redistributed). If the budget cannot even cover the minimum the
   call is refused rather than silently dropping rare types.
@@ -66,7 +69,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from sqlalchemy import func, select
 
@@ -89,8 +92,6 @@ from honeypot_mcp.tools._format import (
 from honeypot_mcp.tools._planted import Planted, load_planted
 from honeypot_mcp.tools._scan import _first_id_since
 from honeypot_mcp.tools._window import window_anchor, window_end
-
-Action = Literal["sample", "score"]
 
 SCHEMA_VERSION = 1
 _DEFAULT_SAMPLE = 200
@@ -446,11 +447,23 @@ def _readme_record(item_count: int) -> dict[str, Any]:
     }
 
 
+def _data_seed(populations: dict[str, int], first_id: int, last_id: int) -> int:
+    """A seed that depends only on the data being sampled (the event types with their counts and
+    the alert id range), so asking again about the same data redraws the same sample."""
+    basis = json.dumps([sorted(populations.items()), first_id, last_id], separators=(",", ":"))
+    return int(hashlib.sha256(basis.encode()).hexdigest()[:8], 16) % (2**31 - 1) + 1
+
+
 async def _sample(
-    since_hours: float | None, sample_size: int, seed: int | None, per_type_min: int
+    since_hours: float | None,
+    sample_size: int | None = None,
+    seed: int | None = None,
+    per_type_min: int = 1,
 ) -> dict[str, Any]:
+    """Draw and write the blind and key files. `sample_size` None = enough for every event type plus
+    a proportional share (`_DEFAULT_SAMPLE` at least); `seed` None = derived from the data."""
     started = time.monotonic()
-    if (
+    if sample_size is not None and (
         isinstance(sample_size, bool)
         or not isinstance(sample_size, int)
         or not 1 <= sample_size <= _MAX_SAMPLE
@@ -460,8 +473,6 @@ async def _sample(
         return {"error": "per_type_min must be an integer of at least 0."}
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
         return {"error": "seed must be an integer."}
-    if seed is None:
-        seed = random.SystemRandom().randrange(1, 2**31)
 
     since, end, window, error = await _window(since_hours)
     if error:
@@ -473,19 +484,25 @@ async def _sample(
         )
     populations = {et: n for et, n in counts.items() if n > 0}
     if not populations:
-        return {"error": "No alerts in the window; nothing to sample.", "window": window}
+        return {
+            "error": "No alerts in the window; nothing to sample.",
+            "hint": "Leave the time window out to sample the whole run, or widen it.",
+            "window": window,
+        }
 
     mapping: dict[str, list[dict[str, Any]]] = {}
     for event_type in sorted(populations):
         mapping[event_type] = await map_to_attack([event_type])
     kinds = {et: _kind_of(et, bool(mapping[et])) for et in populations}
 
+    if sample_size is None:
+        sample_size = min(_MAX_SAMPLE, max(_DEFAULT_SAMPLE, len(populations) + 100))
     try:
         alloc = allocate(populations, sample_size, per_type_min)
     except ValueError as exc:
         return {
-            "error": f"{exc}: raise sample_size to at least {len(populations) * per_type_min}, "
-            "or lower per_type_min. Rare event types are never dropped silently.",
+            "error": f"{exc}: rare event types are never dropped silently.",
+            "hint": "Use a shorter time window so fewer event types are in play.",
             "strata": len(populations),
         }
 
@@ -494,8 +511,15 @@ async def _sample(
         first_id = (await session.execute(select(func.min(Alert.id)))).scalar()
         high_id = (await session.execute(select(func.max(Alert.id)))).scalar()
     if first_id is None or high_id is None:
-        return {"error": "The alert table is empty; nothing to sample.", "window": window}
+        return {
+            "error": "The alert table is empty; nothing to sample.",
+            "hint": "Capture some traffic first, or point the server at a database that has alerts.",
+            "window": window,
+        }
     low_id = max(int(first_id), int(low)) if low is not None else int(first_id)
+    seed_was_derived = seed is None
+    if seed is None:
+        seed = _data_seed(populations, int(first_id), int(high_id))
 
     drawn: dict[str, list[int]] = {}
     for event_type in sorted(alloc):
@@ -651,6 +675,11 @@ async def _sample(
         {
             "action": "sample",
             "seed": seed,
+            "seed_note": (
+                "Derived from the data, so sampling the same data again gives the same items."
+                if seed_was_derived
+                else "Given by the caller."
+            ),
             "window": window,
             "requested": sample_size,
             "sampled": len(key),
@@ -662,9 +691,9 @@ async def _sample(
             "seconds": round(time.monotonic() - started, 2),
             "next_step": (
                 "Give ONLY the blind file to each labeller (the key holds the project's mapping). "
-                "Each writes a JSON Lines labels file into reports_dir; then call "
-                f"mapping_audit(action='score', labels_file=..., key_file='{key_name}', "
-                "second_labels_file=...)."
+                "Each writes a JSON Lines labels file into the reports directory; then call "
+                "mapping_audit(labels_file=<their file>) to score it (add second_labels_file for "
+                "a second labeller). The matching key file is found automatically."
             ),
         }
     )
@@ -1442,12 +1471,12 @@ async def _score(
 ) -> dict[str, Any]:
     if not labels_file or not key_file:
         return {
-            "error": "action='score' needs labels_file and key_file (file names in reports_dir)."
+            "error": "scoring needs a labels file and a key file (names in the reports directory)."
         }
     if isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= _MAX_TOP:
         return {"error": f"top must be an integer from 1 to {_MAX_TOP}."}
     if isinstance(draws, bool) or not isinstance(draws, int) or not 100 <= draws <= _MAX_DRAWS:
-        return {"error": f"interval_draws must be an integer from 100 to {_MAX_DRAWS}."}
+        return {"error": f"draws must be an integer from 100 to {_MAX_DRAWS}."}
     try:
         header, key_items = parse_key(_read_report_text(key_file))
         parsed: list[tuple[str, dict[str, dict[str, Any]]]] = []
@@ -1499,73 +1528,150 @@ async def _score(
     return mark_untrusted(result)
 
 
+_KEY_GLOB = "mapping-audit-key-*.jsonl"
+_KEYS_CONSIDERED = 10
+_SCORE_TOP = 15
+
+
+def _recent_files(pattern: str, *, exclude_prefixes: tuple[str, ...] = ()) -> list[str]:
+    """Names of regular files in the reports directory matching `pattern`, newest first."""
+    root = get_settings().reports_dir
+    try:
+        found = [
+            p
+            for p in root.glob(pattern)
+            if p.is_file() and not p.is_symlink() and not p.name.startswith(exclude_prefixes)
+        ]
+        found.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError:
+        return []
+    return [p.name for p in found]
+
+
+def _label_candidates() -> list[str]:
+    """Files that could be a labels file: JSON Lines in the reports directory that are not a
+    sample's own blind or key file."""
+    return _recent_files("*.jsonl", exclude_prefixes=("mapping-audit-blind-", "mapping-audit-key-"))
+
+
+def _find_key(labels_name: str) -> tuple[str | None, dict[str, Any] | None]:
+    """The key file a labels file answers: the recent key containing the most of its item ids
+    (newest wins a tie). `(name, None)` on success, `(None, error)` otherwise."""
+    try:
+        rows, _problems = _json_lines(_read_report_text(labels_name))
+    except _FileError as exc:
+        return None, {"error": str(exc)}
+    wanted = {
+        r["item_id"] for _, r in rows if isinstance(r, dict) and isinstance(r.get("item_id"), str)
+    }
+    if not wanted:
+        return None, {
+            "error": f'{labels_name}: no labelled items (lines like {{"item_id": ..., "techniques": [...]}}).',
+            "hint": "The labels file is JSON Lines, one object per item; the README record in the "
+            "sample's blind file explains the format.",
+        }
+    keys = _recent_files(_KEY_GLOB)[:_KEYS_CONSIDERED]
+    if not keys:
+        return None, {
+            "error": "No sample key file was found in the reports directory.",
+            "hint": "Draw a sample first with mapping_audit() (no files): it writes the blind file "
+            "to label and the key file that scoring needs.",
+        }
+    best: tuple[int, str] | None = None
+    for name in keys:
+        try:
+            _header, items = parse_key(_read_report_text(name))
+        except _FileError:
+            continue
+        overlap = len(wanted & items.keys())
+        if overlap and (best is None or overlap > best[0]):
+            best = (overlap, name)
+    if best is None:
+        return None, {
+            "error": f"None of the item ids in {labels_name} appear in any sample key file.",
+            "hint": f"Label the items of a blind file drawn by mapping_audit(). Key files present: "
+            f"{', '.join(keys[:5])}.",
+        }
+    return best[1], None
+
+
+async def _score_named(labels_file: str, second_labels_file: str | None) -> dict[str, Any]:
+    """Score the named labels file(s), finding the sample key they answer."""
+    key_file, problem = _find_key(labels_file)
+    if problem is not None or key_file is None:
+        result = problem or {"error": "no key file found"}
+        if "not found" in str(result.get("error")):
+            names = _label_candidates()
+            result["hint"] = (
+                f"Label files in the reports directory: {', '.join(names[:8])}."
+                if names
+                else "There is no labels file in the reports directory: have a labeller write "
+                "one (JSON Lines) there."
+            )
+        return result
+    result = await _score(labels_file, key_file, second_labels_file, _SCORE_TOP, _DEFAULT_DRAWS)
+    if "error" in result:
+        names = _label_candidates()
+        if "not found" in result["error"] and names:
+            result["hint"] = f"Label files in the reports directory: {', '.join(names[:8])}."
+        else:
+            result.setdefault(
+                "hint",
+                "Each label line is {item_id, techniques: [...]} using ids from the blind file; "
+                "fix the lines listed under `problems` and run again.",
+            )
+    else:
+        result["key_file_used"] = key_file
+    return result
+
+
 @mcp.tool(auth=require_role("operator"), **hints("mapping_audit"))
 async def mapping_audit(
-    action: Action,
     since_hours: float | None = None,
-    sample_size: int = _DEFAULT_SAMPLE,
-    seed: int | None = None,
-    per_type_min: int = 1,
     labels_file: str | None = None,
-    key_file: str | None = None,
     second_labels_file: str | None = None,
-    top: int = 15,
-    interval_draws: int = _DEFAULT_DRAWS,
 ) -> dict[str, Any]:
-    """Measure the ATT&CK mapping against independent labels: draw a blind sample, then score it.
+    """Check how accurate the ATT&CK mapping is: draw a blind sample, then score people's labels.
 
-    The mapping from event types to techniques (`intel/mitre.py`) is the author's judgement. This
-    tool checks it against someone else's, in two steps done by different people.
-
-    `action="sample"` draws a reproducible stratified sample (one stratum per event type seen:
-    `per_type_min` of each, the rest of `sample_size` proportional to how common the type is) and writes
-    two files into the reports directory: a BLIND file for labellers (a README record, then items with
-    only the event type, protocol, severity and a clipped, masked payload digest) and a KEY file with
-    the project's mapping per item and the population of each stratum. Give labellers only the blind
-    file. Same seed on the same data gives the same sample.
-
-    `action="score"` compares labels against the key. Labellers write JSON Lines
-    `{item_id, techniques: ["T1110.001", ...], tactic?, label_confidence?}` (an empty list means no
-    technique applies). Reports item agreement, per-technique and per-tactic precision/recall/F1,
-    the share of mapped alerts judged wrong and of labelled alerts left unmapped, strict and
-    parent-level, re-weighted to the whole window with a 95% interval. Every headline metric also
-    carries `by_kind`, `concentration` (the three strata contributing most) and `sensitivity` (the
-    estimate without the single largest stratum), because a few huge event types can carry a rate.
-    Also the worst disagreements by event type and, with `second_labels_file`, inter-annotator
-    agreement (Cohen's kappa, Jaccard). The full result is also written to a JSON artifact.
+    Use it for "check how accurate the ATT&CK mapping is" (no files: draws a sample) and "score my
+    labels in labels.jsonl" (names the labels file: scores it). Step 1 writes a BLIND file for a
+    labeller (event type, protocol, severity, masked payload digest, no mapping) and a KEY file with
+    the project's mapping, to the reports directory; the sample covers every event type seen and is
+    reproducible. Step 2: the labeller writes JSON Lines `{item_id, techniques: ["T1110.001"]}`
+    (empty list = no technique); scoring finds the key itself and reports agreement (strict and
+    parent-technique), per-technique and per-tactic precision/recall, error rates re-weighted to
+    the whole run with 95% intervals, the worst disagreements, and Cohen's kappa with a second
+    labeller. Full result also saved as a file.
 
     Args:
-        action: `sample` or `score`.
-        since_hours: Sample only the last N hours (analysis mode: ending at the newest alert).
-        sample_size: Total items to draw (1 to 5000; default 200).
-        seed: Integer seed; omit for a random one (it is returned).
-        per_type_min: Minimum items per event type (default 1; 0 turns the floor off).
-        labels_file: Score: the labeller's labels file in the reports directory.
-        key_file: Score: the key file written by `sample`.
-        second_labels_file: Score: a second labeller's file, for inter-annotator agreement.
-        top: Score: rows to return in each ranked list.
-        interval_draws: Score: Monte Carlo draws for the intervals (100 to 20000).
+        since_hours: Sampling only: just the last N hours ("this week" is 168). Default: the whole run.
+        labels_file: Scoring: name of the labeller's file in the reports directory. Leave out to
+                     draw a new sample.
+        second_labels_file: Scoring: a second labeller's file, to measure how well they agree.
     """
-    if action == "sample":
-        result = await _sample(since_hours, sample_size, seed, per_type_min)
-        await _audit.record_action(
-            "mapping_audit",
-            (
-                f"Drew a blind ATT&CK mapping sample of {result.get('sampled')} items"
-                if "error" not in result
-                else "Mapping audit sample refused"
-            ),
-            arguments={
-                "action": action,
-                "since_hours": since_hours,
-                "sample_size": sample_size,
-                "seed": seed,
-            },
-            target=(result.get("key_file") or {}).get("name"),
-            outcome="ok" if "error" not in result else "error",
-            error=result.get("error"),
+    if labels_file or second_labels_file:
+        if not labels_file:
+            return {
+                "error": "second_labels_file was given without labels_file.",
+                "hint": "Name the first labeller's file in labels_file.",
+            }
+        return await _score_named(labels_file, second_labels_file)
+    result = await _sample(since_hours)
+    await _audit.record_action(
+        "mapping_audit",
+        (
+            f"Drew a blind ATT&CK mapping sample of {result.get('sampled')} items"
+            if "error" not in result
+            else "Mapping audit sample refused"
+        ),
+        arguments={"since_hours": since_hours},
+        target=(result.get("key_file") or {}).get("name"),
+        outcome="ok" if "error" not in result else "error",
+        error=result.get("error"),
+    )
+    if "error" in result:
+        result.setdefault(
+            "hint",
+            "since_hours is a number of hours (168 = a week); leave it out for the whole run.",
         )
-        return result
-    if action == "score":
-        return await _score(labels_file, key_file, second_labels_file, top, interval_draws)
-    return {"error": "action must be 'sample' or 'score'."}
+    return result

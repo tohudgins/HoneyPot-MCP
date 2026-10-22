@@ -144,7 +144,7 @@ async def _kex(
 
 
 async def test_scattered_addresses_sharing_a_fingerprint_become_one_cluster():
-    from honeypot_mcp.tools.analysis import fingerprint_clusters
+    from honeypot_mcp.tools.analysis import cluster_ssh_clients, fingerprint_clusters
 
     for i in range(6):  # one botnet binary, six addresses
         await _kex(f"198.51.100.{i + 1}", "botnet-hassh", f"s{i}", version="SSH-2.0-Go")
@@ -153,7 +153,7 @@ async def test_scattered_addresses_sharing_a_fingerprint_become_one_cluster():
     )  # same IP/other session
     await _kex("203.0.113.7", "openssh-hassh", "t1", version="SSH-2.0-OpenSSH_9.6")  # a one-off
 
-    out = await fingerprint_clusters()
+    out = await cluster_ssh_clients(168, 2, 100)
     assert out["fingerprints_seen"] == 2
     assert out["clusters_matching"] == 1, "the lone OpenSSH client is below min_sources=2"
     cluster = out["clusters"][0]
@@ -163,6 +163,11 @@ async def test_scattered_addresses_sharing_a_fingerprint_become_one_cluster():
     assert (
         len(cluster["example_ips"]) <= 10 and cluster["kex_offer_start"][0] == "curve25519-sha256"
     )
+
+    # The tool trims the same cluster for an agent: fewer examples, no key-exchange offer.
+    shown = (await fingerprint_clusters())["clusters"][0]
+    assert shown["hassh"] == "botnet-hassh" and shown["distinct_ips"] == 7
+    assert len(shown["example_ips"]) == 5 and "kex_offer_start" not in shown
 
 
 async def test_min_sources_one_includes_every_fingerprint_largest_first():

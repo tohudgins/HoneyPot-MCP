@@ -856,6 +856,55 @@ async def test_a_directory_is_not_a_capture(monkeypatch, capture):
     assert "error" in await pcap_detect("adir")
 
 
+async def test_no_path_replays_the_newest_capture_and_says_so(docker_client, capture, rules_cache):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    older = make_pcap(Path(get_settings().reports_dir) / "pcap-198.51.100.5-20260101T000000Z.pcap")
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    result = await pcap_detect()
+
+    assert "error" not in result, result
+    assert result["file"]["name"] == capture.name
+    assert "newest capture was used" in result["file"]["chosen"]
+
+
+async def test_an_attacker_address_selects_that_sources_newest_capture(
+    docker_client, capture, rules_cache
+):
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    other = make_pcap(Path(get_settings().reports_dir) / "pcap-198.51.100.5-20260101T000000Z.pcap")
+    os.utime(other, (1_900_000_000, 1_900_000_000))  # newer than `capture`, but another source
+    result = await pcap_detect("192.0.2.10")
+
+    assert "error" not in result, result
+    assert result["file"]["name"] == capture.name
+    assert "newest for 192.0.2.10" in result["file"]["chosen"]
+
+
+async def test_an_address_with_no_capture_says_which_exist(monkeypatch, capture):
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    _no_docker(monkeypatch)
+    result = await pcap_detect("203.0.113.77")
+
+    assert "203.0.113.77" in result["error"]
+    assert "192.0.2.10" in result["hint"]
+
+
+async def test_a_misspelt_name_lists_the_captures_that_exist(monkeypatch, capture):
+    from honeypot_mcp.tools.detect import pcap_detect
+
+    _no_docker(monkeypatch)
+    result = await pcap_detect(capture.name.replace("2026", "2025"))
+
+    assert "error" in result
+    assert result["available"] == [capture.name]
+    assert capture.name in result["hint"]
+
+
 async def test_oversize_capture_is_refused_with_the_setting_named(monkeypatch, capture):
     from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools.detect import pcap_detect
@@ -1207,7 +1256,7 @@ async def test_update_with_no_docker_or_no_network_image(docker_client):
 async def test_suricata_digest_from_eve_json(docker_client, capture, rules_cache):
     from honeypot_mcp.tools.detect import pcap_detect
 
-    result = await pcap_detect(capture.name, top=10)
+    result = await pcap_detect(capture.name)
 
     assert result["engine"] == "suricata"
     assert result["engine_version"] == "8.0.7"
@@ -1414,7 +1463,7 @@ async def test_zeek_digest_from_json_logs(docker_client, capture):
     from honeypot_mcp.tools.detect import pcap_detect
 
     docker_client.runner = docker_client.run_zeek
-    result = await pcap_detect(capture.name, engine="zeek", top=5)
+    result = await pcap_detect(capture.name, engine="zeek")
 
     assert result["engine"] == "zeek" and result["engine_version"] == "8.0.10"
     assert result["packets"] == 3 and result["window"]["seconds"] == 4.0
@@ -1551,7 +1600,7 @@ async def test_each_run_is_audited_without_file_contents(docker_client, capture)
     row = rows[0]
     assert row.outcome == "ok"
     assert row.target == capture.name
-    assert row.arguments == {"path": capture.name, "engine": "suricata", "top": 10}
+    assert row.arguments == {"path": capture.name, "engine": "suricata"}
     assert "invalid checksum" not in (row.summary or "")
     assert "SECRET" not in json.dumps(row.arguments) + (row.summary or "")
     assert "alert" not in json.dumps(row.arguments)
@@ -1593,7 +1642,7 @@ async def test_tiers_and_decorators():
     assert tools["detection_rules_update"].annotations.openWorldHint is True
     props = tools["pcap_detect"].parameters["properties"]
     assert props["engine"]["enum"] == ["suricata", "zeek"]
-    assert set(props) == {"path", "engine", "top"}
+    assert set(props) == {"path", "engine"}
     assert tools["detection_rules_update"].parameters.get("properties", {}) == {}
 
 

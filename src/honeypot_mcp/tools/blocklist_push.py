@@ -15,9 +15,11 @@ All three follow the same pattern:
    never anything in `BLOCKLIST_ALLOWLIST` or this server's own canary IP.
 2. Read the destination's current state (existing list / alias / IPSet).
 3. Compute the diff — only push IPs that aren't already blocked.
-4. Apply the change (or report what would happen if `dry_run=True`).
-5. Return a uniform `{added, skipped, failed, dry_run}` shape so a
-   downstream automation can reason about each result identically.
+4. Apply the change, or only report what would happen: `dry_run` defaults to
+   True, so a live firewall is never touched until the caller says so.
+5. Return a uniform `{added, skipped, failed, dry_run}` shape (lists capped,
+   with `*_count` totals, an `error`/`hint` pair on failure and a `note`) so
+   an agent and an automation both read each result identically.
 
 All three are idempotent — re-running is a no-op when nothing changed. Every
 call is written to the audit log (destination host, counts, dry_run — never
@@ -131,8 +133,89 @@ async def _offender_ips(hours: int, min_hits: int) -> tuple[list[str], int]:
     return pushable, len(ips) - len(pushable)
 
 
-def _rejected(error: str, dry_run: bool) -> dict[str, Any]:
-    return {"added": [], "skipped": [], "failed": [{"ip": "*", "error": error}], "dry_run": dry_run}
+_LIST_CAP = 50  # addresses echoed per list; the *_count fields carry the totals
+
+
+def _rejected(error: str, dry_run: bool, hint: str | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "added": [],
+        "skipped": [],
+        "failed": [{"ip": "*", "error": error}],
+        "dry_run": dry_run,
+    }
+    if hint:
+        out["hint"] = hint
+    return out
+
+
+def _hint_for(error: str) -> str:
+    """What to do about a failure, from its text: the caller is a model that cannot guess."""
+    e = error.lower()
+    if "unable to locate credentials" in e or "nocredentials" in e:
+        return (
+            "AWS credentials were not found on the server. Set AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY (or AWS_PROFILE) in its environment, or run it with an IAM role."
+        )
+    if "specify a region" in e or "noregion" in e:
+        return "Pass region (e.g. us-east-1) or set AWS_DEFAULT_REGION in the server's environment."
+    if "boto3 not installed" in e:
+        return "Install boto3 on the server (pip install boto3), then run again."
+    if "accessdenied" in e or "not authorized" in e or "401" in e or "403" in e:
+        return (
+            "The credential was rejected or lacks permission: use one that may edit this "
+            "list, alias or IP set (Cloudflare: Account Filter Lists Edit; AWS: wafv2:GetIPSet, "
+            "wafv2:UpdateIPSet, wafv2:ListIPSets)."
+        )
+    if "not found" in e or "404" in e or "nonexistent" in e or "does not exist" in e:
+        return (
+            "The list, alias or IP set was not found: check its name/id and, for AWS, the "
+            "region and scope. It must already exist; this tool does not create it."
+        )
+    if "while contacting" in e or "timeout" in e or "connect" in e:
+        return (
+            "The appliance could not be reached from this server: check the address and that "
+            "this host is allowed to connect to it (VPN, firewall)."
+        )
+    return "Run again with dry_run=true to preview, and check the identifiers and credential."
+
+
+def _shape(
+    result: dict[str, Any], target: str, arguments: dict[str, Any], excluded: int
+) -> dict[str, Any]:
+    """The reply an agent reads: capped lists with true totals, one error and hint, one note."""
+    out = dict(result)
+    dry_run = bool(result.get("dry_run"))
+    full = {key: list(result.get(key) or []) for key in ("added", "skipped", "failed")}
+    for key, items in full.items():
+        out[key] = items[:_LIST_CAP]
+        out[f"{key}_count"] = len(items)
+    out["excluded_count"] = excluded
+    whole_failure = next((f for f in full["failed"] if f.get("ip") == "*"), None)
+    if whole_failure:
+        out["error"] = whole_failure.get("error", "push failed")
+        out.setdefault("hint", _hint_for(str(out["error"])))
+        return out
+    n_add, n_skip, n_fail = len(full["added"]), len(full["skipped"]), len(full["failed"])
+    if not (n_add or n_skip or n_fail):
+        out["note"] = (
+            f"Nothing to push: no public source reached {arguments.get('min_hits')} alerts in the "
+            f"last {arguments.get('hours')} hours (private, allowlisted and UDP-only sources are "
+            "never pushed). Ask for a longer period to include more."
+        )
+        return out
+    if dry_run:
+        note = (
+            f"Preview only, nothing was changed: {n_add} address(es) would be added to {target} "
+            f"({n_skip} already there). To apply, run again with dry_run=false."
+        )
+    else:
+        note = f"Added {n_add} address(es) to {target} ({n_skip} already there)."
+    if n_fail:
+        note += f" {n_fail} failed: see `failed`."
+    if max(n_add, n_skip, n_fail) > _LIST_CAP:
+        note += f" Lists show the first {_LIST_CAP}; the *_count fields are the totals."
+    out["note"] = note
+    return out
 
 
 async def _finish(
@@ -157,7 +240,33 @@ async def _finish(
         outcome="error" if failed else "ok",
         error="; ".join(f"{f.get('ip')}: {f.get('error')}" for f in failed[:20]) or None,
     )
-    return result
+    return _shape(result, target, arguments, excluded)
+
+
+def _blank(value: str | None) -> bool:
+    return value is None or not value.strip()
+
+
+async def _missing_inputs(
+    tool: str,
+    target: str,
+    arguments: dict[str, Any],
+    missing: dict[str, str],
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Tell the caller exactly what to supply, and show what *would* be pushed: the preview needs
+    no credential, so a missing one never leaves the person with nothing."""
+    try:
+        offenders, excluded = await _offender_ips(arguments["hours"], arguments["min_hits"])
+    except ValueError:
+        offenders, excluded = [], 0
+    result = _rejected(
+        "Missing " + ", ".join(missing) + ".",
+        dry_run,
+        "Ask the person for: " + "; ".join(f"{k} ({v})" for k, v in missing.items()) + ".",
+    )
+    result["would_push"] = {"count": len(offenders), "sample": offenders[:20]}
+    return await _finish(tool, target, arguments, result, excluded)
 
 
 # ── Cloudflare ──────────────────────────────────────────────────────────────
@@ -165,30 +274,24 @@ async def _finish(
 
 @mcp.tool(auth=require_role("admin"), **hints("blocklist_push_cloudflare"))
 async def blocklist_push_cloudflare(
-    account_id: str,
-    list_id: str,
-    api_token: str,
+    account_id: str | None = None,
+    list_id: str | None = None,
+    api_token: str | None = None,
     hours: int = 24,
     min_hits: int = 5,
-    dry_run: bool = False,
+    dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Push offender IPs to a Cloudflare custom list (lists API).
+    """Add the recent attacker IPs to a Cloudflare custom list.
 
-    Cloudflare custom lists hold IPs you can reference in WAF / firewall
-    expressions. The list must already exist — create it once in the
-    Cloudflare dashboard, then call this tool to keep it current.
+    Use it for "block today's attackers in Cloudflare". It previews by default (nothing changes until dry_run=false) and adds only public addresses not already on the list. Without the three Cloudflare values it still shows which IPs would be pushed. The list must already exist.
 
     Args:
-        account_id: Cloudflare account ID (URL-friendly hex string).
-        list_id: ID of the custom list to update.
-        api_token: API token with `Account:Account Filter Lists:Edit` scope.
-        hours: Time window for offenders (default 24).
-        min_hits: Minimum alert count to include (default 5).
-        dry_run: If True, compute the diff but don't apply.
-
-    Returns:
-        `{added: [...], skipped: [...], failed: [...], dry_run: bool}`.
-        `skipped` IPs were already on the list.
+        account_id: Cloudflare account id (dashboard sidebar, or the account URL).
+        list_id: Id of the existing custom list (Manage Account > Configurations > Lists).
+        api_token: API token that can edit account filter lists.
+        hours: How far back to look for attackers: "today" is 24, "this week" 168.
+        min_hits: Only sources with at least this many alerts.
+        dry_run: True (default) previews; False applies the change.
     """
     tool = "blocklist_push_cloudflare"
     target = "api.cloudflare.com"
@@ -199,9 +302,30 @@ async def blocklist_push_cloudflare(
         "min_hits": min_hits,
         "dry_run": dry_run,
     }
+    missing = {
+        name: what
+        for name, value, what in (
+            ("account_id", account_id, "Cloudflare account id"),
+            ("list_id", list_id, "id of the custom list to update"),
+            ("api_token", api_token, "API token with account filter lists edit permission"),
+        )
+        if _blank(value)
+    }
+    if missing:
+        return await _missing_inputs(tool, target, args, missing, dry_run)
+    assert account_id and list_id and api_token
     if not (_CF_ID_RE.fullmatch(account_id) and _CF_ID_RE.fullmatch(list_id)):
         msg = "account_id and list_id must each match [A-Za-z0-9_-]{1,64}."
-        return await _finish(tool, target, args, _rejected(msg, dry_run))
+        return await _finish(
+            tool,
+            target,
+            args,
+            _rejected(
+                msg,
+                dry_run,
+                "Copy the ids exactly as Cloudflare shows them (hex, no spaces or URLs).",
+            ),
+        )
     try:
         offenders, excluded = await _offender_ips(hours, min_hits)
     except ValueError as e:
@@ -328,42 +452,29 @@ async def _cloudflare_wait(
 
 @mcp.tool(auth=require_role("admin"), **hints("blocklist_push_pfsense"))
 async def blocklist_push_pfsense(
-    base_url: str,
-    api_key: str,
-    alias_name: str,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    alias_name: str | None = None,
     hours: int = 24,
     min_hits: int = 5,
-    dry_run: bool = False,
+    dry_run: bool = True,
     verify_tls: bool = True,
 ) -> dict[str, Any]:
-    """Push offender IPs to a pfSense firewall alias via the pfrest v2 REST API.
+    """Add the recent attacker IPs to a pfSense firewall alias (pfrest v2 REST API).
 
-    The alias must already exist and be of type `host` or `network`. After
-    updating the alias, the API call to `/firewall/apply` actually commits
-    the change to the running ruleset — without that, the alias contents
-    update but the firewall keeps using the old version.
+    Use it for "block today's attackers on the pfSense". It previews by default (nothing changes until dry_run=false) and, when applying, also commits the firewall. Without the three pfSense values it still shows which IPs would be pushed. The alias must already exist (type host or network).
 
     Args:
-        base_url: pfSense base URL, e.g. `https://pfsense.local`.
-        api_key: API key (admin → User Manager → user → API key).
-        alias_name: Name of the existing firewall alias to update.
-        hours: Time window for offenders.
-        min_hits: Minimum alert count to include.
-        dry_run: If True, compute the diff but don't apply.
-        verify_tls: Verify the appliance's TLS certificate (default True).
-              pfSense's REST API commonly runs on a self-signed cert out of
-              the box — set this to False ONLY for that case, and only once
-              you've confirmed you're actually talking to your own appliance
-              (e.g. over a trusted network segment or VPN). Disabling this
-              makes the API key and the blocklist push vulnerable to MITM by
-              anyone on the network path, not just to the appliance's own
-              self-signed cert.
-
-    Returns:
-        `{added, skipped, failed, dry_run}` uniform shape.
+        base_url: The firewall's address, e.g. https://pfsense.local (https only).
+        api_key: pfrest API key (System > REST API > Keys).
+        alias_name: Name of the existing alias to add to.
+        hours: How far back to look for attackers: "today" is 24, "this week" 168.
+        min_hits: Only sources with at least this many alerts.
+        dry_run: True (default) previews; False applies the change.
+        verify_tls: Set False only for a self-signed certificate on an appliance you trust: it lets anyone on the network path read the key.
     """
     tool = "blocklist_push_pfsense"
-    parsed = urlparse(base_url)
+    parsed = urlparse((base_url or "").strip())
     host = parsed.hostname or ""
     args: dict[str, Any] = {
         "host": host,
@@ -373,8 +484,28 @@ async def blocklist_push_pfsense(
         "dry_run": dry_run,
         "verify_tls": verify_tls,
     }
+    missing = {
+        name: what
+        for name, value, what in (
+            ("base_url", base_url, "the firewall's address, e.g. https://pfsense.local"),
+            ("api_key", api_key, "pfrest API key"),
+            ("alias_name", alias_name, "name of the existing alias"),
+        )
+        if _blank(value)
+    }
+    if missing:
+        return await _missing_inputs(tool, host or "pfsense", args, missing, dry_run)
+    assert base_url and api_key and alias_name
+    base_url = base_url.strip()
     if err := _pfsense_url_error(parsed.scheme, host):
-        return await _finish(tool, host or "pfsense", args, _rejected(err, dry_run))
+        return await _finish(
+            tool,
+            host or "pfsense",
+            args,
+            _rejected(
+                err, dry_run, "Use the firewall's https:// address, e.g. https://pfsense.local."
+            ),
+        )
     try:
         offenders, excluded = await _offender_ips(hours, min_hits)
     except ValueError as e:
@@ -499,34 +630,31 @@ async def _pfsense_push(
 
 @mcp.tool(auth=require_role("admin"), **hints("blocklist_push_aws_waf"))
 async def blocklist_push_aws_waf(
-    ip_set_id: str,
-    ip_set_name: str,
-    region: str,
+    ip_set_name: str | None = None,
     scope: Literal["REGIONAL", "CLOUDFRONT"] = "REGIONAL",
+    region: str | None = None,
     hours: int = 24,
     min_hits: int = 5,
-    dry_run: bool = False,
+    dry_run: bool = True,
+    ip_set_id: str | None = None,
 ) -> dict[str, Any]:
-    """Push offender IPs to an AWS WAFv2 IPSet.
+    """Add the recent attacker IPs to an AWS WAFv2 IP set.
 
-    The IPSet must already exist. Bare IPs are converted to `/32` (IPv4) or
-    `/128` (IPv6) since WAFv2 requires CIDR. Credentials are picked up from
-    the standard boto3 chain (env vars, IAM role, profile).
+    Use it for "block today's attackers in AWS WAF". It previews by default (nothing changes until dry_run=false) and adds only public addresses not already in the set. AWS credentials come from the server's environment or IAM role, never from here. The IP set must already exist.
 
     Args:
-        ip_set_id: WAFv2 IPSet ID (the `Id` field of the IPSet resource).
-        ip_set_name: IPSet name (WAFv2 requires both for update).
-        region: AWS region of the IPSet (use `us-east-1` for CLOUDFRONT scope).
-        scope: `REGIONAL` for ALB/API Gateway, `CLOUDFRONT` for CloudFront.
-        hours: Time window for offenders.
-        min_hits: Minimum alert count to include.
-        dry_run: If True, compute the diff but don't apply.
-
-    Returns:
-        `{added, skipped, failed, dry_run}` uniform shape.
+        ip_set_name: Name of the existing IP set. Without it, the call only shows which IPs would be pushed.
+        scope: REGIONAL for ALB/API Gateway (default), CLOUDFRONT for CloudFront.
+        region: AWS region of the set (CloudFront is always us-east-1); default is the server's AWS region.
+        hours: How far back to look for attackers: "today" is 24, "this week" 168.
+        min_hits: Only sources with at least this many alerts.
+        dry_run: True (default) previews; False applies the change.
+        ip_set_id: The set's Id; found from the name when omitted.
     """
     tool = "blocklist_push_aws_waf"
-    target = f"wafv2:{region}/{ip_set_name}"
+    if scope == "CLOUDFRONT":
+        region = "us-east-1"
+    target = f"wafv2:{region or 'default-region'}/{ip_set_name or '?'}"
     args: dict[str, Any] = {
         "ip_set_id": ip_set_id,
         "ip_set_name": ip_set_name,
@@ -536,6 +664,10 @@ async def blocklist_push_aws_waf(
         "min_hits": min_hits,
         "dry_run": dry_run,
     }
+    if _blank(ip_set_name):
+        missing = {"ip_set_name": "name of the existing WAFv2 IP set"}
+        return await _missing_inputs(tool, target, args, missing, dry_run)
+    assert ip_set_name
     try:
         offenders, excluded = await _offender_ips(hours, min_hits)
     except ValueError as e:
@@ -547,10 +679,24 @@ async def blocklist_push_aws_waf(
     return await _finish(tool, target, args, result, excluded)
 
 
+async def _waf_find_id(client: Any, name: str, scope: str) -> str:
+    """The Id of the IP set called `name` (WAFv2 addresses sets by name *and* id)."""
+    kwargs: dict[str, Any] = {"Scope": scope, "Limit": 100}
+    while True:
+        page = await asyncio.to_thread(client.list_ip_sets, **kwargs)
+        for entry in page.get("IPSets") or []:
+            if entry.get("Name") == name:
+                return str(entry["Id"])
+        marker = page.get("NextMarker")
+        if not marker or not page.get("IPSets"):
+            raise LookupError(f"IP set {name!r} not found in scope {scope}")
+        kwargs["NextMarker"] = marker
+
+
 async def _waf_push(
-    ip_set_id: str,
+    ip_set_id: str | None,
     ip_set_name: str,
-    region: str,
+    region: str | None,
     scope: str,
     offenders: list[str],
     dry_run: bool,
@@ -581,6 +727,8 @@ async def _waf_push(
     # treatment via asyncio.to_thread.
     try:
         client = await asyncio.to_thread(boto3.client, "wafv2", region_name=region)
+        if not ip_set_id:
+            ip_set_id = await _waf_find_id(client, ip_set_name, scope)
         current = await asyncio.to_thread(
             client.get_ip_set, Name=ip_set_name, Id=ip_set_id, Scope=scope
         )
@@ -588,7 +736,7 @@ async def _waf_push(
         return {
             "added": [],
             "skipped": [],
-            "failed": [{"ip": "*", "error": f"get_ip_set: {e!s}"[:200]}],
+            "failed": [{"ip": "*", "error": f"get_ip_set: {type(e).__name__}: {e!s}"[:200]}],
             "dry_run": dry_run,
         }
 

@@ -109,7 +109,7 @@ async def test_self_test_http_end_to_end():
             )
 
         # Run the self-test — should find its own probe
-        result = await honeypot_self_test("test-http", timeout_seconds=10)
+        result = await honeypot_self_test("test-http")
 
         assert result.get("probe_sent") is True, result
         assert result.get("alert_received") is True, result
@@ -182,7 +182,7 @@ async def test_self_test_in_process_engines_end_to_end(engine_path, engine_cls, 
                 update(Honeypot).where(Honeypot.name == name).values(container_id=container_id)
             )
 
-        result = await honeypot_self_test(name, timeout_seconds=10)
+        result = await honeypot_self_test(name)
         assert result.get("probe_sent") is True, result
         assert result.get("alert_received") is True, result
     finally:

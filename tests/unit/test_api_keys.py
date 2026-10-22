@@ -128,10 +128,10 @@ async def test_revoke_marks_the_key_revoked():
     assert result["status"] == "revoked"
 
     active = await api_key_list()
-    assert not any(k["id"] == created["id"] for k in active)
+    assert not any(k["id"] == created["id"] for k in active["keys"])
 
     everything = await api_key_list(include_revoked=True)
-    revoked = next(k for k in everything if k["id"] == created["id"])
+    revoked = next(k for k in everything["keys"] if k["id"] == created["id"])
     assert revoked["revoked_at"] is not None
 
 
@@ -172,7 +172,9 @@ async def test_list_never_returns_the_token_or_its_hash():
     from honeypot_mcp.tools.api_keys import api_key_create, api_key_list
 
     created = await api_key_create(label="alice", role="viewer")
-    entries = await api_key_list()
+    listing = await api_key_list()
+    entries = listing["keys"]
+    assert listing["count"] == len(entries)
     assert entries[0]["id"] == created["id"]
     for entry in entries:
         assert set(entry) == {
@@ -182,6 +184,7 @@ async def test_list_never_returns_the_token_or_its_hash():
             "created_by",
             "created_at",
             "expires_at",
+            "expired",
             "revoked_at",
         }
         assert created["token"] not in str(entry)
@@ -196,10 +199,10 @@ async def test_list_excludes_revoked_by_default():
     await api_key_revoke(gone["id"])
 
     active_only = await api_key_list()
-    assert {k["id"] for k in active_only} == {kept["id"]}
+    assert {k["id"] for k in active_only["keys"]} == {kept["id"]}
 
     everything = await api_key_list(include_revoked=True)
-    assert {k["id"] for k in everything} == {kept["id"], gone["id"]}
+    assert {k["id"] for k in everything["keys"]} == {kept["id"], gone["id"]}
 
 
 # ── rbac.verify_db_token: the actual verification path ──────────────────────

@@ -36,6 +36,9 @@ from honeypot_mcp.deception.capabilities import (
     PROFILES,
     EnvironmentProfile,
     all_profiles,
+    resolve_profile,
+    resolve_type,
+    suggest_types,
 )
 
 _MAX_PORT = 65535
@@ -47,7 +50,7 @@ _DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _DOMAIN_RE = re.compile(rf"^{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})*$")
 
 
-def _reserved_ports() -> dict[int, str]:
+def reserved_ports() -> dict[int, str]:
     """Ports this process itself listens on, which no sensor may be planned onto."""
     from honeypot_mcp.config import get_settings
 
@@ -123,27 +126,50 @@ def _pick_hostname(engine_type: str, prefix: str, taken: set[str]) -> str:
 def resolve_services(
     profile_id: str | None, services: list[str] | None, include_optional: bool
 ) -> tuple[list[str], EnvironmentProfile | None, list[str]]:
-    """Work out the sensor list. Returns (types, profile, warnings)."""
+    """Work out the sensor list. Returns (types, profile, warnings).
+
+    Names are read forgivingly ("Windows" is a profile, "Postgres" a sensor type). A profile and a
+    services list combine: the profile's sensors plus the extra ones named, which is what "a
+    Windows domain with a Postgres warehouse" means. With neither, the broad mixed estate is
+    planned and the warning says so, since the sentence did not describe anything narrower."""
     warnings: list[str] = []
-    if services:
-        known = [s for s in services if s in BY_TYPE]
-        unknown = [s for s in services if s not in BY_TYPE]
-        if unknown:
+    profile: EnvironmentProfile | None = None
+    if profile_id:
+        profile, near = resolve_profile(profile_id)
+        if profile is None:
             warnings.append(
-                f"Ignored unknown service(s): {', '.join(sorted(unknown))}. "
-                f"Valid types: {', '.join(sorted(BY_TYPE))}."
+                f"Unknown profile '{profile_id}'"
+                + (f" (closest: {', '.join(near)})" if near else "")
+                + f". Valid profiles: {', '.join(p.id for p in all_profiles())}."
             )
-        return known, PROFILES.get(profile_id or ""), warnings
+        elif profile.id != profile_id:
+            warnings.append(f"Read profile '{profile_id}' as '{profile.id}'.")
 
-    profile = PROFILES.get(profile_id or "")
-    if profile is None:
+    chosen: list[str] = []
+    if profile is not None:
+        chosen = list(profile.core) + (list(profile.optional) if include_optional else [])
+    unknown: list[str] = []
+    for name in services or []:
+        resolved = resolve_type(name)
+        if resolved is None:
+            near_types = suggest_types(name)
+            unknown.append(
+                f"'{name}'" + (f" (did you mean {', '.join(near_types)}?)" if near_types else "")
+            )
+        elif resolved not in chosen:
+            chosen.append(resolved)
+    if unknown:
         warnings.append(
-            f"Unknown profile '{profile_id}'. Valid profiles: "
-            f"{', '.join(p.id for p in all_profiles())}."
+            f"Ignored unknown service(s): {', '.join(unknown)}. "
+            f"Valid types: {', '.join(sorted(BY_TYPE))}."
         )
-        return [], None, warnings
-
-    chosen = list(profile.core) + (list(profile.optional) if include_optional else [])
+    if not chosen and not profile_id and not services:
+        profile = PROFILES["mixed_enterprise"]
+        chosen = list(profile.core) + (list(profile.optional) if include_optional else [])
+        warnings.append(
+            "No environment was described, so this is the broad `mixed_enterprise` estate. "
+            "Say what is run (a Windows domain, a web app, containers, databases) for a closer fit."
+        )
     return chosen, profile, warnings
 
 
@@ -166,12 +192,18 @@ def build_plan(
     types, profile, warnings = resolve_services(profile_id, services, include_optional)
     if not types:
         return {
-            "error": "No sensors resolved — supply a valid `profile` or an explicit `services` list.",
+            "error": "No sensors could be planned from that description.",
+            "hint": (
+                "Pass a `profile` (one of the ids below, or words like 'windows', 'web app', "
+                "'containers', 'databases') and/or `services` naming sensor types; with neither, "
+                "a broad mixed estate is planned."
+            ),
             "valid_profiles": [
-                {"id": p.id, "display_name": p.display_name, "description": p.description}
+                {"id": p.id, "for": p.description.split(". ")[0].rstrip(".")}
                 for p in all_profiles()
             ],
             "valid_services": sorted(BY_TYPE),
+            **({"warnings": warnings} if warnings else {}),
         }
 
     prefix = identity_prefix or (profile.hostname_prefix if profile else "srv")
@@ -187,7 +219,7 @@ def build_plan(
         resolved_domain = f"{prefix}.local"
 
     taken_hostnames: set[str] = set()
-    used_ports = {**_reserved_ports(), **existing_ports}
+    used_ports = {**reserved_ports(), **existing_ports}
     sensors: list[PlannedSensor] = []
     conflicts: list[str] = []
 

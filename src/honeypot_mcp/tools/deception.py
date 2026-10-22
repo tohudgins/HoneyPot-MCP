@@ -19,12 +19,18 @@ thinner way to call an API:
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, Literal
+from typing import Any
 
 from sqlalchemy import select
 
 from honeypot_mcp import instance_lock
-from honeypot_mcp.deception.capabilities import BY_TYPE, all_capabilities, all_profiles
+from honeypot_mcp.deception.capabilities import (
+    BY_TYPE,
+    all_profiles,
+    resolve_profile,
+    resolve_type,
+    suggest_types,
+)
 from honeypot_mcp.deception.coverage import build_coverage
 from honeypot_mcp.deception.planner import build_plan
 from honeypot_mcp.rbac import require_role
@@ -50,59 +56,71 @@ from honeypot_mcp.tools._sources import (
 from honeypot_mcp.tools._window import annotate_window, window_bounds
 
 
-@mcp.tool(**hints("deception_profiles"))
-async def deception_profiles() -> dict[str, Any]:
-    """List environment profiles and every deployable sensor type.
+def _one_line(text: str, limit: int = 110) -> str:
+    sentence = text.strip().split(". ")[0].rstrip(".")
+    if len(sentence) <= limit:
+        return sentence
+    return sentence[: limit - 1].rsplit(" ", 1)[0] + "…"
 
-    Call this before `deception_plan` to pick a profile that matches how the
-    user described their estate. Each profile is a shape of environment (a
-    Windows domain, a Linux web app, a container platform) and the sensors that
-    make that shape believable together.
+
+@mcp.tool(**hints("deception_profiles"))
+async def deception_profiles(profile: str | None = None) -> dict[str, Any]:
+    """What kinds of environment can be planned, and which decoys make each one believable?
+
+    Use it for "what can you protect?", "what is in the Windows setup?". With no argument it lists
+    each environment profile in one line with its sensors; with a profile it gives the details.
+    `deception_plan` turns a profile into a deployment; `honeypot_templates` describes the
+    individual sensor types.
+
+    Args:
+        profile: One profile (an id, or words like "windows", "containers", "databases") for its
+            details. Omit for the short list.
     """
+    if profile:
+        chosen, near = resolve_profile(profile)
+        if chosen is None:
+            return {
+                "error": f"No profile matches '{profile}'.",
+                "hint": (f"Closest: {', '.join(near)}. " if near else "")
+                + "Valid profiles: "
+                + ", ".join(p.id for p in all_profiles())
+                + ". Call without a profile for what each is for.",
+            }
+        return {
+            "id": chosen.id,
+            "name": chosen.display_name,
+            "description": chosen.description,
+            "os_family": chosen.os_family,
+            "core_sensors": [
+                {"type": t, "port": BY_TYPE[t].default_port, "what": _one_line(BY_TYPE[t].summary)}
+                for t in chosen.core
+            ],
+            "optional_sensors": [
+                {"type": t, "port": BY_TYPE[t].default_port, "what": _one_line(BY_TYPE[t].summary)}
+                for t in chosen.optional
+            ],
+            "note": f"Plan it with deception_plan(profile='{chosen.id}'); include_optional adds "
+            "the optional sensors.",
+        }
     return {
+        "count": len(all_profiles()),
         "profiles": [
             {
                 "id": p.id,
-                "display_name": p.display_name,
-                "description": p.description,
-                "os_family": p.os_family,
+                "for": _one_line(p.description),
                 "core_sensors": list(p.core),
                 "optional_sensors": list(p.optional),
             }
             for p in all_profiles()
         ],
-        "sensor_types": [
-            {
-                "type": c.type,
-                "display_name": c.display_name,
-                "default_port": c.default_port,
-                "real_world_port": c.real_world_port,
-                "os_family": c.os_family,
-                "roles": list(c.roles),
-                "summary": c.summary,
-                "requires_docker": c.requires_docker,
-                "captures_credentials_as": c.captures_credentials_as,
-            }
-            for c in all_capabilities()
-        ],
-        "note": (
-            "Pick a profile when the user described an environment; pass an explicit "
-            "`services` list when they named specific technologies."
-        ),
+        "note": "Pick the profile closest to what the user runs, or name sensor types with "
+        "`services` in deception_plan. `honeypot_templates` lists every sensor type.",
     }
 
 
 @mcp.tool(**hints("deception_plan"))
 async def deception_plan(
-    profile: Literal[
-        "corporate_windows",
-        "linux_web",
-        "cloud_native",
-        "data_platform",
-        "network_edge",
-        "mixed_enterprise",
-    ]
-    | None = None,
+    profile: str | None = None,
     services: list[str] | None = None,
     identity_prefix: str | None = None,
     domain: str | None = None,
@@ -110,35 +128,25 @@ async def deception_plan(
     include_tokens: bool = True,
     use_real_ports: bool = False,
 ) -> dict[str, Any]:
-    """Design a coherent deception deployment for an environment. Deploys nothing.
+    """Design a believable set of decoys and bait for an environment. Deploys nothing.
 
-    Use this when someone describes what they run rather than naming a protocol
-    and a port — "we have a customer portal and a Postgres warehouse", "a
-    Windows domain with file shares", "everything is containers". Translate that
-    description into a `profile` (or an explicit `services` list) and this
-    returns a full plan: sensors with non-conflicting ports, hostnames and
-    identities that agree with each other, and honeytokens tied to sensors that
-    can actually detect them.
-
-    Review the `coherence` block with the user before deploying — it names the
-    seams an attacker would notice, and any credential token that could never
-    fire — and any `caution` on a sensor (SMTP and DNS: leave them off a public
-    cloud VPS, where they look like an open relay and an open resolver). The
-    same text is in `warnings`. Then pass the returned plan to `deception_deploy_plan`.
+    Use it for "protect a Windows domain with a Postgres warehouse", "we run containers", "cover
+    our web app". With no arguments a broad mixed estate is planned. The plan has sensors with free
+    ports and matching identities, plus honeytokens tied to sensors that can catch them. Read
+    `coherence` and `warnings` (seams an attacker would notice; SMTP and DNS look like an open
+    relay or resolver on a cloud VPS) with the user, then pass `sensors` and `tokens` to
+    `deception_deploy_plan`.
 
     Args:
-        profile: Environment shape. Call `deception_profiles` to see the options.
-        services: Explicit sensor types, overriding the profile's list. Use when
-                  the user named specific technologies.
-        identity_prefix: Hostname prefix tying the estate together (e.g. "corp"
-                         gives corp-dc1, corp-fs01). Defaults from the profile.
-        domain: AD/DNS domain for Windows-style estates (e.g. "corp.local").
-                Used for the LDAP base DN and mail domain so they agree.
-        include_optional: Include the profile's optional sensors for wider
-                          coverage at the cost of a larger footprint.
-        include_tokens: Plan honeytokens alongside the sensors.
-        use_real_ports: Use real-world ports (22, 445, 3389) instead of the
-                        unprivileged defaults. Needs root or a container mapping.
+        profile: The kind of environment, as an id or the user's words: corporate_windows,
+            linux_web, cloud_native, data_platform, network_edge, mixed_enterprise ("windows",
+            "containers" work). `deception_profiles` explains each.
+        services: Sensor types to include or add to the profile ("postgres", "ssh", "redis").
+        identity_prefix: Hostname prefix, if the user names one ("acme" gives acme-dc1).
+        domain: Windows/AD domain, if named ("corp.local").
+        include_optional: True when the user wants wider coverage or "everything".
+        include_tokens: False if the user wants no honeytokens.
+        use_real_ports: True for standard ports (22, 445, 3389); needs root or a port mapping.
     """
     async with get_session() as session:
         rows = (
@@ -180,53 +188,70 @@ async def deception_deploy_plan(
     tokens: list[dict[str, Any]] | None = None,
     stop_on_error: bool = True,
 ) -> dict[str, Any]:
-    """Deploy a plan from `deception_plan`.
+    """Bring up the decoys and bait from a `deception_plan`.
 
-    Pass the `sensors` and `tokens` lists straight through from the plan. Each
-    sensor is brought up in turn and each token created after.
-
-    `stop_on_error` defaults to True and rolls back: if a sensor fails to start,
-    everything already deployed by this call is stopped and removed, so a failed
-    deployment leaves nothing half-built. Set it to False to deploy whatever
-    works and report the rest — reasonable when one port is unavailable and the
-    remaining sensors are still worth having.
+    Use it after the user approves a plan ("deploy that"). Pass the plan's `sensors` and `tokens`
+    lists straight through. Each sensor is started and each token created. By default a failure
+    rolls everything back so nothing is left half-built; set `stop_on_error` false only if the
+    user wants whatever can start to start.
 
     Args:
-        sensors: Sensor entries from the plan (type, name, port, config).
-        tokens: Token entries from the plan (type, label, metadata).
-        stop_on_error: Roll back everything on the first failure.
+        sensors: The plan's `sensors` list (each has type, name, port, config).
+        tokens: The plan's `tokens` list (type, label, metadata); omit for no tokens.
+        stop_on_error: False to keep what deployed and report the rest.
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
+    if not sensors or not all(isinstance(s, dict) for s in sensors):
+        return {
+            "error": "`sensors` must be the plan's list of sensor objects.",
+            "hint": "Call `deception_plan` first and pass its `sensors` (and `tokens`) unchanged.",
+        }
     from honeypot_mcp.tools.honeypot import honeypot_deploy, honeypot_stop
     from honeypot_mcp.tools.honeytoken import honeytoken_create
 
     deployed: list[str] = []
     deployed_types: dict[str, str] = {}
+    deployed_ports: dict[str, int] = {}
     created_tokens: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
 
     for sensor in sensors:
-        sensor_type = sensor.get("type")
         name = sensor.get("name")
-        if sensor_type not in BY_TYPE:
-            failures.append({"sensor": str(name), "error": f"unknown sensor type '{sensor_type}'"})
+        sensor_type = resolve_type(sensor.get("type"))
+        if sensor_type is None:
+            near = suggest_types(sensor.get("type")) if sensor.get("type") else []
+            failures.append(
+                {
+                    "sensor": str(name),
+                    "error": f"unknown sensor type '{sensor.get('type')}'",
+                    "hint": (f"Did you mean {', '.join(near)}? " if near else "")
+                    + f"Valid types: {', '.join(BY_TYPE)}.",
+                }
+            )
             if stop_on_error:
                 break
             continue
         result = await honeypot_deploy(
-            type=sensor_type,  # type: ignore[arg-type]
+            type=sensor_type,
             name=name,
             port=sensor.get("port"),
             config=sensor.get("config") or {},
         )
         if "error" in result:
-            failures.append({"sensor": str(name), "error": result["error"]})
+            failures.append(
+                {
+                    "sensor": str(name),
+                    "error": result["error"],
+                    **({"hint": result["hint"]} if "hint" in result else {}),
+                }
+            )
             if stop_on_error:
                 break
         else:
-            deployed.append(str(name))
-            deployed_types[str(name)] = sensor_type
+            deployed.append(result["name"])
+            deployed_types[result["name"]] = sensor_type
+            deployed_ports[result["name"]] = result["port"]
 
     rolled_back = False
     aborted = bool(failures and stop_on_error)
@@ -236,6 +261,7 @@ async def deception_deploy_plan(
         rolled_back = True
         deployed = []
         deployed_types = {}
+        deployed_ports = {}
 
     # No tokens after a failed deployment, whether or not anything had been
     # deployed yet: a credential token whose target service has no sensor can
@@ -257,7 +283,13 @@ async def deception_deploy_plan(
                 failures.append({"token": str(token.get("label")), "error": str(e)})
                 continue
             if "error" in created:
-                failures.append({"token": str(token.get("label")), "error": created["error"]})
+                failures.append(
+                    {
+                        "token": str(token.get("label")),
+                        "error": created["error"],
+                        **({"hint": created["hint"]} if "hint" in created else {}),
+                    }
+                )
             else:
                 created_tokens.append(
                     {
@@ -288,38 +320,29 @@ async def deception_deploy_plan(
     ]
     return {
         "deployed_sensors": deployed,
+        "ports": deployed_ports,
         "created_tokens": created_tokens,
         "failures": failures,
         "rolled_back": rolled_back,
         "status": "ok" if not failures else ("rolled_back" if rolled_back else "partial"),
         **({"cautions": cautions} if cautions else {}),
         "next_step": (
-            "Plant each token at its `plant_location`, then call `deception_coverage` "
-            "to confirm what this now detects."
+            "Plant each token at its `plant_location`, run `honeypot_self_test` on the sensors, "
+            "then `deception_coverage` to confirm what this now detects."
             if deployed
-            else "Nothing is running. Fix the failures above and retry."
+            else "Nothing is running. Fix the failures above (each has a hint) and retry."
         ),
     }
 
 
 @mcp.tool(**hints("deception_coverage"))
-async def deception_coverage(include_recommendations: bool = True) -> dict[str, Any]:
-    """What the live deployment can detect, per ATT&CK tactic, and where it is blind.
+async def deception_coverage() -> dict[str, Any]:
+    """What can the running decoys detect, per MITRE ATT&CK tactic, and where are they blind?
 
-    Answers "is our deception any good?" — the question a list of running
-    containers cannot. Coverage is computed from each sensor's real event types
-    through the same ATT&CK mappings the alerts use, so it reflects what would
-    actually be caught rather than what was intended.
-
-    `blind_spots` names the cheapest concrete action that closes each gap,
-    ranked by how many new techniques it adds. A recommendation for a sensor the
-    project advises against on a public cloud VPS (`dns`, `smtp`: they look like an
-    open resolver and an open relay to automated checks, and several providers'
-    acceptable-use policies prohibit both) carries a `caution` saying so; check
-    where the deployment runs before acting on it.
-
-    Args:
-        include_recommendations: Include the ranked blind-spot list.
+    Use it for "is our deception any good?", "what are we missing?". It maps each running
+    sensor's real event types and each live honeytoken to ATT&CK, and `blind_spots` names the
+    cheapest sensor or token that would close each gap. A sensor advised against on a public cloud
+    VPS (dns, smtp) carries a `caution`.
     """
     async with get_session() as session:
         sensor_rows = (
@@ -348,7 +371,7 @@ async def deception_coverage(include_recommendations: bool = True) -> dict[str, 
             "profiles": [{"id": p.id, "display_name": p.display_name} for p in all_profiles()],
         }
 
-    return await build_coverage(deployed, tokens, include_recommendations=include_recommendations)
+    return await build_coverage(deployed, tokens, include_recommendations=True)
 
 
 # How many event types `soc_brief` lists in `urgent_by_event_type` (the full count is reported).
@@ -413,24 +436,18 @@ async def soc_brief(
 ) -> dict[str, Any]:
     """Shift handover: what happened, what needs a human, what was noise.
 
-    The everyday entry point — use it for "what happened overnight?", "anything
-    I should look at?", "brief me". It separates events that need a decision
-    (untriaged CRITICAL/HIGH, honeytoken trips, sensor failures) from the
-    background radiation that makes up most honeypot traffic, so volume never
-    buries the one thing that matters.
-
-    Every argument is optional; with none it summarises the last 12 hours. Fill them in from what
-    the user said, never ask them for a flag.
+    The everyday entry point: use it for "what happened overnight?", "anything I should look
+    at?", "brief me". It separates events that need a decision (untriaged CRITICAL/HIGH, honeytoken
+    trips, sensor failures) from the background radiation that makes up most honeypot traffic.
+    With no arguments it summarises the last 12 hours.
 
     Args:
-        since_hours: The window: "overnight" or "this shift" is 12, "today" 24, "this week" 168,
-            "the whole run" a large number.
-        max_highlights: Individual items to show in `needs_attention` (default 8); raise it when
-            the user wants more detail.
-        exclude_sources: IP addresses or CIDR ranges to leave out of the urgent queue, when the
-            user says some traffic is theirs ("ignore my scanner at 203.0.113.7", "that's my test
-            network"). Nothing is excluded unless they say so: each example carries a
-            `source_scope`, and the result states what was excluded and how many alerts that hid.
+        since_hours: The window: "overnight" 12, "today" 24, "this week" 168, "the whole run" a
+            large number.
+        max_highlights: Items to show in `needs_attention` (default 8); raise it for more detail.
+        exclude_sources: IP addresses or CIDR ranges to leave out of the urgent queue, only when the
+            user says some traffic is theirs ("ignore my scanner at 203.0.113.7"). The result
+            states what was excluded and how many alerts that hid.
     """
     requested, bad = parse_source_filters(exclude_sources)
     if bad:

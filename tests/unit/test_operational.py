@@ -78,10 +78,11 @@ async def test_suppression_load_preset_idempotent():
 async def test_suppression_list_presets_finds_bundled():
     from honeypot_mcp.tools.integrations import suppression_list_presets
 
-    presets = await suppression_list_presets()
+    presets = {p["name"]: p for p in (await suppression_list_presets())["presets"]}
     assert "shodan" in presets
     assert "censys" in presets
     assert "internal-rfc1918" in presets
+    assert presets["shodan"]["rules"] > 0 and presets["shodan"]["description"]
 
 
 # ── Canary rate limiting ────────────────────────────────────────────────

@@ -22,39 +22,18 @@ from honeypot_mcp.tools import _audit
 
 
 @mcp.tool(auth=require_role("admin"), **hints("grafana_start"))
-async def grafana_start(port: int = 3000) -> dict[str, Any]:
-    """Put the Grafana dashboards on this server's database.
+async def grafana_start(port: int | None = None) -> dict[str, Any]:
+    """Put the Grafana dashboards on this server's database and give back the URL.
 
-    Use when someone asks to "put the dashboards on my data", see the overview, threat map,
-    ATT&CK coverage, query or alerts dashboards, or look at a backup visually. Starts a
-    pinned Grafana container with the five packaged dashboards, reading the configured SQLite
-    database read-only, and waits until it is healthy and a test query through its SQLite
-    datasource succeeds. Works in ANALYSIS_MODE against a restored backup. Starting it again
-    REPLACES the previous instance: its containers, networks and private directory are removed
-    first (Grafana keeps nothing between runs, so edits made in its UI are lost).
-
-    Admin tier, because the dashboards can query the whole database, including the tables that
-    hold honeytoken values and API-key digests. Grafana is published on 127.0.0.1 only (there is
-    no bind-address option), has no anonymous access, runs as a non-root user, and gets a
-    generated admin password that is written to a 0600 file: the result carries that file's path,
-    never the password. The Grafana container that holds the data has no route out (internal
-    Docker network); a small forwarder container publishes the loopback port and does keep
-    outbound access, but holds no data. The SQLite plugin is a pinned version, checksum-verified.
-
-    The database is exposed through a private directory that holds only the database files:
-    `db_mount` says how (`hardlink` is a live view; `reflink` or `copy` is a snapshot as of the
-    start, with the reason in `notes`). `GRAFANA_DIR` must be an empty or dedicated directory. The
-    first start pulls the Grafana image and every start downloads the plugin, so it needs
-    internet access; Docker must be running.
+    Use it for "show me the dashboards", "open the threat map", or to look at a restored backup
+    visually. Starts Grafana in Docker with the five packaged dashboards reading the SQLite
+    database read-only, then waits until it answers. Works in analysis mode; starting again
+    replaces the previous instance. Reachable on 127.0.0.1 only, login `admin`, password in the
+    returned `password_file` (never returned itself). Needs Docker and internet. Admin only:
+    dashboards can query the whole database.
 
     Args:
-        port: Local port to publish Grafana on (default 3000). Loopback only.
-
-    Returns:
-        `url`, `username`, `password_file`, `db_mount`, `dashboards` (names) and
-        `dashboard_urls`, `datasource_ok`, `needs_prometheus` (dashboards that would show no data
-        here), and `notes`. On failure (no Docker, offline, port busy, database not SQLite or
-        missing) `error` and `hint`.
+        port: Local port. Optional: by default a free one is chosen and reported in `url`.
     """
     result = await grafana.start(port)
     ok = "error" not in result
@@ -65,7 +44,7 @@ async def grafana_start(port: int = 3000) -> dict[str, Any]:
             if ok
             else "Grafana start failed"
         ),
-        arguments={"port": port},
+        arguments={"port": port} if port is not None else {},
         target=grafana.CONTAINER_NAME,
         outcome="ok" if ok else "error",
         error=None if ok else str(result["error"])[:500],
@@ -75,17 +54,11 @@ async def grafana_start(port: int = 3000) -> dict[str, Any]:
 
 @mcp.tool(auth=require_role("admin"), **hints("grafana_stop"))
 async def grafana_stop() -> dict[str, Any]:
-    """Stop the Grafana started by `grafana_start` and remove its private files.
+    """Stop the dashboards started by `grafana_start` and remove their temporary files.
 
-    Removes only the containers and networks this server created (identified by their label,
-    never by name alone) and, from `GRAFANA_DIR`, only the exact names `grafana_start` made there
-    (the database view, config, plugin, password file, marker) and only if the marker is present.
-    Safe to call when nothing is running: it reports that and changes nothing. Does not touch the
-    database or anyone else's Grafana. Admin tier, like `grafana_start`.
-
-    Returns:
-        `stopped`, `was_running`, `removed_containers`, `removed_networks`, `removed_link_dir`,
-        `note`; or `error` when Docker cannot be reached.
+    Use it for "stop Grafana", "shut the dashboards down". Safe when nothing is running (it says
+    so). Removes only what this server created; the database and anyone else's Grafana are never
+    touched. Takes no arguments. Admin only.
     """
     result = await grafana.stop()
     ok = "error" not in result
@@ -101,14 +74,10 @@ async def grafana_stop() -> dict[str, Any]:
 
 @mcp.tool(**hints("grafana_status"))
 async def grafana_status() -> dict[str, Any]:
-    """Is the Grafana from `grafana_start` running, and which database does it serve?
+    """Are the dashboards running, and at what URL?
 
-    Reports whether the container is up, its URL, the dashboards it carries, the database file
-    it reads and how that file is mounted (`db_mount`), and how long it has been up. Reveals no
-    credential: the password file's path comes back from `grafana_start`, not from here.
-
-    Returns:
-        `running`, `url`, `dashboards`, `database`, `db_mount`, `uptime_seconds`; `error` when
-        Docker cannot be reached.
+    Use it for "is Grafana up?", "what's the dashboard URL?". Reports whether it is up, its URL,
+    which database it serves and for how long. No password is shown: `grafana_start` returns the
+    password file's path. Takes no arguments.
     """
     return await grafana.status()

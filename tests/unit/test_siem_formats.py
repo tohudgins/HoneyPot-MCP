@@ -671,7 +671,7 @@ async def test_webhook_delivery_records_format_in_subscriptions_list():
         await session.flush()
 
     out = await alert_subscriptions_list(active_only=True)
-    by_label = {s["label"]: s for s in out}
+    by_label = {s["label"]: s for s in out["subscriptions"]}
     assert by_label["json-sub"]["format"] == "json"
     assert by_label["cef-sub"]["format"] == "cef"
 

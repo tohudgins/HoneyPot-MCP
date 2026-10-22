@@ -7,6 +7,7 @@ action is taken by a language model rather than a human clicking a button.
 
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -78,11 +79,10 @@ async def test_bulk_triage_by_filter_clears_a_scanner_sweep():
         source_ip="185.220.101.5",
         disposition="benign",
         note="known Tor exit node",
-        analyst="tyler",
     )
     assert result["acknowledged"] == 150
     assert result["disposition"] == "benign"
-    assert result["analyst"] == "tyler"
+    assert result["triaged_by"] == "stdio", "the caller's identity, never a name they type"
 
     # The other IP is untouched.
     from honeypot_mcp.tools.alerts import alerts_recent
@@ -107,50 +107,56 @@ async def test_triage_requires_a_selection():
 
     await _seed(count=10)
     result = await alerts_acknowledge(disposition="benign")
-    assert "error" in result
+    assert "error" in result and "alert_ids" in result["hint"]
 
 
 @pytest.mark.asyncio
-async def test_triage_caps_and_says_so():
+async def test_triage_caps_and_says_so(monkeypatch):
     """An over-broad filter is capped, and the caller is told there is more —
     silently triaging thousands of alerts is not a recoverable mistake."""
+    from honeypot_mcp.tools import alerts as alerts_module
     from honeypot_mcp.tools.alerts import alerts_acknowledge
 
+    monkeypatch.setattr(alerts_module, "_TRIAGE_CAP", 10)
     await _seed(ip="192.0.2.50", count=25)
-    result = await alerts_acknowledge(source_ip="192.0.2.50", max_alerts=10)
+    result = await alerts_acknowledge(source_ip="192.0.2.50")
     assert result["acknowledged"] == 10
     assert result["capped"] is True
     assert "note" in result
 
 
 @pytest.mark.asyncio
-async def test_a_second_bulk_triage_does_not_overwrite_the_first_analysts_work():
+async def test_a_second_bulk_triage_does_not_overwrite_the_first_analysts_work(monkeypatch):
     """Found by triaging a real flooder twice on the live VPS: a filter re-selected the 500
     newest matches, which were the already-triaged ones, and rewrote their disposition, note and
     analyst. With the cap it also never reached the older untriaged alerts."""
+    from honeypot_mcp import rbac
     from honeypot_mcp.tools.alerts import alerts_acknowledge, alerts_get
 
     ids = await _seed(ip="192.0.2.77", count=6, hours_ago=0.1)
+    monkeypatch.setattr(rbac, "current_actor", lambda: "alice (operator)")
     first = await alerts_acknowledge(
-        alert_ids=ids[:3], disposition="true_positive", note="alice: real", analyst="alice"
+        alert_ids=ids[:3], disposition="true_positive", note="alice: real"
     )
     assert first["acknowledged"] == 3
 
+    monkeypatch.setattr(rbac, "current_actor", lambda: "bob (operator)")
     second = await alerts_acknowledge(
-        source_ip="192.0.2.77", disposition="benign", note="bob: noise", analyst="bob"
+        source_ip="192.0.2.77", disposition="benign", note="bob: noise"
     )
     assert second["acknowledged"] == 3, "only the three still untriaged"
 
     kept = await alerts_get(ids[0])
-    assert kept["triaged_by"] == "alice" and kept["disposition"] == "true_positive"
+    assert kept["triaged_by"] == "alice (operator)" and kept["disposition"] == "true_positive"
     assert kept["triage_note"] == "alice: real"
     reached = await alerts_get(ids[-1])
-    assert reached["triaged_by"] == "bob" and reached["disposition"] == "benign"
+    assert reached["triaged_by"] == "bob (operator)" and reached["disposition"] == "benign"
 
     # Naming ids is the deliberate way to re-triage something already triaged.
-    again = await alerts_acknowledge(alert_ids=ids[:1], disposition="duplicate", analyst="carol")
+    monkeypatch.setattr(rbac, "current_actor", lambda: "carol (operator)")
+    again = await alerts_acknowledge(alert_ids=ids[:1], disposition="duplicate")
     assert again["acknowledged"] == 1
-    assert (await alerts_get(ids[0]))["triaged_by"] == "carol"
+    assert (await alerts_get(ids[0]))["triaged_by"] == "carol (operator)"
 
 
 @pytest.mark.asyncio
@@ -162,14 +168,13 @@ async def test_triage_records_who_what_and_why():
         alert_ids=ids,
         disposition="false_positive",
         note="our own vuln scanner",
-        analyst="alice",
     )
 
     detail = await alerts_get(ids[0])
     assert detail["acknowledged"] is True
     assert detail["disposition"] == "false_positive"
     assert detail["triage_note"] == "our own vuln scanner"
-    assert detail["triaged_by"] == "alice"
+    assert detail["triaged_by"] == "stdio"
     assert detail["triaged_at"] is not None
 
 
@@ -373,10 +378,10 @@ async def test_generate_report_writes_a_file_with_headline_figures(reports_dir):
     from honeypot_mcp.tools.analysis import generate_report
 
     await _seed(count=5, severity="high")
-    dest = reports_dir / "r.md"
-    result = await generate_report(format="markdown", output_path="r.md")
+    result = await generate_report(format="markdown")
 
-    assert result["path"] == str(dest)
+    dest = Path(result["path"])
+    assert dest.parent == reports_dir.resolve() and dest.suffix == ".md"
     assert result["alerts_analysed"] == 5
     assert result["by_severity"] == {"high": 5}
     assert dest.exists()

@@ -2495,3 +2495,134 @@ def list_capture_files(
     found = sorted(set(found), key=lambda item: (item[0], str(item[1])))
     more = len(found) > limit
     return [path for _mtime, path in found[-limit:]], more
+
+
+# ── Choosing a capture the way a user names one ─────────────────────────────
+
+CAPTURE_PATTERNS = ("*.pcap", "*.pcapng")
+_NAMES_SHOWN = 8
+_EXTRACT_NAME_RE = re.compile(r"^pcap-(?P<ip>.+)-\d{8}T\d{6}Z(?:-\d+)?\.pcap(?:ng)?$")
+
+
+def extract_source_ip(file_name: str) -> str | None:
+    """The address in a `pcap_extract` file name (`pcap-<ip>-<stamp>.pcap`), or None."""
+    match = _EXTRACT_NAME_RE.match(file_name)
+    return match.group("ip").replace("_", ":") if match else None
+
+
+def extract_files_newest_first(roots: Sequence[tuple[str, Path]]) -> list[Path]:
+    """Every capture file in the `extract` roots, newest first. Blocking."""
+    found: list[Path] = []
+    for kind, directory in roots:
+        if kind != "extract":
+            continue
+        files, _more = list_capture_files(Path(directory).expanduser(), CAPTURE_PATTERNS)
+        found.extend(files)
+
+    def _age_key(path: Path) -> tuple[float, str]:
+        try:
+            return path.stat().st_mtime, path.name
+        except OSError:
+            return 0.0, path.name
+
+    found.sort(key=_age_key, reverse=True)
+    return found
+
+
+def _no_captures_hint() -> str:
+    return (
+        "There are no capture extracts yet. On a live server run pcap_extract(source_ip=<attacker "
+        "address>); on a restored backup, copy the .pcap files into the reports directory."
+    )
+
+
+def missing_capture(name: str, roots: Sequence[tuple[str, Path]]) -> dict[str, Any]:
+    """The error for a capture name that matches nothing: what is available, and the closest names."""
+    import difflib
+
+    names = [p.name for p in extract_files_newest_first(roots)]
+    out: dict[str, Any] = {"error": f"No capture file named {name!r}."}
+    if not names:
+        out["hint"] = _no_captures_hint()
+        return out
+    close = difflib.get_close_matches(name.strip(), names, n=3, cutoff=0.6)
+    shown = names[:_NAMES_SHOWN]
+    out["available"] = shown
+    out["hint"] = (
+        (f"Did you mean {close[0]!r}? " if close else "")
+        + f"Newest captures: {', '.join(shown)}"
+        + (
+            f" (and {len(names) - len(shown)} more; pcap_files lists them all)"
+            if len(names) > len(shown)
+            else ""
+        )
+        + ". Name one of them, name an attacker IP to use its newest capture, or leave the file "
+        "out to use the newest."
+    )
+    return out
+
+
+def access_error(
+    exc: CaptureAccessError, name: str | None, roots: Sequence[tuple[str, Path]]
+) -> dict[str, Any]:
+    """`CaptureAccessError` as `{error, hint}`; a name that was not found also lists what exists."""
+    message = str(exc)
+    if message.startswith("file not found") and name:
+        return missing_capture(name, roots)
+    return {
+        "error": message,
+        "hint": "Name a file listed by pcap_files, or leave the file out to use the newest capture.",
+    }
+
+
+def describe_choice(how: str, name: str) -> str:
+    """One sentence saying which capture was picked for the user and why."""
+    if how == "newest":
+        return f"No file was named, so the newest capture was used ({name}); pcap_files lists the others."
+    return f"Used the {how} ({name}); pcap_files lists the others."
+
+
+def choose_capture(
+    name: str | None, roots: Sequence[tuple[str, Path]]
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """Turn what a user said into a file name to open: `(name, how, error)`.
+
+    No name -> the newest extract (`how="newest"`). An IP address -> that source's newest extract
+    (`how="newest for <ip>"`). Anything else is passed through untouched for `open_capture` to
+    confine and open. Blocking (lists directories): run in a thread.
+    """
+    import ipaddress
+
+    text = (name or "").strip()
+    if text:
+        try:
+            ip = str(ipaddress.ip_address(text))
+        except ValueError:
+            return text, None, None
+        files = extract_files_newest_first(roots)
+        for path in files:
+            if extract_source_ip(path.name) == ip:
+                return path.name, f"newest for {ip}", None
+        if not files:
+            return (
+                None,
+                None,
+                {"error": f"No capture extract exists for {ip}.", "hint": _no_captures_hint()},
+            )
+        mine = {a for p in files if (a := extract_source_ip(p.name)) is not None}
+        return (
+            None,
+            None,
+            {
+                "error": f"No capture extract exists for {ip}.",
+                "hint": (
+                    f"Extracts exist for {len(mine)} other address(es), e.g. "
+                    f"{', '.join(sorted(mine)[:5])}. On a live server pcap_extract(source_ip={ip!r}) "
+                    "makes one from the ring buffer."
+                ),
+            },
+        )
+    files = extract_files_newest_first(roots)
+    if not files:
+        return None, None, {"error": "No capture file to read.", "hint": _no_captures_hint()}
+    return files[0].name, "newest", None

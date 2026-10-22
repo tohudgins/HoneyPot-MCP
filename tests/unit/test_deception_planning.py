@@ -62,7 +62,8 @@ async def test_honeypot_templates_reads_from_the_registry():
     from honeypot_mcp.tools.honeypot import honeypot_templates
 
     templates = await honeypot_templates()
-    assert {t["type"] for t in templates} == set(BY_TYPE)
+    assert templates["count"] == len(BY_TYPE)
+    assert {t["type"] for t in templates["types"]} == set(BY_TYPE)
 
 
 async def test_profiles_only_reference_real_sensor_types():
@@ -903,7 +904,7 @@ async def test_deploy_plan_reports_the_caution_for_what_it_deployed(monkeypatch)
     from honeypot_mcp.tools.deception import deception_deploy_plan
 
     async def fake_deploy(**kwargs):
-        return {"name": kwargs["name"]}
+        return {"name": kwargs["name"], "port": kwargs["port"]}
 
     monkeypatch.setattr(honeypot_tools, "honeypot_deploy", fake_deploy)
 

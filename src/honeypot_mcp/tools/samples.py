@@ -30,6 +30,7 @@ from honeypot_mcp.tools._format import mark_untrusted, write_artifact
 from honeypot_mcp.tools._planted import load_planted
 from honeypot_mcp.tools._scan import _FILE_TYPES, _clip, _iso, _jv, file_origin
 
+_TOP_FILES = 10
 # Hashes per database pass. Every pass reads the file-event rows once (the `event_type` index, then
 # the payload of each row), so the number of passes is what costs: 900 stays under SQLite's old
 # 999-variable ceiling with the six event types, and is 4.5x fewer passes than the 200 it was.
@@ -145,72 +146,63 @@ async def database_context(hashes: list[str]) -> DatabaseContext:
     return result
 
 
+def _quarantine_entries() -> list[str]:
+    """Top-level names in the quarantine (what `path` can name), without creating anything."""
+    try:
+        root = get_settings().samples_dir
+        return sorted(p.name for p in root.iterdir() if p.is_dir() and not p.is_symlink())
+    except OSError:
+        return []
+
+
 @mcp.tool(auth=require_role("operator"), **hints("sample_scan"))
-async def sample_scan(
-    path: str | None = None, rules: str | None = None, top: int = 20
-) -> dict[str, Any]:
+async def sample_scan(path: str | None = None) -> dict[str, Any]:
     """Hash, type and YARA-scan the malware samples the honeypots captured.
 
-    Use when someone asks what the captured files are, whether any is a known botnet binary,
-    miner, dropper or webshell, or "scan the samples". Reads files from the quarantine directory
-    (the `samples_dir` setting, where `sample_collect` puts them and where
-    `scripts/fetch_backup.sh --samples` keeps them with no permissions), including files whose
-    mode is 000. Nothing is executed and the originals are not changed. For every file it gives
-    the SHA-256, size, type by magic bytes (ELF architecture and linking, script interpreter,
-    text, archive, Cowrie TTY recording), an entropy bucket (packed or encrypted content stands
-    out), the YARA rules that matched with their `family` and `severity` (info, low, medium,
-    high) and which rule strings matched where, and, when the hash appears in the database, the
-    capture context: how many distinct sources sent it, first and last seen, the names it was
-    saved under, and whether the shell wrote it (`written_by_session`, the attacker's own typed
-    text) or it was fetched from the network. Bundled rules cover Mirai and Gafgyt binaries, IoT
-    droppers (busybox probes, echo -ne hex droppers, per-architecture download scripts), UPX and
-    small static ELF loaders, cryptominers, reverse shells, SSH-key persistence, webshells,
-    fetch-chmod-run-delete scripts, credential-theft strings and the harmless "can I run a file
-    here" probe (severity info). Rules you add as `*.yar` files in the `yara_rules_dir` directory
-    load too; a user rule file that does not compile is reported with its file and line and does
-    not disable the others.
-
-    Operator tier. The result is a digest: counts of files scanned and skipped (with reasons),
-    hits by rule, family and severity, duplicates by hash, unknown-type files, and the most
-    significant files. The full per-file table is written to a file in the reports directory.
-    Hand any hash from the result to `lookup_hash` to ask MalwareBazaar about it.
+    Use it for "what did the attackers drop?", "scan the samples", "is any of it Mirai or a
+    miner?". Scans the whole quarantine by default (files `sample_collect` copied from the
+    sensors, or a fetched backup's samples); nothing is executed or changed. Gives each file's
+    SHA-256, size, type, YARA hits (family, severity), duplicates, and how many sources sent it
+    and whether the shell wrote it or it was downloaded. The digest lists the ten most significant
+    files; the full table is a file in the reports directory. Hand a hash to `lookup_hash`.
 
     Args:
-        path: A file or directory name inside the samples directory (for example
-            `honeypot-hp-ssh` or `honeypot-hp-ssh/downloads`). Omit it to scan everything. `..`,
-            absolute paths outside the directory and symbolic links are refused.
-        rules: Limit the scan to named rule files, comma separated: a bundled name (`miners`,
-            `iot_botnets`, `shells`, `webshells`) or a file in the rules directory. Omit it to use
-            every bundled rule plus the user's.
-        top: How many of the most significant files to detail in the result (1-100, default 20).
-
-    Returns:
-        `files_scanned`, `distinct_hashes`, `files_skipped`, `by_type`, `hits_by_rule`,
-        `hits_by_family`, `hits_by_severity`, `top_files`, `duplicates`, `database`, `rules`
-        (what loaded, with any compile errors) and `artifact` (the full table's path). The
-        capture-context lookup has a wall-clock budget (`sample_context_seconds`, default 20 s):
-        `database_context_complete` is false when it ran out, and `database.context_note` says
-        how many hashes were not looked up (their files carry `database_looked_up: false` in the
-        artifact; `database: null` there then means "not asked", not "no events"). When no
-        YARA engine is installed: `{"available": False, "note": ...}`. On a bad path or an
-        unusable directory: `error` and `hint`.
+        path: Only one sensor's samples, by name (for example `hp-ssh`). Optional.
     """
     status = samples.availability()
     if not status["available"]:
         return status
-    top = max(1, min(int(top), 100))
+    path = path.strip() if isinstance(path, str) and path.strip() else None
     try:
-        report = await asyncio.to_thread(samples.scan_records, path, rules)
+        try:
+            report = await asyncio.to_thread(samples.scan_records, path, None)
+        except samples.SampleAccessError as exc:
+            # "hp-ssh" is how a sensor is named; its directory is "honeypot-hp-ssh".
+            if not (path and "not found" in exc.message and not path.startswith("honeypot-")):
+                raise
+            try:
+                report = await asyncio.to_thread(samples.scan_records, f"honeypot-{path}", None)
+                path = f"honeypot-{path}"
+            except samples.SampleError:
+                raise exc from None
     except samples.SampleError as exc:
         await _audit.record_action(
             "sample_scan",
             "Sample scan refused",
-            arguments={"path": path, "rules": rules},
+            arguments={"path": path},
             target=(path or ".")[:128],
             outcome="error",
             error=exc.message[:500],
         )
-        return exc.as_result()
+        failure = exc.as_result()
+        entries = _quarantine_entries()
+        if path and "not found" in exc.message:
+            failure["hint"] = (
+                f"Sample folders: {', '.join(entries[:10])}. Name one of them."
+                if entries
+                else "The quarantine holds no samples yet: run sample_collect on the sensor host."
+            )
+        return failure
 
     context = await database_context(sorted({r["sha256"] for r in report.records}))
     for record in report.records:
@@ -220,7 +212,7 @@ async def sample_scan(
     summary = samples.digest(
         report.records,
         report.skipped,
-        top=top,
+        top=_TOP_FILES,
         not_scanned=report.not_scanned,
         max_files=report.max_files,
     )
@@ -252,7 +244,7 @@ async def sample_scan(
             "hashes were not looked up"
             + (" (the result-size cap was reached)" if context.capped else "")
             + ", so a file with `database: null` and `database_looked_up: false` may well have "
-            "events. Raise sample_context_seconds, or scan one directory at a time."
+            "events. Scan one sensor's folder at a time to look them all up."
         )
     result: dict[str, Any] = {
         "available": True,
@@ -272,12 +264,21 @@ async def sample_scan(
         result["artifact_error"] = artifact["error"]
     else:
         result["artifact"] = artifact
+    if not report.records and not report.skipped:
+        entries = _quarantine_entries()
+        result["note"] = (
+            "No sample files found"
+            + (f" under {path!r}" if path else " in the quarantine")
+            + ". On the sensor host run sample_collect to copy what the SSH/Telnet honeypots "
+            "captured; for a restored backup, copy its samples folder into the samples directory."
+            + (f" Folders present: {', '.join(entries[:10])}." if entries else "")
+        )
     hit_files = summary["files_with_hits"]
     await _audit.record_action(
         "sample_scan",
         f"Scanned {len(report.records)} sample file(s): {hit_files} with rule hits, "
         f"{len(report.skipped)} skipped",
-        arguments={"path": path, "rules": rules, "top": top},
+        arguments={"path": path},
         target=(path or ".")[:128],
     )
     return mark_untrusted(result)
@@ -287,33 +288,15 @@ async def sample_scan(
 async def sample_collect(honeypot: str | None = None) -> dict[str, Any]:
     """Copy the files the SSH and Telnet honeypots captured into the local quarantine.
 
-    Use when someone asks to "pull the samples", "collect what the honeypots downloaded" or
-    wants to look at captured malware or TTY recordings from a live sensor. Cowrie keeps what
-    attackers download or upload, and each session's TTY recording, inside its container, so
-    they are lost when the container is replaced: collect before a redeploy. This copies them
-    out of the running Cowrie containers with Docker's copy-out API (the same files
-    `scripts/fetch_backup.sh --samples` bundles), writes each into the samples directory as
-    `<container>/downloads/<sha256>` (named by content hash) or `<container>/tty/<name>`, mode
-    000, never over an existing file, and records their hashes in `SHA256SUMS`. Files already
-    collected are skipped, so it is safe to run repeatedly. Then use `sample_scan` on them.
-
-    Admin tier: the files are live malware and the container is treated as hostile. The archive
-    is read as a stream under size and file-count limits; only regular files directly inside
-    `downloads` and `tty` are kept (links, devices, nested or oddly named paths are counted and
-    refused); nothing is executed. Only Cowrie (the `ssh` and `telnet` honeypot types) runs in a
-    container; every other honeypot runs inside this server and has no files to collect. It
-    works on the host that runs the sensors, and says so when Docker or a container is missing,
-    or when the server is in ANALYSIS_MODE (no containers exist there).
+    Use it for "pull the samples", "collect what the honeypots downloaded", before redeploying a
+    sensor (Cowrie keeps downloads and session recordings inside its container, lost when the
+    container is replaced). Safe to repeat: files already collected are skipped. Then run
+    `sample_scan`. Only SSH and Telnet sensors run in a container; it needs Docker on the sensor
+    host and says so clearly when there is none, or in analysis mode. Admin only.
 
     Args:
-        honeypot: Collect from one honeypot, by its name or container name (for example
-            `hp-ssh` or `honeypot-hp-ssh`). Omit it to collect from every running Cowrie
-            container.
-
-    Returns:
-        `new_files`, `new_bytes`, `duplicates_skipped`, and per container: `new` (path, sha256,
-        size), what was `skipped` and why, and `truncated` when a limit was hit. On failure
-        (Docker unavailable, no running container, analysis mode): `error` and `hint`.
+        honeypot: One sensor by name (for example `hp-ssh`). Optional: default is every running
+                  SSH/Telnet sensor.
     """
     try:
         result = await asyncio.to_thread(samples.collect, honeypot)

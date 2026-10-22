@@ -32,6 +32,8 @@ The fields exist to answer specific questions:
 
 from __future__ import annotations
 
+import difflib
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -695,6 +697,9 @@ class EnvironmentProfile:
     optional: tuple[str, ...] = field(default=())
     hostname_prefix: str = "srv"
     domain: str | None = None
+    # Words a person uses for this shape of estate ("windows", "warehouse", "k8s"), matched whole
+    # against what they typed so a profile can be chosen from a sentence, not only from its id.
+    keywords: tuple[str, ...] = ()
 
 
 _PROFILES: tuple[EnvironmentProfile, ...] = (
@@ -710,6 +715,16 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         optional=("mssql", "http", "ftp"),
         hostname_prefix="corp",
         domain="corp.local",
+        keywords=(
+            "windows",
+            "active",
+            "directory",
+            "ad",
+            "domain",
+            "microsoft",
+            "corporate",
+            "office",
+        ),
     ),
     EnvironmentProfile(
         id="linux_web",
@@ -719,6 +734,7 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         core=("http", "ssh", "postgresql"),
         optional=("redis", "mysql", "ftp", "imap", "pop3", "rsync"),
         hostname_prefix="web",
+        keywords=("web", "website", "webapp", "linux", "lamp", "portal", "app", "application"),
     ),
     EnvironmentProfile(
         id="cloud_native",
@@ -731,6 +747,16 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         core=("docker_api", "kubernetes", "http", "ssh"),
         optional=("elasticsearch", "redis", "postgresql", "kubernetes"),
         hostname_prefix="node",
+        keywords=(
+            "cloud",
+            "container",
+            "containers",
+            "docker",
+            "kubernetes",
+            "k8s",
+            "devops",
+            "microservices",
+        ),
     ),
     EnvironmentProfile(
         id="data_platform",
@@ -740,6 +766,16 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         core=("postgresql", "elasticsearch", "redis"),
         optional=("mongodb", "mysql", "ssh", "memcached"),
         hostname_prefix="data",
+        keywords=(
+            "data",
+            "database",
+            "databases",
+            "db",
+            "warehouse",
+            "analytics",
+            "search",
+            "cache",
+        ),
     ),
     EnvironmentProfile(
         id="network_edge",
@@ -749,6 +785,16 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         core=("snmp", "dns", "telnet"),
         optional=("ssh", "ftp", "http"),
         hostname_prefix="net",
+        keywords=(
+            "network",
+            "router",
+            "routers",
+            "switch",
+            "switches",
+            "iot",
+            "edge",
+            "infrastructure",
+        ),
     ),
     EnvironmentProfile(
         id="mixed_enterprise",
@@ -772,6 +818,16 @@ _PROFILES: tuple[EnvironmentProfile, ...] = (
         ),
         hostname_prefix="srv",
         domain="corp.local",
+        keywords=(
+            "mixed",
+            "enterprise",
+            "unknown",
+            "varied",
+            "general",
+            "everything",
+            "all",
+            "default",
+        ),
     ),
 )
 
@@ -780,3 +836,104 @@ PROFILES: dict[str, EnvironmentProfile] = {p.id: p for p in _PROFILES}
 
 def all_profiles() -> tuple[EnvironmentProfile, ...]:
     return _PROFILES
+
+
+def _normalise(value: object) -> str:
+    return re.sub(r"[\s\-/.]+", "_", str(value).strip().lower()).strip("_")
+
+
+# What people call each sensor type that is not its identifier. Resolved case-insensitively and
+# without separators; every target is checked against `BY_TYPE` by the tests.
+_TYPE_ALIASES: dict[str, str] = {
+    "postgres": "postgresql",
+    "pg": "postgresql",
+    "psql": "postgresql",
+    "sqlserver": "mssql",
+    "sql_server": "mssql",
+    "microsoft_sql_server": "mssql",
+    "mongo": "mongodb",
+    "elastic": "elasticsearch",
+    "elk": "elasticsearch",
+    "opensearch": "elasticsearch",
+    "mariadb": "mysql",
+    "docker": "docker_api",
+    "dockerapi": "docker_api",
+    "docker_daemon": "docker_api",
+    "k8s": "kubernetes",
+    "kube": "kubernetes",
+    "kubernetes_api": "kubernetes",
+    "samba": "smb",
+    "cifs": "smb",
+    "file_share": "smb",
+    "fileshare": "smb",
+    "windows_file_share": "smb",
+    "web": "http",
+    "https": "http",
+    "website": "http",
+    "web_server": "http",
+    "webserver": "http",
+    "memcache": "memcached",
+    "voip": "sip",
+    "pbx": "sip",
+    "asterisk": "sip",
+    "openssh": "ssh",
+    "cowrie": "ssh",
+    "remote_desktop": "rdp",
+    "windows_remote_desktop": "rdp",
+    "active_directory": "ldap",
+    "directory": "ldap",
+    "nameserver": "dns",
+    "name_server": "dns",
+    "rsyncd": "rsync",
+    "pop": "pop3",
+    "imap4": "imap",
+    "ftps": "ftp",
+    "router": "snmp",
+}
+
+# Words that only say "this is a sensor": "ssh honeypot", "redis server".
+_FILLER = re.compile(r"_(honeypot|honeypots|sensor|sensors|decoy|decoys|server|service|instance)$")
+
+
+def resolve_type(value: object) -> str | None:
+    """The sensor type a person meant by `value` ("Postgres", "SSH honeypot", "k8s"), or None.
+
+    Exact and alias matches only; `suggest_types` is for the near misses, because acting on a
+    guess (deploying or stopping the wrong thing) is worse than asking."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    key = _FILLER.sub("", _normalise(value))
+    if key in BY_TYPE:
+        return key
+    return _TYPE_ALIASES.get(key)
+
+
+def suggest_types(value: object) -> list[str]:
+    """Valid sensor types close to a misspelling, best first."""
+    key = _FILLER.sub("", _normalise(value))
+    vocabulary = {**{t: t for t in BY_TYPE}, **_TYPE_ALIASES}
+    close = difflib.get_close_matches(key, list(vocabulary), n=5, cutoff=0.6)
+    return list(dict.fromkeys(vocabulary[c] for c in close))[:3]
+
+
+def resolve_profile(value: object) -> tuple[EnvironmentProfile | None, list[str]]:
+    """The profile a person meant, and the candidates when it is not clear.
+
+    Accepts the id, the display name, or the words of a description ("a Windows domain", "k8s
+    platform", "warehouse"): the profile with the most keyword hits wins, a tie is not guessed."""
+    key = _normalise(value) if isinstance(value, str) else ""
+    if not key:
+        return None, []
+    for profile in _PROFILES:
+        if key in (profile.id, _normalise(profile.display_name)):
+            return profile, []
+    words = set(key.split("_"))
+    scored = [(len(words & set(p.keywords)), p) for p in _PROFILES]
+    best = max((score for score, _ in scored), default=0)
+    top = [p for score, p in scored if score == best and best > 0]
+    if len(top) == 1:
+        return top[0], []
+    if top:
+        return None, [p.id for p in top]
+    close = difflib.get_close_matches(key, [p.id for p in _PROFILES], n=3, cutoff=0.5)
+    return None, close

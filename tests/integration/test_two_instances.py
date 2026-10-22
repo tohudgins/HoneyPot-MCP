@@ -91,7 +91,7 @@ async def test_a_second_server_is_read_only_and_raises_no_false_alarm(tmp_path):
         )
         assert "read-only" in str(refused.data) and "pid" in str(refused.data)
         listed = await _call(b_port, "honeypot_list", {})
-        assert [h["name"] for h in listed.data] == ["shared"]
+        assert [h["name"] for h in listed.data["honeypots"]] == ["shared"]
 
         # No false alarm in the data, and the first server's sensor is untouched.
         con = sqlite3.connect(work / "shared.db")

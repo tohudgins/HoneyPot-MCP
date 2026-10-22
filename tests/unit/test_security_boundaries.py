@@ -82,21 +82,52 @@ def test_artifact_path_allows_ordinary_filenames_and_subdirectories():
 @pytest.mark.parametrize("bad_path", ESCAPE_ATTEMPTS)
 async def test_every_export_tool_refuses_to_write_outside_reports_dir(bad_path):
     """All four bulk writers must share the boundary — a new export tool that
-    forgets it reintroduces an arbitrary-file-write primitive."""
+    forgets it reintroduces an arbitrary-file-write primitive.
+
+    `export_stix`, `export_blocklist` and `generate_report` no longer take a path at all (their
+    files get generated names inside reports_dir), so the caller-named path survives only on the
+    writers behind them and on `alerts_export`; each must still refuse to leave reports_dir."""
     from honeypot_mcp.tools.alerts import alerts_export
-    from honeypot_mcp.tools.analysis import export_blocklist, export_stix, generate_report
+    from honeypot_mcp.tools.analysis import write_blocklist, write_report, write_stix_bundle
 
     await _seed()
 
     results = {
         "alerts_export": await alerts_export(format="csv", output_path=bad_path),
-        "export_stix": await export_stix(hours=24, min_hits=1, output_path=bad_path),
-        "export_blocklist": await export_blocklist(hours=24, min_hits=5, output_path=bad_path),
-        "generate_report": await generate_report(format="markdown", output_path=bad_path),
+        "export_stix": await write_stix_bundle(24, 1, output_path=bad_path),
+        "export_blocklist": await write_blocklist("plain", 24, 5, output_path=bad_path),
+        "generate_report": await write_report(None, None, "markdown", None, output_path=bad_path),
     }
     for tool, result in results.items():
         assert "error" in result, f"{tool} accepted {bad_path}: {result}"
         assert "path" not in result
+
+
+@pytest.mark.asyncio
+async def test_path_free_export_tools_expose_no_path_and_write_only_inside_reports_dir(
+    tmp_path, monkeypatch
+):
+    """The attacker-reachable argument is gone from the tool surface: no parameter can name a
+    destination, and the file each tool creates lands in reports_dir under a generated name."""
+    import inspect
+    from pathlib import Path
+
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.tools.analysis import export_blocklist, export_stix, generate_report
+
+    for tool in (export_stix, export_blocklist, generate_report):
+        params = set(inspect.signature(tool).parameters)
+        assert not params & {"output_path", "path", "destination", "filename"}, (tool, params)
+
+    monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
+    await _seed()
+    for result in (
+        await export_stix(hours=24, min_hits=1),
+        await export_blocklist(hours=24, min_hits=5),
+        await generate_report(format="markdown"),
+    ):
+        assert "error" not in result, result
+        assert Path(result["path"]).resolve().parent == tmp_path.resolve()
 
 
 @pytest.mark.asyncio

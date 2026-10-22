@@ -99,7 +99,7 @@ async def _deploy(*types: str) -> None:
 async def _running() -> list[str]:
     from honeypot_mcp.tools.honeypot import honeypot_list
 
-    return [h["name"] for h in await honeypot_list() if h["status"] == "running"]
+    return [h["name"] for h in (await honeypot_list())["honeypots"] if h["status"] == "running"]
 
 
 async def test_stop_with_no_arguments_is_refused():
@@ -111,7 +111,8 @@ async def test_stop_with_no_arguments_is_refused():
 
     result = await honeypot_stop()
     assert "error" in result
-    assert "Refusing to guess" in result["error"]
+    assert "Nothing says which honeypots to stop" in result["error"]
+    assert "never guessed" in result["hint"]
 
 
 async def test_stop_several_by_name():
@@ -302,7 +303,7 @@ async def test_rotation_issues_a_new_secret_and_keeps_the_old_one():
     assert new["metadata"]["planted_at"] == "wiki page IT-114"
     assert new["metadata"]["rotated_from"] == original["id"]
 
-    statuses = {t["id"]: t["status"] for t in await honeytoken_list()}
+    statuses = {t["id"]: t["status"] for t in (await honeytoken_list())["tokens"]}
     assert statuses[original["id"]] == "revoked", "the old token must stop matching"
     assert statuses[new["id"]] == "active"
 

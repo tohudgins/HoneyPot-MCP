@@ -781,7 +781,11 @@ async def test_triage_is_attributed_to_the_caller_not_to_a_name_they_supply(monk
 
     await _alerts_for(["203.0.113.77"], count=2)
     monkeypatch.setattr(rbac, "current_actor", lambda: "alice (operator)")
-    result = await alerts_acknowledge(source_ip="203.0.113.77", analyst="bob (admin)" + "x" * 300)
+    # there is no `analyst` argument to supply: the attribution can only be the caller's
+    import inspect
+
+    assert "analyst" not in inspect.signature(alerts_acknowledge).parameters
+    result = await alerts_acknowledge(source_ip="203.0.113.77")
     assert "error" not in result, result
     async with get_session() as session:
         alerts = (
@@ -790,7 +794,6 @@ async def test_triage_is_attributed_to_the_caller_not_to_a_name_they_supply(monk
             .all()
         )
     assert alerts and all(a.triaged_by == "alice (operator)" for a in alerts)
-    assert all("analyst: bob" in (a.triage_note or "") for a in alerts)
 
 
 # ── Blocklists ──────────────────────────────────────────────────────────────

@@ -21,30 +21,25 @@ from typing import Any, Literal
 
 from honeypot_mcp.storage.models import Alert
 
-RankBy = Literal["score", "sources", "events", "recent"]
-RANK_BY_VALUES: tuple[str, ...] = ("score", "sources", "events", "recent")
-
 
 async def detect_campaigns(
     alerts: list[Alert],
     window_minutes: int = 60,
     min_sources: int = 3,
-    rank_by: RankBy = "score",
-    merge_recurring: bool = True,
+    event_type_contains: str | None = None,
+    involving_ip: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Detect coordinated attack campaigns from a list of alerts, ranked.
+    """Detect coordinated attack campaigns from a list of alerts, best first by score.
 
     A window is: multiple distinct source IPs all hitting the same event_type within the same
-    rolling time window. A campaign is one window, or, with `merge_recurring`, every window of one
-    event type that largely shares its sources (see `_merge_recurring`); `occurrences` says how
-    many. `merge_recurring=False` returns the windows themselves.
+    rolling time window. A campaign is every window of one event type that largely shares its
+    sources (see `_merge_recurring`); `occurrences` says how many windows.
 
     Each campaign carries a `kind`, a `score` and a `why` (see `score_campaign`), and the list is
-    ordered by `rank_by`: `score` (default), `sources`, `events` or `recent` (newest first). Ties
-    fall back to score, then to sources, so the order is deterministic.
+    ordered by score, then sources, so the order is deterministic. `event_type_contains` keeps campaigns
+    whose event type contains that text; `involving_ip` keeps campaigns that source took part in.
+    Both filters apply after scoring, so a campaign's score never depends on them.
     """
-    if rank_by not in RANK_BY_VALUES:
-        raise ValueError(f"rank_by must be one of {', '.join(RANK_BY_VALUES)}; got {rank_by!r}")
     if not alerts:
         return []
 
@@ -93,19 +88,24 @@ async def detect_campaigns(
 
             i = j if j > i else i + 1
 
-    if merge_recurring:
-        # Merging subsumes de-duplication: a window whose sources are a subset of another's joins
-        # it instead of being dropped, so its events and its hour still count.
-        campaigns = _merge_recurring(campaigns)
-    else:
-        # Deduplicate overlapping windows (keep the largest)
-        campaigns = [_combine([w]) for w in _deduplicate(campaigns)]
+    # A window whose sources are a subset of another's joins its campaign instead of being
+    # dropped, so its events and its hour still count.
+    campaigns = _merge_recurring(campaigns)
     _attach_scores(campaigns, alerts)
+    kept = []
     for campaign in campaigns:
         sources = campaign.pop("_sources")
+        if (
+            event_type_contains
+            and event_type_contains.lower() not in campaign["event_type"].lower()
+        ):
+            continue
+        if involving_ip and involving_ip not in sources:
+            continue
         campaign["source_ips"] = sources[:MAX_SOURCE_IPS]
         campaign["source_ips_shown"] = len(campaign["source_ips"])
-    return _order(campaigns, rank_by)
+        kept.append(campaign)
+    return _order(kept)
 
 
 # ── recurrence ───────────────────────────────────────────────────────────────────────────────
@@ -124,13 +124,12 @@ _RECURRENCE_OVERLAP = 0.5
 def _merge_recurring(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fold windows of one event type that largely share their sources into one campaign.
 
-    This replaces `_deduplicate` when merging: a window that is a subset of another one joins the
-    campaign that holds the other instead of being discarded. Windows are taken largest first (so
-    the seed is the widest picture of the actors) and each joins the first existing campaign of
-    its event type that already holds at least `_RECURRENCE_OVERLAP` of its sources, else starts
-    one. Each window therefore belongs to exactly one campaign, and the sum of `occurrences` is
-    the number of windows. The campaign keeps the full source list under `_sources` (most
-    windows first) until scoring is done."""
+    A window that is a subset of another one joins the campaign that holds the other instead of
+    being discarded. Windows are taken largest first (so the seed is the widest picture of the
+    actors) and each joins the first existing campaign of its event type that already holds at
+    least `_RECURRENCE_OVERLAP` of its sources, else starts one. Each window therefore belongs to
+    exactly one campaign, and the sum of `occurrences` is the number of windows. The campaign
+    keeps the full source list under `_sources` (most windows first) until scoring is done."""
     clusters: dict[str, list[tuple[set[str], list[dict[str, Any]]]]] = defaultdict(list)
     for window in sorted(
         windows, key=lambda c: (-len(c["source_ips"]), c["event_type"], c["start_time"])
@@ -401,46 +400,17 @@ def _attach_scores(campaigns: list[dict[str, Any]], alerts: list[Any]) -> None:
         campaign.update(score_campaign(campaign, _shared_event_types(campaign, rows_by_source)))
 
 
-def _order(campaigns: list[dict[str, Any]], rank_by: str) -> list[dict[str, Any]]:
-    """Sort by the chosen key, best first; ties by score, then sources, then id (stable)."""
-    ordered = sorted(
+def _order(campaigns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Best score first; ties by sources, then id and start (stable)."""
+    return sorted(
         campaigns,
         key=lambda c: (-c["score"], -c["unique_source_ips"], c["campaign_id"], c["start_time"]),
     )
-    primary = {
-        "score": lambda c: c["score"],
-        "sources": lambda c: c["unique_source_ips"],
-        "events": lambda c: c["total_events"],
-        "recent": lambda c: c["end_time"],
-    }[rank_by]
-    return sorted(ordered, key=primary, reverse=True)
 
 
 def _make_campaign_id(event_type: str, start) -> str:
     ts = start.strftime("%Y%m%d%H%M")
     return f"camp-{event_type[:8]}-{ts}"
-
-
-def _deduplicate(campaigns: list[dict]) -> list[dict]:
-    """Remove campaigns that are strict subsets of larger campaigns.
-
-    Processes largest-first. A campaign is only ever compared against ones
-    already accepted into `seen`, so if a smaller window were kept ahead of a
-    later, larger superset — the common case, since windows for one
-    event_type are produced in chronological (not size) order and an
-    attacker scanning over hours shows up in more than one of them — the
-    smaller one would never get retroactively dropped. Sorting first
-    guarantees every superset is in `seen` before any of its subsets are
-    considered, regardless of which window was detected earlier.
-    """
-    seen: list[dict] = []
-    for c in sorted(campaigns, key=lambda c: len(c["source_ips"]), reverse=True):
-        ips = set(c["source_ips"])
-        if not any(
-            ips.issubset(set(s["source_ips"])) and c["event_type"] == s["event_type"] for s in seen
-        ):
-            seen.append(c)
-    return seen
 
 
 @dataclass(frozen=True, slots=True)

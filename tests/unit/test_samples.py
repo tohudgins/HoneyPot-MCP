@@ -612,11 +612,16 @@ async def test_the_full_table_goes_to_a_file_in_the_reports_directory(engine):
     assert str(get_settings().samples_dir) not in artifact.read_text()  # relative paths only
 
 
-async def test_top_limits_the_detail_not_the_counts(engine):
-    for i in range(4):
+async def test_the_digest_lists_the_top_files_but_counts_them_all(engine):
+    from honeypot_mcp.tools.samples import _TOP_FILES
+
+    total = _TOP_FILES + 3
+    for i in range(total):
         put(f"h/{i}", TEXT_SAMPLES["reverse_shell"][0] + str(i).encode())
-    result = await scan(top=2)
-    assert result["files_with_hits"] == 4 and len(result["top_files"]) == 2
+    result = await scan()
+    assert result["files_with_hits"] == total and len(result["top_files"]) == _TOP_FILES
+    table = json.loads(Path(result["artifact"]["path"]).read_text())
+    assert len(table["files"]) == total  # the full table in the file is not clipped
 
 
 async def test_scanning_one_file_or_one_directory(engine):
@@ -696,16 +701,22 @@ async def test_includes_in_a_user_rule_cannot_read_other_files(engine, tmp_path)
 
 
 async def test_rule_selection_narrows_the_scan_and_rejects_unknown_names(engine):
+    """The tool takes no rule argument any more (it always uses every rule); the selection logic
+    the scanner is built on is still what narrows a scan, so it is checked where it lives."""
+    from honeypot_mcp import samples
+
     put("h/miner", TEXT_SAMPLES["xmrig"][0])
     put("h/shell", TEXT_SAMPLES["reverse_shell"][0])
-    only = await scan(rules="miners")
-    assert only["rules"]["bundled"] == ["miners"]
-    assert {r["rule"] for r in only["hits_by_rule"]} <= {
+    only = samples.scan_records(None, "miners")
+    assert only.ruleset.describe()["bundled"] == ["miners"]
+    assert {h["rule"] for r in only.records for h in r["hits"]} <= {
         "Miner_XMRig_Artefacts", "Miner_Stratum_Pool_Reference"
     }  # fmt: skip
-    assert only["files_with_hits"] == 1
-    unknown = await scan(rules="nonexistent")
-    assert "nonexistent" in unknown["error"] and "miners" in unknown["hint"]
+    assert sum(1 for r in only.records if r["hits"]) == 1
+    with pytest.raises(samples.SampleError) as unknown:
+        samples.scan_records(None, "nonexistent")
+    result = unknown.value.as_result()
+    assert "nonexistent" in result["error"] and "miners" in result["hint"]
 
 
 async def test_rules_are_compiled_once_and_reused(engine, monkeypatch):

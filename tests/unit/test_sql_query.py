@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 
@@ -89,7 +90,7 @@ async def test_anything_that_writes_or_is_not_one_select_is_refused(query):
     await _seed(2)
     out = await sql_query(query)
 
-    assert "error" in out, query
+    assert "error" in out and out.get("hint"), (query, out)
     from honeypot_mcp.tools.alerts import alerts_stats
 
     assert (await alerts_stats())["total_alerts"] == 2, "nothing may have changed"
@@ -113,6 +114,7 @@ async def test_tables_that_hold_secrets_are_refused_even_for_a_viewer(query):
     out = await sql_query(query)
 
     assert "error" in out and "secrets" in out["error"], (query, out)
+    assert out["hint"], "a refusal must say what to do instead"
 
 
 async def test_a_keyword_inside_a_string_or_comment_is_not_a_write():
@@ -127,23 +129,83 @@ async def test_a_keyword_inside_a_string_or_comment_is_not_a_write():
     assert out["rows"] == [[2]]
 
 
-async def test_results_are_capped_and_say_so():
-    from honeypot_mcp.tools.sql import sql_query
+async def test_results_are_capped_and_say_so(monkeypatch):
+    from honeypot_mcp.tools import sql
 
     await _seed(8)
-    out = await sql_query("SELECT id FROM alerts ORDER BY id", limit=3)
+    monkeypatch.setattr(sql, "_MAX_ROWS", 3)
+    out = await sql.sql_query("SELECT id FROM alerts ORDER BY id")
 
-    assert out["row_count"] == 3 and out["truncated"] is True and "cut at 3" in out["note"]
-    huge = await sql_query("SELECT id FROM alerts", limit=10**6)
-    assert huge["row_count"] == 8 and huge["truncated"] is False
+    assert out["row_count"] == 3 and out["truncated"] is True
+    assert "first 3 rows" in out["note"] and "LIMIT/OFFSET" in out["note"]
+    monkeypatch.undo()
+    everything = await sql.sql_query("SELECT id FROM alerts")
+    assert everything["row_count"] == 8 and everything["truncated"] is False
 
 
-async def test_a_bad_query_is_an_error_message_not_a_crash():
+async def test_a_bad_column_says_which_columns_exist():
     from honeypot_mcp.tools.sql import sql_query
 
     out = await sql_query("SELECT no_such_column FROM alerts")
 
-    assert "error" in out
+    assert "no_such_column" in out["error"]
+    assert "alerts(" in out["hint"] and "source_ip" in out["hint"], out
+
+
+async def test_a_missing_table_lists_the_tables_to_use():
+    from honeypot_mcp.tools.sql import sql_query
+
+    out = await sql_query("SELECT * FROM events")
+
+    assert "alerts(" in out["hint"] and "alert_rollups(" in out["hint"], out
+    assert "honeytokens(" not in out["hint"], "secret tables are never offered"
+
+
+async def test_a_second_statement_is_refused_with_the_fix():
+    from honeypot_mcp.tools.sql import sql_query
+
+    out = await sql_query("SELECT 1; SELECT 2")
+
+    assert "one statement" in out["error"] and "UNION" in out["hint"], out
+
+
+async def test_a_refused_table_names_the_tool_to_use_instead():
+    from honeypot_mcp.tools.sql import sql_query
+
+    out = await sql_query("SELECT * FROM audit_log")
+
+    assert "audit_log_search" in out["hint"], out
+
+
+async def test_an_empty_result_says_so():
+    from honeypot_mcp.tools.sql import sql_query
+
+    out = await sql_query("SELECT id FROM alerts WHERE id < 0")
+
+    assert out["rows"] == [] and "no rows" in out["note"], out
+
+
+async def test_a_default_sized_result_stays_within_the_context_budget():
+    """200 alerts with a fat payload each, selected whole: the reply is cut near 12 KB."""
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.sql import sql_query
+
+    async with get_session() as session:
+        for i in range(200):
+            session.add(
+                Alert(
+                    source_ip="192.0.2.1",
+                    event_type="http_request",
+                    severity=AlertSeverity.LOW,
+                    timestamp=datetime.now(UTC),
+                    payload={"body": "x" * 3000, "n": i},
+                )
+            )
+    out = await sql_query("SELECT id, payload FROM alerts ORDER BY id")
+
+    assert out["truncated"] is True and 0 < out["row_count"] < 200
+    assert len(json.dumps(out)) < 13_000, len(json.dumps(out))
 
 
 async def test_read_only_mode_is_reset_so_normal_writes_still_work():
@@ -192,8 +254,7 @@ async def test_a_runaway_query_is_stopped_inside_sqlite_and_leaves_a_working_ses
     elapsed = time.monotonic() - started
 
     assert "did not finish" in out["error"], out
-    assert "sql_query_timeout_seconds" in out["error"], "the message must name the setting"
-    assert "attack_patterns" in out["error"] and "alert_rollups" in out["error"], out
+    assert "attack_patterns" in out["hint"] and "alert_rollups" in out["hint"], out
     assert 0.9 < elapsed < 6, f"a 1 s limit took {elapsed:.1f}s"
     assert (await sql.sql_query("SELECT 1 AS ok"))["rows"] == [[1]], "the next query must just work"
     await _seed(2)
@@ -278,15 +339,15 @@ async def test_a_blob_cell_is_clipped_before_it_is_hexed():
 
 
 async def test_a_wide_result_is_cut_at_a_total_size_and_says_so(monkeypatch):
-    """Rows x columns x 2,000 characters is unbounded by `limit` alone, and the result lands in a
-    model's context."""
+    """Rows x columns is unbounded by the row cap alone, and the result lands in a model's
+    context."""
     from honeypot_mcp.tools import sql
 
     await _seed(50)
-    monkeypatch.setattr(sql, "_MAX_RESULT_CHARS", 300)
+    monkeypatch.setattr(sql, "_MAX_RESULT_BYTES", 300)
     out = await sql.sql_query("SELECT id, event_type, source_ip FROM alerts ORDER BY id")
 
-    assert out["truncated"] is True and "characters" in out["note"], out
+    assert out["truncated"] is True and "cut at about" in out["note"], out
     assert 0 < out["row_count"] < 50
     assert out["row_count"] == len(out["rows"])
 
@@ -295,7 +356,7 @@ async def test_the_first_row_is_always_returned_even_if_it_alone_exceeds_the_bud
     from honeypot_mcp.tools import sql
 
     await _seed(2)
-    monkeypatch.setattr(sql, "_MAX_RESULT_CHARS", 3)
+    monkeypatch.setattr(sql, "_MAX_RESULT_BYTES", 3)
     out = await sql.sql_query("SELECT event_type FROM alerts")
 
     assert out["row_count"] == 1 and out["truncated"] is True
@@ -308,7 +369,7 @@ async def test_rows_are_streamed_in_small_batches_not_fetched_whole(monkeypatch)
 
     await _seed(25)
     monkeypatch.setattr(sql, "_FETCH_BATCH", 4)
-    out = await sql.sql_query("SELECT id FROM alerts ORDER BY id", limit=1000)
+    out = await sql.sql_query("SELECT id FROM alerts ORDER BY id")
 
     assert out["row_count"] == 25 and out["truncated"] is False
 

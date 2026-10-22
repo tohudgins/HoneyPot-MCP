@@ -116,16 +116,16 @@ async def test_alerts_recent_digests_instead_of_dumping_payload():
 
 
 @pytest.mark.asyncio
-async def test_alerts_recent_include_payload_opts_into_full_capture():
-    from honeypot_mcp.tools.alerts import alerts_recent
+async def test_the_full_capture_is_only_in_alerts_get_not_in_the_list():
+    from honeypot_mcp.tools.alerts import alerts_get, alerts_recent
 
-    await _seed_alert(payload=_fat_http_payload())
-    result = await alerts_recent(include_payload=True)
+    alert_id = await _seed_alert(payload=_fat_http_payload())
+    listed = (await alerts_recent())["alerts"][0]
+    assert "payload" not in listed
 
-    row = result["alerts"][0]
-    assert "digest" not in row
-    assert row["payload"]["headers"]  # bulk is present when asked for
-    assert row["payload"]["username"] == "admin"
+    detail = await alerts_get(alert_id)
+    assert detail["payload"]["headers"]  # bulk is present in the drill-down
+    assert detail["payload"]["username"] == "admin"
 
 
 @pytest.mark.asyncio
@@ -331,7 +331,7 @@ async def test_deploy_rejects_out_of_range_port():
 
     result = await honeypot_deploy(type="http", port=99999)
     assert "error" in result
-    assert "65535" in result["error"]
+    assert "out of range" in result["error"] and "65535" in result["hint"]
 
 
 @pytest.mark.asyncio

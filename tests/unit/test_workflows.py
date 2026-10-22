@@ -77,7 +77,7 @@ async def test_run_analysis_writes_a_summary_with_every_section(tmp_path):
     from honeypot_mcp.tools.workflows import run_analysis
 
     await _seed()
-    out = await run_analysis(top=2, hours=24)
+    out = await run_analysis(hours=24)
 
     assert out["complete"] is True and out["failed"] == []
     assert out["headline"]["total_alerts"] == 90
@@ -89,7 +89,13 @@ async def test_run_analysis_writes_a_summary_with_every_section(tmp_path):
     # ssh_connection is bookkeeping: unmapped, and the mapped share says so
     assert [u["type"] for u in out["attack"]["unmapped"]] == ["ssh_connection"]
     assert out["attack"]["mapped_share"] == pytest.approx(81 / 90, abs=1e-3)
-    assert [s["ip"] for s in out["top_sources"]] == ["198.51.100.1", "198.51.100.2"]
+    # no `top` argument: the five busiest sources, busiest first (4 exist here)
+    assert [s["ip"] for s in out["top_sources"]] == [
+        "198.51.100.1",
+        "198.51.100.2",
+        "203.0.113.9",
+        "198.51.100.3",
+    ]
     assert out["campaigns"]["total"] == 1  # three sources, one event type, one hour
 
     summary = Path(out["summary_file"]["path"])
@@ -100,7 +106,7 @@ async def test_run_analysis_writes_a_summary_with_every_section(tmp_path):
         "## ATT&CK: what the run did, by tactic",
         "| Credential Access | T1110",
         "Left unmapped: ssh_connection (9)",
-        "## Top 2 sources",
+        "## Top 4 sources",
         "## Campaigns and shared tooling",
         "## Files",
         "planted-admin",
@@ -124,7 +130,7 @@ async def test_one_failing_sub_tool_is_reported_and_the_rest_still_lands(monkeyp
 
     monkeypatch.setattr(analysis, "fingerprint_clusters", boom)
     await _seed()
-    out = await run_analysis(top=1, hours=24)
+    out = await run_analysis(hours=24)
 
     assert out["complete"] is False
     assert [f["part"] for f in out["failed"]] == ["fingerprint_clusters"]
@@ -145,7 +151,7 @@ async def test_a_tool_that_returns_an_error_dict_counts_as_a_failed_part(monkeyp
 
     monkeypatch.setattr(analysis, "analyze_campaign", refuse)
     await _seed()
-    out = await run_analysis(top=1, hours=24)
+    out = await run_analysis(hours=24)
     assert [f["part"] for f in out["failed"]] == ["analyze_campaign"]
     assert "campaigns" not in out and out["files"]
 
@@ -155,50 +161,73 @@ async def test_the_window_ends_at_the_newest_alert_not_at_the_wall_clock():
     from honeypot_mcp.tools.workflows import run_analysis
 
     await _seed(age=timedelta(days=10))
-    out = await run_analysis(top=1, hours=24, write_exports=False)
+    out = await run_analysis(hours=24)
 
     assert out["window"]["effective_hours"] >= 24 + 239
     assert "newest alert is" in out["window"]["note"]
-    assert out["soc"]["volume"]["total_events"] == 90  # not "nothing needs a decision"
+    text = Path(out["summary_file"]["path"]).read_text()
+    assert f"last {out['window']['effective_hours']} h of data: 90 alerts" in text  # not "nothing"
     assert out["top_sources"][0]["ip"] == "198.51.100.1"
 
 
-async def test_without_exports_nothing_is_written_and_the_summary_comes_back_inline(tmp_path):
+async def test_the_summary_is_written_and_the_digest_names_every_file(tmp_path):
+    """There is no opt-out of the files any more: the digest points at each one it wrote."""
     from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools.workflows import run_analysis
 
     await _seed()
-    out = await run_analysis(top=1, hours=24, write_exports=False)
+    out = await run_analysis(hours=24)
 
-    assert "summary_file" not in out and out["files"] == {}
-    assert out["summary_markdown"].startswith("# Analysis summary")
-    assert not get_settings().reports_dir.exists()
+    reports = get_settings().reports_dir.resolve()
+    assert Path(out["summary_file"]["path"]).parent == reports
+    assert "summary_markdown" not in out
+    assert out["files"], "the exports and per-source reports are always written"
+    for name in out["files"].values():
+        if name.endswith((".md", ".html", ".json", ".txt")):
+            assert (reports / name).is_file(), name
 
 
 async def test_an_empty_database_is_analysed_without_error():
     from honeypot_mcp.tools.workflows import run_analysis
 
-    out = await run_analysis(top=3, hours=24, write_exports=False)
+    out = await run_analysis(hours=24)
     assert out["complete"] is True
     assert out["headline"]["total_alerts"] == 0 and out["top_sources"] == []
     assert "no alerts" in out["window"]["note"]
 
 
-async def test_bad_arguments_are_refused_and_top_is_clamped():
-    from honeypot_mcp.tools.workflows import run_analysis
+async def test_bad_arguments_are_refused_and_the_busiest_sources_are_capped():
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.workflows import _TOP_SOURCES, run_analysis
 
-    assert "error" in await run_analysis(hours=0)
-    await _seed()
-    out = await run_analysis(top=9999, hours=24, write_exports=False)
-    assert out["top_sources_count"] <= 25
+    for bad in (0, -3, True, "24", 1.5):
+        assert "error" in await run_analysis(hours=bad), bad  # type: ignore[arg-type]
+    # more sources than the digest shows: it keeps the busiest _TOP_SOURCES, not all of them
+    now = datetime.now(UTC)
+    async with get_session() as session:
+        for n in range(_TOP_SOURCES + 3):
+            for i in range(3 + n):
+                session.add(
+                    Alert(
+                        source_ip=f"198.51.100.{100 + n}",
+                        event_type="ssh_login_failed",
+                        severity=AlertSeverity.MEDIUM,
+                        timestamp=now - timedelta(seconds=i),
+                        payload={},
+                    )
+                )
+    out = await run_analysis(hours=24)
+    assert out["top_sources_count"] == len(out["top_sources"]) == _TOP_SOURCES
+    assert out["top_sources"][0]["ip"] == f"198.51.100.{100 + _TOP_SOURCES + 2}"
 
 
 async def test_the_summary_is_regenerated_on_every_run_but_exports_are_not_overwritten():
     from honeypot_mcp.tools.workflows import run_analysis
 
     await _seed()
-    first = await run_analysis(top=1, hours=24)
-    second = await run_analysis(top=1, hours=24)
+    first = await run_analysis(hours=24)
+    second = await run_analysis(hours=24)
     assert first["summary_file"]["path"] == second["summary_file"]["path"]
     assert second["complete"] is True
 
@@ -303,62 +332,41 @@ async def test_backup_is_audited_without_secrets(source_db):
     from honeypot_mcp.storage.models import AuditLog
     from honeypot_mcp.tools.workflows import database_backup
 
-    await database_backup(destination="nightly")
+    out = await database_backup()
     async with get_session() as session:
         rows = (
             (await session.execute(select(AuditLog).where(AuditLog.tool == "database_backup")))
             .scalars()
             .all()
         )
-    assert len(rows) == 1 and rows[0].outcome == "ok" and rows[0].target == "nightly"
+    assert len(rows) == 1 and rows[0].outcome == "ok" and rows[0].target == Path(out["path"]).name
 
 
-async def test_backup_refuses_to_overwrite(source_db, tmp_path):
-    from honeypot_mcp.tools.workflows import database_backup
+async def test_two_backups_in_the_same_second_never_replace_each_other(
+    source_db, tmp_path, monkeypatch
+):
+    """Backups are named by timestamp, so a clash is possible: the second gets a suffix."""
+    from honeypot_mcp.tools import workflows
 
-    first = await database_backup(destination="nightly")
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 22, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(workflows, "datetime", _Frozen)
+    first = await workflows.database_backup()
     marker = Path(first["path"]) / "honeypot_mcp.db"
     before = marker.read_bytes()
-    second = await database_backup(destination="nightly")
+    second = await workflows.database_backup()
 
-    assert "already exists" in second["error"]
+    assert "error" not in first and "error" not in second
+    assert Path(first["path"]).name == "honeypot-20261022T120000Z"
+    assert Path(second["path"]).name == "honeypot-20261022T120000Z-2"
     assert marker.read_bytes() == before
-    assert [p.name for p in (tmp_path / "backups").iterdir()] == ["nightly"]
-
-
-@pytest.mark.parametrize(
-    "destination",
-    [
-        "../escape",
-        "../../etc/cron.d/x",
-        "/tmp/elsewhere",
-        "a/../../out",
-        ".",
-        "",
-        "..",
-        ".hidden",
-        "x.partial",
-    ],
-)
-async def test_backup_destination_is_confined(source_db, tmp_path, destination):
-    from honeypot_mcp.tools.workflows import database_backup
-
-    out = await database_backup(destination=destination)
-    if destination == "":  # falsy means "use the default timestamped name"
-        assert "error" not in out
-        return
-    assert "error" in out and "path" not in out
-    assert not (tmp_path / "escape").exists() and not Path("/tmp/elsewhere").exists()
-    assert not (tmp_path / "backups").exists() or list((tmp_path / "backups").iterdir()) == []
-
-
-async def test_backup_accepts_an_absolute_path_inside_the_backups_directory(source_db, tmp_path):
-    from honeypot_mcp.tools.workflows import database_backup
-
-    inside = tmp_path / "backups" / "weekly" / "w42"
-    out = await database_backup(destination=str(inside))
-    assert "error" not in out, out
-    assert Path(out["path"]) == inside.resolve()
+    assert sorted(p.name for p in (tmp_path / "backups").iterdir()) == [
+        "honeypot-20261022T120000Z",
+        "honeypot-20261022T120000Z-2",
+    ]
 
 
 async def test_backup_refuses_when_the_disk_cannot_hold_it(source_db, tmp_path, monkeypatch):
@@ -381,7 +389,8 @@ async def test_backup_refuses_non_sqlite(monkeypatch, tmp_path):
         get_settings(), "database_url", "postgresql+asyncpg://u:hunter2@db.example/hp"
     )
     out = await database_backup()
-    assert "pg_dump" in out["error"] and "postgresql" in out["error"]
+    assert "postgresql" in out["error"]
+    assert "pg_dump" in out["hint"]  # a Postgres user is told what to do instead
     assert "hunter2" not in json.dumps(out)
     assert not (tmp_path / "backups").exists()
 
@@ -403,7 +412,7 @@ async def test_a_failed_backup_leaves_no_partial_file(source_db, tmp_path, monke
         raise sqlite3.DatabaseError("disk I/O error")
 
     monkeypatch.setattr(workflows, "_database_facts", explode)
-    out = await workflows.database_backup(destination="nightly")
+    out = await workflows.database_backup()
 
     assert "Backup failed" in out["error"]
     assert list((tmp_path / "backups").iterdir()) == []  # not even a hidden .partial directory
@@ -457,14 +466,6 @@ async def test_a_file_that_is_not_a_honeypot_database_is_not_kept(tmp_path, monk
     assert list((tmp_path / "backups").iterdir()) == []
 
 
-async def test_verify_false_skips_the_integrity_check_and_the_hash(source_db):
-    from honeypot_mcp.tools.workflows import database_backup
-
-    out = await database_backup(verify=False)
-    assert out["verified"] is False and out["sha256"] is None
-    assert out["integrity_check"] == "not run" and out["alerts"] == 30
-
-
 async def test_the_backup_opens_with_the_projects_own_init_db(source_db, tmp_path, monkeypatch):
     """What `scripts/analyze_backup.py` does with a backup: open it with the server's own code."""
     from sqlalchemy import func, select
@@ -504,14 +505,14 @@ async def test_concurrent_backups_do_not_both_pass_the_same_free_space_check(
     def tight_free(_path):
         return state["free"]
 
-    def slow_backup(source, work_dir, verify, expected):
+    def slow_backup(source, work_dir, expected):
         import time
 
         state["running"] += 1
         state["peak"] = max(state["peak"], state["running"])
         try:
             time.sleep(0.2)
-            manifest = real_backup(source, work_dir, verify, expected)
+            manifest = real_backup(source, work_dir, expected)
             state["free"] -= expected  # what this backup took from the disk
             return manifest
         finally:
@@ -519,9 +520,7 @@ async def test_concurrent_backups_do_not_both_pass_the_same_free_space_check(
 
     monkeypatch.setattr(workflows, "_free_bytes", tight_free)
     monkeypatch.setattr(workflows, "_backup_into", slow_backup)
-    first, second = await asyncio.gather(
-        workflows.database_backup(destination="one"), workflows.database_backup(destination="two")
-    )
+    first, second = await asyncio.gather(workflows.database_backup(), workflows.database_backup())
 
     outcomes = sorted("error" in r for r in (first, second))
     assert outcomes == [False, True], (first, second)
@@ -530,21 +529,21 @@ async def test_concurrent_backups_do_not_both_pass_the_same_free_space_check(
     assert len(list((tmp_path / "backups").iterdir())) == 1
 
 
-async def test_a_nested_destination_creates_every_missing_directory_owner_only(
-    source_db, tmp_path, monkeypatch
-):
+async def test_missing_backup_directories_are_created_owner_only(source_db, tmp_path, monkeypatch):
     """`mkdir(mode=0o700, parents=True)` applies the mode to the leaf only: the directories above
     it took the umask's 0755 over a backup that holds every captured credential."""
+    from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools import workflows
 
+    root = tmp_path / "weekly" / "2026" / "backups"
+    monkeypatch.setattr(get_settings(), "backup_dir", root)
     old = os.umask(0o022)
     try:
-        out = await workflows.database_backup(destination="weekly/2026/w42")
+        out = await workflows.database_backup()
     finally:
         os.umask(old)
     assert "error" not in out, out
-    root = tmp_path / "backups"
-    for directory in (root, root / "weekly", root / "weekly" / "2026", root / "weekly/2026/w42"):
+    for directory in (tmp_path / "weekly", tmp_path / "weekly" / "2026", root, Path(out["path"])):
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
 
 
@@ -556,6 +555,6 @@ async def test_an_existing_backup_directory_keeps_the_mode_the_operator_gave_it(
     root = tmp_path / "backups"
     root.mkdir()
     root.chmod(0o750)
-    out = await workflows.database_backup(destination="nightly")
+    out = await workflows.database_backup()
     assert "error" not in out, out
     assert stat.S_IMODE(root.stat().st_mode) == 0o750

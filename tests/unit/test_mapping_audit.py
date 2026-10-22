@@ -84,17 +84,26 @@ def _reports() -> Path:
 
 
 async def _sample(**kwargs: Any) -> dict[str, Any]:
-    from honeypot_mcp.tools.mapping_audit import mapping_audit
+    """The sampler behind the tool. The tool itself takes no sizing knobs (it sizes its own
+    sample and seeds from the data); the knobs stay on `_sample` so the design stays testable."""
+    from honeypot_mcp.tools import mapping_audit as ma
 
     kwargs.setdefault("sample_size", 30)
     kwargs.setdefault("seed", 7)
-    return await mapping_audit("sample", **kwargs)
+    return await ma._sample(kwargs.pop("since_hours", None), **kwargs)
 
 
 async def _score(**kwargs: Any) -> dict[str, Any]:
-    from honeypot_mcp.tools.mapping_audit import mapping_audit
+    """The scorer behind the tool, with explicit key file / top / draws."""
+    from honeypot_mcp.tools import mapping_audit as ma
 
-    return await mapping_audit("score", **kwargs)
+    return await ma._score(
+        kwargs.get("labels_file"),
+        kwargs.get("key_file"),
+        kwargs.get("second_labels_file"),
+        kwargs.get("top", 15),
+        kwargs.get("interval_draws", 200),
+    )
 
 
 def _lines(name: str) -> list[dict[str, Any]]:
@@ -789,18 +798,19 @@ async def test_score_rejects_bad_labels_with_every_problem_listed():
 
 
 async def test_score_needs_both_files_and_valid_options():
-    assert "needs labels_file and key_file" in (await _score())["error"]
+    assert "needs a labels file and a key file" in (await _score())["error"]
     key_name, _ = await _sampled_key()
     _write_labels("e.jsonl", [])
     assert "no labels" in (await _score(labels_file="e.jsonl", key_file=key_name))["error"]
     assert "top" in (await _score(labels_file="e.jsonl", key_file=key_name, top=0))["error"]
     assert (
-        "interval_draws"
+        "draws must be"
         in (await _score(labels_file="e.jsonl", key_file=key_name, interval_draws=5))["error"]
     )
     from honeypot_mcp.tools.mapping_audit import mapping_audit
 
-    assert "action must be" in (await mapping_audit("nonsense"))["error"]  # type: ignore[arg-type]
+    assert "without labels_file" in (await mapping_audit(second_labels_file="e.jsonl"))["error"]
+    assert "since_hours" in (await mapping_audit(since_hours="soon"))["error"]  # type: ignore[arg-type]
 
 
 async def test_score_reads_files_only_from_the_reports_directory(tmp_path, monkeypatch):
@@ -834,6 +844,25 @@ async def test_score_reads_files_only_from_the_reports_directory(tmp_path, monke
 
     monkeypatch.setattr(ma, "_MAX_FILE_BYTES", 10)
     assert "limit" in (await _score(labels_file="real.jsonl", key_file=key_name))["error"]
+
+
+async def test_the_tool_samples_with_no_arguments_and_scores_by_name_alone():
+    from honeypot_mcp.tools.mapping_audit import mapping_audit
+
+    await _seed()
+    drawn = await mapping_audit()
+    assert "error" not in drawn, drawn
+    assert drawn["sampled"] >= len(SEED_COUNTS)
+    key = {i["item_id"]: i for i in _items(drawn["key_file"]["name"])}
+    _write_labels(
+        "mine.jsonl", [{"item_id": i, "techniques": r["mapped_techniques"]} for i, r in key.items()]
+    )
+    out = await mapping_audit(labels_file="mine.jsonl")  # the matching key is found by itself
+    assert "error" not in out, out
+    assert out["key_file_used"] == drawn["key_file"]["name"]
+    assert out["labeller_a"]["headline"]["strict"]["exact_agreement"]["population"]["rate"] == 1.0
+    missing = await mapping_audit(labels_file="missing.jsonl")
+    assert "not found" in missing["error"]
 
 
 async def test_the_tool_is_operator_tier_and_registered():
