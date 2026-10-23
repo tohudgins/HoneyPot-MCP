@@ -372,7 +372,7 @@ Without a forwarder these are believable decoys with no callback ([KNOWN_LIMITAT
 ```bash
 uv run pytest tests/unit/ -v
 uv run ruff check src/ tests/
-uv run mypy src/
+uv run mypy src/ scripts/
 ```
 
 **PostgreSQL:** `pip install -e ".[postgres]"` and `DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/honeypot`. CI runs the whole suite against a real PostgreSQL on every push.

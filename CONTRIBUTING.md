@@ -20,7 +20,7 @@ uv run pytest tests/unit/ -q          # fast; milliseconds each
 uv run pytest tests/integration/ -q   # binds real ports; seconds each
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
-uv run mypy src/
+uv run mypy src/ scripts/
 ```
 
 Lint, format check, type check, the unit and integration suites and a job that

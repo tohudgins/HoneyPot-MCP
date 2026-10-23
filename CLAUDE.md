@@ -32,7 +32,7 @@ uv run ruff check src/ tests/
 uv run ruff format src/ tests/
 
 # Type check
-uv run mypy src/
+uv run mypy src/ scripts/
 ```
 
 ## Architecture
