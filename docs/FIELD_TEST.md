@@ -110,9 +110,11 @@ It covers `alerts_stats` over five window shapes (all time, mid-hour start, on t
 event types with their true counts), per-sensor hit counts, `soc_brief`'s volume and untriaged
 counts and the order of its queue, `alerts_recent` filters, `alerts_search`, `threat_timeline`,
 `analyze_attacker` and the journey for heavy and light real sources (count, first and last seen to
-the microsecond, breakdowns), the blocklist's membership, `analyze_campaign` (the same campaigns and
-event counts as a raw `GROUP BY` over the alert table), `fingerprint_clusters` (distinct IPs,
-sessions and first/last seen per HASSH against `json_extract`), `attack_summary`'s totals, and
+the microsecond, breakdowns), the blocklist's membership, `analyze_campaign` (every hour with three or
+more sources on one event type lands in exactly one campaign, with the same event count as a raw
+`GROUP BY`; the tool's own reply must report the true total and show the top 10 by score),
+`fingerprint_clusters` (distinct IPs, sessions and first/last seen per HASSH against
+`json_extract`, and the tool's reply must be the 10 largest of them), `attack_summary`'s totals, and
 cross-tool invariants. Only `map_ttps` is listed as not covered, with the reason, rather than
 skipped silently.
 
@@ -155,7 +157,7 @@ data was then backed up and checked offline:
 | Check | Result |
 |---|---|
 | `field_test.py attack` then `verify` against the backup | 23 of 23 engines proven end to end; 0 probes failed |
-| `field_test_tools.py` | 86 checks over all 70 registered tools: 85 passed, 1 failed. The failure was the check's own expectation (it required an error message back, and `sql_query` correctly refused the secret table); the check now asserts the refusal and has not been re-run against a live host |
+| `field_test_tools.py` | 86 checks over all 70 registered tools (83 now; every one is called or skipped with a reason): 85 passed, 1 failed. The failure was the check's own expectation (it required an error message back, and `sql_query` correctly refused the secret table); the check now asserts the refusal and has not been re-run against a live host |
 | `field_test_ops.py` | 20 of 20 (after three of its own checks were corrected: the campaign result shape, the triage window, and throttling the sensor's *current* top source) |
 | `field_test_oracle.py` on the final backup | 73 checks, 0 failed, on 17.5M alerts (6 min 25 s on SQLite) |
 | `field_test_injection.py` | 3 of 3 scenarios held (summarise, triage, investigate); one model and one sample each |

@@ -4,6 +4,34 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Every tool answers from one sentence: the agent-first contract
+
+**A tool an assistant has to be taught a flag for is a defect.** The remaining knobs are gone and a
+test now keeps them gone.
+
+- **Sizing and path knobs removed.** `top`, `limit` (on the analysis tools), `rank_by`, `window_minutes`, `timeout_seconds`,
+  `destination`, `verify`, `sample_size`, `seed`, `action`, `analyst` and, on `export_blocklist`,
+  `export_stix` and `generate_report`, `output_path` were removed. Tools show a sensible number of rows and say what was cut in a `count`
+  and a `note`; a bigger answer is a narrower question (an address, an event type). Files are written to
+  `REPORTS_DIR` under generated names. `mapping_audit` samples with no arguments and scores when given a
+  labels file; `database_backup` takes none.
+- **Dict results everywhere.** `honeypot_list`, `honeypot_health`, `honeytoken_list`, `api_key_list` and
+  `honeypot_templates` return `{count, <items>, note}` instead of a bare list, which an MCP client shows
+  as an empty response.
+- **Safer defaults.** `blocklist_push_cloudflare`, `_pfsense` and `_aws_waf` are a dry run until
+  `dry_run=False` is asked for. `alerts_acknowledge` records the caller's identity rather than a
+  caller-supplied `analyst`.
+- **`tests/unit/test_tool_contract.py`** reads the registry: dict returns, every parameter explained, at
+  most three required and eight total parameters, a real first line, and a 70,000-character budget for
+  the tool list (every description and schema sits in the model's context for the whole conversation).
+- **Bugs the removal exposed.** `run_analysis` and `attack_patterns` still passed removed arguments to the
+  tools they call (`run_analysis` raised on every call); `audit_log_search` measured `since_hours` from the
+  wall clock instead of the newest alert, so it returned nothing on a restored backup. Shared logic now
+  sits in helpers (`cluster_ssh_clients`, `write_report`) instead of one tool calling another's signature.
+- **CI.** `run_analysis` runs its parts in sequence on the one shared in-memory test connection (a file
+  database still runs them together), and `pillow`, `certifi` and `opentelemetry-api` were bumped for
+  published advisories.
+
 ## No flags to know, no settings to set
 
 **The point of a natural-language interface is that nobody has to know a flag exists.** The two

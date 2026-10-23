@@ -58,6 +58,16 @@ class Oracle:
         return ("WHERE timestamp >= ?", (stamp(since),)) if since else ("", ())
 
 
+def event_breakdown_ok(got: dict[str, int], want: dict[str, int]) -> bool:
+    """The profile lists an address's 20 most frequent event types: each count must be true and
+    the counts must be the 20 largest (which types fill a tie at the edge is not defined)."""
+    return (
+        all(want.get(t) == n for t, n in got.items())
+        and sorted(got.values(), reverse=True) == sorted(want.values(), reverse=True)[: len(got)]
+        and len(got) == min(20, len(want))
+    )
+
+
 def sev_dict(rows: list[tuple]) -> dict[str, int]:
     return {r[0]: r[1] for r in rows}
 
@@ -158,11 +168,18 @@ async def run(args: argparse.Namespace) -> int:
         )
 
     print("== honeypot_list hit counts against GROUP BY honeypot_id")
-    listed = await H.honeypot_list()
+    listing = await H.honeypot_list()
+    listed = listing["honeypots"]
     want = dict(
         o.rows("SELECT honeypot_id, count(*) FROM alerts WHERE honeypot_id IS NOT NULL GROUP BY 1")
     )
     got_hits = {h["id"]: h["hits"] for h in listed if h["hits"]}
+    check(
+        "sensors",
+        "every sensor is listed",
+        listing["count"] == len(listed) == o.one("SELECT count(*) FROM honeypots"),
+        f"count {listing['count']}, rows {len(listed)}",
+    )
     check("sensors", "per-sensor hits", got_hits == want, f"{len(got_hits)} sensors vs {len(want)}")
     check(
         "invariant",
@@ -193,20 +210,46 @@ async def run(args: argparse.Namespace) -> int:
             brief["untriaged_by_severity"][sev] == want_open,
             f"{brief['untriaged_by_severity'][sev]} != {want_open}",
         )
-    want_ids = [
-        r[0]
-        for r in o.rows(
-            "SELECT id FROM alerts WHERE timestamp >= ? AND severity = 'critical' AND acknowledged = 0 "
-            "ORDER BY timestamp DESC LIMIT 10",
+    # needs_attention is one example per (severity, event type): CRITICAL types before HIGH ones
+    # and, within a severity, the type with the fewest open alerts first.
+    open_types = sorted(
+        o.rows(
+            "SELECT severity, event_type, count(*) FROM alerts WHERE timestamp >= ? "
+            "AND severity IN ('critical', 'high') AND acknowledged = 0 GROUP BY 1, 2",
             cut,
-        )
-    ]
-    got_ids = [a.get("id") or a.get("alert_id") for a in brief["needs_attention"]][:10]
+        ),
+        key=lambda r: (0 if r[0] == "critical" else 1, r[2], r[1]),
+    )
+    want_queue = [(r[0], r[1]) for r in open_types][:10]
+    got_queue = [(a["severity"], a["event_type"]) for a in brief["needs_attention"]]
     check(
         "brief",
-        "needs_attention lists the newest untriaged CRITICAL alerts first",
-        got_ids == want_ids,
-        f"{got_ids[:3]} vs {want_ids[:3]}",
+        "needs_attention is one open example per event type, CRITICAL first, rarest type first",
+        got_queue == want_queue,
+        f"{got_queue[:3]} vs {want_queue[:3]}",
+    )
+    got_ids = [a["alert_id"] for a in brief["needs_attention"]]
+    check(
+        "brief",
+        "each example is a real open alert of that severity and event type",
+        all(
+            o.rows(
+                "SELECT 1 FROM alerts WHERE id = ? AND severity = ? AND event_type = ? "
+                "AND acknowledged = 0 AND timestamp >= ?",
+                a["alert_id"],
+                a["severity"],
+                a["event_type"],
+                cut,
+            )
+            for a in brief["needs_attention"]
+        ),
+        str(got_ids[:5]),
+    )
+    check(
+        "brief",
+        "needs_attention_total is the open CRITICAL + HIGH count",
+        brief["needs_attention_total"] == sum(r[2] for r in open_types),
+        f"{brief['needs_attention_total']} vs {sum(r[2] for r in open_types)}",
     )
 
     print("== alerts_recent filters against ORDER BY ... LIMIT")
@@ -248,35 +291,57 @@ async def run(args: argparse.Namespace) -> int:
     print("== alerts_search against LIKE over source, event type and the payload")
     for q in ("wget", "root", "198.51.100", "CONFIG SET"):
         got = await A.alerts_search(query=q, limit=40)
-        like = f"%{q}%"
         want_ts = [
             r[0]
             for r in o.rows(
-                "SELECT timestamp FROM alerts WHERE source_ip LIKE ? OR event_type LIKE ? OR CAST(payload AS TEXT) LIKE ? "
-                "ORDER BY timestamp DESC LIMIT 40",
-                like,
-                like,
-                like,
+                "SELECT timestamp FROM alerts WHERE instr(source_ip, ?) > 0 OR instr(event_type, ?) > 0 "
+                "OR instr(CAST(payload AS TEXT), ?) > 0 ORDER BY id DESC LIMIT 40",  # ids rise with time
+                q,
+                q,
+                q,
             )
         ]
         got_ts = [stamp(datetime.fromisoformat(a["timestamp"])) for a in got["alerts"]]
+        # The reply is cut to a readable size, and says so in `note`: what it shows must still be
+        # exactly the newest rows, a prefix of the SQL answer.
         check(
             "search",
-            f"'{q}': the newest 40 rows that contain it",
-            got_ts == want_ts,
+            f"'{q}': the newest rows that contain it (case-sensitive), cut only with a note",
+            bool(got_ts) == bool(want_ts)
+            and got_ts == want_ts[: len(got_ts)]
+            and (len(got_ts) == len(want_ts) or bool(got.get("note"))),
             f"{len(got_ts)} vs {len(want_ts)}",
         )
 
     print("== threat_timeline against the window and ordering")
-    tl = await N.threat_timeline(hours=int(hours_ago(t_first)) + 1, limit=500)
+    tl_hours = int(hours_ago(t_first)) + 1
+    tl = await N.threat_timeline(hours=tl_hours)
+    tl_cut = stamp(datetime.now(UTC) - timedelta(hours=tl_hours))
     stamps = [e["timestamp"] for e in tl["events"]]
+    check("timeline", "entries are oldest first", stamps == sorted(stamps))
     check(
         "timeline",
-        "events are in time order",
-        stamps == sorted(stamps) or stamps == sorted(stamps, reverse=True),
+        "events_in_window is the exact SQL count for the window",
+        tl["events_in_window"] == o.one("SELECT count(*) FROM alerts WHERE timestamp >= ?", tl_cut),
+        f"{tl['events_in_window']}",
     )
     check(
-        "timeline", "returns the limit when there is more data", tl["count"] == 500 and total > 500
+        "timeline",
+        "shows at most its 40 entries, and fewer events than the window when it is cut",
+        tl["count"] == len(tl["events"]) <= 40
+        and sum(e.get("repeated", 1) for e in tl["events"]) <= tl["events_in_window"],
+        f"{tl['count']} entries",
+    )
+    newest = o.one("SELECT max(timestamp) FROM alerts WHERE timestamp >= ?", tl_cut)
+    last_entry = tl["events"][-1] if tl["events"] else {}
+    check(
+        "timeline",
+        "the last entry ends at the newest alert in the window",
+        stamp(datetime.fromisoformat(last_entry.get("until", last_entry.get("timestamp", ""))))
+        == newest
+        if last_entry
+        else newest is None,
+        f"{last_entry} vs {newest}",
     )
 
     print("== analyze_attacker for real sources against SQL")
@@ -317,9 +382,14 @@ async def run(args: argparse.Namespace) -> int:
             == sev_dict(
                 o.rows("SELECT severity, count(*) FROM alerts WHERE source_ip = ? GROUP BY 1", ip)
             )
-            and got["event_breakdown"]
-            == dict(
-                o.rows("SELECT event_type, count(*) FROM alerts WHERE source_ip = ? GROUP BY 1", ip)
+            and event_breakdown_ok(
+                got["event_breakdown"],
+                dict(
+                    o.rows(
+                        "SELECT event_type, count(*) FROM alerts WHERE source_ip = ? GROUP BY 1",
+                        ip,
+                    )
+                ),
             ),
         )
     j = await N.analyze_attacker_journey(ip=sample[0], hours=int(hours_ago(t_first)) + 1)
@@ -368,7 +438,7 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     print("== deception_coverage against the signature registry")
-    cov = await D.deception_coverage(include_recommendations=False)
+    cov = await D.deception_coverage()
     from honeypot_mcp.deception import capabilities as caps
 
     live_types = {t for (t,) in o.rows("SELECT DISTINCT type FROM honeypots")}
@@ -386,7 +456,22 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     print("== analyze_campaign against a raw GROUP BY (hour, event type, source)")
-    camp = await N.analyze_campaign(window_minutes=60, min_sources=3, limit=100_000)
+    # The tool shows only its top 10, so the full set is taken from the engine it calls (the hourly
+    # rollup rows through detect_campaigns), which is what the raw SQL below is compared against.
+    from honeypot_mcp.analysis.correlator import detect_campaigns, rolled_alerts
+    from honeypot_mcp.storage import rollups
+    from honeypot_mcp.storage.database import get_session
+
+    async with get_session() as session:
+        campaign_rows = await rollups.campaign_rows(session, None, 500_001)
+    all_campaigns = await detect_campaigns(
+        alerts=rolled_alerts(campaign_rows),
+        window_minutes=0,
+        min_sources=3,
+        event_type_contains=None,
+        involving_ip=None,
+    )
+    camp = await N.analyze_campaign(min_sources=3)
     per: dict[tuple[str, str], list[Any]] = {}
     for et, hour, ip, n in o.rows(
         "SELECT event_type, strftime('%Y-%m-%d %H:00:00', timestamp), source_ip, count(*) "
@@ -395,38 +480,59 @@ async def run(args: argparse.Namespace) -> int:
         group = per.setdefault((et, hour), [set(), 0])
         group[0].add(ip)
         group[1] += n
-    by_type: dict[str, list[tuple[set[str], int]]] = {}
-    for (et, _hour), (ips, n) in per.items():
-        if len(ips) >= 3:
-            by_type.setdefault(et, []).append((ips, n))
-    want: Counter = Counter()
-    want_events = 0
-    for et, groups in by_type.items():
-        kept: list[tuple[set[str], int]] = []
-        for ips, n in sorted(groups, key=lambda g: -len(g[0])):  # largest first, drop subsets
-            if not any(ips <= k[0] for k in kept):
-                kept.append((ips, n))
-        for ips, n in kept:
-            want[(et, frozenset(ips))] += 1
-            want_events += n
-    got = Counter((c["event_type"], frozenset(c["source_ips"])) for c in camp["campaigns"])
+    # An hour in which at least 3 sources hit one event type is a window; windows of one event
+    # type that share their sources are merged into one campaign, none is dropped.
+    hour_windows = {key: g for key, g in per.items() if len(g[0]) >= 3}
+    want_events = sum(n for _, n in hour_windows.values())
+    union_by_type: dict[str, set[str]] = {}
+    for (et, _hour), (ips, _n) in hour_windows.items():
+        union_by_type.setdefault(et, set()).update(ips)
     check(
         "campaigns",
-        "the same campaigns (event type + sources) as the raw SQL",
-        got == want,
-        f"tool {sum(got.values())} vs sql {sum(want.values())}",
+        "every hour with 3+ sources on one event type is in exactly one campaign",
+        sum(c["occurrences"] for c in all_campaigns) == len(hour_windows),
+        f"{sum(c['occurrences'] for c in all_campaigns)} vs {len(hour_windows)}",
     )
     check(
         "campaigns",
-        "the same number of events inside them",
-        sum(c["total_events"] for c in camp["campaigns"]) == want_events,
-        f"{sum(c['total_events'] for c in camp['campaigns'])} vs {want_events}",
+        "the same number of events inside them as the raw SQL",
+        sum(c["total_events"] for c in all_campaigns) == want_events,
+        f"{sum(c['total_events'] for c in all_campaigns)} vs {want_events}",
     )
     check(
         "campaigns",
-        "nothing truncated or hidden",
-        camp["campaigns_total"] == len(camp["campaigns"]),
-        str(camp["campaigns_total"]),
+        "campaign event types and sources are exactly those of the raw SQL hour_windows",
+        {c["event_type"] for c in all_campaigns} == set(union_by_type)
+        and all(
+            set(c["source_ips"]) <= union_by_type[c["event_type"]]
+            and len(c["source_ips"])
+            <= c["unique_source_ips"]
+            <= len(union_by_type[c["event_type"]])
+            for c in all_campaigns
+        )
+        and all(
+            set().union(*(set(c["source_ips"]) for c in all_campaigns if c["event_type"] == et))
+            <= ips
+            for et, ips in union_by_type.items()
+        ),
+    )
+    shown = camp["campaigns"]
+    pool = Counter(
+        (c["event_type"], c["unique_source_ips"], c["total_events"]) for c in all_campaigns
+    )
+    shown_keys = Counter(
+        (c["event_type"], c["unique_source_ips"], c["total_events"]) for c in shown
+    )
+    check(
+        "campaigns",
+        "the tool reports the true total and shows the top 10 of them by score",
+        camp["campaigns_total"] == len(all_campaigns)
+        and camp["count"] == len(shown) == min(10, len(all_campaigns))
+        and [c["score"] for c in shown] == sorted((c["score"] for c in shown), reverse=True)
+        and not shown_keys - pool
+        and [c["score"] for c in shown]
+        == [c["score"] for c in sorted(all_campaigns, key=lambda c: -c["score"])[: len(shown)]],
+        f"total {camp['campaigns_total']} vs {len(all_campaigns)}, shown {len(shown)}",
     )
 
     print("== fingerprint_clusters against json_extract over ssh_client_kex")
@@ -441,7 +547,8 @@ async def run(args: argparse.Namespace) -> int:
             cutoff,
         )
     }
-    fp = await N.fingerprint_clusters(hours=2160, min_sources=1, limit=100)
+    # The tool shows its 10 largest groups; the full comparison uses the clustering it is built on.
+    fp = await N.cluster_ssh_clients(2160, 1, 100)
     check(
         "clusters",
         "fingerprint count and no truncation",
@@ -461,6 +568,16 @@ async def run(args: argparse.Namespace) -> int:
         f"distinct IPs, sessions, first/last seen for {len(fp['clusters'])} clusters",
         not bad,
         str(bad[:3]),
+    )
+    fp_tool = await N.fingerprint_clusters(hours=2160, min_sources=1)
+    fp_top = [(c["distinct_ips"], c["sessions"]) for c in fp["clusters"][:10]]
+    check(
+        "clusters",
+        "the tool shows the 10 largest groups and reports how many match",
+        fp_tool["clusters_matching"] == fp["clusters_matching"] == len(want_fp)
+        and fp_tool["count"] == len(fp_tool["clusters"]) == min(10, len(want_fp))
+        and [(c["distinct_ips"], c["sessions"]) for c in fp_tool["clusters"]] == fp_top,
+        f"{fp_tool['clusters_matching']} matching, {fp_tool['count']} shown",
     )
 
     print("== attack_summary against the alert table")

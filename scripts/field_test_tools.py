@@ -44,6 +44,12 @@ SKIPPED = {
     "suppression_load_preset": "a preset could briefly drop real events on a live collector",
     "deception_deploy_plan": "deploys a second full estate on a live collector; the planner and "
     "the deploy tool it feeds (honeypot_deploy) are both exercised",
+    "database_backup": "copies the whole database onto the collector's disk (minutes and several GB "
+    "on a long run); scripts/backup.sh and fetch_backup.sh are the tested path",
+    "detection_rules_update": "downloads the Emerging Threats ruleset: the only call that gives a "
+    "container a network",
+    "grafana_start": "starts a container on a live collector",
+    "grafana_stop": "stops the container grafana_start would have started",
 }
 
 
@@ -144,22 +150,22 @@ async def run(a: argparse.Namespace) -> int:
     print("== viewer tools (read-only)")
     v = "viewer"
     await sw.expect(v, "ping", None, "answers", lambda d: d)
-    hp = await sw.expect(v, "honeypot_list", None, "lists the estate", lambda d: len(d) >= 1)
-    names = [h["name"] for h in hp or []]
+    hp = await sw.expect(v, "honeypot_list", None, "lists the estate", lambda d: d["count"] >= 1)
+    names = [h["name"] for h in (hp or {}).get("honeypots", [])]
     http_name = next(
         (n for n in names if "http" in n and "elastic" not in n), names[0] if names else ""
     )
     await sw.expect(
         v, "honeypot_status", {"name": http_name}, "one sensor", lambda d: d.get("status")
     )
-    await sw.expect(v, "honeypot_health", None, "probes every sensor", lambda d: d)
+    await sw.expect(v, "honeypot_health", None, "probes every sensor", lambda d: d["count"] >= 1)
     await sw.expect(v, "honeypot_logs", {"name": http_name, "lines": 5}, "recent log lines")
-    await sw.expect(v, "honeypot_templates", None, "engine catalogue", lambda d: d)
+    await sw.expect(v, "honeypot_templates", None, "engine catalogue", lambda d: d["types"])
     await sw.expect(v, "alerts_stats", None, "totals", lambda d: d["total_alerts"] > 0)
     recent = await sw.expect(
         v,
         "alerts_recent",
-        {"limit": 5, "include_payload": True},
+        {"limit": 5},
         "latest alerts",
         lambda d: d["count"] >= 1,
     )
@@ -177,7 +183,7 @@ async def run(a: argparse.Namespace) -> int:
     await sw.expect(
         v,
         "analyze_campaign",
-        {"window_minutes": 600, "min_sources": 2},
+        {"since_hours": 10, "min_sources": 2},
         "campaigns",
         lambda d: d is not None,
     )
@@ -213,14 +219,14 @@ async def run(a: argparse.Namespace) -> int:
     await sw.expect(
         v,
         "fingerprint_clusters",
-        {"hours": 24, "min_sources": 2, "limit": 5},
+        {"hours": 24, "min_sources": 2},
         "clusters",
         lambda d: d is not None,
     )
     await sw.expect(
         v,
         "generate_report",
-        {"title": "field test", "since_hours": 24, "limit": 50},
+        {"since_hours": 24},
         "writes a report artifact",
         lambda d: d,
     )
@@ -265,11 +271,18 @@ async def run(a: argparse.Namespace) -> int:
         "no key: a note; with a key: an answer",
         lambda d: d.get("available") is False or d.get("known") is False,
     )
-    await sw.expect(
-        v, "threat_timeline", {"hours": 24, "limit": 10}, "timeline", lambda d: d["count"] >= 1
-    )
+    await sw.expect(v, "threat_timeline", {"hours": 24}, "timeline", lambda d: d["count"] >= 1)
     await sw.expect(v, "soc_brief", {"since_hours": 24}, "analyst brief", lambda d: d["headline"])
-    await sw.expect(v, "honeytoken_list", None, "tokens", lambda d: d is not None)
+    await sw.expect(v, "honeytoken_list", None, "tokens", lambda d: "tokens" in d)
+    await sw.expect(
+        v,
+        "attack_patterns",
+        {"kind": "credentials", "since_hours": 24, "top": 5},
+        "credential patterns without SQL",
+        lambda d: "count" in d and "window" in d,
+    )
+    await sw.expect(v, "bait_trips", None, "who tripped which bait", lambda d: d is not None)
+    await sw.expect(v, "grafana_status", None, "dashboard state", lambda d: d is not None)
     await sw.expect(v, "pcap_status", None, "capture state explained", lambda d: d)
     await sw.expect(v, "pcap_files", None, "capture files", lambda d: d is not None)
     await sw.expect(v, "suppression_list", None, "rules", lambda d: d is not None)
@@ -289,14 +302,14 @@ async def run(a: argparse.Namespace) -> int:
     await sw.expect(
         o,
         "honeypot_self_test",
-        {"name": tmp, "timeout_seconds": 20},
+        {"name": tmp},
         "end-to-end self test passes",
         lambda d: d.get("probe_sent") is True and d.get("alert_received") is True,
     )
     await sw.expect(
         o,
         "honeypot_configure",
-        {"name": tmp, "config": {"persona": "nginx_ubuntu"}},
+        {"name": tmp, "config": {"persona": "nginx_stable"}},
         "changes its config",
         lambda d: d,
     )
@@ -363,7 +376,6 @@ async def run(a: argparse.Namespace) -> int:
             "event_type": "http_probe",
             "disposition": "benign",
             "note": "field test traffic",
-            "analyst": "field_test",
         },
         "triages by filter",
         lambda d: d is not None,
@@ -388,7 +400,7 @@ async def run(a: argparse.Namespace) -> int:
     sup = await sw.expect(
         o,
         "suppression_add",
-        {"label": f"{tag}-rule", "ip_pattern": "203.0.113.77", "action": "drop"},
+        {"label": f"{tag}-rule", "ip_pattern": "203.0.113.77"},
         "adds a scoped rule",
         lambda d: d,
     )
@@ -425,6 +437,38 @@ async def run(a: argparse.Namespace) -> int:
             (not ok) and "capture" in str(data).lower(),
             str(data),
         )
+
+    # Tools that need an optional dependency (a capture, Docker, YARA) must answer or refuse in words.
+    for tool, args in (
+        ("pcap_detect", None),
+        ("sample_scan", None),
+    ):
+        ok, data = await sw.call(o, tool, args)
+        sw.record(
+            o, tool, "answers, or refuses naming what is missing", ok or bool(data), str(data)
+        )
+    await sw.expect(
+        o,
+        "mapping_audit",
+        {"since_hours": 24},
+        "draws a blind ATT&CK sample into the reports directory",
+        lambda d: d,
+    )
+    await sw.expect(
+        o,
+        "run_analysis",
+        {"hours": 1},
+        "the whole post-run workflow in one call",
+        lambda d: d,
+    )
+    ok, data = await sw.call(v, "pcap_analyze", None)
+    sw.record(
+        v,
+        "pcap_analyze",
+        "reads the newest capture, or names why there is none",
+        ok or "capture" in str(data).lower(),
+        str(data),
+    )
 
     print("== honeytoken round trip (plant -> real SSH login -> CRITICAL -> TRIGGERED)")
     cred = await sw.expect(
@@ -476,7 +520,15 @@ async def run(a: argparse.Namespace) -> int:
 
     print("== admin tools")
     ad = "admin"
-    await sw.expect(ad, "api_key_list", None, "lists keys", lambda d: d is not None)
+    ok, data = await sw.call(ad, "sample_collect", None)
+    sw.record(
+        ad,
+        "sample_collect",
+        "collects from running Cowrie sensors, or says why it cannot",
+        ok or bool(data),
+        str(data),
+    )
+    await sw.expect(ad, "api_key_list", None, "lists keys", lambda d: "keys" in d)
     key = await sw.expect(
         ad,
         "api_key_create",
@@ -506,7 +558,7 @@ async def run(a: argparse.Namespace) -> int:
         "audit_log_search",
         {"since_hours": 1, "limit": 50},
         "the lifecycle above is audited",
-        lambda d: d.get("count", len(d.get("entries", []))) >= 1 or d,
+        lambda d: d.get("count", 0) >= 1,
     )
     await sw.refused(
         ad,
@@ -554,18 +606,18 @@ async def run(a: argparse.Namespace) -> int:
     )
 
     # Leave nothing behind: revoke any token this run labelled that is still active.
-    ok, listed = await sw.call(v, "honeytoken_list", None)
+    ok, listed = await sw.call(v, "honeytoken_list", {"label": tag, "status": "active"})
     leftover = [
         t
-        for t in (listed.get("tokens", listed) if isinstance(listed, dict) else listed or [])
+        for t in (listed.get("tokens", []) if isinstance(listed, dict) else [])
         if str(t.get("label", "")).startswith(tag) and t.get("status") == "active"
     ]
     for t in leftover:
         await sw.call(o, "honeytoken_revoke", {"token_id": t["id"]})
-    ok, listed = await sw.call(v, "honeytoken_list", None)
+    ok, listed = await sw.call(v, "honeytoken_list", {"label": tag, "status": "active"})
     still = [
         t
-        for t in (listed.get("tokens", listed) if isinstance(listed, dict) else listed or [])
+        for t in (listed.get("tokens", []) if isinstance(listed, dict) else [])
         if str(t.get("label", "")).startswith(tag) and t.get("status") == "active"
     ]
     sw.rows.append(
@@ -573,8 +625,8 @@ async def run(a: argparse.Namespace) -> int:
             "-",
             "(cleanup)",
             f"revoked {len(leftover)} leftover token(s); none of this run's tokens remain active",
-            not still,
-            f"still active: {still}",
+            ok and not still,
+            f"still active: {still}" if ok else f"could not list tokens: {listed}",
         )
     )
 

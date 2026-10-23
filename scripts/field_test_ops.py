@@ -84,7 +84,7 @@ async def run(a: argparse.Namespace) -> int:
     ]
     flooder = real[0]["ip"] if real else None
     crit = await r.call(
-        "viewer", "alerts_recent", {"limit": 200, "severity": "critical", "since_hours": 12}
+        "viewer", "alerts_recent", {"limit": 100, "severity": "critical", "since_hours": 12}
     )
     crit_ips = [
         x["source_ip"]
@@ -104,9 +104,7 @@ async def run(a: argparse.Namespace) -> int:
             "severity": "critical",
             "disposition": "true_positive",
             "note": "field test: real attacker triaged",
-            "analyst": "field_test",
             "since_hours": 12,  # the same window the queue below is counted over
-            "max_alerts": 500,
         },
     )
     n = ack.get("acknowledged") or ack.get("updated") or ack.get("count") or 0
@@ -119,7 +117,9 @@ async def run(a: argparse.Namespace) -> int:
         f"{before} -> {after}, acked {n}",
     )
     got = await r.call(
-        "viewer", "alerts_recent", {"source_ip": target, "severity": "critical", "limit": 50}
+        "viewer",
+        "alerts_recent",
+        {"source_ip": target, "severity": "critical", "limit": 50, "since_hours": 12},
     )
     r.check(
         "triage",
@@ -159,27 +159,26 @@ async def run(a: argparse.Namespace) -> int:
     r.check(
         "analysis",
         "ATT&CK mapping names techniques with matched evidence",
-        isinstance(ttps, list) and ttps and ttps[0].get("technique_id", "").startswith("T"),
+        bool(ttps.get("techniques"))
+        and str(ttps["techniques"][0].get("technique_id", "")).startswith("T"),
         str(ttps)[:150],
     )
-    camps = await r.call("viewer", "analyze_campaign", {"window_minutes": 720, "min_sources": 2})
-    found = camps.get("campaigns", []) if isinstance(camps, dict) else camps
+    camps = await r.call("viewer", "analyze_campaign", {"since_hours": 12, "min_sources": 2})
+    found = camps.get("campaigns", [])
     r.check(
         "analysis",
         "campaign analysis groups real sources hitting the same sensor",
         bool(found) and any(c.get("unique_source_ips", 0) >= 2 for c in found),
         str(camps)[:120],
     )
-    clusters = await r.call(
-        "viewer", "fingerprint_clusters", {"hours": 12, "min_sources": 2, "limit": 5}
-    )
+    clusters = await r.call("viewer", "fingerprint_clusters", {"hours": 12, "min_sources": 2})
     r.check(
         "analysis",
         "fingerprint clusters find shared behaviour",
-        bool(clusters),
+        bool(clusters.get("clusters")) and not clusters.get("error"),
         str(clusters)[:120],
     )
-    cov = await r.call("viewer", "deception_coverage", {"include_recommendations": False})
+    cov = await r.call("viewer", "deception_coverage")
     r.check(
         "analysis",
         "coverage counts the live sensors and tokens",
@@ -189,7 +188,7 @@ async def run(a: argparse.Namespace) -> int:
     rep = await r.call(
         "viewer",
         "generate_report",
-        {"title": "field test", "ip": target, "format": "html", "since_hours": 24},
+        {"ip": target, "format": "html", "since_hours": 24},
     )
     r.check(
         "analysis",
@@ -206,7 +205,7 @@ async def run(a: argparse.Namespace) -> int:
     stix = await r.call("operator", "export_stix", {"hours": 24, "min_hits": 20})
     r.check("remediation", "STIX export reports a file", bool(stix.get("path")), str(stix)[:150])
     if flooder:
-        listing = await r.call("viewer", "honeypot_list")
+        listing = (await r.call("viewer", "honeypot_list"))["honeypots"]
         h = {x["name"]: x["hits"] for x in listing}
         hot = max(h, key=h.get)
         hot_id = {x["name"]: x["id"] for x in listing}[hot]
@@ -226,7 +225,9 @@ async def run(a: argparse.Namespace) -> int:
         share = (top_n / top_total) if top_total else 0.0
         h0 = h[hot]
         await asyncio.sleep(20)
-        h1 = {x["name"]: x["hits"] for x in await r.call("viewer", "honeypot_list")}[hot]
+        h1 = {x["name"]: x["hits"] for x in (await r.call("viewer", "honeypot_list"))["honeypots"]}[
+            hot
+        ]
         rate_before = (h1 - h0) / 20
         if rate_before < 5 or share < 0.3:
             r.check(
@@ -243,16 +244,19 @@ async def run(a: argparse.Namespace) -> int:
                 {
                     "label": "field-test ratelimit",
                     "ip_pattern": top_ip,
-                    "action": "rate_limit",
                     "rate_limit_count": 5,
                     "rate_limit_window_seconds": 60,
                 },
             )
             rid = rule.get("id") or rule.get("rule_id")
             await asyncio.sleep(6)
-            h2 = {x["name"]: x["hits"] for x in await r.call("viewer", "honeypot_list")}[hot]
+            h2 = {
+                x["name"]: x["hits"] for x in (await r.call("viewer", "honeypot_list"))["honeypots"]
+            }[hot]
             await asyncio.sleep(20)
-            h3 = {x["name"]: x["hits"] for x in await r.call("viewer", "honeypot_list")}[hot]
+            h3 = {
+                x["name"]: x["hits"] for x in (await r.call("viewer", "honeypot_list"))["honeypots"]
+            }[hot]
             rate_after = (h3 - h2) / 20
             # Throttling one source can remove at most that source's share of the traffic.
             r.check(
@@ -266,7 +270,7 @@ async def run(a: argparse.Namespace) -> int:
                 await r.call("operator", "suppression_remove", {"rule_id": rid})
 
     print("== operations (a real sensor)")
-    sensors = {x["name"]: x for x in await r.call("viewer", "honeypot_list")}
+    sensors = {x["name"]: x for x in (await r.call("viewer", "honeypot_list"))["honeypots"]}
     victim = "hp-vnc" if "hp-vnc" in sensors else next(iter(sensors))
     port = {"hp-vnc": 5900}.get(victim, sensors[victim]["port"])
     r.check("operations", f"{victim} answers on port {port} before", port_open(a.host, port))
@@ -296,7 +300,7 @@ async def run(a: argparse.Namespace) -> int:
     r.check(
         "operations",
         "health probe reports every sensor healthy after the above",
-        "unhealthy" not in json.dumps(stat).lower() or '"unhealthy": []' in json.dumps(stat),
+        stat.get("count", 0) > 0 and not stat.get("not_answering") and not stat.get("error"),
         str(stat)[:120],
     )
 

@@ -42,7 +42,7 @@ flowchart LR
     DB --> ALERT["Alerts<br/>Slack, Teams, email, SIEM"]
 ```
 
-Engines never write to the database directly: every event passes one ingestion path that applies suppression rules, matches planted credentials and caps floods before a single flusher writes it in batches. Statistics are served from hourly rollups rather than the raw alert table, so the cost of an answer does not grow with the size of the database. Tool responses are shaped for an AI context window: list tools return digests, one tool expands a single alert, and bulk output goes to disk. [CLAUDE.md](CLAUDE.md) documents the pipeline and the plugin patterns.
+Engines never write to the database directly: every event passes one ingestion path that applies suppression rules, matches planted credentials and caps floods before a single flusher writes it in batches. Statistics are served from hourly rollups rather than the raw alert table, so the cost of an answer does not grow with the size of the database. Tools are built to be driven from one plain sentence: they return dicts with a count and a note and size their own answers (list tools show a digest, one tool expands a single alert, bulk output goes to a file under `REPORTS_DIR`), and a test caps the size of the tool list so it stays cheap in an assistant's context. [CLAUDE.md](CLAUDE.md) documents the pipeline and the plugin patterns.
 
 ## Applied on a real VPS
 

@@ -169,7 +169,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 - Before exposing a VPS, run `scripts/preflight.sh`: it checks the control plane, bind addresses, disk, ports and backups, and probes every sensor end to end.
 - Harden the host first with [HARDENING.md](HARDENING.md) (default-drop firewall, validating Docker guard, sandboxed units, key-only SSH, moved control ports). The honeypots stay reachable; everything around them does not.
-- Prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one; `field_test_tools.py` exercises all 70 tools at their roles; `field_test_ops.py`, `field_test_injection.py` and `field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([FIELD_TEST.md](FIELD_TEST.md)). A quiet sensor is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
+- Prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one; `field_test_tools.py` exercises all 83 tools at their roles; `field_test_ops.py`, `field_test_injection.py` and `field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([FIELD_TEST.md](FIELD_TEST.md)). A quiet sensor is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
 
 **Internal tripwire.** Put honeypots on ports nothing legitimate uses; anything on your LAN that connects is by definition unexpected. Plant credential tokens and canary URLs on real file shares so lateral movement trips them too.
 
@@ -182,6 +182,8 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 ## MCP tools
 
 83 tools in three roles (39 viewer, 29 operator, 15 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
+
+**Built for an assistant to drive from one sentence.** Every tool returns a dict with a count and a note (never a bare list, which an MCP client shows as empty), explains each parameter to the model, asks for at most three things, and sizes its own answer instead of demanding a `top`, `rank_by` or `window_minutes` flag. A result with an `error` also has a `hint` naming the next step. Reports, exports and extracts are written to `REPORTS_DIR` under generated names. `tests/unit/test_tool_contract.py` enforces this for every registered tool, including a character budget for the tool list, which sits in the model's context for the whole conversation.
 
 ### Honeypots and deception planning
 
@@ -218,7 +220,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `alerts_get` | Full captured payload for one alert |
 | `alerts_search` | Find alerts by payload content: a command, username, path, User-Agent or hash |
 | `alerts_stats` | Totals by severity, top attacker IPs, top event types, optionally windowed |
-| `alerts_acknowledge` | Triage in bulk with a disposition (true/false positive, benign), note and analyst |
+| `alerts_acknowledge` | Triage in bulk with a disposition (true/false positive, benign, duplicate) and a note; recorded under the caller's identity |
 | `alerts_export` / `alerts_prune` | Write JSON/CSV to disk / retention (prune archives first and cancels the delete if the archive fails) |
 | `audit_log_search` | Review every state-changing action the control plane took |
 
@@ -231,14 +233,14 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH); the same tooling behind many IPs is one operator |
 | `analyze_campaign` / `map_ttps` / `threat_timeline` | Campaign correlation, MITRE mapping, chronological timeline |
 | `generate_report` | Write an XSS-safe HTML or Markdown report to disk |
-| `export_blocklist` / `export_stix` | Write an iptables, fail2ban or CIDR list, or a STIX 2.1 bundle, to disk |
+| `export_blocklist` / `export_stix` | Write an iptables, fail2ban or CIDR list, or a STIX 2.1 bundle, to `REPORTS_DIR` and return the path |
 | `report_ip_abuse` | Submit an attacker IP to AbuseIPDB |
 | `attack_summary` / `attack_navigator_layer` | Exact totals by tactic and technique for a window / an ATT&CK Navigator layer scored with the same counts |
 | `extract_iocs` / `lookup_hash` | Distinct URLs, hosts and file hashes from payloads / MalwareBazaar lookup of a hash |
-| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 1,000 rows, `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300); also the **Query** box on Grafana dashboard 04. Whole-run questions over millions of rows belong in `attack_patterns` or `alert_rollups` |
+| `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 500 rows or about 12 KB, `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300); also the **Query** box on Grafana dashboard 04. Whole-run questions over millions of rows belong in `attack_patterns` or `alert_rollups` |
 | `attack_patterns` | **What attackers actually did, without SQL.** `kind` = `credentials` (top pairs, usernames, passwords, accepted vs refused, per service), `commands` (classified by shape: shell-menu words, writable-directory probes, download chains with staging hosts, fingerprint checks, execution-capability probes), `files` (by hash, with *written by the session* separated from *fetched from the network*), `clients` (SSH versions and HASSH families, shared-fingerprint clusters), `sip_dialling` (dial-prefix cycling toward each destination, number masked), `http`, `concentration` (share held by the busiest sources, the long tail, per-day volume). Planted honeytoken passwords are masked, including inside commands |
 | `bait_trips` | **Who used the bait, and what they did first.** For each tripped honeytoken: creation time, delay to the first trip, and for each source whether it had earlier contact, its `first_actions` (the earliest steps, one line each), the decoy fetches and how many seconds before the trip, which services it touched, and whether it replayed the pair on other services; sources that reached the bait with no earlier contact are called out. The answer sizes itself: tokens come most distinct tripping sources first, the first five in full and the rest as one-line summaries, and the three most relevant sources also carry their commands, user agents and the last 30 steps. Everything is optional and follows what you say: name a token ("the bait credential"), a time ("today"), or traffic to ignore ("that's my test network"). Never returns token secrets |
-| `mapping_audit` | **How accurate is the ATT&CK mapping?** `action=sample` draws a reproducible stratified sample of alerts (every event type represented) into two files: a blind one for a labeller (event type, severity and a clipped payload, no technique) and a key with the mapper's answer. `action=score` reads one or two label files and reports agreement, precision and recall per technique and tactic, strict and at parent-technique level, with population-weighted estimates and 95% intervals, the event types that disagree most, how concentrated the result is in a few huge event types (and the estimate without the largest), and inter-labeller agreement. Operator role (it writes files) |
+| `mapping_audit` | **How accurate is the ATT&CK mapping?** With no arguments it draws a reproducible stratified sample of alerts (every event type represented) into two files: a blind one for a labeller (event type, severity and a clipped payload, no technique) and a key with the mapper's answer. Naming a labels file (`labels_file`, and `second_labels_file` for a second labeller) scores it: agreement, precision and recall per technique and tactic, strict and at parent-technique level, with population-weighted estimates and 95% intervals, the event types that disagree most, how concentrated the result is in a few huge event types (and the estimate without the largest), and inter-labeller agreement. The key is found by itself. Operator role (it writes files) |
 | `ping` | Server role (owner or read-only) and liveness |
 
 ### Integrations, suppression and access
@@ -248,7 +250,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `alert_subscribe` / `alert_unsubscribe` / `alert_subscriptions_list` | SIEM, Slack, Teams and email delivery with health stats |
 | `suppression_add` / `suppression_remove` / `suppression_list` | Drop or rate-limit noise (exact IP, CIDR or event-type glob) |
 | `suppression_load_preset` / `suppression_list_presets` | Bundled presets: shodan, censys, internal-rfc1918 |
-| `blocklist_push_cloudflare` / `blocklist_push_pfsense` / `blocklist_push_aws_waf` | Push offenders to live appliances (idempotent, `dry_run`); tested against stubs of the vendors' contracts, not run against a real service |
+| `blocklist_push_cloudflare` / `blocklist_push_pfsense` / `blocklist_push_aws_waf` | Push offenders to live appliances. **Dry run by default**: nothing changes until `dry_run=False` is asked for. Idempotent; tested against stubs of the vendors' contracts, not run against a real service |
 | `api_key_create` / `api_key_revoke` / `api_key_list` | Live-provisioned per-person keys with a role and label |
 
 ### Packet capture (optional, off by default)
@@ -287,9 +289,9 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 ## SIEM and notification delivery
 
-`alert_subscribe(url=..., format=...)` picks the body shape and auth scheme. `hmac_secret` carries whatever credential that format needs:
+`alert_subscribe(url=..., format=...)` picks the body shape and auth scheme (`format` is guessed from the address when omitted). `secret` carries whatever credential that format needs:
 
-| `format` | Body | `hmac_secret` is |
+| `format` | Body | `secret` is |
 |---|---|---|
 | `json` (default) | native JSON envelope | HMAC key, sent as `X-HoneyPot-Signature` |
 | `splunk_hec` | HEC `{time, host, sourcetype, event}` | HEC token, `Authorization: Splunk` |
@@ -303,7 +305,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 > alert_subscribe(
     url="https://splunk.example.com:8088/services/collector/event",
     label="splunk-prod", severity_threshold="medium",
-    hmac_secret="<your-HEC-token>", format="splunk_hec"
+    secret="<your-HEC-token>", format="splunk_hec"
   )
 ```
 
@@ -317,7 +319,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
                   label="soc-mail", format="email", severity_threshold="critical")
 ```
 
-These three are **coalesced**: the same (event_type, source_ip) notifies at most once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed count carried on the next message. CRITICAL always goes through. For Discord, PagerDuty or SOAR use the default `json` format; `hmac_secret=""` generates and returns a 32-byte signing secret. Check delivery health with `alert_subscriptions_list`.
+These three are **coalesced**: the same (event_type, source_ip) notifies at most once per `NOTIFY_THROTTLE_SECONDS` (default 300), with the suppressed count carried on the next message. CRITICAL always goes through. For Discord, PagerDuty or SOAR use the default `json` format; leave `secret` out and a 32-byte signing secret is generated and returned once. Check delivery health with `alert_subscriptions_list`.
 
 ---
 

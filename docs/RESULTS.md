@@ -383,7 +383,7 @@ Everything on this page was first done by hand (SQL, `tcpdump`, a Grafana contai
 | Packet captures | "Decode this capture; what does Suricata or Zeek say about it?" | `pcap_extract` (live ring), `pcap_files`, `pcap_analyze`, `pcap_detect`, `detection_rules_update` |
 | Dashboards | "Put the dashboards on this database" | `grafana_start`, `grafana_status`, `grafana_stop` |
 | Backup | "Back the database up and verify it" | `database_backup` |
-| ATT&CK mapping accuracy | "Draw a blind sample, then score my labels" | `mapping_audit` (`action=sample`, then `action=score`) |
+| ATT&CK mapping accuracy | "Draw a blind sample, then score my labels" | `mapping_audit` (no arguments to sample, then `labels_file` to score) |
 
 These were checked against the database behind this page: `attack_patterns` returns 30,491 successful Telnet logins for the top pair, 1,152 executions of the `filter` script from 15 sources, 17,972 events for the top SSH fingerprint from 37 sources, and the top four sources' 70.41% share; `pcap_analyze` decodes the 12 MB SIP extracts in under a second and its packet counts equal `tcpdump`'s.
 

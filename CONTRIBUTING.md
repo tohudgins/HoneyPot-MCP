@@ -40,6 +40,13 @@ List tools return digests, detail tools expand one record, and bulk output goes
 to a file. A single HTTP alert can carry 64 KB of captured body — a 200-row
 query that inlines payloads can consume an entire context in one call.
 
+**Tools are driven by a model from one sentence.** Return a dict with a count and
+a note (never a bare list), explain every parameter in the docstring `Args:`, ask
+for at most three things, and size the answer yourself instead of adding
+`rank_by`-style flags. `tests/unit/test_tool_contract.py` enforces this and caps the
+total size of the tool list, which sits in every conversation's context. Details
+in the "Agent-first tool contract" section of [CLAUDE.md](CLAUDE.md).
+
 **Fingerprint consistency is a feature.** An engine that reports one version in
 one field and behaves like another version elsewhere is detectable, which
 defeats the point. Keep one version constant per engine and derive everything

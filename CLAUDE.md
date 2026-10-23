@@ -21,7 +21,7 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (2,600+ unit tests covering security-critical paths; about 2 minutes on 4 workers: `-n 4`)
+# Tests (2,900 unit tests covering security-critical paths; about 2 minutes on 4 workers: `-n 4`)
 uv run pytest tests/unit/ -n 4 -q
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
@@ -996,6 +996,33 @@ never read a capped list as the complete picture.
 
 Time filtering (`since_hours`) belongs on anything an analyst asks about
 "recently" — it is the single most common natural-language qualifier.
+
+### Agent-first tool contract
+
+The server is driven by a model from a sentence a person typed, so a tool that needs flags is a
+defect. `tests/unit/test_tool_contract.py` reads the registry and fails the build when a tool:
+- returns anything but `dict[str, Any]` (a bare list is an *empty* MCP response, and an agent
+  cannot tell "nothing matched" from "failed");
+- has a parameter with no `Args:` description (the docstring becomes the schema description; without
+  it the model guesses);
+- requires more than 3 parameters or has more than 8 (`MORE_PARAMETERS_BECAUSE` is the exception
+  list, with a reason);
+- opens with a weak first line (models choose tools from it);
+- pushes the tool list over its weight budget: 3,000 characters per tool and 70,000 in total, because
+  every tool's description plus parameter schema sits in the model's context for the whole
+  conversation. Trim prose (repeated "every argument is optional", examples); FastMCP already drops
+  schema titles.
+
+Design consequences worth knowing: tools size their own answers (a default that fits, and a count and a
+`note` saying what was cut; knobs such as `rank_by`, `window_minutes`, `timeout_seconds` and, on the
+export and report tools, `output_path` are gone, while the few a person plausibly says, like
+`alerts_recent`'s `limit` or `attack_patterns`' `top`, stay optional), files go to `reports_dir` under
+generated names, tools that reach outside this system default to a dry run
+(`blocklist_push_*`), and an error carries a `hint` naming the next step. A tool that needs a bigger
+answer than its default shows should be asked a narrower question (an address, an event type), not
+given a knob. Logic that two tools share lives in a helper (`cluster_ssh_clients`, `write_report`),
+never in one tool calling another's public signature: a removed parameter then breaks the caller only
+when that path runs.
 
 ### Alert query indexes
 
