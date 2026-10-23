@@ -283,7 +283,9 @@ async def test_ftp_pipelined_pasv_leaves_exactly_one_listener():
             w.close()
             return True
 
-        live = [p for p in ports if await _accepts(p)]
+        # The kernel may hand back the port the previous listener just released, so the same number
+        # can appear twice in `ports`: that is one listener, not a leak.
+        live = [p for p in dict.fromkeys(ports) if await _accepts(p)]
         assert len(live) <= 1, f"leaked PASV listeners: {live}"
         writer.close()
     finally:
