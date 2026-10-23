@@ -191,3 +191,34 @@ async def test_connection_and_platform_bookkeeping_is_not_claimed_as_a_technique
     from honeypot_mcp.intel.mitre import map_to_attack
 
     assert await map_to_attack([event_type]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_id", ["32be28c20efb", "aec2f0a1b2c3", "0ec2aaaaaaaa", "c2c2c2c2c2c2"]
+)
+async def test_a_session_id_is_not_a_technique(session_id):
+    """Cowrie session ids are 12 hex characters, so `c2` and `ec2` occur inside them by chance
+    (found on the real run: an attacker that only ran `echo` was filed under Ingress Tool Transfer
+    and Cloud Service Discovery). Identifiers are not behaviour."""
+    terms = [
+        session_id,
+        f"New connection: 203.0.113.9:41792 (172.17.0.3:2222) [session: {session_id}]",
+    ]
+
+    assert await map_to_attack(terms) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("term", "technique"),
+    [
+        ("c2_beacon_callback", "T1105"),
+        ("connects to its c2 server", "T1105"),
+        ("aws ec2 describe-instances", "T1526"),
+        ("aws s3 ls", "T1526"),
+        ("iam_user_enumeration", "T1526"),
+    ],
+)
+async def test_the_standalone_token_still_maps(term, technique):
+    assert technique in {t["technique_id"] for t in await map_to_attack([term])}

@@ -1234,9 +1234,23 @@ async def test_bait_trips_picks_a_token_by_label_text_case_insensitively():
 
     missing = await _call_bait(label="no-such-label")
     assert "No honeytoken" in missing["error"] and "honeytoken_list" in missing["hint"]
-    # LIKE wildcards in the text are literal characters, not patterns.
+    # LIKE wildcards in the text are not patterns, and text with no words in it matches nothing.
     assert "No honeytoken" in (await _call_bait(label="%"))["error"]
-    assert "No honeytoken" in (await _call_bait(label="pub_ic"))["error"]
+    assert "No honeytoken" in (await _call_bait(label="_"))["error"]
+    assert "No honeytoken" in (await _call_bait(label="the token"))["error"]
+
+
+async def test_bait_trips_label_is_what_a_person_says_not_how_the_token_is_spelled():
+    """The real token was `public-bait-mysql-env` and "the public bait credential" found nothing:
+    the label is matched as words, whatever separates them in the stored name, and the token's type
+    counts as part of its name."""
+    solo, crowd = await _seed_two_tokens()  # "Field-Solo", "public-crowd", both credential tokens
+
+    for said in ("public crowd", "the public crowd token", "crowd credential", "PUBLIC_CROWD"):
+        found = await _call_bait(label=said)
+        assert [t["token_id"] for t in found["tokens"]] == [crowd], said
+    # Every word has to match: one stray word means a different token, not the nearest one.
+    assert "No honeytoken" in (await _call_bait(label="public solo"))["error"]
 
 
 async def test_bait_trips_compact_view_keeps_what_the_source_did_first_in_a_long_lead_up():

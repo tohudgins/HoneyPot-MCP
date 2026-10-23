@@ -366,6 +366,10 @@ def set_analysis_mode() -> None:
     _state["analysis"] = True
 
 
+def in_analysis_mode() -> bool:
+    return bool(_state.get("analysis"))
+
+
 def read_only_error() -> dict[str, Any] | None:
     """The error a sensor-changing tool returns in a read-only process, else None."""
     if _state["owned"]:

@@ -1657,6 +1657,12 @@ async def mapping_audit(
             }
         return await _score_named(labels_file, second_labels_file)
     result = await _sample(since_hours)
+    if result.pop("strata", None) is not None:
+        # One row per event type (26 KB on a real run): it is in the key file's header, and the reply
+        # carries the design summary instead.
+        result["strata_note"] = (
+            "The per-event-type population and sample sizes are in the key file."
+        )
     await _audit.record_action(
         "mapping_audit",
         (

@@ -570,7 +570,10 @@ async def write_report(
         alerts = await queries.get_recent_alerts(
             session, limit=_MAX_REPORT_ALERTS, source_ip=ip, since=since
         )
-        stats = await queries.get_alert_stats(session, since=since, now=window_to)
+        # Headline figures describe what the report is about: one address when it is scoped to one,
+        # otherwise the whole window (the severity tiles of a 492-event attacker's report once showed
+        # the whole run's 27,825 critical events).
+        stats = await rollups.stats(session, since, ip=ip, now=window_to)
         totals, first_seen, last_seen = await _exact_totals(session, ip) if ip else ({}, None, None)
 
     # For an IP-scoped report, attach the full intelligence picture (geo/ASN/

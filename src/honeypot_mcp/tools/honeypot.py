@@ -423,6 +423,15 @@ def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
     the owner, which would record it as traffic. Docker-backed sensors are reachable
     through the daemon from anywhere, so they are inspected normally.
     """
+    if instance_lock.in_analysis_mode():
+        # A copy of someone else's database: its Docker-backed sensors are not on this machine, so
+        # probing them would report every one of them dead.
+        return {
+            "note": "Analysis mode: this server holds a copy of a database and runs no sensors, so "
+            "none is probed. The row below is what the original server last recorded.",
+            "alive": None,
+            "method": "not-probed",
+        }
     if instance_lock.sensors_owned():
         return None
     capability = BY_TYPE.get(hp.type.value)

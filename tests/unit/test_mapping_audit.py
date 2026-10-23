@@ -873,3 +873,16 @@ async def test_the_tool_is_operator_tier_and_registered():
     assert "mapping_audit" not in rbac.ADMIN_TOOLS and "mapping_audit" not in rbac.VIEWER_TOOLS
     tool = {t.name: t for t in await mcp.list_tools()}["mapping_audit"]
     assert tool.auth is not None
+
+
+async def test_the_tool_reply_leaves_the_per_event_type_table_to_the_key_file():
+    """On the real run the sample step answered with 28 KB, 26 KB of it one row per event type; the
+    table belongs in the key file, and the reply keeps the design summary."""
+    from honeypot_mcp.tools.mapping_audit import mapping_audit
+
+    await _seed()
+    out = await mapping_audit()
+
+    assert "strata" not in out and "design" in out and out["sampled"] > 0
+    assert "strata_note" in out
+    assert _items(out["key_file"]["name"]) and out["design"]["strata"] > 0

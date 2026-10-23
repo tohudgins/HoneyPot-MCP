@@ -394,3 +394,21 @@ async def test_generate_report_validates_ip_and_window():
 
     assert "error" in await generate_report(ip="not-an-ip")
     assert "error" in await generate_report(since_hours=-1)
+
+
+@pytest.mark.asyncio
+async def test_a_report_about_one_address_counts_that_address_not_the_whole_run(reports_dir):
+    """The severity and source figures of a report scoped to an attacker with 492 events showed the
+    whole run (27,825 critical events, 3,340 sources), which an analyst would read as that attacker's."""
+    from honeypot_mcp.tools.analysis import generate_report
+
+    await _seed(ip="203.0.113.7", count=3, severity="high")
+    await _seed(ip="198.51.100.1", count=40, severity="critical")
+    await _seed(ip="198.51.100.2", count=40, severity="critical")
+
+    scoped = await generate_report(ip="203.0.113.7", format="markdown")
+    whole = await generate_report(format="markdown")
+
+    assert scoped["alerts_analysed"] == 3
+    assert scoped["by_severity"] == {"high": 3} and scoped["unique_source_ips"] == 1
+    assert whole["by_severity"] == {"high": 3, "critical": 80} and whole["unique_source_ips"] == 3

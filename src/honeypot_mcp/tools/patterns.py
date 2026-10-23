@@ -47,7 +47,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, false, func, select
 
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.credential_match import CREDENTIAL_TRIP_PREFIX
@@ -1755,6 +1755,8 @@ async def attack_patterns(
 # ── bait_trips ────────────────────────────────────────────────────────────────
 
 _TRIP_TYPE_PREFIX = "honeytoken_triggered_"
+# Words around a token's name that say nothing about which token is meant ("the bait token").
+_LABEL_FILLER_WORDS = frozenset({"the", "a", "an", "my", "our", "that", "this", "token", "tokens"})
 # File-serving decoys: fetching one of these is how an attacker "reads" a bait.
 _BAIT_FETCH_TYPES = ("http_decoy_served", "ftp_file_download", "rsync_file_request")
 _TRIP_ROW_CAP = 20_000
@@ -2074,16 +2076,23 @@ async def bait_trips(
 
     planted = await load_planted()
     label_text = (label or "").strip()
+    # What a person says ("the public bait credential") is words, while the label is whatever the
+    # token was created with ("public-bait-mysql-env"): every word must appear in the label or the
+    # type, whatever separates them, and filler like "the" or "token" is ignored.
+    label_words = [
+        w for w in re.findall(r"[a-z0-9]+", label_text.lower()) if w not in _LABEL_FILLER_WORDS
+    ]
     explicit = token_id is not None or bool(label_text)
     async with get_session() as session:
         stmt = select(Honeytoken)
         if token_id is not None:
             stmt = stmt.where(Honeytoken.id == token_id)
         if label_text:
-            escaped = (
-                label_text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
-            stmt = stmt.where(func.lower(Honeytoken.label).like(f"%{escaped}%", escape="\\"))
+            if not label_words:
+                stmt = stmt.where(false())
+            haystack = func.lower(Honeytoken.label + " " + cast(Honeytoken.type, String))
+            for word in label_words:
+                stmt = stmt.where(haystack.like(f"%{word}%"))
         tokens = {t.id: t for t in (await session.execute(stmt)).scalars().all()}
         if explicit and not tokens:
             wanted = (

@@ -31,6 +31,21 @@ test now keeps them gone.
 - **CI.** `run_analysis` runs its parts in sequence on the one shared in-memory test connection (a file
   database still runs them together), and `pillow`, `certifi` and `opentelemetry-api` were bumped for
   published advisories.
+- **Found by asking real questions of the 17.7M-event database** (about 70 questions through the MCP
+  protocol, plus a Suricata and Zeek replay and a Grafana start on the same data):
+  - *A session id is not a technique.* The command-and-control rule matched `c2` anywhere, and about 1 in
+    25 of Cowrie's 12-hex-character session ids contains it (`ec2` for the cloud rule likewise), so an
+    attacker that only ran `echo xsec` was filed under Ingress Tool Transfer and a Command and Control
+    phase. Both rules now need the token to stand alone.
+  - *"The public bait credential" found nothing* because the token is stored as `public-bait-mysql-env`.
+    `bait_trips` now matches the words of what was said against the label and type, whatever separates
+    them, and ignores filler like "the" and "token".
+  - *A report about one address showed the whole run's totals* (27,825 critical events, 3,340 sources in
+    the report of a 492-event attacker). Its headline figures now follow the address.
+  - *`honeypot_health` called two sensors dead on a restored backup* because their Docker containers are
+    not on this machine. Analysis mode now says nothing is probed.
+  - *`mapping_audit` answered a sample request with 28 KB*, 26 KB of it a per-event-type table that is
+    already in the key file. The reply keeps the design summary.
 
 ## No flags to know, no settings to set
 

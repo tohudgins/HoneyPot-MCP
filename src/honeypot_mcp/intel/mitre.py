@@ -371,7 +371,9 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
         "Command and Control",
     ),
     (
-        re.compile(r"(c2|command.and.control|reverse.shell)", re.I),
+        # `c2` must stand alone: Cowrie session ids are 12 hex characters and about 1 in 25 of them
+        # contain "c2", which filed an `echo` session under Ingress Tool Transfer.
+        re.compile(r"((?<![a-z0-9])c2(?![a-z0-9])|command.and.control|reverse.shell)", re.I),
         "T1105",
         "Ingress Tool Transfer",
         "Command and Control",
@@ -508,7 +510,12 @@ _BUILTIN_MAPPINGS: list[tuple[re.Pattern, str, str, str]] = [
     (
         # `.*(access|enumerat|)` after the service keyword always succeeded (the
         # empty alternative), so the keyword alone is the whole condition.
-        re.compile(r"(iam|s3|ec2|lambda|metadata\.google|169\.254\.169\.254)", re.I),
+        # The service names are standalone tokens, not substrings: `ec2` is also three hex digits and
+        # `iam` sits inside ordinary words, in session ids and user names.
+        re.compile(
+            r"((?<![a-z0-9])(iam|s3|ec2|lambda)(?![a-z0-9])|metadata\.google|169\.254\.169\.254)",
+            re.I,
+        ),
         "T1526",
         "Cloud Service Discovery",
         "Discovery",
