@@ -196,11 +196,11 @@ def p_ftp(host: str) -> str:
     try:
         f.login("anonymous", "field@test.invalid")
         n.append("anonymous ok")
-        with contextlib.suppress(ftplib.all_errors):
+        with contextlib.suppress(*ftplib.all_errors):
             f.retrlines("LIST")
         import io
 
-        with contextlib.suppress(ftplib.all_errors):
+        with contextlib.suppress(*ftplib.all_errors):
             f.storbinary("STOR fieldtest.txt", io.BytesIO(b"hello"))
     except ftplib.all_errors as e:
         n.append(f"anonymous: {e}")
@@ -209,7 +209,7 @@ def p_ftp(host: str) -> str:
             f.close()
     g = ftplib.FTP()
     g.connect(host, PORTS["ftp"], timeout=TIMEOUT)
-    with contextlib.suppress(ftplib.all_errors):
+    with contextlib.suppress(*ftplib.all_errors):
         g.login("admin", PASSWORD)
     with contextlib.suppress(Exception):
         g.close()

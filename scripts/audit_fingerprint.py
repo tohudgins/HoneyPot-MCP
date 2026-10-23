@@ -88,11 +88,11 @@ async def _probe_ssh(host: str, port: int) -> EngineReport:
         r.add("banner", "tell", "no banner received")
         return r
 
-    banner = banners[0]
-    r.add("banner", "ok" if banner.startswith("SSH-") else "tell", banner)
+    first_banner = banners[0]
+    r.add("banner", "ok" if first_banner.startswith("SSH-") else "tell", first_banner)
 
     # Default Cowrie identifier — the most obvious fingerprint.
-    if "ubuntu-server" in banner.lower():
+    if "ubuntu-server" in first_banner.lower():
         r.add("banner identity", "tell", "default Cowrie hostname leaked")
     else:
         r.add("banner identity", "ok", "non-default hostname")

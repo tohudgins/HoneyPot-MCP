@@ -40,7 +40,8 @@ from fastmcp import Client
 
 class Run:
     def __init__(self, url: str, tokens: dict[str, str]) -> None:
-        self.url, self.tokens, self.rows = url, tokens, []
+        self.url, self.tokens = url, tokens
+        self.rows: list[Any] = []
 
     async def call(self, role: str, tool: str, args: dict[str, Any] | None = None) -> Any:
         async with Client(self.url, auth=self.tokens[role]) as c:
@@ -207,7 +208,7 @@ async def run(a: argparse.Namespace) -> int:
     if flooder:
         listing = (await r.call("viewer", "honeypot_list"))["honeypots"]
         h = {x["name"]: x["hits"] for x in listing}
-        hot = max(h, key=h.get)
+        hot = max(h, key=lambda name: h[name])
         hot_id = {x["name"]: x["id"] for x in listing}[hot]
         # The source to throttle is the one flooding THIS sensor now (from the hourly rollups), not the
         # all-time top source: a flood from many addresses is not cut by throttling one that has gone quiet.

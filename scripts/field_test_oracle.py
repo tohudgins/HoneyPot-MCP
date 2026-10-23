@@ -419,11 +419,11 @@ async def run(args: argparse.Namespace) -> int:
         res.get("ip_count") == len(want),
         f"{res.get('ip_count')} vs {len(want)}",
     )
-    top = {t["ip"]: t["hits"] for t in res.get("top_offenders", [])}
+    offender_hits = {t["ip"]: t["hits"] for t in res.get("top_offenders", [])}
     check(
         "blocklist",
         "and their hit counts are true",
-        all(want.get(ip) == n for ip, n in top.items()),
+        all(want.get(ip) == n for ip, n in offender_hits.items()),
     )
     private = [
         ip
