@@ -197,3 +197,27 @@ async def test_hitting_the_scan_cap_is_reported_not_hidden(monkeypatch):
         await _kex(f"198.51.100.{i + 1}", "h", f"s{i}")
     out = await analysis.fingerprint_clusters()
     assert out["truncated"] is True and "cap" in out["note"]
+
+
+async def test_fingerprint_clusters_answers_for_one_address_however_small_its_group():
+    """ "Is 203.0.113.7 part of a botnet?" needs that address's group even when eleven larger groups
+    fill the ten-largest list (a 3-address group was invisible before)."""
+    from honeypot_mcp.tools.analysis import fingerprint_clusters
+
+    for g in range(11):  # eleven bigger groups, four addresses each
+        for n in range(4):
+            await _kex(f"198.51.{g}.{n + 1}", f"big-{g:02d}", f"g{g}n{n}")
+    small = ["203.0.113.7", "203.0.113.8", "203.0.113.9"]
+    for n, ip in enumerate(small):
+        await _kex(ip, "small-group", f"sm{n}")
+
+    top = await fingerprint_clusters()
+    assert top["count"] == 10 and "small-group" not in {c["hassh"] for c in top["clusters"]}
+
+    mine = await fingerprint_clusters(ip="203.0.113.7")
+    assert [c["hassh"] for c in mine["clusters"]] == ["small-group"]
+    assert set(small) <= set(mine["clusters"][0]["example_ips"])
+
+    nobody = await fingerprint_clusters(ip="203.0.113.200")
+    assert nobody["clusters"] == [] and "No SSH key-exchange" in nobody["note"]
+    assert "error" in await fingerprint_clusters(ip="not-an-ip")

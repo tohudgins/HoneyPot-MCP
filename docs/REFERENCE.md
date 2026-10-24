@@ -229,7 +229,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 |---|---|
 | `enrich_ip` | VirusTotal, AbuseIPDB and GeoIP, plus GreyNoise, abuse.ch, OTX and Shodan InternetDB when configured; parallel and cached |
 | `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile and risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline (exact totals, bounded sample; safe on an attacker with 100k+ events) |
-| `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH); the same tooling behind many IPs is one operator |
+| `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH); the same tooling behind many IPs is one operator. With `ip`, the group that one address belongs to, however small |
 | `analyze_campaign` / `threat_timeline` | Campaign correlation, chronological timeline |
 | `generate_report` | Write an XSS-safe `html` or `markdown` report, or an `attack_navigator` ATT&CK Navigator layer scored with the same counts, to disk |
 | `export_indicators` | Write a plain, iptables, fail2ban or CIDR blocklist, or a STIX 2.1 bundle (`format`), over the last `hours` with at least `min_hits` alerts, to `REPORTS_DIR` and return the path |

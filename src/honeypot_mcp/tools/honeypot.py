@@ -1030,6 +1030,7 @@ async def _health_of_running() -> dict[str, Any]:
     return {
         "count": len(results),
         "answering": up,
+        "not_probed": len(unknown),
         "not_answering": down,
         "honeypots": results,
         "note": note,

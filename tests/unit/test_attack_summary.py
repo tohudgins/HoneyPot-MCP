@@ -124,5 +124,34 @@ async def test_an_ip_maps_its_own_alerts_and_a_bad_ip_is_refused():
     await _seed([("ssh_login_failed", 3, timedelta(0))])
     out = await attack_summary(ip="198.51.100.1")
 
-    assert "most recent alerts from 198.51.100.1" in out["based_on"]
+    assert "every event type from 198.51.100.1" in out["based_on"]
     assert "error" in await attack_summary(ip="not-an-ip")
+
+
+async def test_an_address_is_mapped_from_everything_it_did_not_only_its_newest_alerts():
+    """The mapping used to read the 200 newest alerts, so a technique an active address used earlier
+    (here a Redis config write) vanished behind 250 later ssh login attempts."""
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+    from honeypot_mcp.tools.analysis import attack_summary
+
+    now = datetime.now(UTC)
+    async with get_session() as session:
+        for hours_ago, event_type, count in (
+            (48, "redis_config_set", 3),
+            (1, "ssh_login_failed", 250),
+        ):
+            for _ in range(count):
+                session.add(
+                    Alert(
+                        source_ip="203.0.113.50",
+                        event_type=event_type,
+                        severity=AlertSeverity.MEDIUM,
+                        timestamp=now - timedelta(hours=hours_ago),
+                        payload={},
+                    )
+                )
+
+    ids = {t["technique_id"] for t in (await attack_summary(ip="203.0.113.50"))["techniques"]}
+
+    assert "T1190" in ids and any(i.startswith("T1110") for i in ids)

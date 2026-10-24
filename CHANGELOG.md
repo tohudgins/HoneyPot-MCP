@@ -4,6 +4,28 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## A model drives the merged tools from plain sentences
+
+**Four fresh agents were given only a question and the mounted server (no source, no docs). Of 20
+questions, 13 were rated GOOD by the agent that asked them, 7 OK (they worked but needed a roundabout
+path or left a doubt) and none BAD.** The findings were fixed or recorded:
+
+- *"Is this address part of a botnet?"* had no direct path: `fingerprint_clusters` showed only the ten
+  largest groups, so a group of three addresses was invisible and the agent fell back to hand-written SQL.
+  It now takes an `ip` and returns that address's group(s) and the other members.
+- *`attack_summary(ip=...)` read only the 200 newest alerts*, so a technique an active address used earlier
+  vanished behind later activity. It now maps every event type the address ever produced (exact, from the
+  hourly rollups) plus the payloads of its newest alerts.
+- *`honeypot_status` in analysis mode* said `answering: 0`, which reads as zero healthy. It now also reports
+  `not_probed`, and says the shared reason once in the note instead of on all 23 rows. `export_indicators`
+  says that `hours` defaults to 24 (give a large number for the whole run) and that sources seen only on
+  forgeable UDP services are left out.
+- `analyze_attacker` and `enrich_ip` now say what they return and that they contact third-party services.
+- Recorded, not changed: there is no tool for "the busiest 24 hours" (`sql_query` over `alert_rollups`
+  answers it); `alerts_search` clips long payloads, so a loader's URL needs `alerts_get`; `honeytoken_list`
+  with an id shows a planted credential in full to a full-access caller while `bait_trips` masks it; and
+  `bait_trips` answers a yes/no question with about 20 KB.
+
 ## 83 tools to 67: one tool per question, and no unverified vendor pushes
 
 **The tool list sits in the model's context for the whole conversation, and several tools were the
