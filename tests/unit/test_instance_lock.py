@@ -182,6 +182,8 @@ async def test_a_read_only_process_never_probes_or_inspects_in_process_sensors()
         health = result["honeypots"][0]
         assert health["method"] == "not-probed" and health["alive"] is None
         assert result["answering"] == 0 and result["not_answering"] == []
+        # the one reason is in the note, not repeated on every sensor
+        assert "read-only" in result["note"] and "note" not in health
         status = await honeypot_status("r1")
         assert status["engine_status"]["method"] == "not-probed"
         assert status["recent_log"] == [] and "not read" in status["log_note"]

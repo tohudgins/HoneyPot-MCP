@@ -1017,6 +1017,14 @@ async def _health_of_running() -> dict[str, Any]:
         )
     elif unknown:
         note = f"{up} answering; {len(unknown)} could not be probed from this session."
+        # The same explanation on every row is noise: say it once and keep it on the rows only
+        # when they differ.
+        reasons = {r.get("note") for r in results if r.get("alive") is None}
+        if len(reasons) == 1 and None not in reasons:
+            note += f" {reasons.pop()}"
+            for r in results:
+                if r.get("alive") is None:
+                    r.pop("note", None)
     else:
         note = f"All {len(results)} answering."
     return {
