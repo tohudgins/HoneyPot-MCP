@@ -459,13 +459,19 @@ async def run(a: argparse.Namespace) -> int:
     cap = await sw.call(v, "pcap_files", None)
     capture = cap[1].get("capture") if cap[0] and isinstance(cap[1], dict) else None
     running = bool(isinstance(capture, dict) and capture.get("running"))
-    await sw.expect(
-        o,
-        "pcap_control",
-        {"action": "start"},
-        "start is safe to repeat (and explains itself when capture is unavailable)",
-        lambda d: d is not None,
-    )
+    ok, data = await sw.call(o, "pcap_control", {"action": "start"})
+    if running:
+        sw.record(o, "pcap_control", "start is safe to repeat while capture runs", ok, str(data))
+    else:
+        # Capture is off or cannot start: the tool answers with an `error` that names the cause,
+        # which `call` reports as a failure; that refusal is the expected, explained answer.
+        sw.record(
+            o,
+            "pcap_control",
+            "capture cannot start: starts, or refuses naming the cause (not a crash)",
+            ok or any(w in str(data).lower() for w in ("pcap", "capture", "tcpdump")),
+            str(data),
+        )
     ok, data = await sw.call(o, "pcap_extract", {"source_ip": me})
     if running:
         sw.record(
@@ -537,7 +543,7 @@ async def run(a: argparse.Namespace) -> int:
             cl.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             cl.connect(
                 a.attacker_host,
-                22,
+                a.ssh_port,
                 c0["username"],
                 c0["password"],
                 timeout=10,
@@ -701,6 +707,12 @@ def main() -> int:
     ap.add_argument("--tokens", required=True, help="file with viewer=/operator=/admin= lines")
     ap.add_argument(
         "--attacker-host", required=True, help="the VPS public address (for the honeytoken login)"
+    )
+    ap.add_argument(
+        "--ssh-port",
+        type=int,
+        default=22,
+        help="the SSH sensor's public port (22 on a VPS; a shifted one on a local run)",
     )
     ap.add_argument("--source-ip", help="this machine's public address (auto-detected otherwise)")
     ap.add_argument("--out", help="write a markdown report here")

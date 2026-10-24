@@ -4,6 +4,36 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The tools run live: real data, real samples, real sinks, a real deployment
+
+**Everything that could be exercised without a third party was, on the real 17.7M-event database and
+its captured files, on copy-on-write clones so the original was never written.**
+
+- **Real deployment** (23 sensors owned by a scratch server, two as Cowrie containers, attacked with the
+  field-test clients): `field_test.py` proved 23 of 23 engines, `field_test_tools.py` passed 95 checks with
+  every one of the 67 tools called or skipped with a reason, and the honeytoken round trip (plant an SSH
+  credential, log in with a real client, a CRITICAL alert and a `triggered` token) passed.
+- **Alert delivery to real sinks:** the JSON (signature verified), Slack, Teams, Splunk HEC, Elastic ECS,
+  Loki, Datadog and email (a real SMTP conversation) formats each delivered 3 of 3.
+- **Real captures and samples:** `pcap_analyze` decoded the 11 MB SIP capture in under a second;
+  Suricata (53,257 rules) raised "GPL VOIP SIP 401 Unauthorized Flood" on it and separated 7,552 checksum
+  artifacts from 26 real alerts; Zeek produced the connection and SIP logs; `sample_scan` scanned 159 files
+  (94 distinct hashes, dropper families found); `detection_rules_update` fetched and validated the ruleset.
+- **`database_backup` of the whole 12 GB database** took 202 s, verified (integrity `ok`), kept 17,726,494
+  alerts, and wrote owner-only files.
+- **Bugs this found:**
+  - *memcached recorded nothing for a large `set` arriving in one read* (loopback or a fast link): the
+    buffer-size check ran before parsing and discarded the header, so neither `memcached_large_set` nor the
+    amplification event was raised. The check now runs after parsing and an oversized `set` swallows
+    exactly its declared body, as memcached does.
+  - *`field_test_ops.py` could acknowledge every critical alert as a true positive* when it found no
+    attacker address to use as its subject (`source_ip=None` selects everything). Those checks now skip.
+  - `api_key_list` said "no API keys have been created" when keys existed but all were revoked.
+  - The field-test scripts hardcoded privileged public ports; they take `--port-offset` and `--ssh-port`.
+- **Not exercised:** `report_ip_abuse` (files a real report), `pcap_control`/`pcap_extract` (live capture
+  needs root), and delivery to a real Slack, Teams or mail service (only to local sinks speaking the same
+  formats). Two of `field_test_ops.py`'s checks need real attackers and cannot pass on localhost.
+
 ## A model drives the merged tools from plain sentences
 
 **Four fresh agents were given only a question and the mounted server (no source, no docs). Of 20

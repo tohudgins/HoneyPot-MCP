@@ -165,7 +165,7 @@ async def api_key_list(include_revoked: bool = False) -> dict[str, Any]:
     Args:
         include_revoked: Also show revoked keys, for the history of who ever had access.
     """
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     q = select(ApiKey)
     if not include_revoked:
@@ -188,13 +188,19 @@ async def api_key_list(include_revoked: bool = False) -> dict[str, Any]:
         }
         for r in found
     ]
-    return {
-        "count": len(rows),
-        "keys": rows,
-        "note": (
-            f"{len(rows)} key(s). Keys configured through MCP_AUTH_TOKEN(S) in the server's "
-            "environment are not listed here."
-            if rows
+    note = (
+        f"{len(rows)} key(s). Keys configured through MCP_AUTH_TOKEN(S) in the server's "
+        "environment are not listed here."
+    )
+    if not rows:
+        async with get_session() as session:
+            revoked = (
+                await session.execute(select(func.count()).where(ApiKey.revoked_at.is_not(None)))
+            ).scalar_one()
+        note = (
+            f"No active API keys ({revoked} revoked; include_revoked shows them). Make one with "
+            "api_key_create(label=...)."
+            if revoked
             else "No API keys have been created. Make one with api_key_create(label=...)."
-        ),
-    }
+        )
+    return {"count": len(rows), "keys": rows, "note": note}

@@ -37,6 +37,11 @@ from typing import Any
 
 from fastmcp import Client
 
+NO_SUBJECT = (
+    "SKIPPED: no source outside loopback and private ranges in the last 12 h, so there is no real "
+    "attacker to use as the subject (a run that only attacked itself, e.g. from a laptop)"
+)
+
 
 class Run:
     def __init__(self, url: str, tokens: dict[str, str]) -> None:
@@ -96,74 +101,86 @@ async def run(a: argparse.Namespace) -> int:
     print(f"subjects: busiest real source {flooder}, CRITICAL-heavy source {target}\n")
 
     print("== triage (real alerts)")
-    before = (await r.call("viewer", "soc_brief", {"since_hours": 12}))["untriaged_by_severity"]
-    ack = await r.call(
-        "operator",
-        "alerts_acknowledge",
-        {
-            "source_ip": target,
-            "severity": "critical",
-            "disposition": "true_positive",
-            "note": "field test: real attacker triaged",
-            "since_hours": 12,  # the same window the queue below is counted over
-        },
-    )
-    n = ack.get("acknowledged") or ack.get("updated") or ack.get("count") or 0
-    r.check("triage", "acknowledging by source reports how many it changed", n > 0, str(ack))
-    after = (await r.call("viewer", "soc_brief", {"since_hours": 12}))["untriaged_by_severity"]
-    r.check(
-        "triage",
-        "the untriaged CRITICAL queue shrinks by about that many",
-        before["critical"] - after["critical"] >= max(n - 5, 1),
-        f"{before} -> {after}, acked {n}",
-    )
-    got = await r.call(
-        "viewer",
-        "alerts_recent",
-        {"source_ip": target, "severity": "critical", "limit": 50, "since_hours": 12},
-    )
-    r.check(
-        "triage",
-        "the alert records carry the disposition",
-        got.get("alerts") and all(x.get("acknowledged") for x in got["alerts"]),
-        str(got)[:150],
-    )
-    audit = await r.call(
-        "admin", "audit_log_search", {"tool": "alerts_acknowledge", "since_hours": 1, "limit": 5}
-    )
-    r.check(
-        "triage",
-        "the audit log names who did it",
-        "operator" in json.dumps(audit),
-        str(audit)[:150],
-    )
+    if target is None:
+        # Acknowledging with no source would triage EVERY critical alert of the window, so a
+        # deployment that has seen nothing but itself (a laptop run) must not reach this block.
+        r.check("triage", "acknowledge a real attacker's alerts", True, NO_SUBJECT)
+    else:
+        before = (await r.call("viewer", "soc_brief", {"since_hours": 12}))["untriaged_by_severity"]
+        ack = await r.call(
+            "operator",
+            "alerts_acknowledge",
+            {
+                "source_ip": target,
+                "severity": "critical",
+                "disposition": "true_positive",
+                "note": "field test: real attacker triaged",
+                "since_hours": 12,  # the same window the queue below is counted over
+            },
+        )
+        n = ack.get("acknowledged") or ack.get("updated") or ack.get("count") or 0
+        r.check("triage", "acknowledging by source reports how many it changed", n > 0, str(ack))
+        after = (await r.call("viewer", "soc_brief", {"since_hours": 12}))["untriaged_by_severity"]
+        r.check(
+            "triage",
+            "the untriaged CRITICAL queue shrinks by about that many",
+            before["critical"] - after["critical"] >= max(n - 5, 1),
+            f"{before} -> {after}, acked {n}",
+        )
+        got = await r.call(
+            "viewer",
+            "alerts_recent",
+            {"source_ip": target, "severity": "critical", "limit": 50, "since_hours": 12},
+        )
+        r.check(
+            "triage",
+            "the alert records carry the disposition",
+            got.get("alerts") and all(x.get("acknowledged") for x in got["alerts"]),
+            str(got)[:150],
+        )
+        audit = await r.call(
+            "admin",
+            "audit_log_search",
+            {"tool": "alerts_acknowledge", "since_hours": 1, "limit": 5},
+        )
+        r.check(
+            "triage",
+            "the audit log names who did it",
+            "operator" in json.dumps(audit),
+            str(audit)[:150],
+        )
 
     print("== analysis (real attackers)")
-    prof = await r.call("viewer", "analyze_attacker", {"ip": target})
-    r.check(
-        "analysis",
-        "profile carries risk, MITRE techniques, geography and reputation",
-        prof.get("mitre_techniques")
-        and prof.get("geoip", {}).get("country")
-        and prof.get("abuseipdb", {}).get("abuse_confidence_score") is not None
-        and prof.get("risk_level"),
-        str(prof)[:150],
-    )
-    journey = await r.call("viewer", "analyze_attacker_journey", {"ip": target, "hours": 24})
-    r.check(
-        "analysis",
-        "journey orders the attacker's phases",
-        journey.get("phases") and journey.get("total_events", 0) > 0,
-        str(journey)[:150],
-    )
-    ttps = await r.call("viewer", "attack_summary", {"ip": target})
-    r.check(
-        "analysis",
-        "ATT&CK mapping names techniques with matched evidence",
-        bool(ttps.get("techniques"))
-        and str(ttps["techniques"][0].get("technique_id", "")).startswith("T"),
-        str(ttps)[:150],
-    )
+    if target is None:
+        r.check(
+            "analysis", "profile, journey and ATT&CK mapping of a real attacker", True, NO_SUBJECT
+        )
+    else:
+        prof = await r.call("viewer", "analyze_attacker", {"ip": target})
+        r.check(
+            "analysis",
+            "profile carries risk, MITRE techniques, geography and reputation",
+            prof.get("mitre_techniques")
+            and prof.get("geoip", {}).get("country")
+            and prof.get("abuseipdb", {}).get("abuse_confidence_score") is not None
+            and prof.get("risk_level"),
+            str(prof)[:150],
+        )
+        journey = await r.call("viewer", "analyze_attacker_journey", {"ip": target, "hours": 24})
+        r.check(
+            "analysis",
+            "journey orders the attacker's phases",
+            journey.get("phases") and journey.get("total_events", 0) > 0,
+            str(journey)[:150],
+        )
+        ttps = await r.call("viewer", "attack_summary", {"ip": target})
+        r.check(
+            "analysis",
+            "ATT&CK mapping names techniques with matched evidence",
+            bool(ttps.get("techniques"))
+            and str(ttps["techniques"][0].get("technique_id", "")).startswith("T"),
+            str(ttps)[:150],
+        )
     camps = await r.call("viewer", "analyze_campaign", {"since_hours": 12, "min_sources": 2})
     found = camps.get("campaigns", [])
     r.check(
@@ -275,7 +292,7 @@ async def run(a: argparse.Namespace) -> int:
     print("== operations (a real sensor)")
     sensors = {x["name"]: x for x in (await r.call("viewer", "honeypot_list"))["honeypots"]}
     victim = "hp-vnc" if "hp-vnc" in sensors else next(iter(sensors))
-    port = {"hp-vnc": 5900}.get(victim, sensors[victim]["port"])
+    port = {"hp-vnc": 5900 + a.port_offset}.get(victim, sensors[victim]["port"])
     r.check("operations", f"{victim} answers on port {port} before", port_open(a.host, port))
     try:
         await r.call("operator", "honeypot_pause", {"name": victim})
@@ -293,13 +310,18 @@ async def run(a: argparse.Namespace) -> int:
         and len(json.dumps(logs.get("recent_log", []))) > 200,
         str(logs)[:120],
     )
-    ext = await r.call("operator", "pcap_extract", {"source_ip": target})
-    r.check(
-        "operations",
-        "packets for a real attacker are pulled from the capture ring",
-        (ext.get("packets") or 0) > 0,
-        str(ext)[:150],
-    )
+    if target is None:
+        r.check(
+            "operations", "pull a real attacker's packets from the capture ring", True, NO_SUBJECT
+        )
+    else:
+        ext = await r.call("operator", "pcap_extract", {"source_ip": target})
+        r.check(
+            "operations",
+            "packets for a real attacker are pulled from the capture ring",
+            (ext.get("packets") or 0) > 0,
+            str(ext)[:150],
+        )
     stat = await r.call("viewer", "honeypot_status", {})
     r.check(
         "operations",
@@ -352,6 +374,12 @@ def main() -> int:
         "--my-ip", default="", help="this machine's public address, excluded from the subjects"
     )
     ap.add_argument("--out")
+    ap.add_argument(
+        "--port-offset",
+        type=int,
+        default=0,
+        help="added to the public VNC port (5900) when the sensors listen on shifted ports",
+    )
     ap.add_argument(
         "--keep-ratelimit", action="store_true", help="leave the rate-limit rule in place"
     )

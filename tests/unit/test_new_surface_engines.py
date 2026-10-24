@@ -155,6 +155,42 @@ async def test_memcached_stage_then_retrieve_is_flagged_as_amplification():
     assert critical[0].payload["amplification_factor"] > 100
 
 
+async def test_memcached_oversized_set_in_one_read_is_still_flagged_and_swallowed():
+    """A `set` header and a body far over the buffer bound can arrive in a single read on
+    loopback or a fast link. The buffer guard used to run before parsing and discard the header,
+    so the staging was never recorded and the following `get` was an ordinary miss: the field
+    test's 200 kB stage-then-fetch recorded no amplification on a local run. The body of a value
+    too large to store is swallowed, never parsed as commands."""
+    from honeypot_mcp.engines.memcached import MemcachedEngine
+    from honeypot_mcp.storage.models import HoneypotType
+
+    port = await _register("mc-amp-big", HoneypotType.MEMCACHED)
+    engine = MemcachedEngine()
+    cid = await engine.start("mc-amp-big", port, {})
+    try:
+        blob = b"A" * 200_000
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"set fieldtest 0 0 %d\r\n" % len(blob) + blob + b"\r\nget fieldtest\r\n")
+        await writer.drain()
+        await asyncio.sleep(0.5)
+        reflected = await reader.read(262144)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        await asyncio.sleep(0.5)
+    finally:
+        await engine.stop(cid)
+
+    assert reflected.startswith(b"SERVER_ERROR object too large for cache\r\n")
+    assert b"VALUE fieldtest 0 " in reflected
+    alerts = await _alerts()
+    types = [a.event_type for a in alerts]
+    assert "memcached_large_set" in types
+    assert "memcached_amplification_attempt" in types
+    # The swallowed body produced no stray "command" alert.
+    assert "memcached_command" not in types
+
+
 async def test_memcached_small_set_is_not_an_amplification_alert():
     """Ordinary cache traffic must not cry wolf."""
     from honeypot_mcp.engines.memcached import MemcachedEngine

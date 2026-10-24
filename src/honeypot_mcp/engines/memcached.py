@@ -143,6 +143,10 @@ class _MemcachedProtocol(asyncio.Protocol):
         self._staged: dict[str, int] = {}
         # Set when a `set` header has been read and we are consuming its body.
         self._pending_body: tuple[str, int] | None = None
+        # Body bytes still to be thrown away after a `set` too large to store: real memcached
+        # answers SERVER_ERROR and swallows exactly that many bytes, so they are never parsed
+        # as commands.
+        self._discard = 0
         _MemcachedProtocol._conn_counter += 1
         self._conn_id = _MemcachedProtocol._conn_counter
 
@@ -156,6 +160,7 @@ class _MemcachedProtocol(asyncio.Protocol):
     def _close(self) -> None:
         self._buf.clear()
         self._pending_body = None
+        self._discard = 0
         if self._transport is not None and not self._transport.is_closing():
             self._transport.close()
 
@@ -164,16 +169,6 @@ class _MemcachedProtocol(asyncio.Protocol):
         if t is None or t.is_closing():
             return
         self._buf += data
-        if len(self._buf) > _MAX_LINE_BYTES + _MAX_TRACKED_VALUE_BYTES:
-            # Oversized garbage — real memcached errors out rather than buffering.
-            # Must also drop a pending body: if we discard the buffer without
-            # doing this, the *next* data_received() treats whatever the peer
-            # sends next as the completion of a `set` body that was actually
-            # abandoned here, misparsing an unrelated command as opaque bytes.
-            self._send(b"ERROR\r\n")
-            self._buf.clear()
-            self._pending_body = None
-            return
         buf = self._buf
         pos = 0
         try:
@@ -181,6 +176,13 @@ class _MemcachedProtocol(asyncio.Protocol):
                 if write_backlogged(t, _MAX_WRITE_BUFFER):
                     self._close()  # peer is not reading its replies
                     return
+                if self._discard:
+                    skipped = min(self._discard, len(buf) - pos)
+                    pos += skipped
+                    self._discard -= skipped
+                    if self._discard:
+                        break
+                    continue
                 if self._pending_body is not None:
                     # The data block is exactly `declared` bytes of arbitrary
                     # content — real memcached values can contain embedded CRLFs,
@@ -211,6 +213,15 @@ class _MemcachedProtocol(asyncio.Protocol):
             self._close()
             return
         del buf[:pos]
+        if len(buf) > _MAX_LINE_BYTES + _MAX_TRACKED_VALUE_BYTES:
+            # Oversized garbage that parsed to nothing — real memcached errors out rather than
+            # buffering. Checked AFTER parsing, never before: a loopback or fast-link peer can
+            # deliver a whole `set` header and a large body in one read, and judging the buffer
+            # first threw the header away, so the staging was never recorded. Drop a pending body
+            # too, or the next command would be taken as the end of a `set` that was abandoned.
+            self._send(b"ERROR\r\n")
+            buf.clear()
+            self._pending_body = None
 
     def _send(self, payload: bytes) -> None:
         if self._transport is not None and not self._transport.is_closing():
@@ -270,6 +281,7 @@ class _MemcachedProtocol(asyncio.Protocol):
                 # Consume without storing; still record the intent.
                 self._send(b"SERVER_ERROR object too large for cache\r\n")
                 self._on_stored(key, declared)
+                self._discard = declared + 2
                 return True
             self._pending_body = (key, declared)
             return True

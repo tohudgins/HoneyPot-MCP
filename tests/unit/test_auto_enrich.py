@@ -67,13 +67,17 @@ async def test_critical_alert_gets_enrichment(stub_intel):
                 severity=AlertSeverity.CRITICAL,
             )
         )
-        # Long enough for flush + background enrichment task to settle.
-        await asyncio.sleep(1.5)
+        # Flush, then the background enrichment task: poll for the result instead of guessing how
+        # long a loaded machine needs (a fixed 1.5 s failed intermittently).
+        alerts: list = []
+        for _ in range(100):
+            await asyncio.sleep(0.1)
+            async with get_session() as session:
+                alerts = list((await session.execute(select(Alert))).scalars().all())
+            if alerts and alerts[0].payload.get("enrichment") is not None:
+                break
     finally:
         await buf.stop()
-
-    async with get_session() as session:
-        alerts = list((await session.execute(select(Alert))).scalars().all())
 
     assert len(alerts) == 1
     enrichment = alerts[0].payload.get("enrichment")

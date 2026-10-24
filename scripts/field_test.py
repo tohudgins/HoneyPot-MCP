@@ -773,6 +773,9 @@ def public_ip() -> str:
 
 def cmd_attack(a: argparse.Namespace) -> int:
     only = set(a.only.split(",")) if a.only else None
+    # A deployment that listens on shifted ports (unprivileged ones, on a laptop).
+    for engine in PORTS:
+        PORTS[engine] += a.port_offset
     src = a.source_ip or public_ip()
     started = datetime.now(UTC)
     results: list[Probe] = []
@@ -879,6 +882,12 @@ def main() -> int:
     at.add_argument("--only", help="comma list of engines, e.g. ssh,redis")
     at.add_argument("--source-ip", help="this machine's public address (auto-detected otherwise)")
     at.add_argument("--pause", type=float, default=1.0, help="seconds between probes")
+    at.add_argument(
+        "--port-offset",
+        type=int,
+        default=0,
+        help="add this to every public port (a local run on unprivileged ports, e.g. 20000)",
+    )
     at.set_defaults(fn=cmd_attack)
     v = sub.add_parser("verify", help="check a backup's database against the manifest")
     v.add_argument("--manifest", required=True)

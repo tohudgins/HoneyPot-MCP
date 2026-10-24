@@ -129,6 +129,8 @@ async def test_revoke_marks_the_key_revoked():
 
     active = await api_key_list()
     assert not any(k["id"] == created["id"] for k in active["keys"])
+    # nothing active is not "nothing was ever created"
+    assert "1 revoked" in active["note"] and "never" not in active["note"]
 
     everything = await api_key_list(include_revoked=True)
     revoked = next(k for k in everything["keys"] if k["id"] == created["id"])
