@@ -107,7 +107,6 @@ def test_a_lock_that_cannot_be_created_does_not_stop_the_server(tmp_path, monkey
         ("tools.honeypot:honeypot_stop", {"name": "x"}),
         ("tools.honeypot:honeypot_pause", {"name": "x"}),
         ("tools.honeypot:honeypot_resume", {"name": "x"}),
-        ("tools.honeypot:honeypot_clone", {"source_name": "x", "new_port": 9999}),
         ("tools.honeypot:honeypot_configure", {"name": "x", "config": {}}),
         ("tools.honeypot:honeypot_self_test", {"name": "x"}),
         ("tools.deception:deception_deploy_plan", {"sensors": [], "tokens": []}),
@@ -163,7 +162,7 @@ async def test_a_read_only_process_never_probes_or_inspects_in_process_sensors()
     from honeypot_mcp.storage import event_buffer
     from honeypot_mcp.storage.database import close_db, get_session, init_db
     from honeypot_mcp.storage.models import Alert, Honeypot, HoneypotStatus, HoneypotType
-    from honeypot_mcp.tools.honeypot import honeypot_health, honeypot_status
+    from honeypot_mcp.tools.honeypot import honeypot_status
 
     event_buffer.reset_for_tests()
     await init_db()
@@ -179,12 +178,13 @@ async def test_a_read_only_process_never_probes_or_inspects_in_process_sensors()
                 )
             )
         instance_lock.set_ownership(False, instance_lock.Holder(pid=4242))
-        result = await honeypot_health("r1")
+        result = await honeypot_status()
         health = result["honeypots"][0]
         assert health["method"] == "not-probed" and health["alive"] is None
         assert result["answering"] == 0 and result["not_answering"] == []
         status = await honeypot_status("r1")
         assert status["engine_status"]["method"] == "not-probed"
+        assert status["recent_log"] == [] and "not read" in status["log_note"]
         async with get_session() as session:
             assert (
                 await session.execute(select(func.count()).select_from(Alert))

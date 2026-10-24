@@ -318,9 +318,9 @@ async def test_authenticate_plain_and_login_mechanisms_both_log_in(mail):
 
 async def test_a_planted_credential_logs_in_and_trips_its_token(mail):
     _, port = mail
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
-    created = await honeytoken_generate_credentials("planted-imap", count=1, service="imap")
+    created = await honeytoken_create("credential", "planted-imap", {"count": 1, "service": "imap"})
     pair = created["metadata"]["credentials"][0]
     client = await asyncio.to_thread(_login, port, pair["username"], pair["password"])
     await asyncio.to_thread(client.logout)

@@ -187,11 +187,11 @@ def test_replacing_a_world_readable_artifact_tightens_it_and_a_named_one_is_neve
 
 
 async def test_the_navigator_layer_file_is_owner_only_and_readable_by_its_owner():
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
+    from honeypot_mcp.tools.analysis import generate_report
 
     await _seed([("ssh_login_failed", "192.0.2.1", {"username": "root"}, None)])
 
-    out = await attack_navigator_layer()
+    out = await generate_report(format="attack_navigator")
 
     assert _mode(out["path"]) == 0o600
     assert json.loads(Path(out["path"]).read_text())["domain"] == "enterprise-attack"
@@ -202,9 +202,9 @@ async def test_the_navigator_layer_file_is_owner_only_and_readable_by_its_owner(
 
 async def test_no_read_only_tool_writes_a_file():
     """Derived from the code: a tool whose source writes an artifact must not claim readOnlyHint.
-    Viewer-tier `generate_report` and `attack_navigator_layer` write confined report files by design
-    (documented in CLAUDE.md); what matters is that a client auto-approving read-only tools is never
-    asked to trust one of them."""
+    Viewer-tier `generate_report` (its attack_navigator format included) writes confined report
+    files by design (documented in CLAUDE.md); what matters is that a client auto-approving
+    read-only tools is never asked to trust one of them."""
     import inspect
     import re
 
@@ -217,7 +217,6 @@ async def test_no_read_only_tool_writes_a_file():
             continue
         if writes.search(inspect.getsource(tool.fn)):
             assert tool.annotations.readOnlyHint is False, name
-    assert tools["attack_navigator_layer"].annotations.readOnlyHint is False
     assert tools["generate_report"].annotations.readOnlyHint is False
 
 

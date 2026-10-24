@@ -17,6 +17,13 @@ os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqli
 
 pytestmark = pytest.mark.asyncio
 
+
+async def _aws(label, **keys):
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
+
+    return await honeytoken_create("api_key", label, keys or None)
+
+
 REAL_AWS = {
     "access_key_id": "AKIAIOSFODNN7EXAMPLE",
     "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -49,11 +56,9 @@ def _gcp_key(email="svc-backup-prod@proj.iam.gserviceaccount.com"):
 
 
 async def test_an_aws_key_from_the_account_is_adopted_verbatim_and_a_generated_one_is_marked():
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_aws
-
-    adopted = await honeytoken_generate_aws("decoy", **REAL_AWS)
+    adopted = await _aws("decoy", **REAL_AWS)
     assert adopted["token_value"] == f"{REAL_AWS['access_key_id']}:{REAL_AWS['secret_access_key']}"
-    generated = await honeytoken_generate_aws("lookalike")
+    generated = await _aws("lookalike")
     assert generated["token_value"].split(":")[0] != REAL_AWS["access_key_id"]
 
     from honeypot_mcp.storage.database import get_session
@@ -81,9 +86,9 @@ async def test_an_aws_key_from_the_account_is_adopted_verbatim_and_a_generated_o
     ],
 )
 async def test_a_malformed_aws_key_is_refused_not_turned_into_a_token_that_can_never_fire(bad):
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_aws, honeytoken_list
+    from honeypot_mcp.tools.honeytoken import honeytoken_list
 
-    out = await honeytoken_generate_aws("typo", **bad)
+    out = await _aws("typo", **bad)
     assert "error" in out
     assert all(t["label"] != "typo" for t in (await honeytoken_list())["tokens"])
 
@@ -91,9 +96,8 @@ async def test_a_malformed_aws_key_is_refused_not_turned_into_a_token_that_can_n
 async def test_the_audit_log_event_for_the_decoy_key_triggers_its_token():
     """The point of adoption: CloudTrail's record of the (denied) call names the key."""
     from honeypot_mcp.token_matchers import match_cloud_event
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_aws
 
-    created = await honeytoken_generate_aws("decoy", **REAL_AWS)
+    created = await _aws("decoy", **REAL_AWS)
     cloudtrail = {
         "eventName": "ListBuckets", "errorCode": "AccessDenied", "sourceIPAddress": "203.0.113.9",
         "userIdentity": {"type": "IAMUser", "accessKeyId": REAL_AWS["access_key_id"]},
@@ -148,9 +152,9 @@ async def test_gcp_service_account_key_is_adopted_and_validated():
 
 async def test_a_trailing_newline_cannot_slip_past_the_format_checks():
     """`re.match` with `$` accepts "...\\n", storing a token that no real event can ever match."""
-    from honeypot_mcp.tools.honeytoken import honeytoken_create, honeytoken_generate_aws
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
-    out = await honeytoken_generate_aws(
+    out = await _aws(
         "nl",
         access_key_id=REAL_AWS["access_key_id"] + "\n",
         secret_access_key=REAL_AWS["secret_access_key"],
@@ -199,10 +203,8 @@ async def test_a_malformed_gcp_key_is_refused_and_a_huge_or_deep_one_does_not_cr
 async def test_registering_the_same_identity_twice_is_refused_without_echoing_the_secret():
     """A second registration used to hit a unique-constraint error whose message quoted the
     bound parameters, i.e. the plaintext secret."""
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_aws
-
-    await honeytoken_generate_aws("first", **REAL_AWS)
-    again = await honeytoken_generate_aws("second", **REAL_AWS)
+    await _aws("first", **REAL_AWS)
+    again = await _aws("second", **REAL_AWS)
     assert "already registered" in again["error"]
     assert REAL_AWS["secret_access_key"] not in json.dumps(again)
 
@@ -210,9 +212,9 @@ async def test_registering_the_same_identity_twice_is_refused_without_echoing_th
 async def test_one_identifier_cannot_shadow_another_across_clouds():
     """The cloud index is a single map: a GCP private_key_id equal to an AWS key id would
     take over that entry."""
-    from honeypot_mcp.tools.honeytoken import honeytoken_create, honeytoken_generate_aws
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
-    await honeytoken_generate_aws("aws", **REAL_AWS)
+    await _aws("aws", **REAL_AWS)
     hijack = _gcp_key()
     hijack["private_key_id"] = REAL_AWS["access_key_id"]
     out = await honeytoken_create(
@@ -239,9 +241,9 @@ async def test_the_key_file_is_not_stored_a_second_time():
 async def test_an_adopted_token_cannot_be_rotated_into_a_generated_one():
     """Rotation regenerates the secret. For an adopted token that silently swapped a real
     decoy for a lookalike that exists nowhere, so detection would stop without a sign."""
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_aws, honeytoken_rotate
+    from honeypot_mcp.tools.honeytoken import honeytoken_rotate
 
-    adopted = await honeytoken_generate_aws("real", **REAL_AWS)
+    adopted = await _aws("real", **REAL_AWS)
     out = await honeytoken_rotate(adopted["id"])
     assert "cloud account" in out["error"]
 
@@ -256,9 +258,8 @@ async def test_a_generated_azure_token_still_rotates():
 
 async def test_a_forwarded_event_with_oddly_shaped_fields_does_not_crash_the_matcher():
     from honeypot_mcp.token_matchers import match_cloud_event
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_aws
 
-    await honeytoken_generate_aws("real", **REAL_AWS)
+    await _aws("real", **REAL_AWS)
     for odd in (
         {"userIdentity": "root"}, {"claims": "x"}, {"identity": {"claims": "x"}},
         {"protoPayload": "x"}, {"protoPayload": {"authenticationInfo": []}},

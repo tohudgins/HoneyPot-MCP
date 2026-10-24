@@ -1208,6 +1208,9 @@ async def test_pcap_files_lists_extracts_when_capture_is_disabled_and_dirs_are_m
     try:
         empty = await pcap_files()
         assert empty["count"] == 0 and empty["capture_reaches_back_to"] is None
+        # Absorbed pcap_status: capture state, and the reason it is off, ride along.
+        assert empty["capture"]["running"] is False
+        assert empty["capture"]["capability"] and "not running" in empty["capture"]["note"]
         reports.mkdir()
         write(reports / "pcap-z.pcap", pcap_bytes([]))
         listed = await pcap_files()

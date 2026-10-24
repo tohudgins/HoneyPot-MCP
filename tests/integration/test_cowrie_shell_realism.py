@@ -79,7 +79,7 @@ async def test_real_cowrie_head_uptime_and_tracked_bait():
     from honeypot_mcp.storage import event_buffer
     from honeypot_mcp.storage.database import close_db, init_db
     from honeypot_mcp.tools.honeypot import honeypot_deploy, honeypot_stop
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
     previous_url = os.environ.get("DATABASE_URL")
     db_dir = tempfile.mkdtemp(prefix="honeypot-shell-it-")
@@ -94,7 +94,7 @@ async def test_real_cowrie_head_uptime_and_tracked_bait():
     port = free_port()
     deployed = False
     try:
-        made = await honeytoken_generate_credentials(label="bait-it", count=1, service="mysql")
+        made = await honeytoken_create("credential", "bait-it", {"count": 1, "service": "mysql"})
         assert "error" not in made, made
         pair = made["metadata"]["credentials"][0]
         user, password = pair["username"], pair["password"]

@@ -75,10 +75,14 @@ async def test_suppression_load_preset_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_suppression_list_presets_finds_bundled():
-    from honeypot_mcp.tools.integrations import suppression_list_presets
+async def test_suppression_list_shows_bundled_presets_and_whether_loaded():
+    from honeypot_mcp.tools.integrations import suppression_list, suppression_load_preset
 
-    presets = {p["name"]: p for p in (await suppression_list_presets())["presets"]}
+    presets = {p["name"]: p for p in (await suppression_list())["presets"]}
+    assert presets["censys"]["loaded"] is False
+    await suppression_load_preset("censys")
+    after = {p["name"]: p for p in (await suppression_list())["presets"]}
+    assert after["censys"]["loaded"] is True and after["shodan"]["loaded"] is False
     assert "shodan" in presets
     assert "censys" in presets
     assert "internal-rfc1918" in presets

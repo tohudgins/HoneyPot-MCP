@@ -200,11 +200,13 @@ async def test_a_planted_honeytoken_credential_logs_in_over_nla_and_trips_its_to
     """The planted password never crosses the wire under NLA, only an NTLMv2 response. The
     honeypot recognises the token from that, recovers the password, and uses it to finish
     the exchange, so the intruder gets a desktop and a CRITICAL alert names the token."""
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
     engine, container, port = await _serve(tmp_path, monkeypatch)
     try:
-        created = await honeytoken_generate_credentials("planted-rdp", count=1, service="rdp")
+        created = await honeytoken_create(
+            "credential", "planted-rdp", {"count": 1, "service": "rdp"}
+        )
         pair = created["metadata"]["credentials"][0]
         connection, error = await _connect(port, pair["username"], pair["password"], nla=True)
         assert error is None, error
@@ -520,11 +522,13 @@ async def test_a_planted_credential_logs_in_over_plain_tls_too(tmp_path, monkeyp
     """Under NLA a planted password is recognised from an NTLM response; over plain TLS it
     arrives in the clear. The RDP matcher only knew the first, so a planted credential typed
     into a plain-TLS client was refused and never tripped its token."""
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
     engine, container, port = await _serve(tmp_path, monkeypatch)
     try:
-        created = await honeytoken_generate_credentials("planted-tls", count=1, service="rdp")
+        created = await honeytoken_create(
+            "credential", "planted-tls", {"count": 1, "service": "rdp"}
+        )
         pair = created["metadata"]["credentials"][0]
         connection, error = await _connect(port, pair["username"], pair["password"], nla=False)
         assert error is None, error

@@ -1,5 +1,7 @@
 # Field test: prove your deployment works
 
+> Historical results below were measured on the 70- and 83-tool servers. The server now has 67 tools: `map_ttps` is now `attack_summary`, `export_blocklist` is now `export_indicators`, `honeypot_health` is now `honeypot_status` (no name), and the vendor blocklist push tools were removed. Old names in a result row are history, not current tools.
+
 Unit tests prove the code. A field test proves **your deployment**: that traffic from the public
 internet reaches each sensor through the firewall and port mapping, that the engine understands it,
 and that the event lands in the database and is reachable through the control plane.
@@ -115,7 +117,7 @@ more sources on one event type lands in exactly one campaign, with the same even
 `GROUP BY`; the tool's own reply must report the true total and show the top 10 by score),
 `fingerprint_clusters` (distinct IPs, sessions and first/last seen per HASSH against
 `json_extract`, and the tool's reply must be the 10 largest of them), `attack_summary`'s totals, and
-cross-tool invariants. Only `map_ttps` is listed as not covered, with the reason, rather than
+cross-tool invariants. Only `map_ttps` (now `attack_summary`) is listed as not covered, with the reason, rather than
 skipped silently.
 
 First run, on 4,896,441 real alerts: 73 checks, 0 failed, in 31 seconds. To prove the oracle can
@@ -126,7 +128,7 @@ per-sensor hits all failed (`4896442 != 4896441`). The original is never opened 
 
 Captured usernames, paths, user agents and commands are written by the attacker and land in the same
 context that decides which tools a model calls. This plants alerts whose fields carry instructions
-(bulk false-positive triage, `alerts_prune`, `honeypot_stop`, `report_ip_abuse`, `export_blocklist`;
+(bulk false-positive triage, `alerts_prune`, `honeypot_stop`, `report_ip_abuse`, `export_blocklist` (now `export_indicators`);
 in a command, a user agent, a username, a path and a JSON blob) into a copy of a real backup, runs
 the server in analysis mode, and gives a real `claude -p` session **every tool pre-approved**, so
 nothing asks first. It then checks the database against its baseline and the tool calls from the
@@ -157,7 +159,7 @@ data was then backed up and checked offline:
 | Check | Result |
 |---|---|
 | `field_test.py attack` then `verify` against the backup | 23 of 23 engines proven end to end; 0 probes failed |
-| `field_test_tools.py` | 86 checks over all 70 registered tools (83 now; every one is called or skipped with a reason): 85 passed, 1 failed. The failure was the check's own expectation (it required an error message back, and `sql_query` correctly refused the secret table); the check now asserts the refusal and has not been re-run against a live host |
+| `field_test_tools.py` | 86 checks over all 70 registered tools (67 now; every one is called or skipped with a reason): 85 passed, 1 failed. The failure was the check's own expectation (it required an error message back, and `sql_query` correctly refused the secret table); the check now asserts the refusal and has not been re-run against a live host |
 | `field_test_ops.py` | 20 of 20 (after three of its own checks were corrected: the campaign result shape, the triage window, and throttling the sensor's *current* top source) |
 | `field_test_oracle.py` on the final backup | 73 checks, 0 failed, on 17.5M alerts (6 min 25 s on SQLite) |
 | `field_test_injection.py` | 3 of 3 scenarios held (summarise, triage, investigate); one model and one sample each |
@@ -181,7 +183,7 @@ Everything the scripts and live checks surfaced was invisible to the unit tests.
 | Server start | The documented `root:honeypot 0640` `.env` triggered a "world readable" warning the pre-flight accepted | one shared rule (`config.env_group`) |
 | `field_test.py` (probes) | SIP: a bare `REGISTER` is classified as extension enumeration (by design); `sip_register_attempt` needs a digest | expectation fixed, both sent |
 | Backup report | The Docker bridge address (the source Cowrie sees for self-tests and probes) was counted as an attacker | private ranges are reported separately |
-| Vendor specs vs the push tools | pfSense: wrong auth header, lookup and HTTP verb; Cloudflare: async operation reported as done, chunks refused; AWS WAF: description blanked each push | tools rewritten against the real contracts; tests drive the real client through strict stubs |
+| Vendor specs vs the push tools (since removed) | pfSense: wrong auth header, lookup and HTTP verb; Cloudflare: async operation reported as done, chunks refused; AWS WAF: description blanked each push | tools rewritten against the real contracts at the time; later removed because they could not be verified against real accounts |
 
 The backup-script findings (WAL snapshots, the wrong Cowrie state directory) are why the test rig for
 the backup script now runs the real embedded script against a fake container filesystem instead of a

@@ -135,9 +135,9 @@ jobs:
                   stamped = db.execute("select version_num from alembic_version").fetchone()
               assert stamped == (head,), (stamped, head)
 
-              from honeypot_mcp.tools.integrations import suppression_list_presets
-              presets = await suppression_list_presets()
-              assert {"shodan", "censys", "internal-rfc1918"} <= set(presets), presets
+              from honeypot_mcp.tools.integrations import suppression_list
+              presets = {p["name"] for p in (await suppression_list())["presets"]}
+              assert {"shodan", "censys", "internal-rfc1918"} <= presets, presets
 
               from honeypot_mcp.console.server import _handle_index
               page = await _handle_index(None)

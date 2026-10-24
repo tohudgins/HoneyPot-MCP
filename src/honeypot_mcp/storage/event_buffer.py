@@ -473,7 +473,7 @@ class EventBuffer:
                 session.add(alert)
                 if ev.honeytoken_id is not None:
                     # Only an event that carries a honeytoken link is kept here: it is the trail
-                    # `honeytoken_status` and the journey read. Every other event used to be copied
+                    # `honeytoken_list` (one token) and the journey read. Every other event used to be copied
                     # in full (payload included, with no alert_id), doubling the storage and the
                     # write cost of the whole table for no reader.
                     session.add(

@@ -126,6 +126,14 @@ def _layer(result: dict) -> dict:
     return json.loads(Path(result["path"]).read_text(encoding="utf-8"))
 
 
+async def attack_navigator_layer(
+    since_hours: float | None = None, output_path: str | None = None
+) -> dict:
+    from honeypot_mcp.tools.analysis import write_report
+
+    return await write_report(None, None, "attack_navigator", since_hours, output_path)
+
+
 async def _seed_run() -> None:
     await _seed(
         [
@@ -139,7 +147,6 @@ async def _seed_run() -> None:
 
 async def test_the_layer_validates_against_the_published_format():
     jsonschema = pytest.importorskip("jsonschema")
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
 
     await _seed_run()
     layer = _layer(await attack_navigator_layer())
@@ -158,7 +165,6 @@ async def test_the_layer_validates_against_the_published_format():
 
 async def test_scores_are_the_alert_counts_attack_summary_reports_for_the_same_data():
     from honeypot_mcp.tools.analysis import attack_summary
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
 
     await _seed_run()
     summary = await attack_summary()
@@ -182,8 +188,6 @@ async def test_scores_are_the_alert_counts_attack_summary_reports_for_the_same_d
 
 
 async def test_a_sub_technique_carries_its_parent_so_it_shows_when_expanded():
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
-
     await _seed_run()
     by_id = {t["techniqueID"]: t for t in _layer(await attack_navigator_layer())["techniques"]}
 
@@ -194,8 +198,6 @@ async def test_a_sub_technique_carries_its_parent_so_it_shows_when_expanded():
 
 
 async def test_bookkeeping_is_reported_unmapped_and_never_scored():
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
-
     await _seed_run()
     result = await attack_navigator_layer()
     layer = _layer(result)
@@ -207,8 +209,6 @@ async def test_bookkeeping_is_reported_unmapped_and_never_scored():
 
 
 async def test_the_window_filters_and_a_bad_window_is_refused():
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
-
     await _seed([("redis_config_set", 4, timedelta(0)), ("redis_config_set", 6, timedelta(days=3))])
 
     recent = await attack_navigator_layer(since_hours=24, output_path="recent.json")
@@ -222,7 +222,6 @@ async def test_the_window_filters_and_a_bad_window_is_refused():
 
 async def test_an_empty_database_is_a_valid_empty_layer():
     jsonschema = pytest.importorskip("jsonschema")
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
 
     result = await attack_navigator_layer()
     layer = _layer(result)
@@ -234,7 +233,6 @@ async def test_an_empty_database_is_a_valid_empty_layer():
 
 async def test_the_file_goes_to_the_reports_directory_and_a_named_file_is_never_replaced(tmp_path):
     from honeypot_mcp.config import get_settings
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
 
     await _seed_run()
     reports = get_settings().reports_dir.resolve()
@@ -250,8 +248,6 @@ async def test_the_file_goes_to_the_reports_directory_and_a_named_file_is_never_
 
 @pytest.mark.parametrize("hostile", ["../escape.json", "/tmp/honeypot-navigator-escape.json"])
 async def test_a_path_outside_the_reports_directory_is_refused_and_nothing_is_written(hostile):
-    from honeypot_mcp.tools.ioc import attack_navigator_layer
-
     await _seed_run()
     result = await attack_navigator_layer(output_path=hostile)
 
@@ -259,13 +255,27 @@ async def test_a_path_outside_the_reports_directory_is_refused_and_nothing_is_wr
     assert not Path("/tmp/honeypot-navigator-escape.json").exists()
 
 
-async def test_the_tool_is_registered_viewer_tier_and_honest_about_writing():
+async def test_the_layer_is_a_generate_report_format_and_no_separate_tool_remains():
     from honeypot_mcp import rbac
     from honeypot_mcp.server import mcp
 
     tools = {t.name: t for t in await mcp.list_tools()}
 
-    assert "attack_navigator_layer" in rbac.VIEWER_TOOLS
-    annotations = tools["attack_navigator_layer"].annotations
+    assert "attack_navigator_layer" not in tools
+    assert "generate_report" in rbac.VIEWER_TOOLS
+    assert "attack_navigator" in tools["generate_report"].parameters["properties"]["format"]["enum"]
+    annotations = tools["generate_report"].annotations
     assert annotations.readOnlyHint is False, "it writes a file; it must not claim to be read-only"
-    assert annotations.destructiveHint is False and annotations.openWorldHint is False
+    assert annotations.destructiveHint is False
+
+
+async def test_an_ip_is_ignored_with_a_note_and_a_wrong_extension_is_refused():
+    from honeypot_mcp.tools.analysis import generate_report, write_report
+
+    await _seed_run()
+    result = await generate_report(ip="198.51.100.1", format="attack_navigator")
+    assert "ip (198.51.100.1) was ignored" in result["note"]
+    assert result["total_alerts"] == 74
+
+    wrong = await write_report(None, None, "attack_navigator", None, output_path="layer.md")
+    assert "must end in .json" in wrong["error"]

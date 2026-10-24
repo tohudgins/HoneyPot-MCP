@@ -12,7 +12,7 @@ Two kinds of check:
 * Static: read the configuration and the host (bind addresses, token strength, file modes,
   database, free disk, Docker, whether the ports you plan to use are free).
 * Live (with ``--mcp-url`` / ``--metrics-url``): ask the running server (``/readyz``, ``ping``,
-  ``honeypot_health``, ``honeypot_self_test`` per sensor, the alert subscriptions).
+  ``honeypot_status``, ``honeypot_self_test`` per sensor, the alert subscriptions).
 
 Exit status 0 when nothing failed, 1 otherwise (``--strict`` also fails on warnings), so it can
 gate a deploy script. ``honeypot_self_test`` sends a synthetic probe to each sensor, which
@@ -472,7 +472,8 @@ async def control_plane_checks(call: ToolCaller, *, self_test: bool) -> list[Che
         )  # fmt: skip
     )
 
-    sensors = _dicts(await call("honeypot_list", {}))
+    listed = await call("honeypot_list", {})
+    sensors = _dicts(listed.get("honeypots")) if isinstance(listed, dict) else None
     if sensors is None or any("name" not in h for h in sensors):
         out.append(Check("sensors", FAIL, "honeypot_list did not return a list of sensors",
                          "The server answered unexpectedly; check its log."))  # fmt: skip
@@ -486,27 +487,26 @@ async def control_plane_checks(call: ToolCaller, *, self_test: bool) -> list[Che
     out.append(
         Check("sensors", PASS, f"{len(running)} running")
         if not broken
-        else Check("sensors", FAIL, f"in error: {', '.join(broken)}", "honeypot_health shows why.")
+        else Check("sensors", FAIL, f"in error: {', '.join(broken)}", "honeypot_status shows why.")
     )
 
-    health = _dicts(await call("honeypot_health", {}))
+    status = await call("honeypot_status", {})
+    health = _dicts(status.get("honeypots")) if isinstance(status, dict) else None
     answered = {str(h.get("name")): h.get("alive") for h in health or []}
     not_alive = [str(h["name"]) for h in running if answered.get(str(h["name"])) is not True]
     if health is None:
-        out.append(Check("sensor health", FAIL, "honeypot_health did not return a list",
+        out.append(Check("sensor health", FAIL, "honeypot_status did not return the sensor list",
                          "The server answered unexpectedly; check its log."))  # fmt: skip
     elif not_alive:
         out.append(Check("sensor health", FAIL, f"not confirmed alive: {', '.join(not_alive)}",
-                         "See honeypot_health / honeypot_logs (a read-only process cannot probe)."))  # fmt: skip
+                         "See honeypot_status (a read-only process cannot probe)."))  # fmt: skip
     else:
         out.append(Check("sensor health", PASS, "every running sensor answered its probe"))
 
     if self_test:
         failures = []
         for sensor in running:
-            result = await call(
-                "honeypot_self_test", {"name": sensor["name"], "timeout_seconds": 15}
-            )
+            result = await call("honeypot_self_test", {"name": sensor["name"]})
             if not (isinstance(result, dict) and result.get("alert_received") is True):
                 detail = (
                     result.get("detail") or result.get("error")
@@ -527,7 +527,8 @@ async def control_plane_checks(call: ToolCaller, *, self_test: bool) -> list[Che
     else:
         out.append(Check("end-to-end self-test", SKIP, "--no-self-test"))
 
-    subscriptions = await call("alert_subscriptions_list", {})
+    listed_subs = await call("alert_subscriptions_list", {})
+    subscriptions = listed_subs.get("subscriptions") if isinstance(listed_subs, dict) else None
     if not isinstance(subscriptions, list):
         out.append(Check("alert channel", WARN, "could not read the alert subscriptions",
                          "alert_subscriptions_list returned something unexpected."))  # fmt: skip

@@ -7,7 +7,7 @@ plain http, emit `/32` for IPv6 and left no audit trail.
 Finding 8 — honeypot pause/resume/configure and honeytoken creation were not
 audited, `honeypot_configure` accepted anything (including a telnet port that
 collides with another sensor), `honeypot_stop` could hang on an engine that
-never finishes stopping, and `honeytoken_status` handed viewers the secret.
+never finishes stopping, and `honeytoken_list` by id handed viewers the secret.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -57,43 +56,6 @@ async def _audit_rows(tool: str) -> list[Any]:
         return list(rows.all())
 
 
-async def _insert_offenders(ips: list[str], count: int = 10) -> None:
-    from honeypot_mcp.storage.database import get_session
-    from honeypot_mcp.storage.models import Alert, AlertSeverity
-
-    now = datetime.now(UTC)
-    async with get_session() as session:
-        for ip in ips:
-            for _ in range(count):
-                session.add(
-                    Alert(
-                        timestamp=now,
-                        source_ip=ip,
-                        event_type="ssh_login_failed",
-                        severity=AlertSeverity.MEDIUM,
-                        payload={},
-                    )
-                )
-
-
-class _FakeCFClient:
-    def __init__(self) -> None:
-        self.requested_urls: list[str] = []
-
-    async def __aenter__(self) -> _FakeCFClient:
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        return None
-
-    async def get(self, url: str, headers: Any = None, params: Any = None) -> MagicMock:  # noqa: ARG002
-        self.requested_urls.append(url)
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json = MagicMock(return_value={"result": [], "result_info": {"cursors": {}}})
-        return resp
-
-
 def _settings_override(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
     from honeypot_mcp.config import get_settings
 
@@ -102,12 +64,11 @@ def _settings_override(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
         monkeypatch.setattr(settings, key, value)
 
 
-# ── Finding 7: blocklist pushes ─────────────────────────────────────────────
+# ── Finding 7: blocklist exports never carry private/allowlisted/own addresses ──
 
 
-@pytest.mark.asyncio
-async def test_blocklist_never_pushes_private_allowlisted_or_own_ip(monkeypatch):
-    from honeypot_mcp.tools import blocklist_push
+def test_blocklist_never_includes_private_allowlisted_or_own_ip(monkeypatch):
+    from honeypot_mcp.tools.analysis import _usable_offenders
 
     _settings_override(
         monkeypatch,
@@ -115,185 +76,33 @@ async def test_blocklist_never_pushes_private_allowlisted_or_own_ip(monkeypatch)
         canary_public_url="http://203.0.113.77:8888",
         canary_callback_host="0.0.0.0",
     )
-    await _insert_offenders(
-        [
-            "1.1.1.1",  # global → pushed
-            "10.0.0.5",  # RFC1918
-            "127.0.0.1",  # loopback
-            "8.8.8.8",  # allowlisted CIDR
-            "2001:4860:4860::8888",  # allowlisted IPv6 CIDR
-            "203.0.113.77",  # our own canary host (TEST-NET, so also non-global)
-            "9.9.9.9",  # global → pushed
-        ]
-    )
-    fake = _FakeCFClient()
-    with patch("httpx.AsyncClient", return_value=fake):
-        result = await blocklist_push.blocklist_push_cloudflare(
-            account_id="acct", list_id="list", api_token="tok-SECRET", dry_run=True
-        )
-
-    assert sorted(result["added"]) == ["1.1.1.1", "9.9.9.9"]
-    assert result["failed"] == []
+    offenders = [
+        ("1.1.1.1", 10),  # global -> exported
+        ("10.0.0.5", 10),  # RFC1918
+        ("127.0.0.1", 10),  # loopback
+        ("8.8.8.8", 10),  # allowlisted CIDR
+        ("2001:4860:4860::8888", 10),  # allowlisted IPv6 CIDR
+        ("203.0.113.77", 10),  # our own canary host (TEST-NET, so also non-global)
+        ("9.9.9.9", 10),  # global -> exported
+    ]
+    assert sorted(str(a) for a, _ in _usable_offenders(offenders)) == ["1.1.1.1", "9.9.9.9"]
 
 
-@pytest.mark.asyncio
-async def test_blocklist_excludes_own_public_ip_even_when_global(monkeypatch):
+def test_blocklist_excludes_own_public_ip_even_when_global(monkeypatch):
     """The canary filter must not rely on the address happening to be non-global."""
-    from honeypot_mcp.tools import blocklist_push
+    from honeypot_mcp.tools.analysis import _usable_offenders
 
     _settings_override(monkeypatch, canary_public_url="https://[2606:4700::1111]:8443/x")
-    await _insert_offenders(["2606:4700::1111", "1.0.0.1"])
-    with patch("httpx.AsyncClient", return_value=_FakeCFClient()):
-        result = await blocklist_push.blocklist_push_cloudflare(
-            account_id="acct", list_id="list", api_token="tok", dry_run=True
-        )
-    assert result["added"] == ["1.0.0.1"]
+    usable = _usable_offenders([("2606:4700::1111", 10), ("1.0.0.1", 10)])
+    assert [str(a) for a, _ in usable] == ["1.0.0.1"]
 
 
-@pytest.mark.asyncio
-async def test_malformed_allowlist_refuses_to_push(monkeypatch):
-    from honeypot_mcp.tools import blocklist_push
+def test_malformed_allowlist_refuses_to_export(monkeypatch):
+    from honeypot_mcp.tools.analysis import _usable_offenders
 
     _settings_override(monkeypatch, blocklist_allowlist="1.1.1.1,not-an-ip")
-    await _insert_offenders(["1.1.1.1"])
-    client_factory = MagicMock()
-    with patch("httpx.AsyncClient", client_factory):
-        result = await blocklist_push.blocklist_push_cloudflare(
-            account_id="acct", list_id="list", api_token="tok"
-        )
-    assert result["added"] == []
-    assert "not-an-ip" in result["failed"][0]["error"]
-    client_factory.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("account_id", "list_id"),
-    [("acct/../../zones", "list"), ("acct", "list?x=1"), ("", "list"), ("a" * 65, "list")],
-)
-async def test_cloudflare_rejects_ids_that_would_alter_the_url(account_id, list_id):
-    from honeypot_mcp.tools import blocklist_push
-
-    await _insert_offenders(["1.1.1.1"])
-    client_factory = MagicMock()
-    with patch("httpx.AsyncClient", client_factory):
-        result = await blocklist_push.blocklist_push_cloudflare(
-            account_id=account_id, list_id=list_id, api_token="tok"
-        )
-    assert result["added"] == []
-    assert result["failed"][0]["ip"] == "*"
-    client_factory.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "base_url",
-    ["http://pfsense.example", "http://192.168.1.1", "ftp://pf.local", "pfsense.local"],
-)
-async def test_pfsense_refuses_cleartext_or_relative_urls(base_url):
-    from honeypot_mcp.tools import blocklist_push
-
-    await _insert_offenders(["1.1.1.1"])
-    client_factory = MagicMock()
-    with patch("httpx.AsyncClient", client_factory):
-        result = await blocklist_push.blocklist_push_pfsense(
-            base_url=base_url, api_key="k", alias_name="block"
-        )
-    assert result["added"] == []
-    assert result["failed"][0]["ip"] == "*"
-    client_factory.assert_not_called()
-
-
-class _PfClient:
-    """Stands in for httpx.AsyncClient against a pfSense API."""
-
-    async def __aenter__(self) -> _PfClient:
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        return None
-
-    async def get(self, _url: str, headers: Any = None, params: Any = None) -> MagicMock:  # noqa: ARG002
-        # pfrest v2: the plural endpoint returns a list of aliases, each with its integer id.
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json = MagicMock(
-            return_value={
-                "data": [{"id": 1, "name": (params or {}).get("name"), "address": [], "detail": []}]
-            }
-        )
-        return resp
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("base_url", ["http://127.0.0.1:8443", "http://localhost", "http://[::1]"])
-async def test_pfsense_allows_http_to_loopback(base_url):
-    from honeypot_mcp.tools import blocklist_push
-
-    await _insert_offenders(["1.1.1.1"])
-
-    with patch("httpx.AsyncClient", return_value=_PfClient()):
-        result = await blocklist_push.blocklist_push_pfsense(
-            base_url=base_url, api_key="k", alias_name="block", dry_run=True
-        )
-    assert result["added"] == ["1.1.1.1"]
-
-
-@pytest.mark.asyncio
-async def test_waf_uses_host_prefix_per_address_family():
-    from honeypot_mcp.tools import blocklist_push
-
-    await _insert_offenders(["1.1.1.1", "2606:4700:4700::1111"])
-    boto_client = MagicMock()
-    boto_client.get_ip_set.return_value = {"IPSet": {"Addresses": []}, "LockToken": "l"}
-    with patch("boto3.client", return_value=boto_client):
-        result = await blocklist_push.blocklist_push_aws_waf(
-            ip_set_id="x", ip_set_name="x", region="us-east-1", dry_run=True
-        )
-    assert sorted(result["added"]) == ["1.1.1.1/32", "2606:4700:4700::1111/128"]
-
-
-@pytest.mark.asyncio
-async def test_blocklist_push_is_audited_without_the_credential():
-    from honeypot_mcp.tools import blocklist_push
-
-    await _insert_offenders(["1.1.1.1"])
-    with patch("httpx.AsyncClient", return_value=_FakeCFClient()):
-        await blocklist_push.blocklist_push_cloudflare(
-            account_id="acct", list_id="list", api_token="tok-SUPERSECRET", dry_run=True
-        )
-
-    rows = await _audit_rows("blocklist_push_cloudflare")
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.target == "api.cloudflare.com"
-    assert row.arguments["dry_run"] is True
-    assert "1 IP" in row.summary
-    flat = f"{row.summary} {row.arguments} {row.target} {row.error}"
-    assert "SUPERSECRET" not in flat
-
-
-@pytest.mark.asyncio
-async def test_pfsense_audit_records_host_not_url_credentials():
-    from honeypot_mcp.tools import blocklist_push
-
-    # An offender must exist, or the tool returns early on "nothing to push" and
-    # never builds the URL-bearing summary/error this test is about.
-    await _insert_offenders(["1.1.1.1"])
-    with patch("httpx.AsyncClient", return_value=_PfClient()):
-        await blocklist_push.blocklist_push_pfsense(
-            base_url="https://admin:hunter2@pf.example:8443/",
-            api_key="KEY-XYZ",
-            alias_name="b",
-            dry_run=True,
-        )
-    rows = await _audit_rows("blocklist_push_pfsense")
-    assert len(rows) == 1
-    assert "1 IP" in rows[0].summary  # the push path ran, not the empty-offenders branch
-    assert rows[0].target == "pf.example"
-    flat = f"{rows[0].summary} {rows[0].arguments} {rows[0].target}"
-    assert "hunter2" not in flat
-    assert "KEY-XYZ" not in flat
+    with pytest.raises(ValueError, match="not-an-ip"):
+        _usable_offenders([("1.1.1.1", 10)])
 
 
 # ── Finding 8: honeypot tools ───────────────────────────────────────────────
@@ -419,21 +228,21 @@ async def test_stop_does_not_hang_on_an_engine_that_never_finishes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_honeytoken_status_masks_secret_for_viewers(monkeypatch):
-    from honeypot_mcp.tools.honeytoken import honeytoken_create, honeytoken_status
+async def test_honeytoken_list_by_id_masks_secret_for_viewers(monkeypatch):
+    from honeypot_mcp.tools.honeytoken import honeytoken_create, honeytoken_list
 
     created = await honeytoken_create(type="canary_url", label="wiki", planted_at="IT-114")
     full = created["token_value"]
 
-    as_admin = await honeytoken_status(created["id"])
+    as_admin = await honeytoken_list(token_id=created["id"])
     assert as_admin["token_value"] == full
     assert as_admin["metadata"]["planted_at"] == "IT-114"
 
     _as(monkeypatch, "operator")
-    assert (await honeytoken_status(created["id"]))["token_value"] == full
+    assert (await honeytoken_list(token_id=created["id"]))["token_value"] == full
 
     _as(monkeypatch, "viewer")
-    masked = await honeytoken_status(created["id"])
+    masked = await honeytoken_list(token_id=created["id"])
     assert masked["token_value"] == f"{full[:4]}…"
     assert masked["metadata"] == {"redacted": True}
     assert full not in repr(masked)
@@ -446,14 +255,16 @@ async def test_honeytoken_creation_paths_are_audited_once_without_secret():
     created = await ht.honeytoken_create(
         type="credential", label="db creds", metadata={"service": "ssh"}
     )
-    generated = await ht.honeytoken_generate_credentials(label="gen", service="ftp")
+    generated = await ht.honeytoken_create(
+        type="credential", label="gen", metadata={"service": "ftp"}
+    )
 
-    rows = await _audit_rows("honeytoken_create")
+    all_rows = await _audit_rows("honeytoken_create")
+    assert len(all_rows) == 2
+    rows = [r for r in all_rows if r.target == str(created["id"])]
+    gen_rows = [r for r in all_rows if r.target == str(generated["id"])]
     assert len(rows) == 1
-    assert rows[0].target == str(created["id"])
-    gen_rows = await _audit_rows("honeytoken_generate_credentials")
     assert len(gen_rows) == 1
-    assert gen_rows[0].target == str(generated["id"])
 
     for row, token in ((rows[0], created), (gen_rows[0], generated)):
         flat = f"{row.summary} {row.arguments} {row.target}"

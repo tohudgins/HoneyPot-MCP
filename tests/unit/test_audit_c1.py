@@ -171,13 +171,13 @@ async def test_generate_report_auto_names_still_work(reports_dir):
 
 
 @pytest.mark.asyncio
-async def test_export_blocklist_drops_non_global_and_uses_v6_syntax(reports_dir):
-    from honeypot_mcp.tools.analysis import export_blocklist
+async def test_export_indicators_drops_non_global_and_uses_v6_syntax(reports_dir):
+    from honeypot_mcp.tools.analysis import export_indicators
 
     await _seed("10.0.0.5", 6)
     await _seed("2606:4700::1111", 6)
     await _seed("8.8.8.8", 6)
-    result = await export_blocklist(format="iptables", min_hits=5)
+    result = await export_indicators(format="iptables", min_hits=5)
     text = Path(result["path"]).read_text()
 
     assert result["ip_count"] == 2
@@ -186,13 +186,13 @@ async def test_export_blocklist_drops_non_global_and_uses_v6_syntax(reports_dir)
 
 
 @pytest.mark.asyncio
-async def test_export_stix_types_ipv6_indicators_correctly(reports_dir):
+async def test_export_indicators_stix_types_ipv6_indicators_correctly(reports_dir):
     import json
 
-    from honeypot_mcp.tools.analysis import export_stix
+    from honeypot_mcp.tools.analysis import export_indicators
 
     await _seed("2606:4700::1111", 2)
-    result = await export_stix(min_hits=1)
+    result = await export_indicators(format="stix", min_hits=1)
     patterns = [o["pattern"] for o in json.loads(Path(result["path"]).read_text())["objects"]]
 
     assert patterns == ["[ipv6-addr:value = '2606:4700::1111']"]

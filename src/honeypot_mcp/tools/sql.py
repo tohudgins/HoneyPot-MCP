@@ -71,7 +71,7 @@ _PADDING_FUNCTIONS = re.compile(r"\b(repeat|lpad|rpad|array_fill)\s*\(")
 
 # Where a refused table's data lives, so the refusal can say what to call instead.
 _DEDICATED_TOOL = {
-    "honeytokens": "honeytoken_list / honeytoken_status",
+    "honeytokens": "honeytoken_list",
     "api_keys": "api_key_list",
     "subscriptions": "alert_subscriptions_list",
     "audit_log": "audit_log_search",

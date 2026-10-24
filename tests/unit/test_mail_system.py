@@ -288,9 +288,9 @@ async def test_an_executable_attachment_is_critical_and_hashed_in_the_event(mail
 
 async def test_a_planted_pop3_credential_logs_in_and_trips_its_honeytoken(mail):
     _, pop_port = mail
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
-    created = await honeytoken_generate_credentials("planted-mail", count=1, service="pop3")
+    created = await honeytoken_create("credential", "planted-mail", {"count": 1, "service": "pop3"})
     pair = created["metadata"]["credentials"][0]
     client = await asyncio.to_thread(_pop, pop_port, pair["username"], pair["password"])
     try:
@@ -548,9 +548,9 @@ async def test_a_planted_credential_sent_over_auth_login_trips_its_token(mail):
     """AUTH LOGIN was never decoded, so a planted credential sent that way was neither
     matched nor let in."""
     _, pop_port = mail
-    from honeypot_mcp.tools.honeytoken import honeytoken_generate_credentials
+    from honeypot_mcp.tools.honeytoken import honeytoken_create
 
-    created = await honeytoken_generate_credentials("sasl", count=1, service="pop3")
+    created = await honeytoken_create("credential", "sasl", {"count": 1, "service": "pop3"})
     pair = created["metadata"]["credentials"][0]
     raw = await _Raw.open(pop_port)
     try:

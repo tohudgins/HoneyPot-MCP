@@ -23,9 +23,7 @@ Three roles, each a strict superset of the one before it:
               system's own data.
   - admin:    operator + the handful of tools whose blast radius reaches
               outside this system's own database: `alerts_prune` (permanent
-              evidence deletion), the `blocklist_push_*` tools (write to a
-              real external firewall/WAF — production infrastructure this
-              codebase doesn't own), `alert_subscribe`/`alert_unsubscribe`
+              evidence deletion), `alert_subscribe`/`alert_unsubscribe`
               (point a stream of captured attack data — and, via SMTP/HTTP
               destinations, outbound requests from this host — at an
               address of the caller's choosing), `audit_log_search`
@@ -359,10 +357,8 @@ VIEWER_TOOLS: frozenset[str] = frozenset(
         "enrich_ip",
         "analyze_attacker",
         "analyze_campaign",
-        "map_ttps",
         "attack_summary",
         "extract_iocs",
-        "attack_navigator_layer",
         "lookup_hash",
         "sql_query",
         "attack_patterns",
@@ -377,15 +373,9 @@ VIEWER_TOOLS: frozenset[str] = frozenset(
         "soc_brief",
         "honeypot_list",
         "honeypot_status",
-        "honeypot_logs",
-        "honeypot_templates",
-        "honeypot_health",
         "honeytoken_list",
-        "honeytoken_status",
         "alert_subscriptions_list",
         "suppression_list",
-        "suppression_list_presets",
-        "pcap_status",
         "pcap_files",
         "pcap_analyze",
         "ping",
@@ -400,14 +390,10 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
         "honeypot_pause",
         "honeypot_resume",
         "honeypot_configure",
-        "honeypot_clone",
         "honeypot_self_test",
         "honeytoken_create",
         "honeytoken_rotate",
         "honeytoken_revoke",
-        "honeytoken_generate_aws",
-        "honeytoken_generate_credentials",
-        "honeytoken_embed_file",
         "honeytoken_export",
         "alerts_acknowledge",
         "alerts_export",
@@ -421,8 +407,7 @@ OPERATOR_TOOLS: frozenset[str] = frozenset(
         "sample_scan",
         "mapping_audit",
         "run_analysis",
-        "export_blocklist",
-        "export_stix",
+        "export_indicators",
         "report_ip_abuse",
     }
 )
@@ -432,9 +417,6 @@ ADMIN_TOOLS: frozenset[str] = frozenset(
         "alerts_prune",
         "alert_subscribe",
         "alert_unsubscribe",
-        "blocklist_push_cloudflare",
-        "blocklist_push_pfsense",
-        "blocklist_push_aws_waf",
         "audit_log_search",
         "database_backup",
         "detection_rules_update",

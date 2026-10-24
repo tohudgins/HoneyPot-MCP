@@ -1,7 +1,7 @@
 """`mapping_audit`: measure the ATT&CK mapping against independent human labels.
 
 `intel/mitre.py` maps an alert to techniques by its event type (and regexes over payload text for
-`map_ttps`). Nobody had checked those mappings against anyone's judgement, so every ATT&CK figure the
+`attack_summary` with an address or event types). Nobody had checked those mappings against anyone's judgement, so every ATT&CK figure the
 server prints rested on the author's own reading of each event type. This tool turns that into a
 measurement, in two steps that happen days apart and are done by different people:
 

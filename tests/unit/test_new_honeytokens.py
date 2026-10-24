@@ -483,3 +483,47 @@ async def test_every_registered_provider_produces_a_token(token_type: str):
     assert created["status"] == "active"
     assert created["token_value"], f"{token_type} produced an empty token value"
     assert created["plant_instructions"].strip(), f"{token_type} has no plant instructions"
+
+
+@pytest.mark.asyncio
+async def test_create_applies_per_type_defaults_and_bounds():
+    from honeypot_mcp.tools.honeytoken import honeytoken_create, honeytoken_list
+
+    aws = await honeytoken_create("api_key")
+    assert aws["label"] == "AWS key"
+    assert aws["metadata"]["region"] == "us-east-1"
+
+    creds = await honeytoken_create("credential", metadata={"service": " FTP "})
+    assert creds["label"] == "ftp credentials"
+    assert len(creds["metadata"]["credentials"]) == 5
+
+    for bad in (0, 21, "3"):
+        assert "error" in await honeytoken_create("credential", metadata={"count": bad})
+    assert "error" in await honeytoken_create("file", metadata={"file_type": "exe"})
+
+    doc = await honeytoken_create("file", metadata={"file_type": "docx"})
+    assert doc["label"] == "docx document"
+    assert doc["metadata"]["document_title"] == "Confidential Report"
+
+    # One token chosen by name comes back in full, with its trail.
+    one = await honeytoken_list(label="ftp credentials")
+    assert one["id"] == creds["id"] and "trail" in one
+    missing = await honeytoken_list(token_id=99999)
+    assert "error" in missing
+
+
+@pytest.mark.asyncio
+async def test_honeytoken_list_finds_a_token_by_what_a_person_says():
+    """`public-bait-mysql-env` is "the public bait credential": the words of the question must all
+    be in the label or the type, in any order, ignoring filler (the same rule as bait_trips)."""
+    from honeypot_mcp.tools.honeytoken import honeytoken_create, honeytoken_list
+
+    await honeytoken_create(type="credential", label="public-bait-mysql-env")
+    await honeytoken_create(type="canary_url", label="public-bait-canary-env")
+
+    for said in ("public bait credential", "the bait credential", "MYSQL env", "public_bait_mysql"):
+        found = await honeytoken_list(label=said)
+        # exactly one match returns that token's detail view
+        assert found.get("label") == "public-bait-mysql-env", said
+    assert (await honeytoken_list(label="public bait"))["count"] == 2
+    assert (await honeytoken_list(label="the token"))["count"] == 0

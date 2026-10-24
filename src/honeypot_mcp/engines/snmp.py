@@ -11,7 +11,7 @@ read it.
 What this catches:
 
 * **Community-string brute force** — each attempt is recorded with the string
-  itself, so `honeytoken_generate_credentials` values planted as fake community
+  itself, so `honeytoken_create` credential values planted as fake community
   strings cross-reference here like any other service.
 * **Default-credential success** — `public` / `private` are answered, because a
   scanner that gets nothing back moves on and you learn only that it knocked.

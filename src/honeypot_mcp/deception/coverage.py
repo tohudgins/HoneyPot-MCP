@@ -225,7 +225,7 @@ async def _recommend(
                     "false-positive signal and the only one that catches an attacker "
                     "who never touches a sensor."
                 ),
-                "command": 'honeytoken_generate_credentials(service="<a deployed service>")',
+                "command": 'honeytoken_create(type="credential", metadata={"service": "<a deployed service>"})',
             },
         )
 

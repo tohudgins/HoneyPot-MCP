@@ -26,6 +26,7 @@ from sqlalchemy import select
 from honeypot_mcp import instance_lock
 from honeypot_mcp.deception.capabilities import (
     BY_TYPE,
+    all_capabilities,
     all_profiles,
     resolve_profile,
     resolve_type,
@@ -64,18 +65,43 @@ def _one_line(text: str, limit: int = 110) -> str:
 
 
 @mcp.tool(**hints("deception_profiles"))
-async def deception_profiles(profile: str | None = None) -> dict[str, Any]:
-    """What kinds of environment can be planned, and which decoys make each one believable?
+async def deception_profiles(profile: str | None = None, type: str | None = None) -> dict[str, Any]:
+    """What can be deployed: environment profiles, sensor types, and what each one catches?
 
-    Use it for "what can you protect?", "what is in the Windows setup?". With no argument it lists
-    each environment profile in one line with its sensors; with a profile it gives the details.
-    `deception_plan` turns a profile into a deployment; `honeypot_templates` describes the
-    individual sensor types.
+    Use it for "what can you protect?", "what honeypots can I run?", "what does the redis
+    honeypot capture?". No argument: every profile and every sensor type, one line each. With a
+    profile: its sensors. With a type: everything about it, including its `config` settings.
+    `deception_plan` turns a profile into a deployment; `honeypot_deploy` runs one sensor.
 
     Args:
-        profile: One profile (an id, or words like "windows", "containers", "databases") for its
-            details. Omit for the short list.
+        profile: One profile (an id, or words like "windows", "containers", "databases").
+        type: One sensor type (ssh, postgres, k8s, ...) for its full details and settings.
     """
+    if type:
+        # Deferred: tools.honeypot imports server, which imports this module (a load-time cycle).
+        from honeypot_mcp.tools.honeypot import _CHECKS, _CONFIG_KEYS, _type_error
+
+        kind = resolve_type(type)
+        if kind is None:
+            return _type_error(type)
+        c = BY_TYPE[kind]
+        return {
+            "type": c.type,
+            "name": c.display_name,
+            "what_it_captures": c.summary,
+            "default_port": c.default_port,
+            "real_world_port": c.real_world_port,
+            "transport": c.transport,
+            "os_family": c.os_family,
+            "roles": list(c.roles),
+            "needs_docker": c.requires_docker,
+            "credentials_recorded_as": c.captures_credentials_as,
+            "detects": list(c.signature_events),
+            "settings": {k: _CHECKS[k][1] for k in sorted(_CONFIG_KEYS.get(c.type, ()))},
+            "pairs_well_with": list(c.pairs_well_with),
+            **({"caution": c.public_cloud_caution} if c.public_cloud_caution else {}),
+            "note": f"Deploy it with honeypot_deploy(type='{c.type}'). Settings go in `config`.",
+        }
     if profile:
         chosen, near = resolve_profile(profile)
         if chosen is None:
@@ -113,8 +139,18 @@ async def deception_profiles(profile: str | None = None) -> dict[str, Any]:
             }
             for p in all_profiles()
         ],
+        "sensor_types": [
+            {
+                "type": c.type,
+                "port": c.default_port,
+                "what": _one_line(c.summary),
+                **({"needs_docker": True} if c.requires_docker else {}),
+            }
+            for c in all_capabilities()
+        ],
         "note": "Pick the profile closest to what the user runs, or name sensor types with "
-        "`services` in deception_plan. `honeypot_templates` lists every sensor type.",
+        "`services` in deception_plan. `port` is the default; a free one is chosen if taken. "
+        "Ask with `type` for one sensor's detail and settings.",
     }
 
 

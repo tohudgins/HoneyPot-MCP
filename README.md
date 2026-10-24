@@ -23,7 +23,7 @@ HoneyPot MCP is a single server that runs decoy services and decoy credentials, 
 |---|---|
 | **25 protocol engines** | Remote access (SSH, Telnet, RDP, VNC), databases (MySQL, PostgreSQL, MSSQL, MongoDB, Redis, Elasticsearch, Memcached), web and APIs (HTTP/S, Docker API, Kubernetes API), mail (SMTP, IMAP, POP3), file sharing (SMB, FTP, NFS, rsync), VoIP and directory (SIP, LDAP, SNMP, DNS), tested against real clients and scanners |
 | **Honeytokens and canary files** | Cloud keys, credential pairs, canary URLs, document trackers and more; a planted credential used on any honeypot escalates straight to CRITICAL |
-| **83 MCP tools in three roles** | Viewer, operator and admin, with live-provisioned per-person API keys and an audit log of every control-plane action |
+| **67 MCP tools in three roles** | Viewer, operator and admin, with live-provisioned per-person API keys and an audit log of every control-plane action |
 | **Analysis** | MITRE ATT&CK mapping (with a tool that measures its accuracy against blind labels), attacker profiles and risk scores, cross-honeypot timelines, campaign correlation, what attackers did (credentials, commands, dropped files, SSH clients, SIP dialling), who used the bait, packet captures replayed through Suricata or Zeek, YARA scanning of captured files, reports and STIX export, all as tools |
 | **Dashboards** | Five provisioned Grafana dashboards (started by one tool call, on loopback only) and a built-in read-only operations console |
 | **Alerts** | Slack, Teams, email and SIEM delivery (Splunk, Elastic, CEF, syslog, Loki, Datadog) |
@@ -42,7 +42,7 @@ flowchart LR
     DB --> ALERT["Alerts<br/>Slack, Teams, email, SIEM"]
 ```
 
-Engines never write to the database directly: every event passes one ingestion path that applies suppression rules, matches planted credentials and caps floods before a single flusher writes it in batches. Statistics are served from hourly rollups rather than the raw alert table, so the cost of an answer does not grow with the size of the database. Tools are built to be driven from one plain sentence: they return dicts with a count and a note and size their own answers (list tools show a digest, one tool expands a single alert, bulk output goes to a file under `REPORTS_DIR`), and a test caps the size of the tool list so it stays cheap in an assistant's context. [CLAUDE.md](CLAUDE.md) documents the pipeline and the plugin patterns.
+Engines never write to the database directly: every event passes one ingestion path that applies suppression rules, matches planted credentials and caps floods before a single flusher writes it in batches. Statistics are served from hourly rollups rather than the raw alert table, so the cost of an answer does not grow with the size of the database. Tools are built to be driven from one plain sentence and size their own answers ([how](docs/REFERENCE.md#mcp-tools)). [CLAUDE.md](CLAUDE.md) documents the pipeline and the plugin patterns.
 
 ## Applied on a real VPS
 
@@ -98,7 +98,7 @@ This starts the server, a live Cowrie SSH honeypot on `:2222`, an HTTP honeypot 
 
 Deploy honeypots only on infrastructure you own and are allowed to expose. A honeypot deliberately attracts hostile traffic and stores the malware and credentials it is sent, so treat the host as untrusted and follow [docs/HARDENING.md](docs/HARDENING.md) before putting one on a public address. The software is provided as is, without warranty.
 
-Not verified: GreyNoise enrichment and the pfSense, Cloudflare and AWS WAF push tools were not run against real services.
+Not verified: GreyNoise enrichment was not run against the live service.
 
 ## License
 

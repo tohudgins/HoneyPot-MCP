@@ -1,4 +1,4 @@
-"""Packet-capture tools: check capture, extract one attacker's packets, list files, read one back.
+"""Packet-capture tools: list files and capture state, extract one attacker's packets, read one back.
 
 A 1 GB ring buffer is not an answer to "what did this IP send", so `pcap_extract` pulls one source's
 packets into a file and `pcap_analyze` turns that file into a digest. Every tool that reads a file
@@ -41,22 +41,16 @@ _ANALYZE_SLOTS = 2
 _analysis_slots: LoopBound[asyncio.Semaphore] = LoopBound(lambda: asyncio.Semaphore(_ANALYZE_SLOTS))
 
 
-@mcp.tool(**hints("pcap_status"))
-async def pcap_status() -> dict[str, Any]:
-    """Is packet capture running, and how much disk is it using?
-
-    Use it for "is the packet capture on?", "why is there no pcap?". When capture is off it says
-    why (tcpdump missing, no permission, or disabled) and what to do. Takes no arguments.
-    """
-    capture = pcap_module.get_capture()
-    status = capture.status()
+def _capture_section() -> dict[str, Any]:
+    """Is capture running, disk use, and (when off) the actual reason and fix."""
+    status = pcap_module.get_capture().status()
     if not status["running"]:
         capability = pcap_module.probe_capability().as_dict()
         status["capability"] = capability
         status["note"] = (
             "Packet capture is not running"
             + (f": {capability['reason']}" if capability.get("reason") else ".")
-            + " Existing extracts can still be listed with pcap_files and read with pcap_analyze."
+            + " Existing files below can still be read with pcap_analyze."
         )
     else:
         status["note"] = "Packet capture is running."
@@ -69,7 +63,7 @@ async def pcap_extract(source_ip: str) -> dict[str, Any]:
 
     Use it for "get me the traffic from 203.0.113.7", "save that attacker's packets". The file
     lands in the reports directory; read it with `pcap_analyze` or `pcap_detect`. Needs a live
-    server with packet capture running (see `pcap_status`); it searches the whole ring buffer.
+    server with packet capture running (see `pcap_files`); it searches the whole ring buffer.
 
     Args:
         source_ip: The attacker's address, as it appears on the alert.
@@ -106,7 +100,7 @@ async def pcap_extract(source_ip: str) -> dict[str, Any]:
         )
         result.setdefault(
             "hint",
-            "Check pcap_status: extracting needs a live server with packet capture running. "
+            "Check pcap_files(): extracting needs a live server with packet capture running. "
             "Extracts that already exist are listed by pcap_files.",
         )
     return result
@@ -147,10 +141,11 @@ def _describe_files(ring: list[Path], extracts: list[Path], now: float) -> list[
 
 @mcp.tool(**hints("pcap_files"))
 async def pcap_files(source_ip: str | None = None) -> dict[str, Any]:
-    """List the saved packet captures and how far back the live capture reaches.
+    """List the saved packet captures, how far back capture reaches and whether it is running.
 
-    Use it for "what captures do I have?", "is there a pcap for 203.0.113.7?", "how far back
-    does the capture go?". `extract` files are what `pcap_extract` saved (newest 25 shown); `ring`
+    Use it for "what captures do I have?", "is there a pcap for 203.0.113.7?", "is the packet
+    capture on?", "why is there no pcap?". `capture` says if capture runs, its disk use and, when
+    off, why and the fix. `extract` files are what `pcap_extract` saved (newest 25 shown); `ring`
     files are the rolling live buffer. Works with capture off and in analysis mode. Name any
     listed file in `pcap_analyze` or `pcap_detect`.
 
@@ -215,6 +210,7 @@ async def pcap_files(source_ip: str | None = None) -> dict[str, Any]:
         "files": rows,
         "extract_bytes": extract_bytes,
         "ring_bytes": sum(ring_stats),
+        "capture": _capture_section(),
         "capture_reaches_back_to": (
             datetime.fromtimestamp(ring[0].stat().st_mtime, UTC).isoformat()
             if ring and ring[0].exists()
@@ -333,7 +329,7 @@ async def pcap_control(action: Literal["start", "stop", "restart"]) -> dict[str,
         out.setdefault("error", str(result.get("reason") or "Packet capture did not start."))
         out.setdefault(
             "hint",
-            "Check pcap_status for the cause; capture needs tcpdump with permission to sniff and "
+            "Check pcap_files() `capture` for the cause; capture needs tcpdump with permission to sniff and "
             "at least one running honeypot.",
         )
     return out

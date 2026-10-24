@@ -367,12 +367,14 @@ async def run_analysis(hours: int = 168) -> dict[str, Any]:
             _analysis_tools.write_report("Run summary", None, "html", float(effective)),
         ),
         run.step(
-            "export_stix",
-            _analysis_tools.export_stix(hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS),
+            "export_indicators(stix)",
+            _analysis_tools.export_indicators(
+                format="stix", hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS
+            ),
         ),
         run.step(
-            "export_blocklist",
-            _analysis_tools.export_blocklist(
+            "export_indicators(plain)",
+            _analysis_tools.export_indicators(
                 format="plain", hours=effective, min_hits=_MIN_HITS_FOR_EXPORTS
             ),
         ),

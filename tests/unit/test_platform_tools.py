@@ -1,7 +1,7 @@
 """Tests for the SOC platform tools — exports, retention.
 
-Format-stability tests: any downstream tool consuming `export_blocklist` or
-`export_stix` should not break if we tweak the implementation.
+Format-stability tests: any downstream tool consuming `export_indicators` should not break if we
+tweak the implementation.
 """
 
 import json
@@ -58,15 +58,15 @@ async def _seed_alerts(ip: str, count: int, hours_ago: int = 1):
 
 
 @pytest.mark.asyncio
-async def test_export_blocklist_plain_format(reports_dir):
+async def test_export_indicators_plain_format(reports_dir):
     """Blocklists are written to disk, not returned inline — the content is
     destined for a firewall and grows a line per offending IP."""
-    from honeypot_mcp.tools.analysis import export_blocklist
+    from honeypot_mcp.tools.analysis import export_indicators
 
     await _seed_alerts("8.8.8.8", count=10)
     await _seed_alerts("9.9.9.9", count=2)  # Below threshold
 
-    result = await export_blocklist(format="plain", hours=24, min_hits=5)
+    result = await export_indicators(format="plain", hours=24, min_hits=5)
     assert result["ip_count"] == 1
     dest = Path(result["path"])
     assert dest.parent == reports_dir.resolve() and dest.name.startswith("blocklist-")
@@ -77,22 +77,22 @@ async def test_export_blocklist_plain_format(reports_dir):
 
 
 @pytest.mark.asyncio
-async def test_export_blocklist_iptables_format(reports_dir):
-    from honeypot_mcp.tools.analysis import export_blocklist
+async def test_export_indicators_iptables_format(reports_dir):
+    from honeypot_mcp.tools.analysis import export_indicators
 
     await _seed_alerts("1.2.3.4", count=10)
-    result = await export_blocklist(format="iptables", hours=24, min_hits=5)
+    result = await export_indicators(format="iptables", hours=24, min_hits=5)
     assert "iptables -A INPUT -s 1.2.3.4 -j DROP" in Path(result["path"]).read_text()
 
 
 @pytest.mark.asyncio
-async def test_export_stix_emits_valid_bundle(reports_dir):
+async def test_export_indicators_stix_emits_valid_bundle(reports_dir):
     """STIX goes to a file: a few hundred alerts exceed 100 KB of JSON, and the
     bundle is meant for a TIP rather than for reading back."""
-    from honeypot_mcp.tools.analysis import export_stix
+    from honeypot_mcp.tools.analysis import export_indicators
 
     await _seed_alerts("4.4.4.4", count=3)
-    result = await export_stix(hours=24, min_hits=1)
+    result = await export_indicators(format="stix", hours=24, min_hits=1)
     assert result["indicator_count"] >= 1
     dest = Path(result["path"])
     assert dest.parent == reports_dir.resolve() and dest.name.startswith("stix-")

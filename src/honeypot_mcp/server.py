@@ -319,7 +319,7 @@ mcp = FastMCP(
         "settings are needed. A result with an `error` also has a `hint` for the next step.\n"
         "Where to start:\n"
         '- "What happened?": `soc_brief`. "Is everything running?": `honeypot_list`, '
-        "`honeypot_health`.\n"
+        "`honeypot_status`.\n"
         '- "Who is this IP?": `analyze_attacker`, then `analyze_attacker_journey`.\n'
         '- "Who used the bait?": `bait_trips`.\n'
         '- "What are attackers doing?": `attack_patterns` (credentials, commands, files, '
@@ -347,7 +347,6 @@ import honeypot_mcp.prompts  # noqa: E402, F401
 import honeypot_mcp.tools.alerts  # noqa: E402, F401
 import honeypot_mcp.tools.analysis  # noqa: E402, F401
 import honeypot_mcp.tools.api_keys  # noqa: E402, F401
-import honeypot_mcp.tools.blocklist_push  # noqa: E402, F401
 import honeypot_mcp.tools.deception  # noqa: E402, F401
 import honeypot_mcp.tools.detect  # noqa: E402, F401
 import honeypot_mcp.tools.grafana  # noqa: E402, F401

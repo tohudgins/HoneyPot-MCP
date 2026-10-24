@@ -186,7 +186,7 @@ def test_release_smoke_checks_the_installed_wheel_outside_the_source_tree(releas
         "samples.load_rules",
         "grafana.list_dashboards",
         "_handle_index",
-        "suppression_list_presets",
+        "suppression_list()",
         "py.typed",
         "list_tools",  # the console script speaks MCP
         "cd /tmp/elsewhere",

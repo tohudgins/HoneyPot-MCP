@@ -461,9 +461,9 @@ class Settings(BaseSettings):
     # it. It applies to containers created after the setting changes.
     cowrie_janitor_interval_seconds: float = 300.0
     cowrie_max_tty_files: int = 5000
-    # Comma-separated IPs/CIDRs that `blocklist_push_*` must never push (your
+    # Comma-separated IPs/CIDRs that blocklist exports must never contain (your
     # own gateway, monitoring, office egress). Link-local/private/loopback and
-    # non-global addresses are never pushed regardless.
+    # non-global addresses are never exported regardless.
     blocklist_allowlist: str = ""
     # Extra Host header names the operations console answers to, comma-
     # separated, in addition to loopback and `console_host`. Anything else gets

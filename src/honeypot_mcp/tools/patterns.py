@@ -2285,7 +2285,7 @@ async def bait_trips(
     if unattributed:
         notes.append(
             f"{sum(unattributed.values())} trip alert(s) could not be tied to a token "
-            "(see unattributed_trips); honeytoken_status lists a token's own trail."
+            "(see unattributed_trips); honeytoken_list with a token id lists its own trail."
         )
     sources_shown = sum(len(t["sources"]) for t in out_tokens)
     if sources_shown > detailed:

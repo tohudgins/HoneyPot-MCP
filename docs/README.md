@@ -34,5 +34,6 @@ The scripts it describes are in `scripts/`: `field_test.py`, `field_test_tools.p
 |---|---|
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | You are sending a change: setup, checks, and the project's non-obvious rules. |
 | [../CLAUDE.md](../CLAUDE.md) | You are changing the code: architecture, invariants and development notes. |
+| [LESSONS.md](LESSONS.md) | You are about to change one of CLAUDE.md's rules and want the longer account of why it exists. |
 | [../CHANGELOG.md](../CHANGELOG.md) | You want the reasoning behind a change, with the measurement that motivated it. |
 | [../SECURITY.md](../SECURITY.md) | You found a vulnerability, or want the threat model for the control plane. |

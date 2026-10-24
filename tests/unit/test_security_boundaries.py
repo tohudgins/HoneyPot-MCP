@@ -84,7 +84,7 @@ async def test_every_export_tool_refuses_to_write_outside_reports_dir(bad_path):
     """All four bulk writers must share the boundary — a new export tool that
     forgets it reintroduces an arbitrary-file-write primitive.
 
-    `export_stix`, `export_blocklist` and `generate_report` no longer take a path at all (their
+    `export_indicators` and `generate_report` no longer take a path at all (their
     files get generated names inside reports_dir), so the caller-named path survives only on the
     writers behind them and on `alerts_export`; each must still refuse to leave reports_dir."""
     from honeypot_mcp.tools.alerts import alerts_export
@@ -94,8 +94,8 @@ async def test_every_export_tool_refuses_to_write_outside_reports_dir(bad_path):
 
     results = {
         "alerts_export": await alerts_export(format="csv", output_path=bad_path),
-        "export_stix": await write_stix_bundle(24, 1, output_path=bad_path),
-        "export_blocklist": await write_blocklist("plain", 24, 5, output_path=bad_path),
+        "export_indicators_stix": await write_stix_bundle(24, 1, output_path=bad_path),
+        "export_indicators_blocklist": await write_blocklist("plain", 24, 5, output_path=bad_path),
         "generate_report": await write_report(None, None, "markdown", None, output_path=bad_path),
     }
     for tool, result in results.items():
@@ -113,17 +113,17 @@ async def test_path_free_export_tools_expose_no_path_and_write_only_inside_repor
     from pathlib import Path
 
     from honeypot_mcp.config import get_settings
-    from honeypot_mcp.tools.analysis import export_blocklist, export_stix, generate_report
+    from honeypot_mcp.tools.analysis import export_indicators, generate_report
 
-    for tool in (export_stix, export_blocklist, generate_report):
+    for tool in (export_indicators, generate_report):
         params = set(inspect.signature(tool).parameters)
         assert not params & {"output_path", "path", "destination", "filename"}, (tool, params)
 
     monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
     await _seed()
     for result in (
-        await export_stix(hours=24, min_hits=1),
-        await export_blocklist(hours=24, min_hits=5),
+        await export_indicators(format="stix", hours=24),
+        await export_indicators(hours=24, min_hits=5),
         await generate_report(format="markdown"),
     ):
         assert "error" not in result, result

@@ -46,7 +46,7 @@ countries, never source addresses.
 | `real-run/threat-map.png` | Grafana: attacker origins and top countries |
 | `real-run/mitre-coverage.png` | Grafana: ATT&CK tactics and event types, rendered on the final database |
 | `real-run/operations-console.png` | The operations console against the live database |
-| `real-run/attack-navigator.png` | ATT&CK Navigator view of the layer from the `attack_navigator_layer` tool, final database |
+| `real-run/attack-navigator.png` | ATT&CK Navigator view of the layer written by `generate_report format=attack_navigator` (then the `attack_navigator_layer` tool), final database |
 | `real-run/attack-navigator-layer.json` | The layer file, regenerated on the final database (17,726,494 alerts) with the current mapping |
 
 Snapshots were taken while the run was still going, so their counts are lower than the final

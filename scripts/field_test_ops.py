@@ -156,7 +156,7 @@ async def run(a: argparse.Namespace) -> int:
         journey.get("phases") and journey.get("total_events", 0) > 0,
         str(journey)[:150],
     )
-    ttps = await r.call("viewer", "map_ttps", {"ip": target})
+    ttps = await r.call("viewer", "attack_summary", {"ip": target})
     r.check(
         "analysis",
         "ATT&CK mapping names techniques with matched evidence",
@@ -200,10 +200,12 @@ async def run(a: argparse.Namespace) -> int:
 
     print("== remediation")
     bl = await r.call(
-        "operator", "export_blocklist", {"format": "plain", "hours": 24, "min_hits": 20}
+        "operator", "export_indicators", {"format": "plain", "hours": 24, "min_hits": 20}
     )
     r.check("remediation", "blocklist export reports a file", bool(bl.get("path")), str(bl)[:150])
-    stix = await r.call("operator", "export_stix", {"hours": 24, "min_hits": 20})
+    stix = await r.call(
+        "operator", "export_indicators", {"format": "stix", "hours": 24, "min_hits": 20}
+    )
     r.check("remediation", "STIX export reports a file", bool(stix.get("path")), str(stix)[:150])
     if flooder:
         listing = (await r.call("viewer", "honeypot_list"))["honeypots"]
@@ -283,11 +285,12 @@ async def run(a: argparse.Namespace) -> int:
         await r.call("operator", "honeypot_resume", {"name": victim})
     await asyncio.sleep(3)
     r.check("operations", "resuming it reopens the port", port_open(a.host, port))
-    logs = await r.call("viewer", "honeypot_logs", {"name": "hp-ssh", "lines": 20})
+    logs = await r.call("viewer", "honeypot_status", {"name": "hp-ssh"})
     r.check(
         "operations",
         "a real sensor's log shows real sessions",
-        "ssh" in json.dumps(logs).lower() and len(json.dumps(logs)) > 200,
+        "ssh" in json.dumps(logs.get("recent_log", [])).lower()
+        and len(json.dumps(logs.get("recent_log", []))) > 200,
         str(logs)[:120],
     )
     ext = await r.call("operator", "pcap_extract", {"source_ip": target})
@@ -297,7 +300,7 @@ async def run(a: argparse.Namespace) -> int:
         (ext.get("packets") or 0) > 0,
         str(ext)[:150],
     )
-    stat = await r.call("viewer", "honeypot_health", {})
+    stat = await r.call("viewer", "honeypot_status", {})
     r.check(
         "operations",
         "health probe reports every sensor healthy after the above",

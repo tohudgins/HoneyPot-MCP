@@ -1,8 +1,9 @@
-"""Indicator tools: `extract_iocs`, `attack_navigator_layer`, `lookup_hash`.
+"""Indicator tools: `extract_iocs`, `lookup_hash`, and the ATT&CK Navigator layer writer.
 
-All three are viewer-tier. They turn what the sensors captured into things other tools consume:
-the URLs, hosts and file hashes an attacker used (for a blocklist, a sandbox, a TIP), the ATT&CK
-coverage as a layer MITRE's Navigator opens, and a one-hash MalwareBazaar check.
+Both tools are viewer-tier. They turn what the sensors captured into things other tools consume:
+the URLs, hosts and file hashes an attacker used (for a blocklist, a sandbox, a TIP) and a
+one-hash MalwareBazaar check. `write_navigator_layer` (the ATT&CK coverage as a layer MITRE's
+Navigator opens) is reached through `generate_report(format="attack_navigator")`.
 
 **Everything extracted here is attacker-authored text.** Output is therefore structured, not
 prose: URLs come from a regex that cannot cross whitespace and are clipped, hosts are validated
@@ -708,20 +709,11 @@ async def build_navigator_layer(
     return layer, unmapped
 
 
-@mcp.tool(**hints("attack_navigator_layer"))
-async def attack_navigator_layer(
-    since_hours: float | None = None, output_path: str | None = None
+async def write_navigator_layer(
+    since_hours: float | None, output_path: str | None = None
 ) -> dict[str, Any]:
-    """Write a MITRE ATT&CK Navigator layer file of the techniques the sensors observed.
-
-    Use it for "give me an ATT&CK heat map" or "export what we detected for the Navigator". Scored
-    by alert count; open the file at mitre-attack.github.io/attack-navigator ("Open Existing
-    Layer"). The response names the file and lists event types that map to no technique.
-
-    Args:
-        since_hours: Only the last N hours ("today" 24, "this week" 168); default everything.
-        output_path: File name to save as, only if the user names one; default is timestamped.
-    """
+    """Write the Navigator layer file; `generate_report(format="attack_navigator")` is this with
+    an automatic file name."""
     if since_hours is not None and since_hours <= 0:
         return {
             "error": "since_hours must be greater than 0.",

@@ -46,6 +46,7 @@ _NAME_LIST_CAP = 30
 _LIST_CAP = 100
 _PORT_SCAN_SPAN = 200
 _LOG_LINE_CHARS = 240
+_STATUS_LOG_LINES = 20
 _LOG_TOTAL_CHARS = 8000
 _TRANSPORT_LABEL = {"tcp": "tcp", "udp": "udp", "both": "tcp+udp"}
 
@@ -56,7 +57,7 @@ def _type_error(value: Any, *, extra: str = "") -> dict[str, Any]:
     return {
         "error": f"Unknown honeypot type '{value}'.",
         "hint": (f"Did you mean {', '.join(near)}? " if near else "")
-        + f"Valid types: {', '.join(BY_TYPE)}{extra}. `honeypot_templates` says what each captures.",
+        + f"Valid types: {', '.join(BY_TYPE)}{extra}. `deception_profiles` says what each captures.",
     }
 
 
@@ -172,8 +173,9 @@ async def honeypot_deploy(
 
     Use it for "deploy an SSH honeypot", "put a fake Redis on the network", "open a decoy MySQL".
     Only `type` is needed: a free port (the type's usual one when free) and a readable name are
-    chosen, and the result says where it listens. Check it with `honeypot_self_test`. For several
-    decoys that should look like one environment, use `deception_plan` instead.
+    chosen, and the result says where it listens. Check it with `honeypot_self_test`. To copy an
+    existing honeypot, deploy its `type` with its `config` (`honeypot_status` shows both). For
+    several decoys that should look like one environment, use `deception_plan` instead.
 
     Args:
         type: ssh, telnet, http, smtp, ftp, dns, rdp, vnc, redis, mysql, elasticsearch, smb,
@@ -181,7 +183,7 @@ async def honeypot_deploy(
             pop3 or kubernetes ("postgres", "k8s" work). ssh and telnet need Docker.
         port: Only if the user names a port ("on 8080"); otherwise leave out.
         name: Only if the user names it; otherwise something like `ftp-2121` is used.
-        config: Rarely needed settings for this type; `honeypot_templates` with the type lists them.
+        config: Rarely needed settings for this type; `deception_profiles` with the type lists them.
     """
     if (read_only := instance_lock.read_only_error()) is not None:
         return read_only
@@ -194,7 +196,7 @@ async def honeypot_deploy(
     capability = BY_TYPE[type]
     resolved_config = {} if config is None else config
     # The same allow-list and value checks `honeypot_configure` applies: deploy,
-    # deception_deploy_plan and clone all store this dict verbatim and hand it to
+    # deception_deploy_plan both store this dict verbatim and hand it to
     # the engine, so a CR/LF in a banner or an unread key slipped in here.
     if not isinstance(resolved_config, dict):
         return {"error": "config must be a JSON object.", "hint": _config_hint(type)}
@@ -317,7 +319,7 @@ async def honeypot_deploy(
             )
         else:
             failure["hint"] = (
-                "`honeypot_list` shows what is deployed; `honeypot_logs` may say more."
+                "`honeypot_list` shows what is deployed; `honeypot_status` may say more."
             )
         return failure
 
@@ -363,7 +365,7 @@ async def honeypot_list(status: str | None = None, type: str | None = None) -> d
 
     Use it for "what is running?", "list the sensors", "which ssh honeypots do I have?". One row
     per honeypot: name, type, port, status and the number of alerts it has captured. Use
-    `honeypot_health` to confirm they actually answer, `honeypot_status` for one in detail.
+    `honeypot_status` (no name) to confirm they actually answer, or with a name for one in detail.
 
     Args:
         status: Only honeypots in this state: running, paused, stopped or error. Omit for all.
@@ -447,15 +449,20 @@ def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
 
 
 @mcp.tool(**hints("honeypot_status"))
-async def honeypot_status(name: str) -> dict[str, Any]:
-    """How is one honeypot doing: its settings, whether it is alive and what it captured lately?
+async def honeypot_status(name: str | None = None) -> dict[str, Any]:
+    """How is a honeypot doing, or are all of them answering on their ports?
 
-    Use it for "how is the ftp honeypot doing?", "what is hp-ssh configured as?". Use
-    `honeypot_list` to see all of them.
+    Use it for "how is the ftp honeypot doing?", "what is hp-ssh configured as?", "are all the
+    sensors up?", "why is hp-ftp failing?". With a name: settings, engine state, recent alerts and
+    the sensor's own last log lines. Without: probes every running one's port (and the Docker
+    container for ssh/telnet). `honeypot_self_test` proves one records attacks.
 
     Args:
-        name: The honeypot's name; its type ("ftp") or port also work when only one matches.
+        name: The honeypot's name (its type or port also work when only one matches). Omit to
+            probe every running honeypot.
     """
+    if not name:
+        return await _health_of_running()
     async with get_session() as session:
         hp, problem = await _find_sensor(session, name)
         if hp is None:
@@ -466,13 +473,24 @@ async def honeypot_status(name: str) -> dict[str, Any]:
 
         engine = get_engine(hp.type)
         engine_status: dict[str, Any] = {}
+        log_lines: list[str] = []
+        log_note: str | None
         if foreign := _owned_elsewhere(hp):
             engine_status = foreign
+            log_note = "The log is not read from this session."
         elif hp.container_id:
             try:
                 engine_status = await engine.status(hp.container_id)
             except Exception as e:  # noqa: BLE001 - report it rather than fail the whole answer
                 engine_status = {"error": f"Could not read the engine's state: {e}"}
+            try:
+                log_lines, log_note = _log_tail(
+                    await engine.get_logs(hp.container_id, lines=_STATUS_LOG_LINES)
+                )
+            except Exception as e:  # noqa: BLE001 - the log is a bonus, never fail the status
+                log_note = f"The log could not be read: {e}"
+        else:
+            log_note = f"Not running (status={hp.status.value}), so it has no log."
 
         config = dict(hp.config or {})
         endpoints = config.get("endpoints")
@@ -480,7 +498,7 @@ async def honeypot_status(name: str) -> dict[str, Any]:
             config["endpoints"] = endpoints[:10]
             config["endpoints_note"] = f"first 10 of {len(endpoints)}"
 
-        return {
+        result: dict[str, Any] = {
             "id": hp.id,
             "name": hp.name,
             "type": hp.type.value,
@@ -501,12 +519,16 @@ async def honeypot_status(name: str) -> dict[str, Any]:
                 }
                 for a in recent
             ],
+            "recent_log": log_lines,
             "note": (
                 "The newest 10 alerts are listed; use `alerts_recent` or `alerts_search` for more."
                 if hits > len(recent)
                 else "All of this honeypot's alerts are listed."
             ),
         }
+        if log_note:
+            result["log_note"] = log_note
+        return mark_untrusted(result)
 
 
 @mcp.tool(auth=require_role("operator"), **hints("honeypot_stop"))
@@ -668,7 +690,7 @@ async def honeypot_stop(
     if already_stopped:
         result["already_stopped"] = already_stopped
     if failed:
-        result["hint"] = "Failures are listed under `failed`; `honeypot_health` shows the state."
+        result["hint"] = "Failures are listed under `failed`; `honeypot_status` shows the state."
     if timed_out:
         result["timed_out"] = timed_out
         result["note"] += (
@@ -698,7 +720,7 @@ async def honeypot_pause(name: str) -> dict[str, Any]:
             return {
                 "error": f"Honeypot '{hp.name}' is not running (status={hp.status.value}).",
                 "hint": "Only a running honeypot can be paused; `honeypot_resume` restarts a "
-                "paused one and `honeypot_health` says why one is in error.",
+                "paused one and `honeypot_status` says why one is in error.",
             }
 
         engine = get_engine(hp.type)
@@ -783,7 +805,7 @@ async def honeypot_configure(name: str, config: dict[str, Any]) -> dict[str, Any
     """Change a honeypot's settings (its banner, hostname, web persona, ...).
 
     Use it for "make the ftp honeypot announce itself as ...". The keys differ per type and a
-    wrong key or value is refused with the valid ones; `honeypot_templates` with the type lists
+    wrong key or value is refused with the valid ones; `deception_profiles` with the type lists
     them too. Settings are merged into the current ones and apply the next time it starts.
 
     Args:
@@ -935,39 +957,8 @@ def _config_hint(hp_type: str) -> str:
     return f"{hp_type} accepts: " + "; ".join(f"{k} ({_CHECKS[k][1]})" for k in keys) + "."
 
 
-@mcp.tool(**hints("honeypot_logs"))
-async def honeypot_logs(name: str, lines: int = 30) -> dict[str, Any]:
-    """Show a honeypot's own log lines, for working out why a sensor misbehaves.
-
-    Use it for "show the ssh honeypot's log", "why is hp-ftp failing?". It is not where attacks
-    are read: use `alerts_recent` or `alerts_search` for those.
-
-    Args:
-        name: The honeypot's name (its type or port also work when only one matches).
-        lines: How many of the newest lines (default 30, at most 1000); long ones are clipped.
-    """
-    # Raw container logs are unbounded; an uncapped `lines` would put an
-    # arbitrary slice of Cowrie's JSON log into the response.
-    lines = max(1, min(int(lines), 1000))
-    async with get_session() as session:
-        hp, problem = await _find_sensor(session, name)
-        if hp is None:
-            return problem or {"error": f"No honeypot named '{name}'."}
-        if not hp.container_id:
-            return {
-                "error": f"Honeypot '{hp.name}' is not running (status={hp.status.value}), so it "
-                "has no log.",
-                "hint": "`honeypot_resume` restarts a paused one, `honeypot_deploy` a stopped one.",
-            }
-
-        if foreign := _owned_elsewhere(hp):
-            return {"name": hp.name, "count": 0, "logs": [], **foreign}
-        engine = get_engine(hp.type)
-        log_data = await engine.get_logs(hp.container_id, lines=lines)
-        resolved = hp.name
-
-    # Cowrie's JSON lines run to hundreds of characters: clip each and keep the newest within a
-    # budget, so a default call stays small however chatty the sensor is.
+def _log_tail(log_data: list[str]) -> tuple[list[str], str | None]:
+    """The newest log lines within a character budget (long ones clipped), and a note if cut."""
     clipped = [
         line if len(line) <= _LOG_LINE_CHARS else line[:_LOG_LINE_CHARS] + "..."
         for line in log_data
@@ -980,78 +971,13 @@ async def honeypot_logs(name: str, lines: int = 30) -> dict[str, Any]:
         kept.append(line)
         used += len(line)
     kept.reverse()
-    result: dict[str, Any] = {"name": resolved, "count": len(kept), "logs": kept}
     if not kept:
-        result["note"] = "The log is empty."
-    elif len(kept) < len(log_data):
-        result["note"] = (
-            f"Showing the newest {len(kept)} of {len(log_data)} lines; ask for fewer lines "
-            "to see them in full."
-        )
-    elif len(clipped) != len(log_data) or any(
-        c != o for c, o in zip(clipped, log_data, strict=True)
-    ):
-        result["note"] = "Long lines are clipped."
-    return mark_untrusted(result)
-
-
-def _first_sentence(text: str, limit: int = 110) -> str:
-    sentence = text.strip().split(". ")[0].rstrip(".")
-    if len(sentence) <= limit:
-        return sentence
-    return sentence[: limit - 1].rsplit(" ", 1)[0] + "…"
-
-
-@mcp.tool(**hints("honeypot_templates"))
-async def honeypot_templates(type: str | None = None) -> dict[str, Any]:
-    """What kinds of honeypot can be deployed, and what does each one catch?
-
-    Use it for "what honeypots can I run?", "what does the redis honeypot capture?". With no
-    argument it lists every type in one line each; with a type it gives everything about that one,
-    including the settings it accepts. `honeypot_deploy` runs one; `deception_plan` designs a set.
-
-    Args:
-        type: One kind (ssh, postgres, k8s, ...) for its full details. Omit for the short list.
-    """
-    from honeypot_mcp.deception.capabilities import all_capabilities
-
-    if type:
-        kind = resolve_type(type)
-        if kind is None:
-            return _type_error(type)
-        c = BY_TYPE[kind]
-        return {
-            "type": c.type,
-            "name": c.display_name,
-            "what_it_captures": c.summary,
-            "default_port": c.default_port,
-            "real_world_port": c.real_world_port,
-            "transport": c.transport,
-            "os_family": c.os_family,
-            "roles": list(c.roles),
-            "needs_docker": c.requires_docker,
-            "credentials_recorded_as": c.captures_credentials_as,
-            "detects": list(c.signature_events),
-            "settings": {k: _CHECKS[k][1] for k in sorted(_CONFIG_KEYS.get(c.type, ()))},
-            "pairs_well_with": list(c.pairs_well_with),
-            **({"caution": c.public_cloud_caution} if c.public_cloud_caution else {}),
-            "note": f"Deploy it with honeypot_deploy(type='{c.type}'). Settings go in `config`.",
-        }
-    rows = [
-        {
-            "type": c.type,
-            "port": c.default_port,
-            "what": _first_sentence(c.summary),
-            **({"needs_docker": True} if c.requires_docker else {}),
-        }
-        for c in all_capabilities()
-    ]
-    return {
-        "count": len(rows),
-        "types": rows,
-        "note": "`port` is the default; a free one is chosen if it is taken. Ask with `type` for "
-        "one kind's detail and settings; `honeypot_deploy` runs one.",
-    }
+        return kept, "The log is empty."
+    if len(kept) < len(log_data):
+        return kept, f"Showing the newest {len(kept)} of {len(log_data)} lines."
+    if any(c != o for c, o in zip(clipped, log_data, strict=True)):
+        return kept, "Long lines are clipped."
+    return kept, None
 
 
 async def _probe_health(hp: Honeypot) -> dict[str, Any]:
@@ -1073,26 +999,10 @@ async def _probe_health(hp: Honeypot) -> dict[str, Any]:
     return entry
 
 
-@mcp.tool(**hints("honeypot_health"))
-async def honeypot_health(name: str | None = None) -> dict[str, Any]:
-    """Are the honeypots actually answering on their ports?
-
-    Use it for "are all the sensors up?", "is hp-ssh alive?". A honeypot can show as running in
-    `honeypot_list` after its process or container died; this probes the port (and the Docker
-    container for ssh/telnet). `honeypot_self_test` goes further and proves it records attacks.
-
-    Args:
-        name: One honeypot (its type or port also work when only one matches). Omit to check every
-            running one.
-    """
+async def _health_of_running() -> dict[str, Any]:
+    """Probe every running honeypot: who answers, who does not, who cannot be probed from here."""
     async with get_session() as session:
-        if name:
-            hp, problem = await _find_sensor(session, name)
-            if hp is None:
-                return problem or {"error": f"No honeypot named '{name}'."}
-            honeypots = [hp]
-        else:
-            honeypots = await queries.list_honeypots(session, status=HoneypotStatus.RUNNING)
+        honeypots = await queries.list_honeypots(session, status=HoneypotStatus.RUNNING)
 
     results = list(await asyncio.gather(*(_probe_health(hp) for hp in honeypots)))
     down = [r["name"] for r in results if r.get("alive") is False]
@@ -1103,7 +1013,7 @@ async def honeypot_health(name: str | None = None) -> dict[str, Any]:
     elif down:
         note = (
             f"{len(down)} of {len(results)} not answering: {', '.join(down)}. "
-            "`honeypot_logs` or `honeypot_status` says more; stop and redeploy one that stays down."
+            "`honeypot_status` with a name shows its log; stop and redeploy one that stays down."
         )
     elif unknown:
         note = f"{up} answering; {len(unknown)} could not be probed from this session."
@@ -1123,7 +1033,7 @@ async def honeypot_self_test(name: str) -> dict[str, Any]:
     """Prove a honeypot really records attacks: send it a probe and check an alert appears.
 
     Use it for "test the new honeypot", "does hp-http actually log?". It catches what
-    `honeypot_health` misses (an engine that accepts connections but never logs, suppression
+    `honeypot_status` misses (an engine that accepts connections but never logs, suppression
     dropping events, a stalled event buffer). The probe is harmless and speaks the sensor's own
     protocol; its alert is marked as a self-test. Takes a few seconds (up to 30 for ssh/telnet).
 
@@ -1143,7 +1053,7 @@ async def honeypot_self_test(name: str) -> dict[str, Any]:
         if hp.status != HoneypotStatus.RUNNING:
             return {
                 "error": f"Honeypot '{hp.name}' is not running (status={hp.status.value}).",
-                "hint": "`honeypot_resume` restarts a paused one; `honeypot_health` says why one "
+                "hint": "`honeypot_resume` restarts a paused one; `honeypot_status` says why one "
                 "is in error.",
             }
         name = hp.name
@@ -1162,7 +1072,7 @@ async def honeypot_self_test(name: str) -> dict[str, Any]:
             "probe_sent": False,
             "alert_received": False,
             "detail": send_detail,
-            "hint": "`honeypot_health` shows whether the honeypot answers at all.",
+            "hint": "`honeypot_status` shows whether the honeypot answers at all.",
         }
 
     # Cowrie's log is polled, so ssh and telnet take longer to show their alert.
@@ -1206,11 +1116,11 @@ async def honeypot_self_test(name: str) -> dict[str, Any]:
         "alert_received": False,
         "detail": (
             f"Probe sent but no matching alert within {timeout_seconds}s. "
-            "Possible causes: honeypot crashed (run honeypot_health), suppression "
+            "Possible causes: honeypot crashed (run honeypot_status), suppression "
             "rule is dropping the event, or the event buffer flusher has stalled."
         ),
-        "hint": "Run `honeypot_health`, check `suppression_list` for a rule matching "
-        "127.0.0.1, and `honeypot_logs` for the honeypot's own errors.",
+        "hint": "Run `honeypot_status` with this honeypot's name (it shows the last log lines), and "
+        "check `suppression_list` for a rule matching 127.0.0.1.",
     }
 
 
@@ -1772,42 +1682,3 @@ _PROBES: dict[str, Any] = {
     "pop3": _pop3_probe,
     "kubernetes": _kubernetes_probe,
 }
-
-
-@mcp.tool(auth=require_role("operator"), **hints("honeypot_clone"))
-async def honeypot_clone(
-    source_name: str, new_port: int | None = None, new_name: str | None = None
-) -> dict[str, Any]:
-    """Run another copy of an existing honeypot (same type and settings) on a different port.
-
-    Use it for "run the same ssh honeypot on a second port", "duplicate hp-http". The clone's
-    name and port are chosen for you unless you say them.
-
-    Args:
-        source_name: The honeypot to copy (its type or port also work when only one matches).
-        new_port: Only if the user names a port; otherwise the next free one is used.
-        new_name: Only if the user names the copy; otherwise something like `http-8081`.
-    """
-    if (read_only := instance_lock.read_only_error()) is not None:
-        return read_only
-    async with get_session() as session:
-        source, problem = await _find_sensor(session, source_name)
-        if source is None:
-            return problem or {"error": f"No honeypot named '{source_name}'."}
-        clone_config = dict(source.config)
-        clone_type = source.type.value
-        port = new_port
-        if port is None:
-            taken = {
-                h.port
-                for h in await queries.list_honeypots(session)
-                if h.status in (HoneypotStatus.RUNNING, HoneypotStatus.PAUSED)
-            }
-            port = _free_port(source.port + 1, BY_TYPE[clone_type].transport, taken)
-            if port is None:
-                return {
-                    "error": f"No free port found after {source.port}.",
-                    "hint": "Name a free port with `new_port`.",
-                }
-
-    return await honeypot_deploy(type=clone_type, port=port, name=new_name, config=clone_config)

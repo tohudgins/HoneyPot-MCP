@@ -401,9 +401,9 @@ async def run(args: argparse.Namespace) -> int:
         str(j.get("total_alerts")),
     )
 
-    print("== export_blocklist against the offender definition")
+    print("== export_indicators against the offender definition")
     hours = int(hours_ago(t_first)) + 1
-    res = await N.export_blocklist(format="plain", hours=hours, min_hits=200)
+    res = await N.export_indicators(format="plain", hours=hours, min_hits=200)
     cutoff = stamp(datetime.now(UTC) - timedelta(hours=hours))
     want = {
         ip: n
@@ -597,7 +597,7 @@ async def run(args: argparse.Namespace) -> int:
 
     for what, why in (
         (
-            "map_ttps",
+            "attack_summary(ip=...)",
             "a regex-to-ATT&CK table: correctness is the mapping table itself, covered by test_mitre_dashboard",
         ),
     ):

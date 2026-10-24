@@ -13,9 +13,9 @@ the role that owns it, with arguments that cannot hurt the deployment, and the a
 
 * RBAC: no token, a wrong token, a viewer calling an operator tool and an operator calling an admin
   tool are all refused.
-* Read tools (the 30 viewer ones) return sane shapes against the live database.
+* Read tools (the viewer-tier ones) return sane shapes against the live database.
 * Write tools run a lifecycle and clean up after themselves: a temporary sensor is deployed,
-  self-tested, configured, cloned, paused, resumed and removed; honeytokens are created, exported,
+  self-tested, configured, duplicated by a second deploy, paused, resumed and removed; honeytokens are created, exported,
   rotated and revoked; a live-provisioned API key is created, *used*, and revoked (and is refused
   afterwards); a suppression rule is added and removed.
 * A honeytoken round trip: a planted credential is used through a real SSH client against the
@@ -158,9 +158,34 @@ async def run(a: argparse.Namespace) -> int:
     await sw.expect(
         v, "honeypot_status", {"name": http_name}, "one sensor", lambda d: d.get("status")
     )
-    await sw.expect(v, "honeypot_health", None, "probes every sensor", lambda d: d["count"] >= 1)
-    await sw.expect(v, "honeypot_logs", {"name": http_name, "lines": 5}, "recent log lines")
-    await sw.expect(v, "honeypot_templates", None, "engine catalogue", lambda d: d["types"])
+    await sw.expect(
+        v,
+        "honeypot_status",
+        None,
+        "probes every sensor",
+        lambda d: d["count"] >= 1 and "honeypots" in d and "not_answering" in d,
+    )
+    await sw.expect(
+        v,
+        "honeypot_status",
+        {"name": http_name},
+        "a named sensor carries its recent log lines",
+        lambda d: "recent_log" in d,
+    )
+    await sw.expect(
+        v,
+        "deception_profiles",
+        {"type": "http"},
+        "engine catalogue entry for one sensor type",
+        lambda d: d.get("type") == "http" and d.get("default_port"),
+    )
+    await sw.expect(
+        v,
+        "deception_profiles",
+        None,
+        "profiles plus the sensor types",
+        lambda d: d["profiles"] and d["sensor_types"],
+    )
     await sw.expect(v, "alerts_stats", None, "totals", lambda d: d["total_alerts"] > 0)
     recent = await sw.expect(
         v,
@@ -230,7 +255,7 @@ async def run(a: argparse.Namespace) -> int:
         "writes a report artifact",
         lambda d: d,
     )
-    await sw.expect(v, "map_ttps", {"ip": me}, "ATT&CK mapping", lambda d: d)
+    await sw.expect(v, "attack_summary", {"ip": me}, "ATT&CK mapping of one source", lambda d: d)
     await sw.expect(
         v,
         "attack_summary",
@@ -240,8 +265,8 @@ async def run(a: argparse.Namespace) -> int:
     )
     await sw.expect(
         v,
-        "attack_navigator_layer",
-        {"since_hours": 24},
+        "generate_report",
+        {"since_hours": 24, "format": "attack_navigator"},
         "Navigator layer written",
         lambda d: d["techniques"] > 0 and str(d["path"]).endswith(".json"),
     )
@@ -283,15 +308,17 @@ async def run(a: argparse.Namespace) -> int:
     )
     await sw.expect(v, "bait_trips", None, "who tripped which bait", lambda d: d is not None)
     await sw.expect(v, "grafana_status", None, "dashboard state", lambda d: d is not None)
-    await sw.expect(v, "pcap_status", None, "capture state explained", lambda d: d)
-    await sw.expect(v, "pcap_files", None, "capture files", lambda d: d is not None)
-    await sw.expect(v, "suppression_list", None, "rules", lambda d: d is not None)
-    await sw.expect(v, "suppression_list_presets", None, "presets", lambda d: d)
+    await sw.expect(
+        v, "pcap_files", None, "capture files and state explained", lambda d: "capture" in d
+    )
+    await sw.expect(
+        v, "suppression_list", None, "rules and loadable presets", lambda d: "presets" in d
+    )
     await sw.expect(v, "alert_subscriptions_list", None, "subscriptions", lambda d: d is not None)
 
     print("== operator tools (lifecycles, cleaned up)")
     o = "operator"
-    tmp, clone = f"{tag}-http", f"{tag}-http2"
+    tmp, twin = f"{tag}-http", f"{tag}-http2"
     await sw.expect(
         o,
         "honeypot_deploy",
@@ -315,17 +342,17 @@ async def run(a: argparse.Namespace) -> int:
     )
     await sw.expect(
         o,
-        "honeypot_clone",
-        {"source_name": tmp, "new_port": 18901, "new_name": clone},
-        "clones it",
-        lambda d: d,
+        "honeypot_deploy",
+        {"type": "http", "port": 18901, "name": twin, "config": {"persona": "nginx_stable"}},
+        "a second sensor of the same type and config (what clone used to do)",
+        lambda d: d.get("status") in ("running", "deployed") or d.get("name") == twin,
     )
     await sw.expect(o, "honeypot_pause", {"name": tmp}, "pauses", lambda d: d)
     await sw.expect(o, "honeypot_resume", {"name": tmp}, "resumes", lambda d: d)
     await sw.expect(
         o,
         "honeypot_stop",
-        {"names": [tmp, clone], "remove": True},
+        {"names": [tmp, twin], "remove": True},
         "stops and removes both",
         lambda d: d,
     )
@@ -339,17 +366,31 @@ async def run(a: argparse.Namespace) -> int:
     )
     tid = (tok or {}).get("id")
     await sw.expect(
-        o, "honeytoken_generate_aws", {"label": f"{tag}-aws"}, "AWS-shaped keys", lambda d: d
+        o,
+        "honeytoken_create",
+        {"type": "api_key", "label": f"{tag}-aws", "metadata": {"region": "us-east-1"}},
+        "AWS-shaped keys",
+        lambda d: d["id"],
     )
     await sw.expect(
         o,
-        "honeytoken_embed_file",
-        {"label": f"{tag}-doc", "file_type": "pdf"},
+        "honeytoken_create",
+        {
+            "type": "file",
+            "label": f"{tag}-doc",
+            "metadata": {"file_type": "pdf", "document_title": "Q3 payroll"},
+        },
         "canary document",
-        lambda d: d,
+        lambda d: d["id"],
     )
     if tid:
-        await sw.expect(v, "honeytoken_status", {"token_id": tid}, "status of a token", lambda d: d)
+        await sw.expect(
+            v,
+            "honeytoken_list",
+            {"token_id": tid},
+            "one token in full with its trail",
+            lambda d: d.get("id") == tid or d.get("token", {}).get("id") == tid,
+        )
         await sw.expect(
             o,
             "honeytoken_export",
@@ -389,13 +430,17 @@ async def run(a: argparse.Namespace) -> int:
     )
     await sw.expect(
         o,
-        "export_blocklist",
+        "export_indicators",
         {"format": "plain", "hours": 24, "min_hits": 1},
         "writes a blocklist",
         lambda d: d,
     )
     await sw.expect(
-        o, "export_stix", {"hours": 24, "min_hits": 1}, "writes a STIX bundle", lambda d: d
+        o,
+        "export_indicators",
+        {"format": "stix", "hours": 24, "min_hits": 1},
+        "writes a STIX bundle",
+        lambda d: d,
     )
     sup = await sw.expect(
         o,
@@ -411,8 +456,9 @@ async def run(a: argparse.Namespace) -> int:
         sw.record(o, "suppression_remove", "removes it", False, f"no rule id in {sup}")
     # Never stop a capture that is running: this sweep runs against live deployments, and the
     # earlier version called action="stop" and silently ended packet capture on the VPS.
-    cap = await sw.call(v, "pcap_status", None)
-    running = bool(cap[0] and isinstance(cap[1], dict) and cap[1].get("running"))
+    cap = await sw.call(v, "pcap_files", None)
+    capture = cap[1].get("capture") if cap[0] and isinstance(cap[1], dict) else None
+    running = bool(isinstance(capture, dict) and capture.get("running"))
     await sw.expect(
         o,
         "pcap_control",
@@ -473,8 +519,12 @@ async def run(a: argparse.Namespace) -> int:
     print("== honeytoken round trip (plant -> real SSH login -> CRITICAL -> TRIGGERED)")
     cred = await sw.expect(
         o,
-        "honeytoken_generate_credentials",
-        {"label": f"{tag}-trip", "count": 1, "service": "ssh"},
+        "honeytoken_create",
+        {
+            "type": "credential",
+            "label": f"{tag}-trip",
+            "metadata": {"count": 1, "service": "ssh"},
+        },
         "plants an ssh credential",
         lambda d: d["metadata"]["credentials"],
     )
@@ -501,7 +551,7 @@ async def run(a: argparse.Namespace) -> int:
         await asyncio.sleep(3)  # the event buffer flushes about every second
         await sw.expect(
             v,
-            "honeytoken_status",
+            "honeytoken_list",
             {"token_id": cred["id"]},
             f"token is TRIGGERED after the login ({used})",
             lambda d: str(d.get("status")).lower() == "triggered",
@@ -573,33 +623,6 @@ async def run(a: argparse.Namespace) -> int:
         "prunes nothing (nothing is that old)",
         lambda d: d is not None,
     )
-    for tool, args in (
-        (
-            "blocklist_push_cloudflare",
-            {"account_id": "x", "list_id": "x", "api_token": "x", "dry_run": True},
-        ),
-        (
-            "blocklist_push_aws_waf",
-            {"ip_set_id": "x", "ip_set_name": "x", "region": "us-east-1", "dry_run": True},
-        ),
-        (
-            "blocklist_push_pfsense",
-            {
-                "base_url": "https://pfsense.invalid",
-                "api_key": "x",
-                "alias_name": "x",
-                "dry_run": True,
-            },
-        ),
-    ):
-        ok, data = await sw.call(ad, tool, args)
-        sw.record(
-            ad,
-            tool,
-            "dry run: answers, never pushes or crashes",
-            ok or isinstance(data, str),
-            str(data),
-        )
     ok, data = await sw.call(ad, "alert_unsubscribe", {"subscription_id": 999999})
     sw.record(
         ad, "alert_unsubscribe", "an unknown id is a clean error", not ok and bool(data), str(data)

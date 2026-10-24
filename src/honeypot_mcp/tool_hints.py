@@ -43,7 +43,6 @@ from mcp.types import ToolAnnotations
 #     are marked destructive even though the row is kept.
 #   report_ip_abuse sends a report about a third party to AbuseIPDB; it cannot be
 #     recalled, so it is destructive and open-world.
-#   blocklist_push_* only ever add addresses, but to a firewall — open-world.
 _FLAGS: dict[str, str] = {
     # ── viewer tier ──────────────────────────────────────────────────────────
     "alert_subscriptions_list": "R",
@@ -61,18 +60,10 @@ _FLAGS: dict[str, str] = {
     "enrich_ip": "RW",
     "fingerprint_clusters": "R",
     "generate_report": "W",
-    "honeypot_health": "R",
     "honeypot_list": "R",
-    "honeypot_logs": "R",
     "honeypot_status": "R",
-    "honeypot_templates": "R",
     "honeytoken_list": "R",
-    "honeytoken_status": "R",
-    "map_ttps": "R",
     "attack_summary": "R",
-    # Writes one new ATT&CK Navigator layer file to the reports directory (never overwrites a
-    # named file), so it is additive rather than read-only.
-    "attack_navigator_layer": "",
     "extract_iocs": "R",
     # Sends the hash to abuse.ch MalwareBazaar.
     "lookup_hash": "RW",
@@ -81,20 +72,16 @@ _FLAGS: dict[str, str] = {
     "bait_trips": "R",
     "pcap_files": "R",
     "pcap_analyze": "R",
-    "pcap_status": "R",
     "ping": "R",
     "grafana_status": "R",
     "soc_brief": "R",
     "suppression_list": "R",
-    "suppression_list_presets": "R",
     "threat_timeline": "R",
     # ── operator tier ────────────────────────────────────────────────────────
     "alerts_acknowledge": "D",
     "alerts_export": "",
     "deception_deploy_plan": "",
-    "export_blocklist": "",
-    "export_stix": "",
-    "honeypot_clone": "",
+    "export_indicators": "",
     "honeypot_configure": "DI",
     "honeypot_deploy": "",
     "honeypot_pause": "I",
@@ -102,10 +89,7 @@ _FLAGS: dict[str, str] = {
     "honeypot_self_test": "",
     "honeypot_stop": "DI",
     "honeytoken_create": "",
-    "honeytoken_embed_file": "",
     "honeytoken_export": "R",
-    "honeytoken_generate_aws": "",
-    "honeytoken_generate_credentials": "",
     "honeytoken_revoke": "DI",
     "honeytoken_rotate": "D",
     "pcap_control": "",
@@ -139,9 +123,6 @@ _FLAGS: dict[str, str] = {
     # Downloads the Emerging Threats Open ruleset (the only container with a network) and
     # replaces the cached rules after Suricata has validated them.
     "detection_rules_update": "W",
-    "blocklist_push_aws_waf": "IW",
-    "blocklist_push_cloudflare": "IW",
-    "blocklist_push_pfsense": "IW",
     # Downloads the Grafana image (first run) and the pinned SQLite plugin from the internet
     # (open-world), and REMOVES its previous containers, networks and private directory before
     # recreating them (destructive: an instance edited in the UI loses those edits).
@@ -169,10 +150,8 @@ _TITLES = {
     "honeypot_stop": "Stop Honeypots",
     "honeytoken_create": "Create Honeytoken",
     "honeytoken_list": "List Honeytokens",
-    "map_ttps": "Map to MITRE ATT&CK",
     "attack_summary": "ATT&CK Summary",
     "extract_iocs": "Extract IOCs",
-    "attack_navigator_layer": "ATT&CK Navigator Layer",
     "lookup_hash": "Look Up File Hash",
     "sql_query": "Read-only SQL Query",
     "attack_patterns": "Attack Patterns",

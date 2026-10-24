@@ -4,6 +4,46 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## 83 tools to 67: one tool per question, and no unverified vendor pushes
+
+**The tool list sits in the model's context for the whole conversation, and several tools were the
+same question asked three ways.** Capability is unchanged, with one exception (below). The list is
+now 67 tools: 31 viewer, 24 operator, 12 admin (it was 39, 29 and 15). Measured with the contract
+test's own weight function, the descriptions and schemas come to about 59,000 characters against the
+unchanged 70,000 cap.
+
+- **Merge map (old name to where it lives now).**
+  - `honeytoken_generate_aws`, `honeytoken_generate_credentials` and `honeytoken_embed_file` are
+    `honeytoken_create(type=api_key|credential|file, metadata={...})`. `api_key` takes `region` or
+    `access_key_id` + `secret_access_key`, `credential` takes `count` and `service`, `file` takes
+    `file_type` and `document_title`.
+  - `honeytoken_status` is `honeytoken_list(token_id=...)`, one token in full with its trail.
+  - `honeypot_health` is `honeypot_status()` with no name: it probes every sensor and returns
+    `honeypots`, `answering` and `not_answering`. `honeypot_logs` is `recent_log` in
+    `honeypot_status(name)`. `honeypot_templates` is `deception_profiles(type=...)` (or with no argument,
+    the profiles plus `sensor_types`). `honeypot_clone` is gone: deploy the same type and config with
+    `honeypot_deploy`.
+  - `map_ttps` is `attack_summary(ip=..., event_types=..., raw_text=...)`. `attack_navigator_layer` is
+    `generate_report(format="attack_navigator")`.
+  - `export_blocklist` and `export_stix` are `export_indicators(format=plain|iptables|fail2ban|cidr|stix,
+    hours, min_hits)`.
+  - `pcap_status` is the `capture` key of `pcap_files()`. `suppression_list_presets` is the `presets`
+    key of `suppression_list()`.
+- **Result shapes are dicts everywhere.** `honeypot_list` returns `{count, honeypots, note}`,
+  `alert_subscriptions_list` `{subscriptions}`, `honeytoken_list` `{tokens}`, `api_key_list` `{keys}`.
+- **Removed outright: `blocklist_push_cloudflare`, `blocklist_push_pfsense`, `blocklist_push_aws_waf`.**
+  This is the one capability that is gone. They had only ever been run against stubs of the vendors'
+  contracts (an earlier review had already found four defects in them), and they took API tokens as
+  tool arguments, which puts a secret in the model's context. A blocklist is written with
+  `export_indicators` and loaded into a firewall by the operator; `BLOCKLIST_ALLOWLIST` still applies to
+  the export. `boto3`, which only the AWS WAF push used, is no longer a dependency.
+- **Pre-flight had been reading the old list shapes against a live server.** `preflight.py` expected
+  bare lists from `honeypot_list` and `alert_subscriptions_list`, so against a real server it saw
+  neither sensors nor subscriptions. It now reads `honeypots` and `subscriptions` and calls
+  `honeypot_status`.
+- Docs, scripts and the role tables were migrated to the new names. Results that name old tools in
+  `docs/RESULTS.md` and `docs/FIELD_TEST.md` are history and say so.
+
 ## Every tool answers from one sentence: the agent-first contract
 
 **A tool an assistant has to be taught a flag for is a defect.** The remaining knobs are gone and a
@@ -23,7 +63,8 @@ test now keeps them gone.
   caller-supplied `analyst`.
 - **`tests/unit/test_tool_contract.py`** reads the registry: dict returns, every parameter explained, at
   most three required and eight total parameters, a real first line, and a 70,000-character budget for
-  the tool list (every description and schema sits in the model's context for the whole conversation).
+  the tool list (every description and schema sits in the model's context for the whole conversation;
+  the list measures about 59,000 characters after the later merge to 67 tools).
 - **Bugs the removal exposed.** `run_analysis` and `attack_patterns` still passed removed arguments to the
   tools they call (`run_analysis` raised on every call); `audit_log_search` measured `since_hours` from the
   wall clock instead of the newest alert, so it returned nothing on a restored backup. Shared logic now

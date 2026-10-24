@@ -471,7 +471,7 @@ async def get_top_offenders(
     now: datetime | None = None,
 ) -> list[tuple[str, int]]:
     """Return [(ip, count), ...] for IPs with at least `min_hits` alerts in
-    the last `hours` (ending at `now`, default the wall clock). Used by export_blocklist and the blocklist pushes.
+    the last `hours` (ending at `now`, default the wall clock). Used by export_indicators.
 
     The result feeds firewalls, so two optional filters guard against blocking
     the wrong thing (both default off, preserving the plain behaviour):

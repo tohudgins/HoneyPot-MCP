@@ -397,7 +397,7 @@ async def suppression_add(
             "Give an ip_pattern, an event_type_pattern, or both: a rule with neither would "
             "match every event.",
             "For Shodan, Censys or private ranges use suppression_load_preset "
-            "(suppression_list_presets shows them); otherwise name the address or event type.",
+            "(suppression_list shows them); otherwise name the address or event type.",
         )
     if ip_pattern and ("," in ip_pattern or " " in ip_pattern):
         return _error(
@@ -533,9 +533,11 @@ async def suppression_remove(rule_id: int) -> dict[str, Any]:
 
 @mcp.tool(**hints("suppression_list"))
 async def suppression_list(active_only: bool = True) -> dict[str, Any]:
-    """Which events are currently being ignored, and how many has each rule hidden?
+    """Which events are currently being ignored, and which known-noise presets can be loaded?
 
-    Use it for "what are we suppressing?", "is the Shodan rule loaded?".
+    Use it for "what are we suppressing?", "is the Shodan rule loaded?", "can we ignore Shodan?".
+    `rules` shows how many events each rule hid; `presets` lists what suppression_load_preset can
+    switch on (shodan, censys, internal-rfc1918) and whether each is loaded.
 
     Args:
         active_only: True (default) shows only rules in effect; set False to include removed and expired ones.
@@ -548,6 +550,11 @@ async def suppression_list(active_only: bool = True) -> dict[str, Any]:
         rules = list(result.scalars().all())
 
     now = datetime.now(UTC)
+    in_effect = {
+        r.label
+        for r in (rules if active_only else [r for r in rules if r.active])
+        if r.label and (r.expires_at is None or r.expires_at > now)
+    }
     if active_only:
         rules = [r for r in rules if r.expires_at is None or r.expires_at > now]
     total = len(rules)
@@ -577,14 +584,23 @@ async def suppression_list(active_only: bool = True) -> dict[str, Any]:
         note = f"Showing the newest {len(rows)} of {total} rules."
     else:
         note = f"{total} rule(s)."
-    return {"count": total, "shown": len(rows), "rules": rows, "note": note}
+    presets = _describe_presets(in_effect)
+    if presets:
+        note += " Presets: load one with suppression_load_preset(preset_name=...)."
+    return {
+        "count": total,
+        "shown": len(rows),
+        "rules": rows,
+        "presets": presets,
+        "note": note,
+    }
 
 
 @mcp.tool(auth=require_role("operator"), **hints("suppression_load_preset"))
 async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     """Stop alerting on a known group of noisy sources in one step.
 
-    Use it for "stop alerting on Shodan", "ignore Censys", "ignore my internal network". Names come from `suppression_list_presets` (shodan, censys, internal-rfc1918). Loading again re-enables rules that were removed.
+    Use it for "stop alerting on Shodan", "ignore Censys", "ignore my internal network". Names come from `suppression_list` (shodan, censys, internal-rfc1918). Loading again re-enables rules that were removed.
 
     Args:
         preset_name: The preset's name, e.g. "shodan".
@@ -601,7 +617,7 @@ async def suppression_load_preset(preset_name: str) -> dict[str, Any]:
     if preset_text is None:
         return _error(
             f"Preset '{preset_name}' not found.",
-            f"Available presets: {available}. suppression_list_presets describes each.",
+            f"Available presets: {available}. suppression_list describes each.",
         )
 
     try:
@@ -757,17 +773,13 @@ def _list_available_presets() -> list[str]:
     return sorted(set(presets))
 
 
-@mcp.tool(**hints("suppression_list_presets"))
-async def suppression_list_presets() -> dict[str, Any]:
-    """Which known-noise lists can be switched on in one step?
-
-    Use it before `suppression_load_preset`, e.g. for "can we ignore Shodan?". Worth loading before exposing a honeypot to the internet.
-    """
+def _describe_presets(in_effect: set[str]) -> list[dict[str, Any]]:
+    """Each available preset: name, what it covers, rule count and whether it is fully loaded."""
     import yaml
 
     presets: list[dict[str, Any]] = []
     for name in _list_available_presets():
-        description, rules = "", None
+        description, labels = "", []
         text = _read_preset(name)
         if text is not None:
             try:
@@ -777,14 +789,15 @@ async def suppression_list_presets() -> dict[str, Any]:
             if isinstance(raw, dict):
                 description = str(raw.get("description") or "")[:200]
                 if isinstance(raw.get("rules"), list):
-                    rules = len(raw["rules"])
-        presets.append({"name": name, "description": description, "rules": rules})
-    return {
-        "count": len(presets),
-        "presets": presets,
-        "note": (
-            "Load one with suppression_load_preset(preset_name=...)."
-            if presets
-            else "No presets are installed; use suppression_add for a single address or event type."
-        ),
-    }
+                    labels = [
+                        e["label"] for e in raw["rules"] if isinstance(e, dict) and e.get("label")
+                    ]
+        presets.append(
+            {
+                "name": name,
+                "description": description,
+                "rules": len(labels) if labels else None,
+                "loaded": bool(labels) and all(label in in_effect for label in labels),
+            }
+        )
+    return presets

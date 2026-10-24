@@ -166,8 +166,8 @@ def test_malformed_multi_token_entry_raises(bad_entry):
         ("honeypot_deploy", "viewer", False),
         ("honeypot_deploy", "operator", True),
         ("honeypot_list", "viewer", True),
-        ("blocklist_push_cloudflare", "operator", False),
-        ("blocklist_push_cloudflare", "admin", True),
+        ("api_key_list", "operator", False),
+        ("api_key_list", "admin", True),
     ],
 )
 async def test_real_registered_tool_enforces_its_declared_role(tool_name, role, should_allow):

@@ -29,7 +29,7 @@ The detailed product reference for HoneyPot MCP: what it can do, how to install 
 <tr><td><b>SIEM delivery</b></td><td>JSON (HMAC-signed), Splunk HEC, Elastic ECS, ArcSight CEF, RFC 5424 syslog, Grafana Loki, Datadog; per-subscription severity thresholds and delivery health</td></tr>
 <tr><td><b>Human notifications</b></td><td>Slack, Microsoft Teams, email; severity-coloured, credentials up front, coalesced so one scanner cannot bury the channel. CRITICAL is never held back</td></tr>
 <tr><td><b>Packet capture</b></td><td>Optional tcpdump ring buffer scoped to the deployed ports; <code>pcap_extract</code> pulls one attacker's packets for Wireshark, Suricata or Zeek. Disk bounded by construction</td></tr>
-<tr><td><b>Response</b></td><td>Blocklist push to Cloudflare, pfSense and AWS WAFv2; iptables, fail2ban and CIDR export; STIX 2.1 bundles; AbuseIPDB reporting</td></tr>
+<tr><td><b>Response</b></td><td>iptables, fail2ban, CIDR and plain blocklist export and STIX 2.1 bundles (`export_indicators`); AbuseIPDB reporting. Loading a blocklist into a firewall is left to the operator</td></tr>
 <tr><td><b>Console</b></td><td>Read-only web dashboard on <code>:8090</code> served by the server itself: live feed, sensor health, severity volume, top attackers and origins</td></tr>
 <tr><td><b>Triage</b></td><td>Bulk acknowledge by filter with a disposition, note and analyst; append-only audit log of every control-plane action</td></tr>
 <tr><td><b>Operations</b></td><td>Health watchdog, restart reconciliation, retention sweep, per-IP connection caps, end-to-end self-test, Prometheus <code>/metrics</code>, Alembic migrations, JSON logging</td></tr>
@@ -143,9 +143,9 @@ The networked control plane can deploy honeypots and read everything they captur
 
 | Role | Tools | Can |
 |---|---|---|
-| `viewer` | 39 | read-only triage, analysis and reports |
-| `operator` | +29 | also deploy and stop honeypots, manage honeytokens, acknowledge alerts, run exports, packet capture, replay captures through Suricata or Zeek, scan captured files, audit the ATT&CK mapping (everything reversible and contained to this system's data) |
-| `admin` | +15 | also prune alerts, push to an external firewall or WAF, manage subscriptions, read the audit log, manage API keys, start Grafana on the database, take backups, update detection rules, collect samples from the sensor containers |
+| `viewer` | 31 | read-only triage, analysis and reports |
+| `operator` | +24 | also deploy and stop honeypots, manage honeytokens, acknowledge alerts, run exports, packet capture, replay captures through Suricata or Zeek, scan captured files, audit the ATT&CK mapping (everything reversible and contained to this system's data) |
+| `admin` | +12 | also prune alerts, manage subscriptions, read the audit log, manage API keys, start Grafana on the database, take backups, update detection rules, collect samples from the sensor containers |
 
 [`rbac.py`](../src/honeypot_mcp/rbac.py) lists which tool needs which role; [DEPLOY.md](DEPLOY.md) has the token format.
 
@@ -169,7 +169,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 - Before exposing a VPS, run `scripts/preflight.sh`: it checks the control plane, bind addresses, disk, ports and backups, and probes every sensor end to end.
 - Harden the host first with [HARDENING.md](HARDENING.md) (default-drop firewall, validating Docker guard, sandboxed units, key-only SSH, moved control ports). The honeypots stay reachable; everything around them does not.
-- Prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one; `field_test_tools.py` exercises all 83 tools at their roles; `field_test_ops.py`, `field_test_injection.py` and `field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([FIELD_TEST.md](FIELD_TEST.md)). A quiet sensor is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
+- Prove it works: `scripts/field_test.py` attacks every engine through its public port with real clients and checks the database recorded each one; `field_test_tools.py` exercises all 67 tools at their roles; `field_test_ops.py`, `field_test_injection.py` and `field_test_oracle.py` cover operations, prompt injection and an independent check of the numbers ([FIELD_TEST.md](FIELD_TEST.md)). A quiet sensor is ambiguous (nobody tried, or it is broken); this removes the ambiguity.
 
 **Internal tripwire.** Put honeypots on ports nothing legitimate uses; anything on your LAN that connects is by definition unexpected. Plant credential tokens and canary URLs on real file shares so lateral movement trips them too.
 
@@ -181,7 +181,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 
 ## MCP tools
 
-83 tools in three roles (39 viewer, 29 operator, 15 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
+67 tools in three roles (31 viewer, 24 operator, 12 admin; see [Run it](#run-it)). Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) and a title, so a client can auto-approve reads and prompt on deletes. Classification lives in one table (`tool_hints.py`); a tool not in it cannot register. Roles live in [`rbac.py`](../src/honeypot_mcp/rbac.py), and a test fails the build if a registered tool has no role.
 
 **Built for an assistant to drive from one sentence.** Every tool returns a dict with a count and a note (never a bare list, which an MCP client shows as empty), explains each parameter to the model, asks for at most three things, and sizes its own answer instead of demanding a `top`, `rank_by` or `window_minutes` flag. A result with an `error` also has a `hint` naming the next step. Reports, exports and extracts are written to `REPORTS_DIR` under generated names. `tests/unit/test_tool_contract.py` enforces this for every registered tool, including a character budget for the tool list, which sits in the model's context for the whole conversation.
 
@@ -196,20 +196,19 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `soc_brief` | Shift handover: what needs a human, separated from the background radiation. The urgent queue is shown by event type (`urgent_by_event_type`), with one example per type, CRITICAL first and the rarest type first, and one headline line per severity names the few event types that are nearly all of it. Each example carries a `source_scope` (public, private, loopback, link_local, ...) and the note says when examples come from non-public addresses. Say which traffic is yours ("ignore my test machine", "that's my test network") and it is set aside; nothing is excluded unless you do, and the result states what was excluded and how many alerts it hid. No settings to configure |
 | `honeypot_deploy` | Deploy any of the 25 engine types |
 | `honeypot_stop` | Stop one, several by name, or every honeypot matching a type or status filter |
-| `honeypot_list` / `honeypot_status` | List all / detail and recent events for one |
+| `honeypot_list` | List every honeypot with its state and volume |
+| `honeypot_status` | With a `name`: settings, engine state, recent alerts and the sensor's own last log lines (`recent_log`). Without: probes every sensor and returns `honeypots`, `answering` and `not_answering`; catches silent deaths |
 | `honeypot_pause` / `honeypot_resume` | Lifecycle control |
-| `honeypot_configure` / `honeypot_clone` / `honeypot_logs` / `honeypot_templates` | Config, cloning, raw logs, profiles |
-| `honeypot_health` | Probe ports and containers; catches silent deaths |
+| `honeypot_configure` | Change a sensor's banner, hostname, persona or other settings |
 | `honeypot_self_test` | End-to-end pipeline check: synthetic probe, alert in DB |
 
 ### Honeytokens
 
 | Tool | Description |
 |---|---|
-| `honeytoken_create` | Create any token type |
-| `honeytoken_generate_aws` / `honeytoken_generate_credentials` | Fake AWS key pair / username-password sets |
-| `honeytoken_embed_file` | PDF/DOCX with an embedded canary tracker |
-| `honeytoken_list` / `honeytoken_status` / `honeytoken_revoke` / `honeytoken_export` | Manage and format for planting |
+| `honeytoken_create` | Create any token type: `type` = `api_key` (`metadata`: `region`, or `access_key_id` + `secret_access_key` of a real decoy IAM user), `credential` (`metadata`: `count`, `service`), `file` (`metadata`: `file_type` PDF/DOCX, `document_title`; carries a canary tracker), `canary_url`, `ssh_key`, `jwt`, `db_row` and the cloud/cluster types |
+| `honeytoken_list` | List tokens; `token_id` (or a label) returns one token in full with its trail |
+| `honeytoken_revoke` / `honeytoken_export` | Stop a token alerting / format an existing token for planting |
 | `honeytoken_rotate` | Replace a token's secret while keeping its identity and history |
 
 ### Alerts
@@ -231,11 +230,11 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | `enrich_ip` | VirusTotal, AbuseIPDB and GeoIP, plus GreyNoise, abuse.ch, OTX and Shodan InternetDB when configured; parallel and cached |
 | `analyze_attacker` / `analyze_session` / `analyze_attacker_journey` | Profile and risk score / Cowrie session reconstruction / cross-honeypot ATT&CK timeline (exact totals, bounded sample; safe on an attacker with 100k+ events) |
 | `fingerprint_clusters` | Group sources by SSH client fingerprint (HASSH); the same tooling behind many IPs is one operator |
-| `analyze_campaign` / `map_ttps` / `threat_timeline` | Campaign correlation, MITRE mapping, chronological timeline |
-| `generate_report` | Write an XSS-safe HTML or Markdown report to disk |
-| `export_blocklist` / `export_stix` | Write an iptables, fail2ban or CIDR list, or a STIX 2.1 bundle, to `REPORTS_DIR` and return the path |
+| `analyze_campaign` / `threat_timeline` | Campaign correlation, chronological timeline |
+| `generate_report` | Write an XSS-safe `html` or `markdown` report, or an `attack_navigator` ATT&CK Navigator layer scored with the same counts, to disk |
+| `export_indicators` | Write a plain, iptables, fail2ban or CIDR blocklist, or a STIX 2.1 bundle (`format`), over the last `hours` with at least `min_hits` alerts, to `REPORTS_DIR` and return the path |
 | `report_ip_abuse` | Submit an attacker IP to AbuseIPDB |
-| `attack_summary` / `attack_navigator_layer` | Exact totals by tactic and technique for a window / an ATT&CK Navigator layer scored with the same counts |
+| `attack_summary` | Exact totals by tactic and technique for a window; with `ip`, `event_types` or `raw_text` it maps that behaviour to ATT&CK instead |
 | `extract_iocs` / `lookup_hash` | Distinct URLs, hosts and file hashes from payloads / MalwareBazaar lookup of a hash |
 | `sql_query` | One read-only `SELECT` over `alerts`, `alert_rollups` and `honeypots` (secret tables refused, 500 rows or about 12 KB, `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300); also the **Query** box on Grafana dashboard 04. Whole-run questions over millions of rows belong in `attack_patterns` or `alert_rollups` |
 | `attack_patterns` | **What attackers actually did, without SQL.** `kind` = `credentials` (top pairs, usernames, passwords, accepted vs refused, per service), `commands` (classified by shape: shell-menu words, writable-directory probes, download chains with staging hosts, fingerprint checks, execution-capability probes), `files` (by hash, with *written by the session* separated from *fetched from the network*), `clients` (SSH versions and HASSH families, shared-fingerprint clusters), `sip_dialling` (dial-prefix cycling toward each destination, number masked), `http`, `concentration` (share held by the busiest sources, the long tail, per-day volume). Planted honeytoken passwords are masked, including inside commands |
@@ -249,8 +248,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 |---|---|
 | `alert_subscribe` / `alert_unsubscribe` / `alert_subscriptions_list` | SIEM, Slack, Teams and email delivery with health stats |
 | `suppression_add` / `suppression_remove` / `suppression_list` | Drop or rate-limit noise (exact IP, CIDR or event-type glob) |
-| `suppression_load_preset` / `suppression_list_presets` | Bundled presets: shodan, censys, internal-rfc1918 |
-| `blocklist_push_cloudflare` / `blocklist_push_pfsense` / `blocklist_push_aws_waf` | Push offenders to live appliances. **Dry run by default**: nothing changes until `dry_run=False` is asked for. Idempotent; tested against stubs of the vendors' contracts, not run against a real service |
+| `suppression_load_preset` | Bundled presets: shodan, censys, internal-rfc1918 (`suppression_list` shows the available `presets`) |
 | `api_key_create` / `api_key_revoke` / `api_key_list` | Live-provisioned per-person keys with a role and label |
 
 ### Packet capture (optional, off by default)
@@ -258,8 +256,7 @@ Runs the capture plane (engines, canary callbacks, watchdog, webhook delivery, `
 | Tool | Description |
 |---|---|
 | `pcap_extract` | **One attacker's packets as a single file** for Wireshark, or replay through Suricata or Zeek |
-| `pcap_status` | Running? Disk used? If not running, the actual reason plus the fix |
-| `pcap_files` | Ring files and written extracts (`kind`), sizes, and how far back the ring reaches |
+| `pcap_files` | Ring files and written extracts, sizes, how far back the ring reaches, and the `capture` state (running? disk used? if not running, the actual reason plus the fix) |
 | `pcap_analyze` | **Read a capture back**: protocol and conversation digest, SIP/HTTP/DNS/SSH/TLS decoding, credentials, payload samples; works on extracts in `REPORTS_DIR` with capture off |
 | `pcap_detect` | **Replay a capture through Suricata or Zeek** in a throwaway sandbox container with no network; alerts, protocol logs and anomalies as a digest. Operator role |
 | `detection_rules_update` | Fetch and validate the Emerging Threats Open ruleset for `pcap_detect` (the only tool that gives a container network). Admin role |
@@ -333,9 +330,8 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # or run as root
 ```
 
 ```
-> pcap_status                                  # running? why not? disk used?
+> pcap_files                                   # running? why not? disk used? ring files and extracts
 > pcap_extract source_ip=203.0.113.44          # that attacker's packets, as one file
-> pcap_files                                   # ring files and the extracts already written, with sizes
 > pcap_analyze path=pcap-203.0.113.44-<stamp>.pcap   # decode an extract: protocols, SIP/HTTP/DNS/SSH detail, credentials
 > pcap_detect path=pcap-203.0.113.44-<stamp>.pcap engine=suricata   # what the ruleset says about it (run detection_rules_update first)
 ```
@@ -412,6 +408,6 @@ Adding an engine or token type is a subclass plus a registry line; [CLAUDE.md](.
 
 **Not a fit without more work:** fooling a skilled human probing by hand. SSH is Cowrie and high-fidelity; the custom engines are detection-focused, so an expert can eventually fingerprint them. For fidelity across more protocols see [T-Pot](https://github.com/telekom-security/tpotce), [OpenCanary](https://github.com/thinkst/opencanary) or [Thinkst Canary](https://canary.tools/).
 
-**Not verified:** GreyNoise enrichment and the pfSense, Cloudflare and AWS WAF push tools were not run against real services.
+**Not verified:** GreyNoise enrichment was not run against the live service.
 
 Full rundown: [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md). Security issues go privately through [SECURITY.md](../SECURITY.md).

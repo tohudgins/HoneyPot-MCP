@@ -303,13 +303,17 @@ def test_ports_are_probed_the_way_asyncio_binds_and_udp_is_probed_too():
 def fake_plane(**responses):
     healthy = {
         "ping": {"status": "ok", "role": "owner"},
-        "honeypot_list": [
-            {"name": "ssh-1", "status": "running"},
-            {"name": "rdp-1", "status": "running"},
-        ],
-        "honeypot_health": [{"name": "ssh-1", "alive": True}, {"name": "rdp-1", "alive": True}],
+        "honeypot_list": {
+            "honeypots": [
+                {"name": "ssh-1", "status": "running"},
+                {"name": "rdp-1", "status": "running"},
+            ]
+        },
+        "honeypot_status": {
+            "honeypots": [{"name": "ssh-1", "alive": True}, {"name": "rdp-1", "alive": True}]
+        },
         "honeypot_self_test": {"alert_received": True},
-        "alert_subscriptions_list": [{"id": 1}],
+        "alert_subscriptions_list": {"subscriptions": [{"id": 1}]},
     }
     healthy.update(responses)
     calls = []
@@ -346,19 +350,23 @@ async def test_each_way_the_estate_can_be_broken_is_reported():
     assert (await run_plane(fake_plane(ping={"role": "read-only"})))[
         "sensor ownership"
     ].status == pf.FAIL
-    assert (await run_plane(fake_plane(honeypot_list=[])))["sensors"].status == pf.FAIL
+    assert (await run_plane(fake_plane(honeypot_list={"honeypots": []})))[
+        "sensors"
+    ].status == pf.FAIL
     errored = fake_plane(
-        honeypot_list=[{"name": "x", "status": "running"}, {"name": "y", "status": "error"}]
+        honeypot_list={
+            "honeypots": [{"name": "x", "status": "running"}, {"name": "y", "status": "error"}]
+        }
     )
     assert "y" in (await run_plane(errored))["sensors"].detail
-    dead = fake_plane(honeypot_health=[{"name": "ssh-1", "alive": False}])
+    dead = fake_plane(honeypot_status={"honeypots": [{"name": "ssh-1", "alive": False}]})
     assert (await run_plane(dead))["sensor health"].status == pf.FAIL
     silent = fake_plane(
         honeypot_self_test=lambda a: {"alert_received": a["name"] != "rdp-1", "detail": "no alert"}
     )
     result = (await run_plane(silent))["end-to-end self-test"]
     assert result.status == pf.FAIL and "rdp-1" in result.detail and "ssh-1" not in result.detail
-    assert (await run_plane(fake_plane(alert_subscriptions_list=[])))[
+    assert (await run_plane(fake_plane(alert_subscriptions_list={"subscriptions": []})))[
         "alert channel"
     ].status == pf.WARN
 
@@ -454,18 +462,18 @@ def test_the_checks_work_on_an_unmodified_checkout(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_unexpected_tool_answers_are_failures_not_passes_or_crashes():
     """An error object where a list was expected must not read as "no sensor is dead"."""
-    plane = await run_plane(fake_plane(honeypot_health={"error": "boom"}))
+    plane = await run_plane(fake_plane(honeypot_status={"error": "boom"}))
     assert plane["sensor health"].status == pf.FAIL
     nonlist = await run_plane(fake_plane(honeypot_list={"error": "x"}))
     assert nonlist["sensors"].status == pf.FAIL
-    mixed = await run_plane(fake_plane(honeypot_list=["not a dict"]))
+    mixed = await run_plane(fake_plane(honeypot_list={"honeypots": ["not a dict"]}))
     assert mixed["sensors"].status == pf.FAIL
-    nameless = await run_plane(fake_plane(honeypot_list=[{"status": "running"}]))
+    nameless = await run_plane(fake_plane(honeypot_list={"honeypots": [{"status": "running"}]}))
     assert nameless["sensors"].status == pf.FAIL
     for bad in ([], "oops", {"alert_received": "false"}, {"error": "not running"}):
         got = await run_plane(fake_plane(honeypot_self_test=bad))
         assert got["end-to-end self-test"].status == pf.FAIL, bad
-    assert (await run_plane(fake_plane(alert_subscriptions_list={"x": 1})))[
+    assert (await run_plane(fake_plane(alert_subscriptions_list={"subscriptions": "x"})))[
         "alert channel"
     ].status == pf.WARN
 
@@ -474,10 +482,12 @@ async def test_unexpected_tool_answers_are_failures_not_passes_or_crashes():
 async def test_a_sensor_that_was_not_probed_is_not_reported_healthy():
     """In a read-only second process every in-process sensor reports alive=None."""
     not_probed = fake_plane(
-        honeypot_health=[{"name": "ssh-1", "alive": None}, {"name": "rdp-1", "alive": None}]
+        honeypot_status={
+            "honeypots": [{"name": "ssh-1", "alive": None}, {"name": "rdp-1", "alive": None}]
+        }
     )
     check = (await run_plane(not_probed))["sensor health"]
     assert check.status == pf.FAIL and "ssh-1" in check.detail
     # a running sensor missing from the health list altogether is not confirmed either
-    missing = fake_plane(honeypot_health=[{"name": "ssh-1", "alive": True}])
+    missing = fake_plane(honeypot_status={"honeypots": [{"name": "ssh-1", "alive": True}]})
     assert "rdp-1" in (await run_plane(missing))["sensor health"].detail

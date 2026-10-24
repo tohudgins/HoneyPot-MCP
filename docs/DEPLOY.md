@@ -168,7 +168,7 @@ DATABASE_URL=sqlite+aiosqlite:///./data/honeypot_mcp.db
 |---|---|
 | `viewer` | Read-only triage and analysis |
 | `operator` | Also deploy/stop honeypots, manage honeytokens, acknowledge alerts: everything reversible and contained to this system's own data |
-| `admin` | Also prune alerts, push to external firewalls/WAFs, read the audit log |
+| `admin` | Also prune alerts, manage subscriptions, read the audit log, manage API keys, back up the database |
 
 `src/honeypot_mcp/rbac.py` lists exactly which tool needs which role. Example:
 `MCP_AUTH_TOKENS=<viewer-token>:viewer,<operator-token>:operator,<admin-token>:admin`.
@@ -196,7 +196,7 @@ Create tokens **after** setting this and restarting, because the URL is baked in
 
 ```text
 > create a canary URL token labelled env-canary          (honeytoken_create, canary_url)
-> generate one mysql credential labelled env-mysql       (honeytoken_generate_credentials)
+> generate one mysql credential labelled env-mysql       (honeytoken_create, credential)
 ```
 
 The HTTP honeypot then serves the credential as the database login, and the canary URL as an
@@ -541,11 +541,11 @@ In analysis mode every `since_hours` window ends at the newest alert in the data
 | To answer | Tool |
 |---|---|
 | What happened, what needs triage | `soc_brief`, `alerts_stats`, `alerts_recent`, `alerts_search` |
-| Which ATT&CK techniques | `attack_summary` (whole run, by tactic, exact counts), `map_ttps` (an IP, event types or text), `deception_coverage` |
+| Which ATT&CK techniques | `attack_summary` (whole run, by tactic, exact counts; or with an IP, event types or text, what that behaviour maps to), `deception_coverage` |
 | Who is this attacker, what did they do in order | `analyze_attacker`, `analyze_attacker_journey`, `analyze_session` |
 | Which sources act together | `analyze_campaign` (ranked by a documented score, behavioural campaigns before connection sweeps, recurring windows of one botnet merged into one entry), `fingerprint_clusters` (SSH client fingerprints) |
 | Record a verdict | `alerts_acknowledge` (a source, an event type or ids; sets true/false positive) |
-| Hand it on | `generate_report` (markdown or html), `export_stix`, `export_blocklist`, `alerts_export` |
+| Hand it on | `generate_report` (markdown, html or attack_navigator), `export_indicators` (blocklist or STIX), `alerts_export` |
 | A question no tool anticipated | `sql_query`: one read-only `SELECT` over `alerts`, `alert_rollups`, `honeypots` (secret tables refused; at most 1,000 rows and `SQL_QUERY_TIMEOUT_SECONDS`, default 15, up to 300). Prefer `alert_rollups` for anything over the whole run. Grafana's **Query** dashboard takes SQL in its `sql` box. |
 | What attackers did, without SQL | `attack_patterns` with `kind` = `credentials`, `commands`, `files`, `clients`, `sip_dialling`, `http` or `concentration` (top logins, command shapes, dropped files, SSH client families, dial-prefix cycling, how concentrated the volume is) |
 | Who used a planted credential and what they did first | `bait_trips` |
@@ -625,7 +625,7 @@ The address ngrok prints is where attackers will find the honeypot.
 
 - Rotate the canary callback URL if you have shared it widely.
 - Rebuild the host from scratch: assume drift and compromise over time.
-- Export attack data (`export_stix`, `export_blocklist`) for upstream threat-intel feeds.
+- Export attack data (`export_indicators` with `format=stix` or a blocklist format) for upstream threat-intel feeds.
 
 If you run the Grafana stack, update it with:
 
@@ -643,7 +643,7 @@ cd /opt/honeypot-mcp/docker && docker compose -f docker-compose.observability.ym
 | No events after 30 minutes | Firewall not open, or port blocked upstream by the provider | Test from another machine: `nc -zv <vps-ip> 22` |
 | `honeypot_self_test` returns `alert_received: False` | Engine is up but the alert pipeline is not | Check suppression rules, DB connectivity, and that the buffer flusher is running |
 | Canary URLs never fire | `CANARY_PUBLIC_URL` wrong, or the callback is not reachable | `curl http://<canary-url>/t/test` should return 200 OK. Under the production profile the callback is loopback-only (18888): point `CANARY_PUBLIC_URL` at an HTTP honeypot on port 80 (step 4) |
-| Cowrie catches nothing but the port is open | Image not pulled, or the container died | `docker logs honeypot-<name>` (containers are named `honeypot-<honeypot-name>`); `honeypot_health <name>` |
+| Cowrie catches nothing but the port is open | Image not pulled, or the container died | `docker logs honeypot-<name>` (containers are named `honeypot-<honeypot-name>`); `honeypot_status <name>` |
 | Webhook deliveries failing | Stale Slack/Discord URL, or HMAC mismatch on the consumer | `alert_subscriptions_list` shows `last_error` |
 | Out of disk space | Alert payloads accumulating | `alerts_prune` more aggressively, or schedule it; see step 11 |
 | Host SSH down (locked out) | Admin port changed by hand, or the firewall blocks you | A browser console that logs in as root does not work once hardened. Use the recovery console; see [Getting back in](#getting-back-in) |

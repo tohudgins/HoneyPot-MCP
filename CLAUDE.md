@@ -2,6 +2,10 @@
 
 Guidance for Claude Code when working with this repository.
 
+Each section states rules and invariants: what to do, what not to do, and why in one line. The longer
+accounts (what broke, what was measured) are in [docs/LESSONS.md](docs/LESSONS.md), organised by topic; read the
+matching section there before changing a rule. Product reference: [docs/REFERENCE.md](docs/REFERENCE.md).
+
 ## Commands
 
 > Every `uv run X` line below is equivalent to plain `X` if the project was
@@ -21,11 +25,12 @@ uv run python -m honeypot_mcp.server
 # or via the installed script
 honeypot-mcp
 
-# Tests (2,900 unit tests covering security-critical paths; about 2 minutes on 4 workers: `-n 4`)
+# Tests (2,896 unit tests covering security-critical paths; about 2 minutes on 4 workers: `-n 4`)
 uv run pytest tests/unit/ -n 4 -q
 uv run pytest tests/unit/test_tokens.py -v
 uv run pytest tests/unit/test_tokens.py::test_aws_key_format
 uv run pytest tests/unit/ --cov=src/honeypot_mcp --cov-report=term-missing
+# Count: uv run pytest tests/unit --collect-only -q | tail -1
 
 # Lint / format
 uv run ruff check src/ tests/
@@ -35,1602 +40,604 @@ uv run ruff format src/ tests/
 uv run mypy src/ scripts/
 ```
 
+- Integration tests under `tests/integration/` are Docker-gated (`RUN_DOCKER_TESTS=1`); unit tests cannot catch
+  wire-level regressions in Cowrie capture, the firewall, the Docker guard or FreeRDP.
+- Launch with `honeypot-mcp` or `python -m honeypot_mcp.server` (it delegates to the canonical module: tools register on
+  `honeypot_mcp.server.mcp`, not `__main__.mcp`).
+- Tests run on SQLite by default; `TEST_DATABASE_URL=postgresql+asyncpg://...` runs the same suite on PostgreSQL
+  (each test gets an empty schema). Test modules must read that variable, never hard-assign a URL, or the CI
+  PostgreSQL job silently tests SQLite.
+
 ## Architecture
 
 ### Event ingestion data path
 
-Engines do NOT write to the DB directly. The path is:
+Engines never write to the DB directly. The path is:
 
 ```
 Engine (any of the 25 — see deception/capabilities.py)
   → submit_event(PendingEvent)             # storage/event_buffer.py
-  → suppression.should_suppress(event)     # in-memory rules, dropped here are gone
-  → credential_match.match(event)          # planted creds → CRITICAL + honeytoken_id tag
-  → flood_guard.admit(event)               # per (source, event type) 600 stored/min; the rest
-                                           # are counted into one flood_summary per window.
-                                           # CRITICAL and honeytoken hits are never dropped
-  → EventBuffer queue
-  → flusher task (single async task, batches up to 50, max 1s wait)
-  → DB transaction (Alert + AttackerEvent rows); credential-trigger events
-    also mark the matched Honeytoken row as TRIGGERED
-  → CRITICAL events fire a background _enrich_alert_async() that merges
-    VT + AbuseIPDB + GeoIP into Alert.payload (cached via intel/_cache.py
-    so repeat CRITICALs cost zero external calls)
-  → on_flush hook
-  → WebhookDelivery queue (separate worker, slow consumers don't back-pressure)
-  → POST to subscribers (HMAC-signed if configured), 3 retries with backoff
+  → suppression.should_suppress(event)     # in-memory rules; dropped here is gone
+  → credential_match / token_matchers      # planted creds, SSH keys, JWTs, DB-row emails → CRITICAL + honeytoken_id
+  → flood_guard.admit(event)               # per (source, event type): 600 stored/min, the rest counted into one
+                                           # flood_summary per window; CRITICAL and honeytoken hits never dropped
+  → EventBuffer queue (unbounded)
+  → flusher task (single async task, batches of 50, max 1s wait)
+  → DB transaction (Alert + AttackerEvent rows); credential-trigger events mark the Honeytoken TRIGGERED
+  → CRITICAL events fire background _enrich_alert_async() (VT + AbuseIPDB + GeoIP merged into Alert.payload)
+  → on_flush hook → WebhookDelivery queue (separate worker) → POST to subscribers
 ```
 
-Each `PendingEvent` carries its own `timestamp` so batched writes preserve chronological order — without that, every event in a batch shares `func.now()` and SOC analysis breaks.
+- `submit_event()` is the ONLY way engines write events. Direct `get_session()` writes from engines bypass
+  suppression, flood control and webhook delivery. Canary/token triggers also go through it.
+- Each `PendingEvent` carries its own `timestamp` so batched writes keep chronological order.
+- `flood_guard` never hides volume: dropped events are counted into a `flood_summary`, and a source that stops
+  mid-window still gets its summary. Its state is bounded in memory.
+- `attacker_events` holds only honeytoken-linked events.
+- The queue is unbounded, so `submit_event` never blocks and nothing is dropped on the way in; commit rate
+  (~1,550 events/s on SQLite) is the ceiling. The one loss path is `stop()`, which drains for
+  `shutdown_drain_seconds` (default 5) and then discards the rest, logging the count at ERROR. Raise it for
+  slow or remote databases. `honeypot_event_queue_depth` (Prometheus) must oscillate around one flush
+  interval's traffic; a climbing value means ingest is outrunning the database.
+- Transient DB errors are retried, permanent ones are not (`EventBuffer._write_retrying`).
+- Auto-enrichment (`_enrich_alert_async`) runs only for globally routable source IPs (`_is_enrichable_ip`),
+  fans out VT + AbuseIPDB + GeoIP in parallel, swallows failures (UX, not a guarantee), and merges into
+  `payload.enrichment`. `intel/_cache.py` (monotonic TTL dict; VT 30 min, AbuseIPDB 15 min, GeoIP 24 h) caches
+  successful responses only; errors and rate limits are never cached.
 
 ### MCP tool registration
 
-`server.py` creates the `FastMCP` instance (`mcp`) and registers the lifespan hook. Tool modules are imported at the bottom of `server.py` so their `@mcp.tool` decorators execute at load time — the import *is* the registration. Add new tool modules to that block.
+`server.py` creates the `FastMCP` instance (`mcp`) and the lifespan hook. Tool modules are imported at the
+bottom of `server.py`; the import *is* the registration. A new module needs an `import honeypot_mcp.tools.<name>`
+line there. `@mcp.tool` returns the original function, so tools are plain async functions in tests.
 
-Current tool modules:
-- `tools/honeypot.py` — deploy/list/stop/configure/clone, plus `honeypot_health` (probe) and `honeypot_self_test` (end-to-end pipeline check)
-- `tools/honeytoken.py` — token CRUD + AWS/credential/file generators
-- `tools/alerts.py` — recent/get/search/stats/acknowledge/export/prune
-- `tools/analysis.py` — enrich, profile, session reconstruction, `analyze_attacker_journey` (cross-honeypot kill-chain timeline), campaign correlation, MITRE mapping (`map_ttps`; `attack_summary` maps every event type seen, from the rollups, by tactic), reports, blocklist + STIX exports
-- `tools/integrations.py` — webhook subscriptions, suppression rules
-- `tools/blocklist_push.py` — push blocked IPs to Cloudflare / AWS WAF / pfSense
-- `tools/deception.py` — the intent-level tools: `deception_plan`,
-  `deception_deploy_plan`, `deception_coverage`, `soc_brief`, `deception_profiles`
-- `tools/pcap.py` — `pcap_status`, `pcap_extract`, `pcap_files`, `pcap_control`, `pcap_analyze` (reads a capture file back; the parser is `pcap_analysis.py`, pure Python, bounded, confined to `reports_dir`/`pcap_dir`)
-- `tools/patterns.py` — `attack_patterns` (credentials, commands, files, clients, sip_dialling, http, concentration) and `bait_trips`. Purpose-built, indexed, time-budgeted queries for the questions that otherwise need hand-written SQL over millions of rows; planted-token passwords are masked
-- `tools/grafana.py` — `grafana_start`, `grafana_stop`, `grafana_status` (lifecycle in `grafana.py`): a pinned container on loopback with a read-only SQLite datasource over a private directory that holds only the database files (hardlink, then reflink, then a size-capped copy); the password goes to a 0600 file and is never returned or audited
-- `tools/workflows.py` — `run_analysis` (the post-run workflow as one call, composing the existing tools in-process) and `database_backup` (SQLite online backup into `backup_dir`, verified, with a manifest)
-- `tools/detect.py` — `pcap_detect` and `detection_rules_update` (orchestration and parsers in `pcap_detect.py`): Suricata/Zeek replay of a capture in a sandbox container (no network, read-only root, all caps dropped, no-new-privileges, non-root, resource limits, label `honeypot-mcp=detect`, always removed). Only the rules update ever gets a network
-- `tools/samples.py` — `sample_scan` and `sample_collect` (`samples.py`, bundled rules in `yara_rules/`): YARA over the mode-000 quarantine without executing or altering anything, joined to the database by hash; collection from Cowrie containers through the Docker guard's read-only allowlist of the two capture directories (`hardening/docker_guard.py`, `COWRIE_SAMPLE_DIRS`)
-- `tools/mapping_audit.py` — `mapping_audit`: the measurement of `intel/mitre.py`. With no arguments it draws a seeded sample stratified by event type as a BLIND file (no technique or tactic anywhere) and a KEY file; independent labellers fill in techniques from the blind file only; given a `labels_file` it scores them at strict and parent-technique level with a stratified Jeffreys Monte Carlo interval per metric, and reports concentration (one huge event type can carry a population rate: `sip_extension_probe` was 97.5% of the weighted disagreement) plus the estimate without the largest stratum. Change `intel/mitre.py` only with evidence of this kind
-- `tools/sql.py` — `sql_query`: one read-only SELECT, row- and time-capped, secret tables refused
-- `tools/ioc.py` — `extract_iocs` and `lookup_hash`: distinct URLs, hosts and file hashes from captured payloads, and MalwareBazaar lookups
-- `tools/api_keys.py` — `api_key_create`, `api_key_revoke`, `api_key_list` (live-provisioned, per-person credentials — see "Role-based access control" below)
+There are 67 tools. Modules (`src/honeypot_mcp/tools/`):
 
-**Rule: anything an analyst does by hand with the data must exist as a tool.** The project's point is that a
-user can reproduce an analysis on their own traffic through the MCP interface. Before doing an analysis
-step in a shell, check whether a tool does it; if none does, the step is a missing tool, not a one-off.
+- `honeypot.py` — deploy, list, status (no name probes every sensor), stop, pause, resume, configure, self_test
+- `honeytoken.py` — create (every type; `api_key`/`credential`/`file` take `metadata`), list (`token_id` for one trail), rotate, revoke, export
+- `alerts.py` — recent/get/search/stats/acknowledge/export/prune, `audit_log_search`
+- `analysis.py` — `enrich_ip`, `report_ip_abuse`, `analyze_*` (attacker, journey, campaign, session), `fingerprint_clusters`, `attack_summary` (also `ip`/`event_types`/`raw_text`), `generate_report` (incl. `format="attack_navigator"`), `export_indicators` (plain/iptables/fail2ban/cidr/stix), `threat_timeline`
+- `integrations.py` — subscriptions (webhook/SIEM/Slack/Teams/email), suppression rules and presets (`suppression_list` carries `presets`)
+- `deception.py` — `deception_profiles` (also sensor types), `deception_plan`, `deception_deploy_plan`, `deception_coverage`, `soc_brief`
+- `pcap.py` — `pcap_files` (also capture status), `pcap_extract`, `pcap_control`, `pcap_analyze` (parser `pcap_analysis.py`: pure Python, bounded, confined to `reports_dir`/`pcap_dir`)
+- `detect.py` — `pcap_detect`, `detection_rules_update`: Suricata/Zeek replay in a sandbox container (no network, read-only root, caps dropped, no-new-privileges, non-root, limits, label `honeypot-mcp=detect`, always removed; only the rules update gets a network)
+- `samples.py` — `sample_scan`, `sample_collect` (rules in `yara_rules/`): YARA over the mode-000 quarantine without executing anything, joined to the DB by hash; collection goes through the Docker guard's read-only allowlist (`COWRIE_SAMPLE_DIRS`)
+- `patterns.py` — `attack_patterns` (credentials, commands, files, clients, sip_dialling, http, concentration), `bait_trips`: indexed, time-budgeted; planted-token passwords are masked
+- `ioc.py` (`extract_iocs`, `lookup_hash`), `sql.py` (`sql_query`, read-only), `mapping_audit.py` (see ATT&CK mapping), `api_keys.py` (see RBAC)
+- `workflows.py` — `run_analysis` (post-run workflow composing existing tools in-process), `database_backup` (SQLite online backup into `backup_dir`, verified, manifest)
+- `grafana.py` — `grafana_start/stop/status`: pinned loopback container, read-only SQLite datasource over a private directory with only the DB files; the password goes to a 0600 file, never returned or audited
 
-The `@mcp.tool` decorator returns the original function unchanged, so tools are directly callable in tests (no `.fn` accessor needed).
+Rules:
+- **Anything an analyst does by hand with the data must exist as a tool.** If a shell step has no tool, that is a
+  missing tool, not a one-off. The point of the project is that a user can reproduce an analysis on their own
+  traffic through the MCP interface.
+- The vendor firewall pushes (Cloudflare/AWS WAF/pfSense) do not exist and `boto3` is not a dependency: a
+  blocklist is produced by `export_indicators` and loaded by the operator.
+- Every tool needs an entry in `tool_hints.py` (`hints(name)` raises for an unlisted tool;
+  `test_tool_hints.py` pins it): read-only, destructive, idempotent and open-world hints for the client.
+- Prompts (`shift_handover`, `investigate_ip`, `honeytoken_tripped`, `hunt_campaigns`, `deploy_deception`,
+  `weekly_report`) live in `prompts.py` and must name current tools only.
 
 ### Plugin patterns
 
-**Honeypot engines** — subclass `HoneypotEngine` (in `engines/base.py`) and implement `start`, `stop`, `status`, `get_logs`. Optionally override `health_check(container_id, port)` if the default TCP probe isn't appropriate (UDP, Docker container check, etc.). Register in `engines/__init__.py:get_engine()`. Inside the engine, push events to the buffer:
-```python
-from honeypot_mcp.storage.event_buffer import PendingEvent, submit_event
-await submit_event(PendingEvent(
-    honeypot_id=hp_id, source_ip=ip, event_type="...",
-    payload=p, severity=AlertSeverity.HIGH,
-))
-```
-No direct DB sessions in engines — go through the buffer.
+**Honeypot engines** — subclass `HoneypotEngine` (`engines/base.py`), implement `start`, `stop`, `status`,
+`get_logs`; override `health_check(container_id, port)` when a TCP probe is wrong (UDP, Docker). Register in
+`engines/__init__.py:get_engine()`. Push events with `submit_event(PendingEvent(honeypot_id=..., source_ip=...,
+event_type=..., payload=..., severity=AlertSeverity.X))`. No direct DB sessions in engines.
 
-**Honeytoken providers** — subclass `HoneytokenProvider` (in `tokens/base.py`) and implement `create` (returns `(token_value, metadata)`) and `plant_instructions`. Register in `tokens/__init__.py`.
+Adding a honeypot type touches six places: `HoneypotType` (`storage/models.py`), the default port in `config.py`,
+the `Literal` and `default_ports` in `tools/honeypot.py`, `get_engine()`, an Alembic migration (`Enum(...)` is a
+native PostgreSQL type: `ALTER TYPE … ADD VALUE`, one statement per value; see `0012_add_five_types`) and the
+`deception/capabilities.py` entry (`transport` when not TCP: the pcap filter derives from it). A test asserts
+the capability registry matches `HoneypotType` exactly.
 
-Registering a provider is **not** enough to ship it. `kubeconfig`,
-`slack_webhook`, `azure_credential` and `gcp_service_account` each had a
-provider module, a registry entry, a `HoneytokenType` value, a migration and an
-ATT&CK mapping in `deception/coverage.py` — and could not be created, because
-the `Literal` on `honeytoken_create` listed seven types. The tool body is fully
-generic (`get_provider(HoneytokenType(type))`), so the annotation was the whole
-blocker and nothing failed loudly; everything downstream was ready and the front
-door was locked. Same defect as Telnet before it became a first-class honeypot
-type: **for a natural-language-driven system, the tool signature is the
-capability surface.** `test_honeytoken_create_offers_every_registered_type`
-asserts the `Literal` equals `HoneytokenType` exactly — add new types to both,
-and to the planner in `deception/planner.py` when a sensor pairs with one.
+**Honeytoken providers** — subclass `HoneytokenProvider` (`tokens/base.py`), implement `create` (returns
+`(token_value, metadata)`) and `plant_instructions`, register in `tokens/__init__.py`. Registering is not
+shipping: the type must also be in `HoneytokenType`, the `Literal` on `honeytoken_create`, a migration, the ATT&CK
+mapping in `deception/coverage.py`, and the planner (`deception/planner.py`) when a sensor pairs with it.
+`test_honeytoken_create_offers_every_registered_type` asserts the `Literal` equals `HoneytokenType`. **For a
+natural-language-driven system the tool signature is the capability surface.**
 
 ### Database layer
 
-`storage/database.py` exposes a single context manager `get_session()`. Auto-commits on clean exit, auto-rolls back on exception. Sessions aren't shared across blocks — each `async with` is its own transaction.
+- `storage/database.py` exposes one context manager, `get_session()`: auto-commit on clean exit, rollback on
+  exception; every `async with` is its own transaction.
+- SQLite by default (`honeypot_mcp.db`). PostgreSQL: `pip install -e ".[postgres]"` and
+  `DATABASE_URL=postgresql+asyncpg://...`; CI runs the suite against a real PostgreSQL.
+- **Alembic owns schema** for persistent DBs: `init_db()` runs `alembic upgrade head`; `":memory:"` URLs use
+  `create_all`. Add one with `uv run alembic revision --autogenerate -m "..."`; the autogenerated file is a
+  starting point, review it. Migrations that add or drop columns guard themselves with `inspect().get_columns(...)`
+  so the chain stays idempotent against fresh DBs; `test_init_db_does_not_log_alembic_fallback_warning` asserts
+  no fallback warning on boot. Keep revision ids short (`alembic_version.version_num` is `VARCHAR(32)`; SQLite
+  ignores it, PostgreSQL enforces it; a test covers this). If Alembic fails, `init_db()` falls back to `create_all()`
+  and logs a warning.
+- **Statistics read rollups, never the alert table** (`storage/rollups.py`, table `alert_rollups`: counts per hour
+  per severity/event type/source/sensor). A `before_flush` hook on `Session` (`rollups.install()`, run when
+  `database` is imported) counts every Alert writer in the same transaction, so nobody calls a helper and a
+  rollback takes its counts. `rollups.window` takes whole hours from rollups and the two partial edges from alert
+  rows (exact to the second); pruning raw alerts does not change lifetime figures. `alerts_stats`, `soc_brief`,
+  `honeypot_list`, profiles, journey totals, blocklist/campaign candidates and `/metrics` read it. When adding a
+  query over alerts, first ask whether it belongs on rollups. `tests/unit/test_rollups.py` checks every windowed
+  statistic against a brute-force count; `tests/unit/test_query_plans.py` pins plans.
+- Indexes: `ix_alerts_acked` and `ix_alerts_urgent` are partial (acknowledged rows; CRITICAL/HIGH rows) so triage
+  never touches the LOW/MEDIUM flood (untriaged = total minus acknowledged). Two composite indexes
+  (`0010_add_alert_query_indexes`) serve severity+window and ip+window. An unindexed filter on a hot path is
+  invisible until the DB is large.
+- PostgreSQL: `coalesce(x, $3)` in SELECT and `coalesce(x, $5)` in GROUP BY are different expressions; use a
+  literal. The in-memory test DB is one shared connection, so the engine disables reset-on-return for `:memory:`
+  (see `test_database.py`).
+- **Timestamps are aware everywhere** (`storage/models.py:UTCDateTime`: normalises on bind, re-attaches UTC on
+  load; stored SQLite string unchanged). A naive `.isoformat()` has no offset and JavaScript reads it as local.
+  Renderers over `PendingEvent` are always aware.
+- **Pruning archives before it deletes** (`retention.py`, shared by `alerts_prune` and the retention sweep):
+  `archive_alerts` streams keyset-paginated chunks to a `.partial` file, renames when complete and returns the
+  highest id written; `delete_before` deletes only up to that id, in bounded chunks, one transaction each. A
+  failed archive cancels the delete. `archive=False` / `RETENTION_ARCHIVE=false` opts out. Helpers that return
+  `{"error": ...}` do not raise: callers must check the result.
+- **`honeypot_stop` takes a set** (`name`, `names`, or a `type`/`status` filter; `type="all"` for everything). A
+  call with none of them is rejected rather than read as "everything". An unknown name aborts the whole call.
+- **`honeytoken_rotate` keeps the thread**: new secret, label/type/settings/`planted_at` carried over, old token
+  marked REVOKED but retained, linked by `rotated_from`/`rotated_to`. Provider-generated fields are excluded from
+  the carry-over.
+- **Triage state**: `acknowledged` plus `disposition` (`true_positive`/`false_positive`/`benign`/`duplicate`),
+  `triage_note`, `triaged_by`, `triaged_at`. `benign` (fired correctly on authorised activity) is distinct from
+  `false_positive` (detection wrong). `alerts_acknowledge` takes `alert_ids` or a filter (`source_ip`,
+  `event_type`, `severity`, `since_hours`); a call with neither is rejected. `queries.triage_alerts` SELECTs before
+  it UPDATEs to report the match count and whether `max_alerts` truncated it.
 
-**Statistics read rollups, never the alert table (`storage/rollups.py`, `alert_rollups`).** A public
-host's alert table grows by millions of rows a day (one SIP flood took it from 1.1M to 4.9M rows in
-nine hours, 3.8 GB, past the host's RAM) and every aggregate over it becomes a full scan:
-`honeypot_list` took 51 s and `alerts_stats`/`soc_brief` timed out. So the cost of a statistic must
-depend on the size of the answer. `alert_rollups` counts alerts per hour per (severity, event type,
-source, sensor). It is written by a `before_flush` hook on `Session` (`rollups.install()`, called
-when `database` is imported), so **every** Alert writer is counted in the same transaction as the
-row, a rolled-back transaction takes its counts with it, and nobody can forget to call a helper. A
-windowed query (`rollups.window`) takes whole hours from the rollups and the two partial edges from
-the alert rows, unioned and aggregated in the database, so it is exact to the second; pruning raw
-alerts does not change lifetime figures. `alerts_stats`, `soc_brief`, `honeypot_list`, the
-analyst's per-source profile and journey totals, the blocklist/campaign candidates and `/metrics` all
-read it. `ix_alerts_acked` and `ix_alerts_urgent` are small *partial* indexes (acknowledged rows;
-CRITICAL/HIGH rows) so the triage queue never touches the LOW/MEDIUM flood: untriaged = total minus
-acknowledged, and the "needs attention" list seeks `ix_alerts_urgent`. `attacker_events` now keeps
-only honeytoken-linked events (it used to copy every event, payload included). When adding a query
-over alerts, ask first whether it belongs on the rollups; `tests/unit/test_rollups.py` checks every
-windowed statistic against a brute-force count and `tests/unit/test_query_plans.py` pins plans.
-Two traps found the hard way: on PostgreSQL `coalesce(x, $3)` in SELECT and `coalesce(x, $5)` in
-GROUP BY are different expressions (use a literal), and the in-memory test database is one shared
-connection, whose pool reset rolled back other sessions' uncommitted writes (the engine disables
-reset-on-return for `:memory:`; see `test_database.py`).
+### Instance ownership
 
-Default is SQLite (`honeypot_mcp.db`). For PostgreSQL, install the driver
-extra and swap the URL — no code changes:
-
-```bash
-pip install -e ".[postgres]"
-DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/honeypot
-```
-
-A CI job runs the full suite against a real PostgreSQL, because this path was
-broken for the project's entire life without anyone noticing: Alembic's
-`alembic_version.version_num` is `VARCHAR(32)`, revision
-`0007_drop_attacker_profile_shodan_data` was 38 characters, SQLite ignores
-VARCHAR limits and PostgreSQL enforces them. The chain died mid-way, `init_db`'s
-`create_all` fallback silently produced a working-looking schema with no version
-stamp, and every restart re-ran every migration. Keep revision ids short — there
-is a test for it.
-
-**Alembic** owns schema for persistent DBs. `init_db()` runs `alembic upgrade head` at startup; in-memory DBs (`":memory:"` in URL) skip Alembic and use `create_all` directly. Migrations live at `src/honeypot_mcp/migrations/versions/`.
-
-The baseline migration uses `Base.metadata.create_all(op.get_bind())` so it's idempotent against pre-Alembic dev DBs — first run on an existing DB is a no-op that just stamps the version row.
-
-To add a migration when a model changes:
-```bash
-uv run alembic revision --autogenerate -m "what changed"
-# Inspect, then it auto-applies on next server start
-```
-
-If Alembic fails for any reason (corrupted version table, missing migration file, etc.), `init_db()` falls back to `create_all()` so the server still starts. The warning is logged.
-
-Migrations that ADD or DROP columns guard themselves with `inspect().get_columns(...)` so the chain stays idempotent against fresh DBs (where `0001_baseline`'s `create_all` already reflects current `models.py`). The regression test `test_init_db_does_not_log_alembic_fallback_warning` asserts no fallback warning fires on boot — keep new migrations idempotent the same way so that signal stays clean.
-
-### SSH personas
-
-`engines/ssh_personas.py` defines OS personas — coherent bundles of (hostname
-pool, kernel version + build string, OpenSSH banner string, distro identity).
-At `SSHEngine.start()` time, if the honeypot's `config` has no `ssh_persona`,
-one is picked randomly, a hostname is sampled from the persona's pool, and
-both are persisted to `Honeypot.config` for stability across restarts.
-
-The persona is passed to Cowrie via `COWRIE_*` env vars built by
-`cowrie_env_vars()`. Both legacy (`COWRIE_HOSTNAME`) and modern
-(`COWRIE_HONEYPOT_HOSTNAME`) naming conventions are set so the persona takes
-effect regardless of Cowrie version.
-
-**`cowrie_env_vars()` also carries the three settings that make capture work
-at all** — do not treat them as cosmetic:
-
-```
-COWRIE_HONEYPOT_LOGTYPE=plain
-COWRIE_OUTPUT_JSONLOG_ENABLED=true
-COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1
-```
-
-`_ingest_logs` reads `container.logs()` and `json.loads` each line. Cowrie's
-stdout is Twisted's *text* log, so on image defaults every line fails to parse
-and the honeypot records nothing while running, answering SSH, and passing
-health checks — the failure is completely silent. `logtype` matters as much as
-the path: the default `rotating` wraps the file in Twisted's `LogFile`, which
-seeks on open and dies with "Illegal seek" on a pipe, disabling the jsonlog
-plugin entirely. `plain` uses a bare `open(path, "w")`.
-
-The same three variables are set on the `cowrie-ssh` service in
-`docker/docker-compose.yml`, which had the identical problem.
-`tests/integration/test_ssh_capture.py` (Docker-gated, `RUN_DOCKER_TESTS=1`)
-is the only test that can catch a regression here — unit tests feed synthetic
-JSON to the parser and pass either way.
-
-User escape hatch: explicit `fake_hostname` / `fake_kernel` keys in config
-override the persona-chosen values. Cowrie's own `cowrie.cfg` defaults are the baseline
-those env vars override.
-
-Adding a persona: append to `_PERSONAS` in `ssh_personas.py`. Keep distro
-identity consistent across all fields — a "Debian" persona must not have an
-"Ubuntu" kernel build string, because mismatched fingerprint surfaces are
-themselves a fingerprint.
-
-### HTTP personas
-
-`engines/http_personas.py` defines server "personas" — coherent bundles of
-(Server header, X-Powered-By, cookie name, 404 page, jitter) that make the
-HTTP honeypot look like a specific real-world stack. `engines/http_templates.py`
-holds the body templates (login pages, fake `.env` files) — kept persona-
-independent so a Laravel `.env` doesn't change with the server identity.
-
-When `HTTPEngine.start()` runs and the honeypot's `config` has no `persona`
-key, it picks one randomly via `pick_random_persona_id()` and writes it back
-to the `Honeypot.config` JSON column. Subsequent restarts read the same
-persona, so a scanner that hits the same honeypot twice can't detect rotation.
-
-Adding a persona: append to `_PERSONAS` in `http_personas.py`. Keep the bundle
-internally consistent — an Nginx persona must NOT have `x_powered_by="PHP/..."`
-because real Nginx setups rarely do, and inconsistency is itself a fingerprint.
+`instance_lock.py`: one process owns a deployment's sensors (flock file beside a SQLite DB; a PostgreSQL advisory
+lock on a dedicated connection). A process that cannot take it starts read-only (queries, analysis, triage,
+tokens) and does not touch ports, reconcile, or run delivery/canary servers; the sensor-changing tools say who
+owns them. It retries every `owner_check_seconds` and promotes itself, re-establishing the sensors as a restart
+would. The OS releases the lock when the owner dies; there is no stale lock.
 
 ### Suppression engine
 
-`suppression.py` runs at `submit_event` time. Rules are cached in memory and refreshed every 30s; the cache is also explicitly invalidated when `suppression_add`/`suppression_remove` MCP tools modify rules.
-
-- IP matching: tries CIDR first (e.g. `10.0.0.0/8`), falls back to exact string match. Empty pattern matches anything.
-- Event-type matching: glob via `fnmatch` (`ssh_*`). Empty matches anything.
-- `action="drop"`: silently discard.
-- `action="rate_limit"`: monotonic-clock sliding window; passes the first N within `rate_limit_window_seconds`, drops the rest.
-
-A rule must specify at least one of `ip_pattern` / `event_type_pattern` — empty rules are rejected at the tool layer (would otherwise drop every event).
+`suppression.py` runs at `submit_event`. Rules are cached in memory, refreshed every 30 s and invalidated
+explicitly by `suppression_add`/`suppression_remove`.
+- IP: CIDR first, then exact string; empty matches anything. Event type: `fnmatch` glob; empty matches anything.
+- `action="drop"` discards; `action="rate_limit"` passes the first N per `rate_limit_window_seconds` (monotonic
+  sliding window).
+- A rule must set at least one of `ip_pattern` / `event_type_pattern`; empty rules are rejected (they would drop
+  every event).
 
 ### Credential honeytoken cross-reference
 
-`credential_match.py` runs after suppression in `submit_event`. It loads all
-active CREDENTIAL honeytokens into an in-memory dict keyed by
-`(service, username_lower, password)`, refreshed every 30s and invalidated
-explicitly on `honeytoken_create` / `honeytoken_revoke`.
-
-When a login-attempt event payload contains a planted pair, the event is
-mutated in place: `severity` → `CRITICAL`, `honeytoken_id` → the matched
-token's id, `event_type` → `honeytoken_triggered_credential_via_<original>`.
-The flusher then calls `mark_honeytoken_triggered()` for any flushed event
-with that event_type prefix.
-
-Two match paths:
-
-*Plaintext* (`_index`, keyed by `(service, username_lower, password)`) — the
-common case. Payload extraction handles:
-- SSH/FTP/HTTP form `{"username": ..., "password": ...}` keys directly.
-- HTTP `post_data` nested dicts — checks common field aliases
-  (`username|user|email|login`, `password|pass|passwd|pwd`).
-- SMTP `AUTH PLAIN <b64>` — base64-decodes and splits on `\0` per RFC 4616.
-
-*Hashed* (`_match_hashed`, services in `_HASHED_SERVICES` = `{mysql, vnc}`) —
-these protocols never send the plaintext password. MySQL sends a
-`mysql_native_password` scramble over a server salt; VNC sends the server
-challenge DES-encrypted under the password. Since the engine generated the
-salt/challenge (and includes `salt_hex` / `challenge_hex` + the captured
-response in the event payload), `credential_verify.py` recomputes the expected
-digest for each planted-password candidate and compares. MySQL also matches on
-the plaintext username it sends in the clear; VNC is password-only. A parallel
-`_candidates` dict (service → `[(user_lower, password, token_id)]`) is built
-alongside `_index` at load time to feed this path.
-
-Service is inferred from `event_type` prefix via `_SERVICE_PREFIXES`
-(`ssh_*`, `http_*`, `ftp_*`, `smtp_*`, `postgresql_*`, `mssql_*`, `redis_*`,
-`mysql_*`, `vnc_*`). Tokens planted with `service="any"` match across all
-services (including the hashed ones).
-
-Limitation: the matcher only fires when the planted creds hit one of our own
-honeypots. It doesn't observe production-system logins — that needs an IdP
-audit-log feed which this project doesn't ship. Documented in
-`KNOWN_LIMITATIONS.md`.
-
-### Auto-enrichment of CRITICAL alerts
-
-`event_buffer._enrich_alert_async` is scheduled as a fire-and-forget task
-for every CRITICAL event that lands with a globally-routable source IP
-(filtered via `_is_enrichable_ip` — drops loopback, RFC1918, link-local,
-TEST-NET, and any address Python's `ipaddress` module marks as non-global).
-The task fans out parallel VT + AbuseIPDB + GeoIP lookups, then re-opens a
-session and merges the result into the alert's `payload.enrichment` dict.
-
-Failures here are swallowed — auto-enrichment is a UX improvement, not a
-guarantee. The `intel/_cache.py` TTL dict means repeat CRITICALs from the
-same IP within the cache window cost zero external API calls.
+`credential_match.py` runs after suppression. It indexes active CREDENTIAL tokens by `(service, username_lower,
+password)`, refreshes every 30 s, and is invalidated on `honeytoken_create`/`honeytoken_revoke`. On a match the
+event is mutated in place: `severity` → CRITICAL, `honeytoken_id` set, `event_type` →
+`honeytoken_triggered_credential_via_<original>`; the flusher then calls `mark_honeytoken_triggered()` for events
+with that prefix. `token_matchers.py` does the same for SSH-key fingerprints, JWT `jti` and DB-row canary emails.
+- Matching runs on the payload **before** it is clamped; a planted credential inside a dropped `post_data` must
+  still escalate. The HTTP engine keeps credential-aliased form fields however much junk precedes them.
+- *Plaintext* extraction: `username`/`password` keys; HTTP `post_data` aliases (`username|user|email|login`,
+  `password|pass|passwd|pwd`); SMTP `AUTH PLAIN` (base64, split on `\0`, RFC 4616).
+- *Hashed* services (`_HASHED_SERVICES` = `{mysql, vnc}`): the engine generated the salt/challenge and stores it with
+  the captured response; `credential_verify.py` recomputes the digest per planted-password candidate (`_candidates`
+  dict). MySQL also matches on the plaintext username; VNC is password-only.
+- Service is inferred from the event_type prefix (`_SERVICE_PREFIXES`); `service="any"` tokens match everywhere.
+  Engines must set `service` on credential events (RDP/SMB NTLM, SNMP, PostgreSQL, MSSQL, …) so planted tokens
+  cross-reference.
+- Limitation: it only fires when planted creds hit one of our own honeypots (documented in `KNOWN_LIMITATIONS.md`).
 
 ### TLS / HTTPS / STARTTLS
 
-`engines/tls.py:ensure_cert` generates a self-signed RSA-2048 cert per
-honeypot, persisted to `tls/<honeypot_name>/server.{crt,key}` so a scanner
-pinning the cert SHA sees a stable identity across restarts. `cryptography`
-is a direct dep.
-
-HTTP: deploy with `config["tls"] = True` to serve HTTPS on the configured
-port. The listener is `engines/tls_front.py` (`start_tls_site`, a drop-in for
-`web.TCPSite(ssl_context=...).start()`), not a bare `TCPSite`: asyncio's TLS layer closes
-silently when the first bytes are not a usable ClientHello, so `nmap -sV` could not tell
-the port was HTTPS (`m2ap?`) and the `ssl-cert` script never ran. The front `MSG_PEEK`s the
-first 16 bytes (bounded: 5 s sniff deadline, 256 unclassified connections overall, 32 per
-source) and then hands a TLS 1.2+ ClientHello to asyncio untouched via
-`loop.connect_accepted_socket` (the handler still sees the real peer), answers a pre-1.2
-ClientHello with Go's `protocol_version` alert, and answers plaintext HTTP with
-`plaintext_reply`: fixed bytes (Go's one-line 400, the default, used by the Kubernetes API),
-a callable given the request's Host header, or `None` to close silently. The HTTP engine
-passes `http_personas.plaintext_on_tls_reply`, so Apache explains itself in its HTML page
-naming host and port, nginx sends its own 400 page, and IIS sends nothing. Any new TLS
-listener on an aiohttp runner must use `start_tls_site`.
-
-The certificate itself is shaped per service by `tls.CertProfile` (CN, optional issuer CN,
-validity, SANs, key usage, EKU): `ensure_cert(name, profile=...)` / `build_server_ssl_context(_async)`
-take one. Kubernetes and MySQL are leaves from a named CA (the CA key is generated and
-discarded, since servers send only the leaf), RDP is self-signed and named for the computer
-FQDN (`_cert_profile` in rdp.py, so `ssl-cert` and `rdp-ntlm-info` agree), and the default is
-a bare backdated `CN=<name>` with no organisation and no `localhost` SAN. A persisted cert
-that no longer matches its profile, or has < 30 days left, is reissued. A new TLS engine
-should pass the profile of the service it impersonates, and callers that read the cert back
-(RDP's CredSSP public key) must pass the same profile or the file ping-pongs.
-
-SMTP: STARTTLS uses `asyncio.start_tls()` to actually complete the TLS
-handshake (the previous behaviour announced STARTTLS but dropped on the
-ClientHello — itself a fingerprint). After upgrade, the engine clears
-protocol state per RFC 3207 and requires the client to re-issue EHLO.
-
-`tls/` is gitignored — keys are private, certs are deployment-specific.
-
-### RDP engine
-
-`engines/rdp.py` parses the X.224 Connection Request, extracts the leaked
-`Cookie: mstshash=user[@DOMAIN]` field (almost every RDP client and brute-force tool sends
-this in the clear), and negotiates TLS or CredSSP. `rdp_nla.py` plays the server side of
-CredSSP/NTLM (bare or SPNEGO-wrapped NTLM, as Windows' own client sends) and captures a
-crackable NetNTLMv2 response. A planted honeytoken credential or the one weak pair derived
-from the honeypot's name (`accepted_logins` / `sessions` in its config) is let in:
-`rdp_nla.py` derives the NTLM session key from the password and seals the server's
-public-key binding (which is how a client that checks it, FreeRDP, aardwolf, proceeds), then
-`rdp_session.py` runs a short MCS/capability exchange, paints a static desktop and records
-keystrokes, clicks and pasted clipboard text (`rdp_cliprdr.py`, MS-RDPECLIP over the `cliprdr`
-static channel: Format List -> Format Data Request -> recorded text; an optional `clipboard_text`
-is announced only after the client's own initial Format List, because clients ignore anything
-else until then). The desktop is `rdp_desktop.py` (a framebuffer `Screen` with Spleen 8x16 glyphs
-from `rdp_font.py`, and a `Desktop` state machine: icons, Start menu, Win+R, a console window;
-`commit()` repaints and returns only the changed rectangle, found by XOR-ing rows as big
-integers), and the console's answers come from `rdp_shell.py` (a pure fake `cmd`/PowerShell:
-no network, no execution, session-local files and `net user /add`). Input becomes `actions`
-via `InputRecorder`; repainting runs in `asyncio.to_thread`. `rdp_command` events carry the
-command and extracted URLs (CRITICAL on a download attempt). The tests drive it with aardwolf (`tests/unit/test_rdp_session.py`,
-including a mutation-replay fuzz of a recorded session) and FreeRDP 3
-(`tests/integration/test_rdp_freerdp.py`, Docker-gated, checks pixels).
-
-Logs `rdp_handshake` at HIGH severity when the X.224 parses, `rdp_invalid_probe`
-at LOW for port-scan garbage.
-
-### SMB / PostgreSQL / MongoDB engines
-
-Three database/file-share engines aimed at the highest-value public-internet
-attack surfaces. All in-process asyncio, same buffer path as the others.
-
-- `engines/smb.py` — tcp/445, the top ransomware initial-access surface.
-  Parses the NetBIOS-framed SMB1/SMB2 negotiate. An SMB1-only negotiate (nmap,
-  exploit tools) gets an SMB1 reply shaped like Windows 7-10 (nmap's
-  `microsoft-ds` rule matches it) and follow-up packets are classified:
-  `smb_exploit_attempt` (CRITICAL) on a DoublePulsar Trans2 SESSION_SETUP
-  (0x000e) or EternalBlue pre-auth Trans2, `smb_session_setup` (HIGH) capturing
-  readable NTLM strings. Anything that offers SMB2 (its own NEGOTIATE, or an
-  SMB1 multi-protocol negotiate listing `SMB 2.002`/`SMB 2.???`) goes to
-  `engines/smb2.py`: dialect 2.1, then the server side of NTLM session setup
-  using the RDP honeypot's `build_challenge`, so one host discloses one
-  identity. The AUTHENTICATE is recorded as `smb_ntlm_auth` (HIGH, with
-  `server_challenge_hex`, `nt_response_hex` and a hashcat `-m 5600` line,
-  `service="smb"`, cross-referenced by `credential_match` like RDP's) and
-  refused with `STATUS_LOGON_FAILURE`. Detection-focused, no real file server
-  and no tree connect — same tier as RDP. `tests/unit/test_attacker_tool_fidelity.py`
-  drives it with impacket and checks the captured response cracks.
-- `engines/postgresql.py` — tcp/5432. Declines SSL (`N`) so the client falls
-  back to cleartext, parses the StartupMessage (user + database), requests
-  cleartext auth, and captures the password from the PasswordMessage before
-  rejecting with `28P01`. Emits `postgresql_login_attempt` with
-  `service="postgresql"` so `credential_match` cross-references planted tokens.
-- `engines/mongodb.py` — tcp/27017. Minimal BSON encode/decode + OP_MSG/OP_QUERY
-  framing. Answers `isMaster`/`hello`/`buildInfo`/`listDatabases` believably so
-  the scanner proceeds, captures each command, and flags `mongodb_destructive`
-  (dropDatabase) and `mongodb_ransom_note` (CRITICAL — bitcoin/recover language
-  in an insert) with the note text. Replies `ok:1` so the ransom note lands.
-  Nothing is persisted or dropped.
-- `engines/mssql.py` — tcp/1433 (TDS). Replies to PRELOGIN with `ENCRYPT_NOT_SUP`
-  so the client sends Login7 in the clear, then parses the Login7 variable-data
-  table to extract hostname/username/password/appname. The password is
-  de-obfuscated (`_decode_tds_password`: XOR 0xA5 + nibble-swap over UTF-16LE).
-  Emits `mssql_login_attempt` with `service="mssql"`; returns an 18456 ERROR
-  token and closes. No query/RPC phase.
-
-Post-auth query capture (like MySQL) also lives in `postgresql.py`: after the
-password is captured it ACCEPTS the login (AuthenticationOk + ParameterStatus +
-ReadyForQuery) and classifies simple-query traffic — `COPY … FROM/TO PROGRAM`
-(CRITICAL RCE), UDF loads, `pg_read_file`/`lo_export` (HIGH), recon (MEDIUM).
-
-### Telnet / Memcached / SNMP / LDAP / Docker API engines
-
-Five additions aimed at surfaces the original catalogue missed entirely.
-
-- `engines/telnet.py` — a ~10-line subclass of `SSHEngine`. One Cowrie
-  container serves SSH on 2222 and Telnet on 2223; `_PRIMARY_CONTAINER_PORT`
-  and `_PRIMARY_IS_TELNET` decide which one gets published and whether Cowrie's
-  telnet listener is switched on. Telnet was previously reachable only as
-  `config={"telnet_enabled": True}` on an SSH honeypot, so `honeypot_deploy(
-  type="telnet")` failed and captures were filed under type `ssh` — for an
-  NL-driven system, a capability that cannot be asked for barely exists.
-  Retagging to `telnet_*` happens in `ssh.py:_retag_for_protocol`.
-- `engines/memcached.py` — tcp/11211 text protocol. The point is not cache
-  data, it is amplification: `stats` measures the reflector, a large `set`
-  stages a payload, and a `get` of that key reflects it. The stage-then-fetch
-  *sequence* is what raises `memcached_amplification_attempt` (CRITICAL) with a
-  measured amplification factor; either half alone is ordinary traffic.
-- `engines/snmp.py` — udp/161, BER by hand. v1/v2c put the community string in
-  the clear, so every request is a credential capture (`service: "snmp"`, so
-  planted community strings cross-reference). Only `public`/`private` are
-  answered — a real agent is silent on a wrong community, and answering
-  everything would fingerprint the sensor in one packet. The agent has a small
-  ordered MIB (system group, `ifNumber`, a four-port `ifTable`), so GetNext and
-  GetBulk behave as against a real agent: each step returns the next OID, a
-  walk ends in `endOfMibView` (v1: `noSuchName`), a missing OID is
-  `noSuchObject`, and `sysUpTime` advances. Before that, every GetNext was
-  answered with sysDescr and `snmpwalk` aborted with "OID not increasing".
-- `engines/ldap.py` — tcp/389, BER by hand. Two populations: simple binds carry
-  the DN and password in the clear (invalidCredentials keeps brute-forcers
-  cycling), and Log4Shell's second stage arrives here as a searchRequest.
-  `looks_like_jndi()` separates the two — a JNDI base object is an opaque token
-  from the payload URL with no `dc=`/`cn=`/`ou=` components, or it asks for
-  `javaClassName`/`javaCodeBase`. The persona is Active Directory (the bind
-  error text is AD's): the rootDSE (empty base, base scope) is readable
-  anonymously and lists naming contexts and capabilities, honouring the
-  requested attributes; other searches before a bind are `operationsError`,
-  as AD does with anonymous access disabled.
-- `engines/docker_api.py` — tcp/2375, aiohttp. An unauthenticated daemon is
-  host compromise, not a foothold. `analyse_container_create()` inspects the
-  create body and returns *named* reasons (host root bind, privileged, host PID
-  namespace, dangerous caps, miner image, payload command); any hit makes it
-  `docker_api_container_escape` (CRITICAL) rather than
-  `docker_api_container_create` (HIGH). "Someone POSTed to /containers/create"
-  is not actionable; "mounts host / at /mnt and runs chroot" is.
-
-**Neither memcached nor SNMP ever amplifies.** Both are reflection vectors with
-trivially spoofed sources, so a faithful large reply would enlist the honeypot
-in someone else's DDoS. Both record the reconnaissance and answer minimally.
-
-Adding a type touches six places (`transport` on the capability entry is the
-sixth if it isn't TCP — the pcap filter derives from it): `HoneypotType` in `storage/models.py`, the
-default port in `config.py`, the `Literal` and `default_ports` dict in
-`tools/honeypot.py`, `engines/__init__.py:get_engine()`, and an Alembic
-migration (`Enum(...)` is a native PostgreSQL type — `ALTER TYPE … ADD VALUE`,
-one statement per value; see `0012_add_five_types`).
-
-### Mail: SMTP queue, maildrop, POP3
-
-`engines/smtp.py` analyses a completed `DATA` (`engines/mail_message.py`: headers, links,
-every attachment SHA-256'd, executable attachments CRITICAL) and routes it per recipient
-(`SMTPProtocol._route`): local mailbox -> `engines/maildrop.py` (process-wide, bounded,
-seeded with ordinary internal mail so an inbox is never conspicuously empty), reserved TLD ->
-RFC 3464 bounce to a *local* sender's mailbox after `_DSN_DELAY`, anything else -> recorded
-as relayed. **Nothing is ever sent onward** (spam source / backscatter), pinned by a test
-that fails on any non-loopback connect. `engines/pop3.py` serves the maildrop to a planted
-credential or one derived weak pair (same acceptance rule as the HTTP admin area and RDP);
-`DELE` is acknowledged per session and never removes mail (IMAP's CREATE/APPEND/COPY likewise live on the connection only, bounded, with the visitor's own mail numbered from 1,000,000 in the inbox so it cannot collide with mail the SMTP honeypot delivers later); `AUTH PLAIN`/`LOGIN` decode through
-the same `_attempt_login` as `USER`/`PASS` (`engines/_sasl.py`). `engines/imap.py` serves the
-same maildrop on the same acceptance rule, with the protocol logic (sequence sets, FETCH item
-tokenizer, ENVELOPE, recursive BODYSTRUCTURE, sections, SEARCH incl. NOT/OR) in the pure
-`engines/imap_mailbox.py`; BODY sections return bytes **as stored, not transfer-decoded**, and
-serialisation uses CRLF (the default LF made every octet count short). Flags/expunges live on
-the connection, never in the shared maildrop. Validated with `imaplib` and `curl`.
-`tests/unit/test_mail_system.py`, `test_imap_session.py` and `test_imap_mailbox.py`.
-
-### IMAP / SIP / rsync / NFS engines
-
-Four more surfaces, each chosen because its traffic means something specific.
-
-- `engines/imap.py` — tcp/143. Mail is where credential stuffing cashes out: a
-  working mailbox owns password resets everywhere else. The greeting
-  deliberately omits `LOGINDISABLED` — a hardened server advertises it to force
-  STARTTLS, but then the attacker never sends the password, and impersonating
-  the misconfigured server is the entire point. Handles `LOGIN` (with IMAP
-  quoted-string parsing, so a password containing a space survives, and literals),
-  and SASL `AUTHENTICATE PLAIN`/`LOGIN`, both SASL-IR and two-step. Only what is
-  implemented is advertised in CAPABILITY.
-- `engines/sip.py` — tcp+udp/5060, both because a service on only one is a
-  tell. Separates the three phases that mean different things: `OPTIONS`
-  sweeps (`friendly-scanner` and friends are named in the alert), extension
-  enumeration via bare `REGISTER`, and `INVITE` to a satellite or premium
-  prefix, which is `sip_toll_fraud_attempt` at CRITICAL. Digest auth is
-  challenged with a fresh nonce so the tool computes a response — captured
-  *with* its nonce, since that is what makes it crackable.
-- `engines/rsync.py` — tcp/873. Backup servers are the usual victim, so the
-  exposure is the archive itself. Listing modules is the whole discovery phase
-  in one command (`rsync_module_enumeration`, HIGH); selecting a module with no
-  `auth users` is `rsync_anonymous_access` at CRITICAL, because the next thing
-  the client sends is a file request.
-- `engines/nfs.py` — tcp/2049, ONC RPC and XDR by hand. `showmount -e` is one
-  MOUNT EXPORT call and discloses everything, so the alert names the exports
-  *and* which are shared to `*` — the detail that decides the attacker's next
-  move. A MNT of a world-shared export is CRITICAL and granted; a restricted
-  one is HIGH and refused. Getting the export list's terminator wrong makes
-  `showmount` hang, which is louder than not answering at all.
-
-`nmap -sV` hard-matches all four: `Dovecot imapd`, `Asterisk PBX 18.10.0`
-(with `Device: PBX`), `rsync (protocol version 31)`, `rpcbind`.
-
-### DNS engine
-
-`engines/dns.py` answers as a **recursive resolver** (`ra`, never `aa` or `ad`; dnslib defaults `aa=1`
-and echoes the request's AD bit, so `dig` once saw `aa ra ad` together, which no real server sends). It
-serves **UDP and TCP/53** on one port: zone transfers are TCP-only, so with UDP alone the
-`dns_zone_transfer` detection could only fire on a rare UDP attempt, and a TCP/53 that refuses
-connections is itself a tell. AXFR/IXFR is recorded and REFUSED. CHAOS `version.bind` answers with a
-BIND version string (Ubuntu 22.04's, matching `_host_identity`), `ANY` with an RFC 8482 `HINFO`
-(consistent with the `A` answer and not an amplification vector). Its capability says
-`transport="both"` for capture, firewall and preflight, but `spoofable_source=True`: UDP reflection
-traffic carries forged sources, so `source_is_spoofable` (not `transport`) decides which sources a
-blocklist must not contain.
-
-### POP3 / Kubernetes API engines
-
-The pair that takes the catalogue to 25.
-
-- `engines/pop3.py` — tcp/110. The same botnets sweep 110 and 143 in one pass,
-  so a host answering IMAP but refusing POP3 is an odd configuration a scanner
-  notices. `USER`/`PASS` sends the password with no encoding at all. `APOP` is
-  offered too and its digest is stored *with the challenge that produced it* —
-  a hash without its salt is not crackable, and the challenge is ours, so
-  keeping both is what makes the capture worth anything.
-- `engines/kubernetes.py` — tcp/6443, the cloud sibling of `docker_api`.
-  `analyse_pod_spec()` names escape indicators the same way
-  `analyse_container_create()` does: `hostPath: /`, host namespaces,
-  `privileged`, dangerous capabilities, miner images, payload commands. Reading
-  Secrets is CRITICAL on its own, because service-account tokens there are
-  usually the whole cluster rather than one workload. Responses carry
-  `Audit-Id` and the `X-Kubernetes-Pf-*` flow-control UIDs that a real API
-  server always sends, and errors use the `Status` object shape — their absence
-  identifies a decoy in one request. It presents as `nginx` because that is
-  what actually fronts 6443 in practice. It serves **TLS only** (a plaintext
-  6443 is unusable by `kubectl` and identifies itself to every scanner) with the
-  per-honeypot self-signed cert, and its identity is **stable**: commit, UIDs,
-  pod names, secret values and the flow-control UIDs derive from the honeypot
-  name (`_uid`), because a scanner that asks twice and gets two identities has
-  found the decoy; only `Audit-Id` varies. Discovery (`/api/v1`,
-  `/apis/{group}/{version}`, shortNames), `/healthz`, nodes, server-side Table
-  output (what makes `kubectl get pods` print `READY STATUS RESTARTS AGE`
-  instead of a bare `NAME AGE`) and `kubectl auth can-i` are served; `_RESOURCES`
-  drives both the discovery document and the generic empty-list handler. Objects come
-  from `_Cluster`, a pure function of the honeypot name, so a list, a single GET
-  (`get pod X`, `describe`, `-o yaml`, a missing name is a real `NotFound` Status) and a
-  `?watch=1` stream agree; namespaces the model does not have contain nothing. It
-  listens through `tls_front.start_tls_site`.
-- `engines/mysql.py` also offers TLS. The greeting advertises `CLIENT_SSL`; a TLS-capable
-  client sends a 32-byte SSLRequest and starts its handshake without waiting, so the same
-  read can hold both. `loop.start_tls` cannot replay bytes the protocol already received, so
-  the session is driven through `ssl.MemoryBIO` (`_TLSTransport`, which keeps the raw
-  transport as the one the connection limiter and write-backlog check track). Logins over
-  TLS carry `tls: true`. `mariadb` >= 11.4 verifies the certificate by default and refuses a
-  self-signed one, as it does a real MySQL; use `--ssl-verify-server-cert=0` to test.
-
-### HTTP realistic endpoints + sessions
-
-`engines/http_endpoints.py` serves `/robots.txt`, `/favicon.ico`,
-`/sitemap.xml`, `/.well-known/security.txt` with persona-aware content.
-A 404 on any of these is a single-curl tell for a honeypot. The
-`robots.txt` deliberately advertises `/admin/`, `/.env`, etc. — pointing
-attackers at exactly the bait.
-
-The engine maintains a per-honeypot in-memory session table keyed by
-cookie value (persona's `cookie_name`: `PHPSESSID` / `ASP.NET_SessionId`).
-Sessions track hit count; after `_RECON_THRESHOLD` (5) hits, severity
-escalates from LOW to MEDIUM and the event type becomes
-`http_active_recon`. Sessions older than `_SESSION_TTL_SECONDS` (1h) are
-pruned opportunistically on each lookup — no separate sweeper task.
-
-Every request is also scanned for exploit signatures (`_classify_http_attack`
-over `_HTTP_ATTACK_SIGNATURES`) across the full surface — path, query, all
-header values, User-Agent, and body — with the surface additionally URL-decoded
-so `%`-encoded payloads don't slip past. A hit re-tags the event to
-`http_exploit_attempt`, raises severity to at least the matched level, and adds
-`payload.exploit_categories`. Covers Log4Shell, Shellshock, command injection,
-webshell upload, OGNL/Struts, Spring4Shell, SQLi, path traversal, LFI/RFI,
-SSRF, deserialization, and XSS. Broad patterns are fine here — a honeypot has
-no legitimate users, so false positives cost nothing.
-
-### Webhook delivery
-
-`webhooks.py` runs a single background worker that drains a queue. Decoupled from the buffer's flusher — slow webhook endpoints can't slow honeypot ingestion.
-
-Signature: `X-HoneyPot-Signature: sha256=<hex>` (HMAC-SHA256 of raw body) — same convention as GitHub webhooks. Consumers verify with the shared secret.
-
-Failure tracking is per subscription: `delivery_count`, `failure_count`, `last_error`. After repeated failures, an admin can deactivate via `alert_unsubscribe` or repair via DB.
-
-Active subscriptions are cached in-process (`_active_subscriptions`, 30s TTL) so delivery doesn't issue a `SELECT … WHERE active` per event on the ingest hot path — the same pattern as the suppression-rule cache. The cache is invalidated on `alert_subscribe`/`alert_unsubscribe` and on worker `start()`. Rows are `expunge_all`'d from the loading session so the per-delivery stat UPDATEs (`_record_outcome`) never interact with the cache. If a test inserts a `Subscription` directly (not via the tool), call `invalidate_subscription_cache()` or start a fresh delivery worker to pick it up.
-
-**The output formats are someone else's detection content, so conformance is
-correctness, not polish.** A regression here is invisible locally and breaks a
-consumer you can't see. `tests/unit/test_siem_formats.py` pins each rule to the
-consumer behaviour it protects; all of these were found by rendering a real
-event and reading the output, never by reading the renderers:
-
-- **`event.outcome` must not be guessed.** It was hardcoded `"success"`, so
-  rejected brute-force attempts arrived in Kibana's Security app as successful
-  logins. `_ecs_outcome()` infers from the event type and returns `unknown` —
-  a valid ECS value — where it genuinely cannot tell.
-- **`user.name` and `related.*` decide whether these events are first-class in
-  Elastic.** `related.ip`/`related.user` drive the click-an-IP-see-everything
-  pivot; without them the data is an island the built-in views can't correlate.
-  A username only inside `event.original` is present but unsearchable.
-- **Never mix a dotted key with its object.** `event.original` sat beside an
-  `event` object; Elasticsearch expands dots at index time so it usually
-  survived, but Logstash/OpenSearch/Vector are ambiguous. Nest it.
-- **CEF standard slots beat custom ones.** `suser` is what correlation rules
-  read; the username was only in a `cs4` JSON blob. Device product was the
-  literal string `"server"`. The signature ID stays the raw `event_type` (rules
-  key on it) while the event *name* is humanised via `_humanize_event_type`,
-  which knows protocol acronyms — `SSH Login Attempt`, not `Ssh Login Attempt`.
-- **Loki stream labels must stay low-cardinality.** `source_ip` was a label,
-  which creates one stream per attacker; an internet-facing honeypot sees tens
-  of thousands a day, blows past `max_streams_per_user` and degrades the whole
-  tenant. The IP lives in the line and LogQL parses it out — the idiomatic
-  pattern, and free at ingest.
-- **Enrichment must reach ECS fields, not just ride in `event.original`.**
-  Auto-enrichment resolves geo, ASN and reputation for every CRITICAL event, and
-  all of it used to reach the wire only inside the `event.original` JSON string.
-  Elastic cannot map, aggregate or filter what it cannot see as a field, so
-  Security's network map stayed empty while the coordinates that would populate
-  it sat in the same document — the `user.name` defect again, one layer out.
-  `_ecs_enrichment()` writes `source.geo.*` (with `location` as a `{lat, lon}`
-  geo_point, the form the default index template maps), `source.as.*`, and
-  reputation as `threat.enrichments[]` — the shape Elastic's own indicator-match
-  rules emit, rather than `threat.indicator.*`, which describes a threat-intel
-  document *about* an indicator instead of an enrichment *of* this event.
-  VirusTotal confidence bands on the **absolute** detection count, not the share
-  of engines: VT polls ~94 engines and most do not score IP reputation at all,
-  so 11 detections is 12% — which every ratio-based band calls "Low" and every
-  analyst calls "block".
-
-Note the split that makes this safe to reason about: renderers operate on
-`PendingEvent`, whose timestamp is always `datetime.now(UTC)` and therefore
-aware. The naive-datetime problem was confined to values read back from the
-database (see `UTCDateTime`), so webhook `rt=`/`time`/`@timestamp` were never
-affected.
-
-### Human notification channels
-
-`slack`, `teams` and `email` are subscription formats like the SIEM ones, but the
-failure mode is different and drives every design choice. A SIEM that receives a
-slightly-wrong document still stores it and an analyst finds it later; a
-notification that is malformed, or that arrives four thousand times, is simply not
-read — and the operator believes they have alerting either way.
-
-- **Slack** sets `text` as well as `blocks`. Slack uses `text` for the mobile push
-  and tab preview, so a blocks-only message arrives on a phone as "This content
-  can't be displayed" — useless for the case notification exists to serve. Sections
-  are capped at 8 of 10 allowed fields; Slack rejects the *whole message* above 10.
-- **Teams** emits a MessageCard, not an Adaptive Card. Adaptive Cards over an
-  incoming webhook need the Power Automate Workflows connector, while MessageCard
-  renders on both that and the classic O365 connector — and the operator only pastes
-  a URL, so we cannot tell which they have. `summary` is mandatory (Teams 400s
-  without it, an easy way to ship a notifier that never posts). `themeColor` is a
-  bare hex triplet; a leading `#` silently renders grey.
-- **Email** goes over SMTP via `asyncio.to_thread` (smtplib blocks, and blocking the
-  delivery worker stalls every other subscription). The URL carries everything:
-  `smtp://user:pw@host:587/?from=…&to=a@x,b@y&tls=starttls|implicit|none`.
-  `smtps://` defaults to 465, `smtp://` to 587. Body is **plain text on purpose** —
-  the content is attacker-controlled and HTML would be an injection surface for no
-  benefit. `_parse_smtp_url` is called at *subscribe* time too, so a typo fails
-  immediately rather than at first delivery.
-
-**`_NotifyThrottle` is what makes these usable.** One scanner produces thousands of
-events an hour; relaying them one-to-one gets the channel muted, leaving an
-integration strictly worse than none because everyone believes they are covered. A
-given `(subscription, event_type, source_ip)` fires at most once per
-`notify_throttle_seconds`, and the suppressed count rides on the next message that
-does go out — throttling must never hide volume, only stop volume being the delivery
-mechanism. **CRITICAL is exempt**: it is rare by construction (honeytoken trip,
-container escape, ransom note) and is exactly what someone must see immediately.
-Throttled events return `(True, None)` from dispatch, not an error — the event is
-stored and queryable, we simply declined to interrupt a human twice.
-
-### Packet capture
-
-`pcap.py` runs one `tcpdump` ring buffer over the deployed honeypot ports. It exists
-because per-event payloads record what the engines *understood*, and three jobs need
-the wire bytes: carving a dropper's second stage, replaying through Suricata/Zeek,
-and producing an artefact rather than an assertion by our own code.
-
-Shelling out to tcpdump rather than sniffing in-process is deliberate — raw sockets
-need the same privileges either way, and BPF filtering, rotation and file format are
-all things a hand-rolled sniffer reimplements worse.
-
-- **`probe_capability()` reports why capture is off**, as a value, not an exception.
-  "Packet capture is silently not running" is the state an operator must never be
-  in: they discover it when they go looking for evidence, which is always after the
-  incident. The check runs `tcpdump -L` — the cheapest operation that actually
-  exercises the permission — and the message names the fix (`setcap
-  cap_net_raw,cap_net_admin=eip`).
-- **Disk is the hazard, so the ring is bounded by construction.** `pcap_file_mb ×
-  pcap_files` is a ceiling tcpdump enforces itself. A full disk stops the database,
-  which ends collection entirely — much worse than having no pcap.
-- **The filter comes from the deployed port set**, via `capabilities.transport_for`
-  rather than a private list of "the UDP ones" (that duplication is what drifted
-  twice already). `honeypot_deploy`/`honeypot_stop` call `refresh_capture()`, which
-  is a silent no-op when disabled. An empty port set never becomes a
-  capture-everything filter — that would record the operator's own SSH session.
-- **`pcap_extract(source_ip)` is the point.** A 1 GB ring is not an answer to "what
-  did this IP send". Filtering runs through tcpdump's own BPF because link framing
-  varies by interface (`any` yields Linux SLL, not Ethernet) and hand-parsing it
-  wrong would silently return zero packets. Merging is hand-written rather than
-  `mergecap`, which ships with Wireshark and is far less likely to be installed;
-  safe because every ring file shares a link type. A merge with no input writes a
-  valid empty pcap — a 0-byte file reads as *corrupt* in Wireshark, which looks like
-  a bug rather than an honest "no matching packets". A truncated trailing record is
-  kept-up-to, since tcpdump may be mid-write on the live file and those are the most
-  recent packets.
-
-Capture needs `NET_ADMIN`+`NET_RAW` and host networking in Docker; `-U`
-(packet-buffered) is set so an extract run moments after an attack does not miss the
-packets being asked about.
-
-### Watchdog
-
-`watchdog.py` runs every 30s. For each `RUNNING` honeypot, calls
-`engine.health_check(container_id, port)`. On failure: flips DB status to
-ERROR, emits a CRITICAL `honeypot_health_failed` alert through the normal
-event pipeline (so it lands in DB + fires webhooks).
-
-`HoneypotEngine.health_check()` default is a TCP probe. SSH overrides to also
-check Docker container status. DNS overrides because UDP — sends a real DNS
-query and waits for any reply.
-
-The `_reported_dead` set prevents alert spam: a dead honeypot generates exactly
-one alert. If it later recovers (becomes alive again), the entry is cleared, so
-a subsequent failure will alert again.
-
-**Probes must not become attack data.** Ten in-process engines log a bare
-`<proto>_connection` event on TCP connect, and a health probe is
-indistinguishable from a real peer at the engine. `self_probe.py` closes that
-loop: `tcp_probe` (and the DNS UDP probe) calls `self_probe.register()` with
-the local `(ip, port)` the kernel gave the probe socket, and `submit_event`
-drops the single event arriving from exactly that address. Matching the full
-socket tuple — rather than suppressing `*_connection` from loopback — is
-deliberate: loopback traffic to a honeypot is a genuine signal (container
-escape, malicious process on the host) and must keep alerting. Any new probe
-that opens a connection to an engine needs the same `register()` call, or it
-will show up as an attacker.
-
-The watchdog also hosts the **retention sweep** (`_maybe_prune`): opt-in via
-`retention_days > 0` (default 0 = off), it deletes alerts + attacker_events
-older than the cutoff at most once per `retention_sweep_interval_hours`
-(default 24h), tracked with a monotonic `_last_prune_at`. Folded in here rather
-than as a separate lifespan task — same operation as the manual `alerts_prune`
-tool, just automatic. On a public IP the DB otherwise grows without bound.
-
-### Per-IP connection caps
-
-`engines/conn_limit.py` caps concurrent connections per source IP for the
-in-process TCP engines. `ConnectionLimiter(max_per_ip)` counts live
-connections; `limited_factory()` wraps a `create_server` protocol factory
-(VNC/Redis/MySQL/PostgreSQL/MSSQL/MongoDB/SMTP) and `limited_handler()` wraps a
-`start_server` coroutine handler (SMB). Each engine holds one limiter in
-`__init__`, sized from `max_connections_per_ip` (default 32, 0 = unlimited).
-Over-cap connections are accepted then immediately closed, and the wrapped
-`_LimitedProtocol` never drives the real protocol for a rejected peer — so its
-state machine only ever runs for admitted connections. The aiohttp engines
-(HTTP/Elasticsearch) are not wrapped; they rely on aiohttp's own limits.
-
-### Startup reconciliation
-
-`reconcile.py` runs once from `lifespan`, AFTER the event buffer starts and
-BEFORE the watchdog (ordering matters — otherwise the watchdog races it to
-mark restartable honeypots dead). MCP clients relaunch this server per chat
-session, so every start is a process restart, and anything the DB left
-`RUNNING` must be re-established:
-
-- In-process engines (HTTP/SMTP/FTP/DNS/RDP/VNC/Redis/MySQL/Elasticsearch)
-  died with the previous process — they get restarted on their recorded port.
-- Cowrie SSH containers survive (`restart_policy=unless-stopped`), but the
-  log-ingestion task doesn't — without re-attaching it, attacks land in
-  Cowrie's logs and never become alerts while health checks still pass.
-
-Each engine's `reattach(name, port, config, container_id)` encapsulates the
-right behaviour (base default = `start()` fresh; SSH overrides to re-attach
-ingestion to the live container). A honeypot that can't be re-established is
-flipped to ERROR with a CRITICAL `honeypot_restart_failed` alert; startup
-never aborts.
-
-Note: `SSHEngine` holds strong references to ingestion tasks in
-`self._ingest_tasks` — asyncio only weakly references tasks, so an unreferenced
-one can be GC'd mid-run, silently stopping capture.
-
-**Container adoption.** `adopt_labelled_containers()` runs straight after
-reconciliation. A Cowrie container only produces alerts if something tails its
-logs, and that only happens for containers with a `Honeypot` row pointing at
-them — so anything started outside this process (the compose stack's
-`cowrie-ssh`, above all) captured attacks into its own logs and raised nothing,
-while `docker ps` and the port both looked healthy. Adoption claims containers
-labelled `honeypot-mcp=true`, creating or re-pointing the row and attaching
-ingestion. It matches on the published host port, skips containers with no
-published port (unreachable, so registering one would be a lie), and re-adopts
-rows stuck in ERROR rather than skipping on container id alone.
-
-**SSH health checks probe twice.** `port` is the *host* published port, which
-is only on loopback when the server runs on the host. In the compose stack the
-server is a container and Cowrie is a sibling, so `127.0.0.1:2222` there is the
-server's own empty loopback — probing only that marked a working honeypot dead
-every 30s. On failure the check falls back to the container's own IP on
-`COWRIE_INTERNAL_PORT`.
-
-**The watchdog sweeps ERROR honeypots too, not just RUNNING.** Watching only
-RUNNING made ERROR a one-way door: the first failed probe set ERROR, and ERROR
-rows were excluded from every later sweep, so a honeypot that recovered stayed
-marked dead forever and was never checked again. A honeypot that answers again
-is flipped back to RUNNING (`_mark_recovered`), with no alert — recovery is
-good news, and alerting on it would make a flapping honeypot noisy.
-
-### Canary callback server
-
-`canary.py` runs an aiohttp server on `canary_callback_host:canary_callback_port` (default `0.0.0.0:8888`). Started/stopped from `lifespan` alongside the DB.
-
-Routes:
-- `GET /t/{token_id}` — matches against `token_meta.token_id` (canary URL tokens) or `token_meta.token_uid` (file tokens). On match: marks `TRIGGERED`, writes a CRITICAL alert, creates an `AttackerEvent`. Returns generic `200 OK` so attackers can't fingerprint.
-- `GET /t/{token_uid}.png` — same matching, returns a 1x1 transparent PNG. Used by PDF file tokens that embed `<img src="...">`.
-
-### Threat intel caching
-
-`intel/_cache.py` is a monotonic-clock TTL dict. Used by `virustotal`, `abuseipdb`, `geoip` lookups. **Only successful responses are cached** — errors and rate-limit hits are NOT cached so callers always retry.
-
-TTLs: VT 30 min, AbuseIPDB 15 min, GeoIP 24 h.
-
-### MITRE ATT&CK
-
-`intel/mitre.py` ships built-in regex mappings keyed by event-type/payload patterns. `_load_stix_index()` is `lru_cache`d and returns `{technique_id: stix_object}` — the index is built once, not on every `map_to_attack` call. If `config/mitre_attack.json` exists, technique descriptions are added; otherwise the built-in mappings still produce technique IDs and tactics.
+- `engines/tls.py:ensure_cert` generates a self-signed RSA-2048 cert per honeypot, persisted at
+  `tls/<honeypot_name>/server.{crt,key}` (stable identity across restarts). `tls/` is gitignored. A persisted cert
+  that no longer matches its profile or has < 30 days left is reissued.
+- The cert is shaped per service by `tls.CertProfile`; pass the profile of the service being impersonated to
+  `ensure_cert`/`build_server_ssl_context(_async)`, and pass the *same* profile from any caller that reads the
+  cert back (RDP's CredSSP public key), or the file ping-pongs. Kubernetes and MySQL are leaves from a named CA
+  (CA key discarded), RDP is self-signed and named for the computer FQDN, the default is a bare backdated
+  `CN=<name>` with no organisation and no `localhost` SAN.
+- **Any new TLS listener on an aiohttp runner must use `engines/tls_front.start_tls_site`**, not a bare `TCPSite`.
+  It `MSG_PEEK`s the first 16 bytes (5 s sniff deadline, 256 unclassified connections, 32 per source), hands a
+  TLS 1.2+ ClientHello to asyncio via `loop.connect_accepted_socket`, answers a pre-1.2 hello with `protocol_version`,
+  and answers plaintext HTTP with `plaintext_reply` (fixed bytes, a callable given the Host header, or `None`).
+  The HTTP engine passes `http_personas.plaintext_on_tls_reply`. HTTP enables TLS with `config["tls"] = True`.
+- SMTP STARTTLS completes a real handshake with `asyncio.start_tls()` and clears protocol state (RFC 3207): the
+  client must re-issue EHLO. MySQL advertises `CLIENT_SSL`, drives TLS through `ssl.MemoryBIO` (`_TLSTransport`) and
+  tags logins `tls: true`; `mariadb` ≥ 11.4 refuses the self-signed cert by default (test with
+  `--ssl-verify-server-cert=0`). Kubernetes serves TLS only.
+
+### Personas
+
+Fingerprint surfaces must agree; a mismatch is itself a fingerprint.
+- **SSH** (`engines/ssh_personas.py`): a persona is (hostname pool, kernel + build string, OpenSSH banner, distro
+  identity). `SSHEngine.start()` picks one if the config has no `ssh_persona` and persists persona and hostname to
+  `Honeypot.config`. `cowrie_env_vars()` passes them as `COWRIE_*` (both legacy `COWRIE_HOSTNAME` and modern
+  `COWRIE_HONEYPOT_HOSTNAME`); explicit `fake_hostname`/`fake_kernel` override. A new persona must be
+  distro-consistent (a Debian persona has no Ubuntu kernel build string).
+- **Cowrie capture needs three settings in `cowrie_env_vars()` and in the compose `cowrie-ssh` service**:
+  `COWRIE_HONEYPOT_LOGTYPE=plain`, `COWRIE_OUTPUT_JSONLOG_ENABLED=true`, `COWRIE_OUTPUT_JSONLOG_LOGFILE=/proc/self/fd/1`.
+  Without them `_ingest_logs` fails `json.loads` on every line and nothing is recorded while health checks pass.
+  Only `tests/integration/test_ssh_capture.py` can catch a regression.
+- Cowrie's persona is env vars (`[shell]` settings `COWRIE_SHELL_*`) plus a rewritten `fs.pickle` (`engines/cowrie_fs.py`),
+  extracted by `ssh.py` into an anonymous volume at `/cowrie/persona` before the container starts; failure falls back to the
+  default with a warning. Never write `/etc/issue.net` (non-empty is a pre-auth banner). A container only picks up persona
+  changes when recreated (`honeypot_stop remove=True`, then deploy).
+- Its fingerprint is patched from inside the container by `engines/cowrie_sitecustomize.py` (import hook delivered with the
+  persona filesystem via `PYTHONPATH=/cowrie/persona/patch:/cowrie/cowrie-git/src`; keep the second entry): narrowed KEXINIT
+  offer (a strict subset of the persona's real OpenSSH), telnet negotiation and prompt, coreutils-like `head`/`tail`, and
+  per-hostname `uptime`/`w`/`/proc/uptime`. Compose values are literals pinned by
+  `test_compose_sensor_carries_the_same_algorithm_environment_as_the_engine`; `tests/integration/test_cowrie_fingerprint.py`
+  reads the real wire.
+- The persona filesystem carries a tracked bait credential (`~/.bash_history` mysql line, `~/.my.cnf` mode 600) from
+  `planted_credential("mysql")` (a deterministic untracked decoy without a token), written to **both** `/root` and the persona
+  user. Cowrie's root filesystem is read-only and `COWRIE_HONEYPOT_OUT_ADDR=127.0.0.1` (default; `cowrie_allow_egress`
+  opts out) makes its wget/curl/tftp/nc emulation fail in-process.
+- **Telnet** is a ~10-line `SSHEngine` subclass (one Cowrie container, SSH on 2222, Telnet on 2223,
+  `_PRIMARY_CONTAINER_PORT`/`_PRIMARY_IS_TELNET`); events are retagged `telnet_*` in `ssh.py:_retag_for_protocol`.
+- **HTTP** (`engines/http_personas.py`, bodies in `http_templates.py`): a persona bundles Server header,
+  X-Powered-By, cookie name, 404 page and jitter. `start()` picks one if `config` has no `persona` and persists it.
+  Keep bundles consistent (no `PHP` X-Powered-By on Nginx).
+
+### Engine notes
+
+All in-process asyncio engines use the same buffer path; validate behaviour with the tool an attacker would use.
+- **RDP** (`rdp*.py`): parses X.224 and the `mstshash` cookie, negotiates TLS or CredSSP, captures a crackable NetNTLMv2. A
+  planted token or the weak pair derived from the honeypot name (`accepted_logins`/`sessions` in config) is let in (session
+  key from the password, sealed public-key binding), then a static framebuffer desktop records keys, clicks and clipboard; the
+  console is a pure fake shell (no network, no execution); repainting runs in `asyncio.to_thread`. `rdp_handshake` HIGH,
+  `rdp_invalid_probe` LOW, `rdp_command` CRITICAL on a download. Tests: aardwolf (`test_rdp_session.py`, incl. mutation-replay
+  fuzz) and FreeRDP 3 (integration).
+- **SMB** (`smb.py`, `smb2.py`): an SMB1-only negotiate gets a Windows-shaped reply; DoublePulsar/EternalBlue Trans2 is
+  `smb_exploit_attempt` (CRITICAL). Anything offering SMB2 goes to `smb2.py` (dialect 2.1, NTLM using RDP's `build_challenge`
+  so one host discloses one identity); AUTHENTICATE is `smb_ntlm_auth` (HIGH, `service="smb"`, `hashcat -m 5600` line) refused
+  with `STATUS_LOGON_FAILURE`; no tree connect; echo TID/PID/UID/MID. `test_attacker_tool_fidelity.py` drives it with impacket.
+- **PostgreSQL** declines SSL, requests cleartext auth, captures the password, then ACCEPTS and classifies simple
+  queries (`COPY … PROGRAM` CRITICAL, UDF loads and `pg_read_file`/`lo_export` HIGH, recon MEDIUM). Malformed startup
+  gets the FATAL ErrorResponse a real server sends.
+- **MongoDB** (hand-written BSON, OP_MSG/OP_QUERY): answers `isMaster`/`hello`/`buildInfo`/`listDatabases`; flags
+  `mongodb_destructive` (dropDatabase) and `mongodb_ransom_note` (CRITICAL); replies `ok:1`, persists nothing.
+- **MSSQL** (TDS): PRELOGIN with `ENCRYPT_NOT_SUP` and all four options, Login7 parsed, password de-obfuscated
+  (`_decode_tds_password`), `service="mssql"`, error 18456, no query phase.
+- **Memcached**: records reconnaissance; the stage-then-fetch *sequence* raises `memcached_amplification_attempt`
+  (CRITICAL) with a measured factor. **SNMP** (udp/161, hand BER): v1/v2c community strings are credential captures
+  (`service: "snmp"`); only `public`/`private` answer (answering everything fingerprints the sensor); a small ordered
+  MIB makes GetNext/GetBulk/walk behave (`endOfMibView`, `noSuchObject`, advancing `sysUpTime`). **Neither memcached
+  nor SNMP ever amplifies**: reflection vectors with spoofable sources.
+- **LDAP** (tcp/389, hand BER): simple binds are captured and refused with `invalidCredentials`; `looks_like_jndi()`
+  separates Log4Shell's second stage (opaque base object, no `dc=`/`cn=`/`ou=`, or `javaClassName`/`javaCodeBase`);
+  persona is Active Directory; the rootDSE is readable anonymously, other searches are `operationsError`.
+- **Docker API** (2375) and **Kubernetes** (6443): `analyse_container_create()`/`analyse_pod_spec()` return *named* escape
+  reasons (host root bind, privileged, host namespaces, dangerous caps, miner image, payload command); any hit is CRITICAL
+  (`docker_api_container_escape`), else HIGH. Kubernetes: Secrets reads are CRITICAL; replies carry `Audit-Id`,
+  `X-Kubernetes-Pf-*` and `Status`-shaped errors; presents as `nginx`, TLS only via `start_tls_site`; identity is stable
+  (UIDs, names, secrets derive from the honeypot name via `_uid`; only `Audit-Id` varies); objects come from `_Cluster`, a
+  pure function of the name, so list/get/describe/`-o yaml`/`NotFound`/`?watch=1` agree; `_RESOURCES` drives discovery.
+- **Mail**: `smtp.py` analyses a completed `DATA` (`mail_message.py`: headers, links, SHA-256 of attachments; executable
+  attachment CRITICAL) and routes per recipient (`SMTPProtocol._route`): local → `maildrop.py` (process-wide, bounded, seeded
+  with ordinary mail), reserved TLD → RFC 3464 bounce after `_DSN_DELAY`, else recorded as relayed. **Nothing is ever sent
+  onward** (a test fails on any non-loopback connect). `pop3.py`/`imap.py` serve the maildrop to a planted credential or the
+  derived weak pair; POP3 `DELE` and IMAP flags/expunge/CREATE/APPEND/COPY live on the connection only (visitor mail
+  numbered from 1,000,000); `AUTH PLAIN/LOGIN` share `_attempt_login` (`engines/_sasl.py`). IMAP omits `LOGINDISABLED` on
+  purpose, advertises only what it implements and keeps logic in pure `imap_mailbox.py` (BODY sections as stored, CRLF). POP3
+  stores `APOP` digests with their challenge. Tests: `test_mail_system.py`, `test_imap_session.py`, `test_imap_mailbox.py`.
+- **SIP** (tcp+udp/5060, both): separates `OPTIONS` sweeps (named scanners), bare-`REGISTER` extension enumeration, and
+  `INVITE` to satellite/premium prefixes (`sip_toll_fraud_attempt`, CRITICAL); digest auth uses a fresh nonce stored
+  with the response. **rsync** (873): module listing is `rsync_module_enumeration` (HIGH); selecting a module with no
+  `auth users` is `rsync_anonymous_access` (CRITICAL). **NFS** (2049, hand ONC RPC/XDR): the export-list terminator must
+  be right or `showmount` hangs; MNT of a world-shared export is CRITICAL and granted, a restricted one HIGH and
+  refused. `nmap -sV` hard-matches Dovecot, Asterisk 18.10.0, rsync 31 and rpcbind.
+- **DNS** answers as a recursive resolver (`ra`, never `aa`/`ad`; dnslib defaults to `aa=1` and echoes AD) on UDP **and**
+  TCP/53 (zone transfers are TCP-only; AXFR/IXFR recorded and REFUSED). `version.bind` returns the BIND string matching
+  `_host_identity`; `ANY` returns an RFC 8482 `HINFO`. `transport="both"` for capture/firewall/preflight but
+  `spoofable_source=True`: `source_is_spoofable`, not `transport`, decides which sources a blocklist must not contain.
+- **HTTP endpoints and sessions** (`http_endpoints.py`): persona-aware `/robots.txt` (advertising the bait), `/favicon.ico`,
+  `/sitemap.xml`, `/.well-known/security.txt` (a 404 there is a tell). A per-honeypot session table keyed by the persona's
+  cookie escalates after `_RECON_THRESHOLD` (5) hits to MEDIUM `http_active_recon`; sessions expire after
+  `_SESSION_TTL_SECONDS` (1 h), pruned on lookup. Every request (path, query, headers, UA, body, also URL-decoded) goes
+  through `_classify_http_attack`/`_HTTP_ATTACK_SIGNATURES`; a hit becomes `http_exploit_attempt` with
+  `payload.exploit_categories`. Broad patterns are fine: a honeypot has no legitimate users.
+- **Per-IP caps** (`engines/conn_limit.py`): `ConnectionLimiter(max_per_ip)` with `limited_factory()` (protocol
+  factories) and `limited_handler()` (`start_server` handlers), sized from `max_connections_per_ip` (default 32,
+  0 = unlimited); over-cap peers are accepted then closed without driving the protocol. aiohttp engines rely on
+  aiohttp's own limits.
 
 ### Protocol fidelity
 
-An engine that accepts connections but is distinguishable from the software it
-impersonates is broken, not merely imperfect: a scanner that fingerprints the
-decoy stops sending the attack traffic the honeypot exists to collect. So
-engines are validated against **real clients** (redis-py, pymongo, psycopg) and
-against `nmap -sV --version-intensity 9`, not just unit tests.
-
-`tests/unit/test_protocol_fidelity.py` pins every finding and quotes the nmap
-signature each check encodes, so a change that breaks identification fails
-loudly. Re-run the sweep after touching any engine's wire format.
-
-Recurring failure modes found this way, worth checking in new engines:
-
-- **Missing handshake commands.** Redis advertised 7.0.5 but never implemented
-  `HELLO`, so every modern client failed at connect and captured nothing.
-- **Self-inconsistent version claims.** MongoDB reported 5.0.14 in `buildInfo`
-  while negotiating wire version 8 (that's 4.0). Keep one constant per engine
-  (`_REDIS_VERSION`, `_MONGO_VERSION`, `_SQL_VERSION`) and derive everything.
-- **Structurally thin responses.** MSSQL's PRELOGIN carried 2 of the 4 options
-  real SQL Server always sends, producing a packet length no signature matches.
-- **Silence where the real service speaks.** PostgreSQL closed mutely on a
-  malformed startup packet; the FATAL ErrorResponse it *should* send is
-  precisely how scanners identify PostgreSQL.
-- **Not echoing correlation fields.** SMB must echo the client's TID/PID/UID/MID
-  — a protocol requirement, and its absence broke nmap's signature.
-- **Zero/epoch placeholder values.** SMB `SystemTime` of 0 is 1601-01-01;
-  MongoDB `localTime` of 0 is 1970-01-01. Both render in any real client.
+An engine distinguishable from what it impersonates is broken: a scanner that fingerprints the decoy stops sending
+the traffic the honeypot exists to collect. Validate against real clients (redis-py, pymongo, psycopg, impacket,
+ftplib, smtplib, httpx, pyspnego, `nmap -sV --version-intensity 9`) and re-run the sweep after any wire-format
+change; `tests/unit/test_protocol_fidelity.py` pins each finding with the nmap signature it encodes. Check new
+engines for: missing handshake commands (Redis `HELLO`), self-inconsistent versions (one constant per engine:
+`_REDIS_VERSION`, `_MONGO_VERSION`, `_SQL_VERSION`), structurally thin responses (MSSQL PRELOGIN options), silence
+where the real service speaks (PostgreSQL FATAL), uncorrelated fields (SMB TID/PID/UID/MID), and epoch/zero
+placeholders (SMB `SystemTime`, Mongo `localTime`). Listing, size and bytes come from one source (FTP tree; HTTP
+backups reuse it).
 
 ### aiohttp server identity
 
-`http_identity.py` controls the `Server` header for every aiohttp server in the
-process (HTTP engine, Elasticsearch engine, canary callback). Two mechanisms,
-because one is not enough:
+`http_identity.py` controls the `Server` header for every aiohttp server (HTTP, Elasticsearch, canary).
+- **A new aiohttp server must use `identity_runner(app, banner)` and set its own identity**; a bare `web.AppRunner`
+  leaks `Python/3.x aiohttp/3.y.z` on protocol-level errors (malformed requests never enter the app, which is what
+  `nmap -sV` sends). It subclasses `AppRunner`/`Server`/`RequestHandler` so `handle_error` stamps that listener's own
+  banner.
+- `server_identity_middleware(server, extra)` pins the header on application responses; a module-import side effect
+  rebinds `aiohttp.web_response.SERVER_SOFTWARE` as the fallback (explicit headers still win). Neither alone is enough.
+- `ExactHeaderResponse` suppresses `Server` entirely and pins header order: scanner signatures are anchored regexes
+  over the whole response (nmap's Docker rule wants `Content-Type`, `Date`, `Content-Length: 29`, in that order).
 
-1. `server_identity_middleware(server, extra)` pins the header on application
-   responses — used for the HTTP persona, Elasticsearch, and the canary.
-2. A module-import side effect rebinds `aiohttp.web_response.SERVER_SOFTWARE`.
-   Middleware **cannot** reach protocol-level errors: a malformed request line
-   is rejected in `RequestHandler.handle_error` without ever entering the app,
-   and that response would otherwise carry `Server: Python/3.x aiohttp/3.y.z`.
-   One junk request thereby exposed the stack behind every persona. aiohttp
-   offers no supported hook, so rebinding the default is the available fix; it
-   only changes the fallback, and explicit headers still win.
+### Webhook delivery and notification channels
 
-3. `identity_runner(app, banner)` covers the case middleware cannot reach *and*
-   the global gets wrong: protocol-level errors. It subclasses `AppRunner`,
-   `Server` and `RequestHandler` so `handle_error` stamps that listener's own
-   banner. Before it, one process-global served every listener, so an
-   Apache-persona honeypot answered a malformed probe as nginx — and since
-   `nmap -sV` deliberately sends malformed probes, that is what it matched on.
-   Every persona leaked at the same seam.
+`webhooks.py` runs one background worker draining a queue, decoupled from the flusher.
+- Signature `X-HoneyPot-Signature: sha256=<hex>` (HMAC-SHA256 of the raw body); compare with `compare_digest`.
+- Failure tracking is per subscription (`delivery_count`, `failure_count`, `last_error`). Active subscriptions are
+  cached 30 s (`_active_subscriptions`); invalidate on `alert_subscribe`/`alert_unsubscribe`, worker `start()`, or
+  call `invalidate_subscription_cache()` after inserting a `Subscription` directly in a test. Rows are
+  `expunge_all`'d from the loading session.
+- Destination policy (`webhook_allow_private_destinations`, default off) is enforced at subscribe **and on every
+  delivery** (`WebhookDelivery._dispatch` → `check_destination`, 10 s cache); syslog connects to the validated
+  address. `alert_subscribe` is admin-tier.
+- **Output formats are someone else's detection content: conformance is correctness.** `tests/unit/test_siem_formats.py`
+  pins each rule; verify by rendering a real event and reading it:
+  - `event.outcome` is never guessed (`_ecs_outcome()` returns `unknown` when it cannot tell).
+  - `user.name` and `related.ip`/`related.user` are always set (they drive Elastic's pivots).
+  - Never mix a dotted key with its object (nest `event.original`).
+  - CEF: use standard slots (`suser`), the signature id is the raw `event_type`, the name is humanised via
+    `_humanize_event_type` (knows acronyms), device product is real.
+  - Loki stream labels stay low-cardinality: `source_ip` is never a label.
+  - Enrichment reaches ECS fields (`_ecs_enrichment()`: `source.geo.*` with `location` as `{lat, lon}`,
+    `source.as.*`, reputation as `threat.enrichments[]`, not `threat.indicator.*`); VirusTotal confidence bands on the
+    absolute detection count, not the share of engines.
+- **Human channels** (`slack`, `teams`, `email`): Slack sets `text` as well as `blocks` (mobile push) and at most 8
+  section fields (10 is the rejection limit); Teams emits a **MessageCard** (works on both connector kinds) with a
+  mandatory `summary` and a bare-hex `themeColor` (no `#`); email goes over SMTP via `asyncio.to_thread`, URL
+  `smtp://user:pw@host:587/?from=…&to=a@x,b@y&tls=starttls|implicit|none` (`smtps://` defaults to 465), plain text
+  only (content is attacker-controlled), `_parse_smtp_url` also runs at subscribe time.
+- **`_NotifyThrottle`**: a `(subscription, event_type, source_ip)` fires at most once per `notify_throttle_seconds`;
+  the suppressed count rides the next message (never hide volume). CRITICAL is exempt. Throttled events return
+  `(True, None)`, not an error.
 
-`ExactHeaderResponse` handles the last mile: it suppresses the `Server` header
-entirely (aiohttp's `setdefault` otherwise guarantees one) and pins header
-order. Both matter because scanner signatures are anchored regexes over the
-whole response — nmap's Docker rule wants `Content-Type`, `Date`,
-`Content-Length: 29` in that order with nothing else, and `Content-Length`
-before `Date` is enough to miss. Header order is semantically irrelevant to
-HTTP and entirely relevant to fingerprinting.
+### Packet capture
 
-Any new aiohttp server must use `identity_runner` and set its own identity;
-`web.AppRunner` alone leaves the protocol-error path wearing the wrong name.
+`pcap.py` runs one `tcpdump` ring over the deployed honeypot ports, because payloads record what engines
+*understood* and three jobs need wire bytes (carving second stages, Suricata/Zeek replay, an artefact not an assertion).
+- `probe_capability()` reports why capture is off as a value, not an exception (runs `tcpdump -L`; the message names
+  the fix, `setcap cap_net_raw,cap_net_admin=eip`). Capture needs `NET_ADMIN`+`NET_RAW` and host networking in Docker;
+  `-U` is set so a fresh extract is not missing the latest packets.
+- The ring is bounded by construction: `pcap_file_mb × pcap_files`. A full disk stops the database.
+- The filter derives from the deployed port set through `capabilities.transport_for` (no private "UDP ones" list);
+  `honeypot_deploy`/`honeypot_stop` call `refresh_capture()` (a silent no-op when disabled). An empty port set never
+  becomes capture-everything (it would record the operator's own SSH).
+- `pcap_extract(source_ip)` filters with tcpdump's BPF (link framing varies; `any` yields Linux SLL) and merges by hand
+  (no `mergecap` dependency; every ring file shares a link type). No match writes a valid empty pcap (a 0-byte file
+  reads as corrupt); a truncated trailing record is kept-up-to.
+
+### Watchdog, reconciliation, adoption
+
+- `watchdog.py` runs every 30 s and health-checks every RUNNING **and ERROR** honeypot (watching only RUNNING made
+  ERROR a one-way door). Failure → status ERROR + one CRITICAL `honeypot_health_failed` alert (`_reported_dead`
+  prevents spam; recovery clears it); recovery → `_mark_recovered` back to RUNNING with no alert.
+- `HoneypotEngine.health_check()` defaults to a TCP probe; SSH also checks Docker (probing the host port, then the
+  container's own IP on `COWRIE_INTERNAL_PORT`, because in the compose stack `127.0.0.1:2222` is the server's own
+  loopback); DNS sends a real query.
+- **Probes must not become attack data**: any new probe that opens a connection to an engine calls
+  `self_probe.register()` with the probe socket's local `(ip, port)`; `submit_event` drops the one event from exactly
+  that tuple. Never suppress `*_connection` from loopback, which is a genuine signal.
+- The watchdog hosts the retention sweep (`_maybe_prune`): opt-in via `retention_days > 0` (default 0), at most once per
+  `retention_sweep_interval_hours` (monotonic `_last_prune_at`).
+- `reconcile.py` runs once from `lifespan`, AFTER the event buffer starts and BEFORE the watchdog (otherwise the
+  watchdog marks restartable honeypots dead). Every start is a process restart, so anything left RUNNING is
+  re-established through `reattach(name, port, config, container_id)` (base default `start()`; SSH re-attaches log
+  ingestion to the live container). One that cannot be re-established becomes ERROR with a CRITICAL
+  `honeypot_restart_failed`; startup never aborts. `SSHEngine` keeps strong references to ingestion tasks
+  (`_ingest_tasks`): asyncio only weakly references tasks.
+- `adopt_labelled_containers()` runs straight after: containers labelled `honeypot-mcp=true` (compose `cowrie-ssh`
+  above all) are claimed by creating or re-pointing a row and attaching ingestion, matched on the published host
+  port; containers with no published port are skipped; rows stuck in ERROR are re-adopted.
+
+### Canary callback server
+
+`canary.py` (aiohttp, `canary_callback_host:canary_callback_port`, default `0.0.0.0:8888`, started in `lifespan`).
+`GET /t/{token_id}` matches `token_meta.token_id` (URL tokens) or `token_uid` (file tokens); on match it marks
+TRIGGERED, writes a CRITICAL alert through the buffer and an `AttackerEvent`, and returns a generic `200 OK`.
+`GET /t/{token_uid}.png` is the same with a 1x1 PNG (PDF tokens). The global rate ceiling applies only to requests
+that matched a token, so random ids cannot starve a real trigger.
+
+### MITRE ATT&CK and risk scoring
+
+Analyst-facing; wrong is worse than absent.
+- `intel/mitre.py` maps event-type/payload regexes to techniques (`_load_stix_index()` is `lru_cache`d;
+  `config/mitre_attack.json` is optional and adds descriptions). Tactics follow ATT&CK Enterprise exactly (Brute Force
+  T1110 is Credential Access). Patterns are ordered most-specific-first and all matches are collected; a generic rule
+  must never be the only hit. Watch cross-category false positives (`smb_exploit_attempt` contains "attempt").
+  Tactic IDs (`TACTIC_IDS`) live there.
+- Coverage must match what engines emit: grep engines for `event_type=` and make sure every high-value one maps; an
+  unmapped capture is invisible. Change mappings only with evidence from `mapping_audit` (blind sample stratified by
+  event type, independent labellers, `score` at strict and parent-technique level with Jeffreys intervals, and the
+  estimate without the largest stratum).
+- **The Grafana ATT&CK dashboard is generated**: `scripts/generate_mitre_dashboard.py` derives the SQL by pushing every
+  `signature_events` entry through `map_to_attack`; `tests/unit/test_mitre_dashboard.py` regenerates and diffs. Re-run
+  it after touching mappings or adding an engine. Multi-tactic events count under every tactic (UNION ALL, not CASE).
+  The tactic-timeline styling is hand-maintained (generator only patches `queryText`/`rawQueryText`): fixed per-tactic
+  colour overrides, unique, log scale, not stacked (`test_every_tactic_has_a_fixed_color_override`,
+  `test_tactic_colors_are_unique`, `test_tactic_timeline_is_not_stacked`).
+- Threat-map basemap renders no place labels (`showLabels: false`; `test_threat_map_basemap_has_no_labels`). Grafana
+  timeseries bucket on `MAX((($__to) - ($__from)) / 240000, 60)` (`$__from`/`$__to`, not `$__interval_ms`); tables never
+  `SELECT MAX(timestamp)` raw: use `strftime('%Y-%m-%dT%H:%M:%SZ', …)` and declare the column in `timeColumns`.
+- `scripts/seed_demo_data.py` must feed every engine it deploys (`_ENGINE_MIX` weights, checked by
+  `_check_engine_mix()` against `_EVENT_PROFILES`); honeypot ids use `HoneypotType.value` (`docker_api` →
+  `demo-docker-api`).
+- `analysis/profiler.py:_calculate_risk` weights local observation over feeds: direct observation alone can reach
+  CRITICAL (VT/AbuseIPDB are optional), a triggered honeytoken dominates, volume is weighted low. Tests assert
+  ordering and band reachability, not exact numbers.
 
 ### Intent-level tools (`deception/`)
 
-Most tools map one-to-one onto an operation — deploy this, list that. Three do
-not, and they are the reason a natural-language interface beats a thinner
-wrapper over the same API:
+- `deception_plan` turns an environment description into sensors and tokens; the model reads the prose, the planner
+  supplies only what it cannot know (free ports, identities that must agree, inert tokens). It deploys nothing.
+- `deception_coverage` pushes each engine's real `signature_events` through `intel.mitre`; an unmapped engine shows as
+  missing coverage, as it is on the dashboard.
+- `soc_brief` separates untriaged CRITICAL/HIGH, token trips and dead sensors from volume. **Headline counts come
+  from their own aggregate query, never `len(needs_attention)`** (that list is capped at `max_highlights`);
+  CRITICAL has its own line; `needs_attention_total`/`_showing` make the cap explicit.
+- `deception/capabilities.py` is the single source of truth for an engine (port, OS family, roles, credential
+  `service` label, signature events, transport). Templates, planner and coverage read it; do not keep copies.
+- `check_coherence` flags a directory server with no Windows services, RDP with no SMB, and, as an *error*, a
+  credential token for a service no sensor captures (it can never fire).
+  `test_planned_tokens_always_target_a_deployed_service` asserts the planner never emits that.
 
-- `deception_plan` — an environment description becomes a coherent set of
-  sensors and tokens. The division of labour is deliberate: the *model* reads
-  "a customer portal and a Postgres warehouse behind it" perfectly well, so the
-  planner supplies only what the model cannot know — which ports are taken,
-  which identities have to agree, which tokens would be inert. It deploys
-  nothing; answering a question must not open listeners.
-- `deception_coverage` — sensors and tokens mapped to ATT&CK. Computed by
-  pushing each engine's real `signature_events` through `intel.mitre`, so it
-  cannot drift from what the alerts actually say. An engine whose events are
-  unmapped shows up as missing coverage, which is correct — it is invisible on
-  the dashboard too.
-- `soc_brief` — separates untriaged CRITICAL/HIGH, token trips and dead sensors
-  from the volume that makes up most honeypot traffic. **The headline counts
-  come from their own aggregate query, never from `len(needs_attention)`** —
-  that list is capped at `max_highlights`, so counting it announced a queue of
-  841 untriaged alerts as "8 untriaged high-severity alert(s)", which reads as
-  a quiet shift. CRITICAL gets its own headline line rather than being folded
-  into a combined figure, and `needs_attention_total` / `_showing` make the cap
-  explicit. This is the list-tool truncation rule from "Tool response shaping"
-  applied to the tool where being wrong costs the most.
+### Tool response shaping and the agent-first contract
 
-`deception/capabilities.py` is the single source of truth for what an engine
-is: port, OS family, roles, the `service` label its credentials carry, and its
-signature events. `honeypot_templates`, the planner and the coverage map all
-read from it. They previously each held a copy, and `honeypot_templates` had
-already drifted — still describing fourteen types after five more shipped, with
-nothing erroring. A test asserts the registry matches `HoneypotType` exactly.
+An MCP result lands in a model's context, so size is correctness. **List tools summarise, detail tools expand, bulk
+goes to disk** (`tools/_format.py`):
+- `digest_payload()` keeps triage fields, drops bulk (`headers`, `raw_body_b64`, `cookies`, nested `enrichment`), clips
+  values at 160 chars; unknown keys pass through. `truncate_payload()` keeps structure, clips values over 4,000
+  chars with a marker. `validate_ip()` runs on every IP argument (a typo otherwise reads as a clean bill of health).
+- `alerts_recent`/`alerts_search` return digests, `alerts_get` the full payload; `alerts_export`, `export_indicators`,
+  `generate_report` write files via `_format.write_artifact()` and return path plus headline figures.
+- List tools return `{count, <items>: [...]}` with a `window` and a `note` when truncated; a capped list must never read
+  as complete. Anything asked "recently" takes `since_hours`.
+- Result shapes are dicts everywhere (`honeypot_list` → `{count, honeypots, note}`, `alert_subscriptions_list` →
+  `{subscriptions}`, `honeytoken_list` → `{tokens}`, `api_key_list` → `{keys}`).
 
-**Coherence checking is the differentiating logic.** Hand-built deception fails
-on mismatched detail more often than on missing detail: an attacker who touches
-two decoys and finds they disagree has learned more than one who finds nothing.
-`check_coherence` flags a directory server with no Windows services behind it,
-RDP with no SMB, and — as an *error* rather than a warning — a credential token
-targeting a service no deployed sensor captures, which can never fire and fails
-silently. `test_planned_tokens_always_target_a_deployed_service` asserts the
-planner never emits that for its own output.
-
-### Tool response shaping
-
-An MCP tool result lands directly in a model's context window, so response
-*size* is a correctness concern, not a style preference. Honeypot payloads are
-the worst case: the HTTP engine captures every request header plus up to 64 KB
-of base64 body per event (`_MAX_RAW_BODY_BYTES`), so an unshaped 200-row
-triage query returns megabytes and can consume a whole context in one call.
-
-The rule: **list tools summarise, detail tools expand, bulk goes to disk.**
-
-`tools/_format.py` implements it:
-- `digest_payload()` — keeps the fields analysts triage on (credentials, path,
-  command, exploit categories, lifted geo/VT/AbuseIPDB verdicts), drops bulk
-  (`headers`, `raw_body_b64`, `cookies`, nested `enrichment`), clips values at
-  160 chars. Unknown keys still pass through, so a new engine's fields aren't
-  invisible just because the allow-list predates it.
-- `truncate_payload()` — full structure, clips only individually oversized
-  values (4,000 chars) with an explicit marker. For detail tools.
-- `validate_ip()` — every IP reaching a tool was transcribed by a model reading
-  an alert, so a typo is realistic. Without validation the query matches
-  nothing and reports "no activity", which reads as a clean bill of health.
-
-So: `alerts_recent`/`alerts_search` return digests, `alerts_get` returns the
-full payload, and every bulk producer — `alerts_export`, `export_stix`,
-`export_blocklist`, `generate_report` — writes a file via
-`_format.write_artifact()` and returns the path plus headline figures. Those
-outputs are destined for a firewall, a TIP or a browser, and they scale with
-attacker count rather than with anything the caller chose: a STIX bundle for a
-few hundred alerts exceeds 100 KB. New tools that return per-row captured data
-or bulk artifacts should follow the same split. List tools also
-return `{count, alerts: [...]}` rather than a bare list, so they can carry a
-`window` and a `note` when results were truncated at the limit — a caller must
-never read a capped list as the complete picture.
-
-Time filtering (`since_hours`) belongs on anything an analyst asks about
-"recently" — it is the single most common natural-language qualifier.
-
-### Agent-first tool contract
-
-The server is driven by a model from a sentence a person typed, so a tool that needs flags is a
-defect. `tests/unit/test_tool_contract.py` reads the registry and fails the build when a tool:
-- returns anything but `dict[str, Any]` (a bare list is an *empty* MCP response, and an agent
-  cannot tell "nothing matched" from "failed");
-- has a parameter with no `Args:` description (the docstring becomes the schema description; without
-  it the model guesses);
-- requires more than 3 parameters or has more than 8 (`MORE_PARAMETERS_BECAUSE` is the exception
-  list, with a reason);
+`tests/unit/test_tool_contract.py` fails the build when a tool:
+- returns anything but `dict[str, Any]` (a bare list is an *empty* MCP response);
+- has a parameter with no `Args:` description (the docstring becomes the schema description);
+- requires more than 3 parameters or has more than 8 (`MORE_PARAMETERS_BECAUSE` is the exception list, currently
+  empty);
 - opens with a weak first line (models choose tools from it);
-- pushes the tool list over its weight budget: 3,000 characters per tool and 70,000 in total, because
-  every tool's description plus parameter schema sits in the model's context for the whole
-  conversation. Trim prose (repeated "every argument is optional", examples); FastMCP already drops
-  schema titles.
+- exceeds the weight budget: 3,000 characters per tool, 70,000 in total (trim prose; FastMCP drops schema titles).
 
-Design consequences worth knowing: tools size their own answers (a default that fits, and a count and a
-`note` saying what was cut; knobs such as `rank_by`, `window_minutes`, `timeout_seconds` and, on the
-export and report tools, `output_path` are gone, while the few a person plausibly says, like
-`alerts_recent`'s `limit` or `attack_patterns`' `top`, stay optional), files go to `reports_dir` under
-generated names, tools that reach outside this system default to a dry run
-(`blocklist_push_*`), and an error carries a `hint` naming the next step. A tool that needs a bigger
-answer than its default shows should be asked a narrower question (an address, an event type), not
-given a knob. Logic that two tools share lives in a helper (`cluster_ssh_clients`, `write_report`),
-never in one tool calling another's public signature: a removed parameter then breaks the caller only
-when that path runs.
+Design consequences: tools size their own answers (a default that fits, a count and a `note` for what was cut; no
+`rank_by`/`window_minutes`/`timeout_seconds`/`output_path` knobs; a bigger answer comes from a narrower question),
+files go to `reports_dir` under generated names, tools that reach outside this system default to a dry run or are
+operator/admin gated, and an error carries a `hint` naming the next step. Logic two tools share lives in a helper
+(`cluster_ssh_clients`, `write_report`), never one tool calling another's public signature.
 
-### Alert query indexes
+### Reports, console, Docker, settings
 
-`alerts` carries two composite indexes (`0010_add_alert_query_indexes`) because
-every triage path filters on a time window plus either severity or source IP.
-Measured at 500k rows: severity+window 30.7 ms → 5.4 ms, ip+window 23.6 ms →
-0.04 ms. The single-column indexes can't serve those pairs, and `severity` had
-no index at all. Keep new query patterns in mind here — an unindexed filter on
-a hot path is invisible until the DB is large.
+- `analysis/reporter.py` uses Jinja2 with `autoescape=select_autoescape(["html", "xml"])`; Markdown cell values go
+  through `_md_cell()` (pipe/backslash/newline). Attacker-controlled fields must never break out of either format.
+- **Console** (`console/`, `127.0.0.1:8090`, `CONSOLE_PORT=0` disables; port 8090 because 8080 is `default_http_port`): one HTML
+  file plus `/api/overview` polled every 5 s, started from `lifespan`, bind failure logged not fatal. **Read-only
+  structurally** (no auth, so GET routes only; `test_console_is_read_only`); the feed ships `digest_payload` digests.
+  Severity is two series (routine low+medium, serious high+critical; `#3987e5`/`#e66767`) plus a text label
+  (`LOW`/`MED`/`HIGH`/`CRIT`), never colour alone; re-run the palette validator if colours change.
+- **Docker**: SSH honeypots use Cowrie (`docker/cowrie/build_persona_fs.py`), HTTP has `docker/http-honeypot/`; the
+  stack runs from `docker/` with `docker compose up -d`. Other engines are in-process.
+- **Settings**: `config.py` (`pydantic-settings`, env and `.env`, `get_settings()` singleton) is the only configuration
+  mechanism; do not add a second source. `tls_dir`/`reports_dir` are settings (tests redirect both to `tmp_path`).
+  `config.warn_on_world_readable_env()` fires at startup when `.env` is readable beyond its owner.
+- Optional dependencies degrade gracefully, returning `{"available": False, "note": "..."}` instead of raising:
+  `VIRUSTOTAL_API_KEY`, `ABUSEIPDB_API_KEY` (also outbound reporting), `GEOIP_DB_PATH` (GeoLite2-City.mmdb),
+  `CANARY_PUBLIC_URL` (default `http://localhost:8888`).
 
-### Reports
+### MCP transport, RBAC, API keys
 
-`analysis/reporter.py` uses Jinja2 with `autoescape=select_autoescape(["html", "xml"])`. Markdown rendering escapes pipe / backslash / newline in cell values via `_md_cell()`. Attacker-controlled fields (IPs, event types, payload values) cannot break out of either format.
-
-### Docker
-
-SSH honeypots use Cowrie via Docker (`docker/cowrie/build_persona_fs.py` builds its persona filesystem). The HTTP honeypot has a minimal Docker image at `docker/http-honeypot/`. Run the full stack from `docker/`:
-```bash
-docker compose up -d
-```
-SMTP, FTP, DNS engines run in-process as asyncio servers — no Docker.
-
-### Settings
-
-`config.py` uses `pydantic-settings` (`BaseSettings`). Values come from environment variables and `.env`, accessed through the `get_settings()` singleton — that is the only configuration mechanism.
-
-A `config/settings.yaml` overlay used to be loaded alongside it. Nothing ever read from it: the accessor was defined and never called, so editing that file silently changed nothing while this document presented it as a config source. It was removed rather than wired up — every value it described already exists as a setting, and one authoritative mechanism beats two where one is a decoy. `config/` now holds only operator-supplied runtime files (GeoLite2 databases, override suppression presets), all gitignored.
-
-### MCP transport + control-plane auth
-
-`server.py:main()` dispatches on `mcp_transport`. `stdio` (default) is the per-chat subprocess Claude Desktop/Code spawn — inherently local, no auth. `http`/`sse`/`streamable-http` run a persistent networked daemon.
-
-`none` is collector mode: `_run_collector()` enters the `lifespan` context and waits on an `asyncio.Event` armed by SIGTERM/SIGINT, so the whole capture plane (engines, canary server, watchdog, webhook delivery, `/metrics`) runs with no MCP transport at all. This is the only correct mode for a detached container — stdio there reads EOF from an unattached stdin and exits immediately, which restart-loops forever. `docker-compose.yml` sets `MCP_TRANSPORT=none` for exactly this reason. Since it exposes no control plane, `_networked_auth_error()` treats it like stdio and requires no token.
-
-The networked control plane can deploy honeypots and read all captured data, so it's **fail-closed**: `main()` calls `_networked_auth_error()` and refuses to start (`SystemExit`) if the transport isn't stdio and none of `mcp_auth_token` / `mcp_auth_tokens` / `mcp_allow_unauthenticated` is set. When a token setting is present, `_build_auth()` attaches FastMCP's `StaticTokenVerifier` (from `fastmcp.server.auth.providers.jwt`) at construction, so clients must send `Authorization: Bearer <token>` (401 otherwise). `_build_auth()` returns `None` for stdio, so the auth object never affects the local path or the test suite (which runs over in-memory stdio). `_networked_auth_error()` is a pure function for testability.
-
-### Role-based access control (`rbac.py`)
-
-Three roles, each a strict superset of the one before it — **viewer** (read-only:
-list/get/search/analyse/report), **operator** (viewer + manage this system's own
-resources: deploy/stop honeypots, create/rotate/revoke honeytokens, acknowledge
-alerts, suppression rules, webhooks, pcap, deception deploy — every effect reversible
-and contained to this system's own data), **admin** (operator + the tools whose blast
-radius reaches outside this system's own database: `alerts_prune`, the
-`blocklist_push_*` tools, `audit_log_search`).
-
-`MCP_AUTH_TOKENS` (`token:role,token:role,...`) replaces the single `MCP_AUTH_TOKEN`
-when set, so an operator can hand out tokens with less than full access instead of one
-shared admin token; `parse_auth_tokens()` falls back to treating a lone
-`MCP_AUTH_TOKEN` as one implicit admin token, so existing single-token deployments are
-unaffected. `_build_auth()` puts the resolved role in each token's `claims["role"]` on
-the verifier's static-token entries.
-
-**Static tokens are restart-only** — `MCP_AUTH_TOKENS` is read once at process start,
-so revoking one team member's access without restarting the whole shared server, or
-adding someone mid-operation, isn't possible through env vars alone. `tools/api_keys.py`
-(`api_key_create`/`api_key_revoke`/`api_key_list`, all admin-only) is the live
-counterpart: `ApiKey` rows in the DB, only a SHA-256 digest stored (never the
-plaintext — returned exactly once, at creation), checked by
-`rbac.build_combined_verifier()`'s `_CombinedTokenVerifier` after the static tokens
-fail to match. A 30s in-memory cache (`rbac.API_KEY_REFRESH_SECONDS`, mirrors
-`suppression.py`'s rule cache exactly) avoids a DB round-trip per request, invalidated
-immediately on create/revoke (`invalidate_api_key_cache()`) so a change is live on the
-process that made it well before the TTL would otherwise expire it. Static tokens
-remain supported specifically as the break-glass bootstrap credential — `api_key_create`
-is itself admin-gated, so at least one credential has to exist before any `ApiKey` row
-can be minted; with zero static tokens configured, `_build_auth()` still returns `None`
-exactly as before; DB-backed keys are purely additive; never a way around the
-`_networked_auth_error` fail-closed gate.
-
-Every `ApiKey` carries a `label` — a real per-person or per-automation identity, not
-just a role — which `rbac.current_actor()` reads into `AuditLog.actor` (see
-"Control-plane audit log" below) as `"alice (operator)"`. This is what makes the audit
-log answer "who," not just "what": under the static-token-only model every operator
-sharing one token was indistinguishable.
-
-Enforcement is per-tool, not global middleware: gated tools carry
-`@mcp.tool(auth=require_role("operator"))` (or `"admin"`) directly on the decorator —
-FastMCP checks `tool.auth` itself before every call and already short-circuits it for
-stdio (`server.py:_get_auth_context`'s `skip_auth`), so `require_role`'s own
-`ctx.token is None → True` branch only ever fires for a networked transport running via
-`MCP_ALLOW_UNAUTHENTICATED` (no token configured at all — see the rbac.py module
-docstring for why that's safe: `_networked_auth_error` guarantees the server never
-reaches that state *with* a token required). Viewer-tier tools carry no `auth=` kwarg
-at all — any caller holding a valid token of any role can use them, matching the "no
-gate below the lowest tier" model.
-
-New tools **must** be added to exactly one of `VIEWER_TOOLS` / `OPERATOR_TOOLS` /
-`ADMIN_TOOLS` in `rbac.py`, and gated ones need the matching decorator —
-`test_rbac_covers_every_registered_tool` (fail-closed: unclassified fails the build,
-never defaults to viewer-open) and `test_operator_and_admin_tools_actually_carry_an_auth_check`
-(catches listing a tool without also decorating it) pin this the same way
-`test_honeytoken_create_offers_every_registered_type` pins `HoneytokenType`.
-
-## Optional external dependencies
-
-All degrade gracefully when missing — they return `{"available": False, "note": "..."}` instead of raising.
-
-- `VIRUSTOTAL_API_KEY` — IP reputation via `intel/virustotal.py`
-- `ABUSEIPDB_API_KEY` — IP abuse reports + outbound reporting via `intel/abuseipdb.py`
-- `GEOIP_DB_PATH` — path to `GeoLite2-City.mmdb` (free MaxMind registration)
-- `CANARY_PUBLIC_URL` — public URL where canary tokens phone home (default `http://localhost:8888`; use ngrok for testing from the internet)
-
-## Common gotchas
-
-- Tools decorated with `@mcp.tool` are still plain async functions — call them directly in tests, no `.fn` accessor.
-- `submit_event()` is the ONLY way engines should write events. Direct `get_session()` writes from engines bypass suppression and webhook delivery.
-- Adding a new MCP tool module? Add an `import honeypot_mcp.tools.<name>` line at the bottom of `server.py` or it won't register.
-- Test files set `DATABASE_URL=sqlite+aiosqlite:///:memory:` at module top BEFORE importing anything from `honeypot_mcp.*` — order matters because `config.get_settings()` is cached.
-- The `EventBuffer` is a process-lifetime singleton. Test fixtures that touch it must call `event_buffer.reset_for_tests()` in setup AND teardown — `asyncio.Queue` is bound to the event loop it was created in, and pytest-asyncio gives each test a fresh loop.
-- Schema changes need a migration: `uv run alembic revision --autogenerate -m "description"`. The autogenerated file is a starting point, not a final answer — review it before committing.
-- `uv sync` without `--extra dev` installs runtime deps only — pytest, ruff, mypy land outside the venv and `uv run pytest` then silently falls through to whatever's on PATH (often Anaconda). Always use `uv sync --extra dev` when developing or testing.
-
-### Data lifecycle: bulk operations, archival, rotation
-
-Three operations that only matter once the tool has been running a while, and
-were missing for exactly that reason.
-
-**`honeypot_stop` takes a set, not a name.** A deployment is twenty-plus
-sensors, so one call per sensor is not a workflow. It accepts `name`, `names`,
-or a `type`/`status` filter (`type="all"` for the whole estate). A call with
-none of those is *rejected* rather than interpreted — the natural default would
-be "everything", and silently ending all collection is not recoverable. An
-unknown name aborts the whole call rather than partially stopping, so the
-caller can fix the list and retry.
-
-**Pruning archives before it deletes.** `alerts_prune` and the retention sweep
-destroy evidence permanently — a campaign that began eleven months ago, gone,
-along with anything a later investigation would have needed. Both now write
-matching alerts to JSON Lines (full payloads, one object per line, streams into
-`jq`/Splunk/S3) before removing anything, and **a failed archive cancels the
-delete** rather than proceeding without one. `archive=False` /
-`RETENTION_ARCHIVE=false` opts out deliberately. The unattended sweep matters
-most here: nobody is watching when it runs.
-
-**`honeytoken_rotate` keeps the thread.** Revoke-then-create severs it — "this
-credential has fired three times in eight months" becomes three unrelated
-incidents, and the old value stops being attributable. Rotation issues a new
-secret, carries label/type/settings/`planted_at` across, marks the old token
-REVOKED but *retains* it so historical triggers still resolve, and links the
-pair with `rotated_from`/`rotated_to`. Provider-generated fields are
-deliberately excluded from the carry-over set, or the "new" token would be the
-old one.
-
-### Triage state
-
-`alerts.acknowledged` alone only records that somebody looked. `disposition`
-(`true_positive` / `false_positive` / `benign` / `duplicate`), `triage_note`,
-`triaged_by` and `triaged_at` record what they concluded, which is what lets a
-shift hand over and what makes "what are we dismissing, and should it be
-suppressed instead?" answerable.
-
-`benign` is deliberately distinct from `false_positive`: a false positive means
-the detection was wrong, benign means it fired correctly on authorised activity.
-Conflating them makes tuning metrics meaningless.
-
-`alerts_acknowledge` takes either explicit `alert_ids` or a filter
-(`source_ip` / `event_type` / `severity` / `since_hours`) and triages the whole
-match — a scanner sweep is hundreds of alerts and one-at-a-time acknowledgement
-is not a workflow. `queries.triage_alerts` deliberately SELECTs before it
-UPDATEs so it can report the match count and whether `max_alerts` truncated the
-set; an over-broad filter silently clearing thousands of alerts is not
-recoverable. A call with neither ids nor filters is rejected.
+- `server.py:main()` dispatches on `mcp_transport`: `stdio` (default, local, no auth), `http`/`sse`/`streamable-http`
+  (persistent networked daemon), `none` (collector: `_run_collector()` runs `lifespan` until SIGTERM/SIGINT; the only
+  correct mode for a detached container, where stdio reads EOF and restart-loops; compose sets `MCP_TRANSPORT=none`).
+- **Networked transports are fail-closed**: `_networked_auth_error()` (pure) makes `main()` raise `SystemExit` unless
+  `mcp_auth_token`, `mcp_auth_tokens` or `mcp_allow_unauthenticated` is set; stdio and `none` need no token.
+  `_build_auth()` attaches `StaticTokenVerifier` (`Authorization: Bearer`, 401 otherwise) and returns `None` for stdio,
+  so the test suite is unaffected.
+- **Three roles, each a strict superset of the one before** (`rbac.py`): *viewer* (31 tools: read-only), *operator* (24:
+  manage this system's own resources, reversible and contained: deploy/stop/pause/resume/configure, token
+  create/rotate/revoke/export, acknowledge, suppression, `alerts_export`, `export_indicators`, pcap, samples scan,
+  `run_analysis`, `mapping_audit`, `report_ip_abuse`, `deception_deploy_plan`), *admin* (12: blast radius outside this
+  system's database or the control plane: `alerts_prune`, `alert_subscribe`/`alert_unsubscribe`, `api_key_*`,
+  `audit_log_search`, `database_backup`, `detection_rules_update`, `grafana_start`/`grafana_stop`, `sample_collect`).
+  Read the lists in `rbac.py`; do not trust this summary for placement.
+- Enforcement is per tool: `@mcp.tool(auth=require_role("operator"|"admin"))` on the decorator (FastMCP skips it for
+  stdio; `require_role` allows `ctx.token is None` only for networked `MCP_ALLOW_UNAUTHENTICATED`). Viewer tools carry
+  no `auth=`. **A new tool must be in exactly one of `VIEWER_TOOLS`/`OPERATOR_TOOLS`/`ADMIN_TOOLS` and, if gated, carry
+  the decorator**: `test_rbac_covers_every_registered_tool` (fail-closed, unclassified fails) and
+  `test_operator_and_admin_tools_actually_carry_an_auth_check`.
+- `MCP_AUTH_TOKENS` (`token:role,token:role`) replaces `MCP_AUTH_TOKEN`; `parse_auth_tokens()` treats a lone
+  `MCP_AUTH_TOKEN` as one admin token. Role goes in the verifier's `claims["role"]`. Static tokens are restart-only and
+  are the break-glass bootstrap credential (`api_key_create` is admin-gated, so one must exist first); with zero static
+  tokens `_build_auth()` still returns `None`.
+- **API keys** (`tools/api_keys.py`): `ApiKey` rows, only a SHA-256 digest stored (plaintext returned once, at creation),
+  checked by `rbac.build_combined_verifier()`'s `_CombinedTokenVerifier` after static tokens. A 30 s cache
+  (`rbac.API_KEY_REFRESH_SECONDS`) is invalidated on create/revoke (`invalidate_api_key_cache()`). Keys are additive:
+  never a way around `_networked_auth_error`. Each carries a per-person/automation `label`.
 
 ### Control-plane audit log
 
-Every state-changing tool call appends to `audit_log` via
-`tools/_audit.py:record_action()`; `audit_log_search` reads it back. The control
-plane is driven by a language model, so "what did the agent do?" is a question
-an operator will need answered — `alerts_prune` can delete months of evidence
-and `honeypot_stop` can silently end collection.
+Every state-changing tool call appends to `audit_log` via `tools/_audit.py:record_action()`; `audit_log_search` (admin) reads
+it. **A new tool that changes state or reaches outside this system must call `record_action`** (deploy/stop/pause/resume/
+configure, token revoke/rotate, plan deploy, pcap, prune, acknowledge, subscriptions, suppression, API keys, backup, rules
+update, reports, grafana, samples, `mapping_audit`, `report_ip_abuse`, `run_analysis`). Reads are not audited. The table is
+append-only and the retention sweep never touches it.
+- Auditing never breaks the action: `record_action` swallows and logs its own failures.
+- Secrets never land in the log: `redact_arguments()` masks keys containing secret/token/password/api_key/credential/auth.
+- Every row says who: `record_action` resolves `rbac.current_actor()` itself (`"alice (operator)"` for an API key, a bare
+  role for a legacy token, `stdio` locally), never an `actor=` parameter. `actor IS NULL` means "recorded before actor
+  tracking", not "unknown caller".
 
-Three invariants:
-- **Auditing never breaks the action.** `record_action` swallows and logs its
-  own failures; refusing to stop a honeypot because the audit table is
-  unavailable would be the worse outcome.
-- **Secrets never land in the log.** Arguments are recorded, so
-  `redact_arguments()` masks anything whose key contains secret/token/password/
-  api_key/credential/auth before persisting.
-- **Every row says who, not just what.** `record_action` resolves
-  `rbac.current_actor()` itself rather than taking an `actor=` parameter, so
-  every one of its ~11 call sites gets correct attribution without having to
-  thread identity through each one individually, and any future call site
-  gets it for free. The actor is an `ApiKey`'s `label (role)` when the caller
-  used one, a bare role for an unlabelled legacy `MCP_AUTH_TOKEN`, or `stdio`
-  for a local chat session — never blank. `audit_log_search(actor=...)`
-  substring-matches it. Rows written before this column existed have `actor
-  IS NULL`, which means "recorded before actor tracking existed", not
-  "caller unknown" — the two are deliberately kept distinguishable.
+### Operations and hardening
 
-Currently audited: `honeypot_deploy` (success and failure), `honeypot_stop`,
-`honeytoken_revoke`, `honeytoken_rotate`, `deception_deploy_plan`,
-`pcap_control`, `pcap_extract`, `alerts_prune`, `alerts_acknowledge`,
-`api_key_create`, `api_key_revoke`. Add a `record_action` call to any new tool
-that changes state. Reads are not audited — they are high-volume and
-low-consequence. The table is append-only and the retention sweep does not
-touch it.
+- `/healthz` (process) and `/readyz` (runs a real query against a real table; 503s on a runaway backlog) answer
+  different questions: alert on `/readyz`, since honeypots keep answering with no database. The metrics and console
+  servers bind loopback by default.
+- `scripts/backup.sh` uses `VACUUM INTO`, never `cp` (WAL) and not `.backup` (restarts forever under write load);
+  `restore.sh` refuses to run while the server is up.
+- Host hardening surrounds the decoys and never makes them less reachable: every honeypot port stays open to everyone
+  with no rate limit, ban or geo-block (`docs/HARDENING.md`).
+  - The service user is **not** in the `docker` group; it talks to `hardening/docker_guard.py`, which forwards only the
+    Cowrie operations the SSH engine makes and 403s the rest. Its create policy is built from `engines/cowrie_limits.py`
+    (the constants `ssh.py` reads); `test_the_engines_own_create_requests_pass_the_guard` runs the real engine, so a
+    container-setting change means a guard change. The guard runs under a syscall deny-list that forbids `chown`.
+  - The guard validates what the daemon reads (`tests/integration/test_docker_guard.py`): it sets `Content-Type` itself per
+    endpoint, refuses bodies on endpoints that take none, parses create bodies strictly (a repeated key at any depth is
+    refused) and applies the `kill` signal allowlist to `stop`/`restart`. A new endpoint needs an explicit content type and
+    an explicit "takes a body or not".
+  - `hardening/firewall.py` renders nftables table `inet hp_fw` (the only thing it touches): default-drop input, redirects
+    only for `fib daddr type local`, container egress closed or `limited`, service-user output restricted; `harden-host.sh`
+    calls its CLI (`--print-listen`) so firewall and pre-flight share one port list. `hardening/hostcheck.py` adds pure-parser
+    Linux checks to `preflight.py`; `check_env_permissions` accepts `root:honeypot 0640`.
+  - `deploy/harden-host.sh`: `prepare` (sshd on 22 and the admin port) → `finalize` (admin port only, firewall with rollback
+    timer) → `confirm` → `status`/`teardown`. `prepare` after `finalize` must not reopen 22; poll for the listener.
+  - The venv needs an interpreter the service user can execute (`UV_PYTHON_INSTALL_DIR=/opt/uv-python`).
+  - `scripts/fetch_backup.sh` treats the VPS as hostile: refuse archive paths leaving `honeypot-<stamp>/` before unpacking,
+    delete symlinks after, one ControlMaster connection (6 new admin SSH connections a minute), macOS bash 3.2 compatible.
+    Reports run read-only with `trusted_schema=OFF`, excluding `selftest_` probes and `0.0.0.0` platform alerts.
+  - Docker-gated `test_firewall_rules.py` and `test_docker_guard.py` check both against a real kernel/daemon.
 
-### ATT&CK mapping and risk scoring
+### Security boundaries and parsing
 
-Both are analyst-facing outputs where being *wrong* is worse than being absent,
-because SOC analysts know ATT&CK and will check the numbers.
-
-**`intel/mitre.py`** — tactics follow ATT&CK Enterprise exactly. Brute Force
-(T1110) is **Credential Access**, not Initial Access; an earlier revision filed
-the SSH/FTP/RDP variants under Initial Access while filing the identical
-technique under Credential Access three entries later. Coverage is aligned to
-what the engines actually emit — grep the engines for `event_type=` and make
-sure every high-value one maps, because an unmapped capture is invisible in the
-ATT&CK dashboard and the kill-chain timeline. Patterns are ordered
-most-specific-first and all matches are collected, so a generic rule must never
-be the only hit. Watch for cross-category false positives: `smb_exploit_attempt`
-contains "attempt" and previously matched the brute-force rule, inflating
-Credential Access while hiding the Lateral Movement finding.
-
-**The Grafana ATT&CK dashboard is generated, not hand-written.** SQL cannot call
-Python, so `03-mitre-coverage.json` used to carry its own CASE-expression copy of
-the event-type → tactic mapping — and it drifted exactly the way a duplicated
-table always does, re-introducing both bugs above (SSH/FTP/RDP brute force under
-Initial Access, `ssh_file_download` under Exfiltration) after `intel/mitre.py`
-had fixed them. It also predated most of the 25 engines, so `docker_api`,
-`kubernetes`, `sip` and the rest fell through to "Uncategorised" on the one
-dashboard whose entire job is showing what you can detect.
-
-`scripts/generate_mitre_dashboard.py` now derives the SQL by pushing every
-`signature_events` entry through `map_to_attack`, and
-`tests/unit/test_mitre_dashboard.py` regenerates and diffs, so drift fails CI.
-Re-run the generator after touching mappings or adding an engine. Tactic IDs
-(`TACTIC_IDS`) live in `intel/mitre.py` for the same single-source reason.
-Multi-tactic events count under *every* tactic they map to — hence UNION ALL
-rather than CASE, which can only bucket a row once and would under-report the
-later tactic.
-
-**The "Tactic timeline" panel's styling is hand-maintained, not generated** —
-`generate_mitre_dashboard.py` only rewrites the two panels' SQL (`_set_panel_sql`
-patches `queryText`/`rawQueryText` in place), so `fieldConfig`/`options` survive
-regeneration untouched and can be edited directly without fighting
-`test_dashboard_matches_the_generator`. That panel now carries fixed, per-tactic
-`fieldConfig.overrides` colors (up to 14 series — Grafana's auto-palette repeats
-hues past ~8, which is exactly the range this panel needs) and
-`scaleDistribution: {type: "log"}`, not just distinct colors: un-stacking the
-chart to fix color legibility (a filled, stacked area blends overlapping bands
-into a muddy blob) revealed a second, different problem — Credential Access
-outweighs the other tactics by 10-100x in raw count, so on a linear axis every
-smaller series still flattens to invisible near zero even with correct colors.
-Log scale is what actually makes a Persistence spike of 3 events visible next to
-a Credential Access band in the thousands. `test_every_tactic_has_a_fixed_color_override` /
-`test_tactic_colors_are_unique` / `test_tactic_timeline_is_not_stacked` pin this.
-
-**The threat map's basemap must not render place labels.** Its `"type": "default"`
-basemap resolves to CARTO's free `basemaps.cartocdn.com` raster XYZ tiles, which
-render OSM's local-language place names with no English-only variant available at
-that endpoint — country/city labels showed up in a mix of Portuguese, Arabic and
-Chinese script. `showLabels: false` in the basemap config removes labels entirely
-rather than chasing a tile provider that promises consistent English (which would
-also add an API-key dependency this docker-compose demo doesn't otherwise need);
-the adjacent "Top countries" table already carries that detail in the viewer's own
-language. `test_threat_map_basemap_has_no_labels` pins it.
-
-**Timeseries panels derive their bucket width from the window, never hardcode
-it.** Every Grafana timeseries query buckets on
-`MAX((($__to) - ($__from)) / 240000, 60)` — about 240 points across whatever
-range the viewer picked, floored at 60s — and `$__from`/`$__to` are used rather
-than `$__interval_ms` because those two are already proven to interpolate in
-these dashboards. A fixed width is wrong in both directions: the severity panel
-grouped by a literal `strftime('%Y-%m-%dT%H:%M')`, which is 1,440 points per
-series over 24h and 43,200 over 30 days across four series, while an hourly
-bucket over a five-minute window is a single column. `console/server.py`'s
-`_bucket_size` already did this correctly, so the two halves of the same product
-disagreed. Table panels have the matching rule: never `SELECT MAX(timestamp)`
-raw — that returns SQLite's storage string (`2026-07-30 20:22:10.632767`, no
-`T`, no offset), which renders as an ambiguous string and cannot be shown in the
-viewer's timezone. Format with `strftime('%Y-%m-%dT%H:%M:%SZ', …)` and declare
-the column in the target's `timeColumns`.
-
-**`scripts/seed_demo_data.py` must feed every engine it deploys.** Its budget
-named five while it created twenty-five, so the demo data that exists to show
-the platform off implied a five-protocol tool and left the ATT&CK dashboard
-showing a fraction of the tactics the sensors detect. `_ENGINE_MIX` now carries
-a weight per engine and `_check_engine_mix()` fails the run if it and
-`_EVENT_PROFILES` disagree. Honeypot ids are keyed by `HoneypotType.value`, not
-display name — `docker_api` deploys as `demo-docker-api` because Docker object
-names disallow underscores.
-
-**Timestamps are aware everywhere** (`storage/models.py:UTCDateTime`). The
-columns were declared `DateTime(timezone=True)`, which PostgreSQL honours and
-SQLite — the default — silently does not, so DB reads came back naive. A naive
-`.isoformat()` has no offset, and JavaScript reads an offset-less date-time as
-*local*: the console rendered its header clock from an aware timestamp and its
-feed from naive ones, showing the newest event four hours in the future on a
-UTC-4 host. `UTCDateTime` normalises on bind and re-attaches UTC on load. The
-stored SQLite string format is unchanged, so Grafana's `datetime()` comparisons
-and existing databases are unaffected.
-
-**`analysis/profiler.py:_calculate_risk`** — weighted toward what was observed
-locally, not what a feed says. Two properties the tests pin:
-
-- *Direct observation alone can reach CRITICAL.* VirusTotal and AbuseIPDB are
-  optional; they previously supplied 60 of ~90 attainable points, so with no
-  API keys (the default) an attacker who ran a full RCE chain and tripped a
-  planted credential could not exceed 30 — MEDIUM. For a deception platform
-  that is backwards: our own capture outranks a reputation lookup.
-- *A triggered honeytoken dominates.* It is the highest-fidelity signal the
-  platform produces and previously contributed nothing beyond its severity.
-
-Volume is deliberately weighted low — one determined scanner produces thousands
-of events, and ranking by noise buries the dangerous attacker. Retune the
-weights freely; the tests assert ordering and band reachability, not exact
-numbers.
-
-### Operations console
-
-`console/` serves a read-only web dashboard (default `127.0.0.1:8090`, set
-`CONSOLE_PORT=0` to disable) from the same process as the honeypots: one HTML
-file plus a `/api/overview` JSON endpoint the page polls every 5s. Started from
-`lifespan` alongside canary and metrics; a bind failure is logged, never fatal.
-
-Three constraints shape it:
-
-1. **Read-only, structurally.** The page has no authentication, so it must not
-   be a second control plane — the router registers GET routes only and
-   `test_console_is_read_only` asserts that no other method ever appears.
-   Deploying and stopping stays on the MCP interface.
-2. **The feed ships digests, not payloads.** At a 5-second poll, sending full
-   captures would move megabytes a minute to tell the viewer nothing extra; it
-   reuses `tools/_format.digest_payload`.
-3. **Port 8090, not 8080.** 8080 is `default_http_port`, so the console would
-   collide with the first HTTP honeypot anyone deploys.
-
-Chart colours are not free choices. The severity split is **two** series
-(routine = low+medium, serious = high+critical) rather than four bands, because
-four adjacent stacked marks cannot be told apart reliably — a green→amber→
-orange→red ramp fails both the CVD and normal-vision separation floors no
-matter how it is stepped. Two well-separated hues (`#3987e5` / `#e66767`) pass
-on the console's dark surface; magnitude bars use a single hue. Severity per
-event is carried by a **text label** (`LOW`/`MED`/`HIGH`/`CRIT`) with colour as
-reinforcement, never colour alone. Re-run the palette validator if these change.
-
-Grafana still owns historical dashboards and the geo map; the console answers
-the three questions someone walking up to a screen has — is everything up, is
-anything on fire, what just happened.
-
-### Production operations
-
-`/healthz` and `/readyz` on the metrics port answer different questions, and
-the difference is the whole point. Every in-process engine keeps serving
-attackers whether or not the database is reachable — the listeners never touch
-it — so removing the database underneath a running server leaves the honeypots
-working perfectly while nothing persists, and a liveness probe sees a healthy
-process throughout. Chaos testing found exactly that: engines kept answering
-and a deploy still returned success. `/readyz` runs a real query against a real
-table, so it is the only signal that separates "running" from "collecting".
-Alert on it, not on `/healthz`. It also 503s on a runaway ingest backlog, since
-the unbounded queue becomes a memory problem before a data-loss one.
-
-`scripts/backup.sh` uses SQLite's `VACUUM INTO`, never `cp` and no longer `.backup`: the server
-runs in WAL mode, so a file copy taken mid-write opens cleanly and is quietly missing recent
-transactions. `.backup` copies in small steps and restarts whenever the server writes between
-steps: on the live 3.8 GB database (about 190 events a second) it ran 38 minutes and never
-finished, while `VACUUM INTO` (one read transaction, writers unblocked in WAL mode) took 203 s and
-gives a compact rollback-mode file that opens read-only anywhere. `restore.sh` refuses to run while
-the server is up,
-because restoring underneath a live process leaves it writing into a replaced
-file it still holds open.
-
-`config.warn_on_world_readable_env()` fires at startup when `.env` is readable
-beyond its owner. A default umask makes `cp .env.example .env` mode 0644, which
-on a shared host hands the control-plane token — and with it every captured
-credential — to any local account.
-
-### Host hardening (`hardening/`, `deploy/`)
-
-A public honeypot host is attacked on purpose, so hardening is about what surrounds the decoys,
-never about making them less reachable: every honeypot port stays open to everyone with no rate
-limit, ban or geo-block. `docs/HARDENING.md` is the guide; the invariants worth knowing:
-
-- **The service is not in the `docker` group.** It talks to `hardening/docker_guard.py`
-  (`honeypot-docker-guard.service`), a separate process that forwards only the Cowrie container
-  operations the SSH engine makes and 403s everything else. Its create-body policy is built from
-  `engines/cowrie_limits.py`, the same constants `ssh.py` reads, and
-  `test_the_engines_own_create_requests_pass_the_guard` runs the real engine and checks its request
-  passes: change the engine's container settings and that test (and the guard) must change with it.
-  The guard runs under a syscall deny-list that forbids `chown`, so it must never ask to.
-  The guard validates, then forwards: it is only as strong as the agreement between what it checks and
-  what the daemon reads. A real daemon showed three gaps in that agreement, all fixed and pinned by
-  `tests/integration/test_docker_guard.py`: (1) the client's `Content-Type` was forwarded, and Go
-  merges an `application/x-www-form-urlencoded` body into the parameters the query check had already
-  approved (`kill?signal=TERM` with body `signal=HUP` delivered HUP; a body on `images/create` made the
-  daemon import from a URL), so the guard now sets `Content-Type` itself per endpoint and refuses a
-  body on endpoints that take none; (2) a create body with a repeated key (`HostConfig` twice) was
-  validated as its last value while the daemon merged both and created a `Privileged` container, so
-  bodies are parsed strictly and a repeated key at any depth is refused; (3) `stop` and `restart`
-  take `?signal=` too and now use the same allowlist as `kill`. Add any new endpoint with an explicit
-  content type and an explicit "takes a body or not".
-- **`hardening/firewall.py` renders the nftables ruleset** (table `inet hp_fw`, the only thing it
-  touches): default-drop input, redirects only for `fib daddr type local` (a bare `dport 80
-  redirect` also caught containers' outbound web requests), container egress closed or `limited`,
-  the service user's output restricted. `harden-host.sh` calls the module's CLI so the ports the
-  operator names once are the ports the firewall and the pre-flight both use (`--print-listen`).
-- **`hardening/hostcheck.py`** adds the Linux host checks to `preflight.py` (public listeners vs
-  the planned ports, firewall loaded, docker access, guard probed *as the service user*, sshd, sysctl,
-  updates). Pure parsers take text so they are tested off Linux. `preflight.check_env_permissions`
-  accepts the documented `root:honeypot 0640` layout.
-- **`scripts/fetch_backup.sh`** (laptop side) pulls a backup, verifies it (SHA-256 vs the VPS,
-  `integrity_check`), quarantines Cowrie samples and prints the run report. The VPS is hostile:
-  archive paths are listed and refused if they leave `honeypot-<stamp>/` before anything is
-  unpacked, symlinks are deleted after. Everything shares one ControlMaster connection because
-  admin SSH is limited to 6 new connections a minute. It must keep working under macOS bash 3.2
-  (no `mapfile`, no associative arrays). Report rows are `LEVEL|message` from SQL run on a read-only
-  connection with `trusted_schema=OFF`; self-test probes (`selftest_` marker) and platform alerts
-  (`0.0.0.0`) are excluded from "attacker activity". Cowrie's samples are inside the container (an
-  anonymous volume on the pinned image; `docker cp` cannot read a tmpfs, so the script runs Python
-  inside the container, which works for either layout).
-- **`deploy/harden-host.sh`** is `prepare` (sshd on 22 *and* the admin port) -> `finalize` (admin
-  port only, firewall loaded with a rollback timer) -> `confirm` -> `status` / `teardown`. Re-running
-  `prepare` after `finalize` must not reopen port 22; sshd re-binds after the reload returns, so
-  the script polls for the listener instead of checking once.
-- **The venv needs an interpreter the service user can execute.** `uv sync` as root puts Python
-  under `/root/.local/share/uv/python`; build with `UV_PYTHON_INSTALL_DIR=/opt/uv-python`.
-- Verified on an Ubuntu 22.04 systemd rehearsal host with a real dockerd (see HARDENING.md); the
-  Docker-gated `tests/integration/test_firewall_rules.py` and `test_docker_guard.py` repeat the
-  firewall-in-a-real-kernel and engine-through-the-guard checks.
-
-### Security boundaries
-
-A security review found two crossable boundaries; both are now enforced and
-pinned by `tests/unit/test_security_boundaries.py`. The threat model that makes
-them matter is unusual and worth holding in mind when adding tools:
-
-**The control plane is driven by a model that reads attacker-authored data.**
-Captured usernames, paths, commands and User-Agents are attacker-chosen strings
-that reach the same context deciding which tools to call with which arguments.
-So a tool parameter that reaches the filesystem is reachable, in principle, by
-someone who never authenticated. "The caller is trusted" is not sufficient
-reasoning for this codebase.
-
-- **Artifact writes are confined to `reports_dir`** via
-  `_format.resolve_artifact_path()`. Exports embed captured payloads, so an
-  unconstrained `output_path` was an arbitrary-file-write primitive with
-  attacker-chosen content. Any new tool that writes a file must route through
-  that helper rather than taking a `Path` directly.
-- **Honeypot names cannot become paths.** `_format.validate_honeypot_name()`
-  restricts them to a Docker-compatible character set; `tls._cert_dir()`
-  re-checks at the point a name becomes a path, because reconciliation and
-  cloning also reach it.
-
-Already verified sound, so don't re-litigate without new evidence: HMAC
-comparisons use `compare_digest`; there is no `eval`/`exec`/`pickle`/`yaml.load`
-anywhere; SQL goes through SQLAlchemy parameter binding (the one raw `text()`
-uses bound parameters); the console escapes every interpolation of
-attacker-controlled data before it reaches the DOM; `/cloud-event` refuses all
-requests until `CLOUD_EVENT_HMAC_SECRET` is set.
+The control plane is driven by a model that reads attacker-authored data (usernames, paths, commands, User-Agents), so
+"the caller is trusted" is not sufficient reasoning. Pinned by `tests/unit/test_security_boundaries.py`.
+- **Artifact writes are confined to `reports_dir`** through `_format.resolve_artifact_path()`; any new tool that writes a
+  file uses it, never a raw `Path`. Caller-named artifact paths refuse to overwrite.
+- **Honeypot names cannot become paths**: `_format.validate_honeypot_name()` (Docker-compatible charset) and a re-check in
+  `tls._cert_dir()` (reconciliation also reaches it). Private files are created 0600, never chmod'd afterwards
+  (`secure_io`).
+- Already verified sound, do not re-litigate without new evidence: HMAC comparisons use `compare_digest`; no
+  `eval`/`exec`/`pickle`/`yaml.load`; SQL uses SQLAlchemy binding (the one raw `text()` binds parameters); the console
+  escapes every interpolation of attacker data; `/cloud-event` refuses all requests until `CLOUD_EVENT_HMAC_SECRET` is set.
+- **Nothing parses attacker bytes without a bound**: check every length field against the buffer and a hard cap before use,
+  advance `pos` strictly in loops, run regexes only over clipped input with bounded gaps (`.{0,40}`, never `.*`).
+  `contextlib.suppress(Exception)` cannot catch an infinite loop and a regex cannot be interrupted.
+- Shared helpers: `engines/_tasks.spawn` (retained fire-and-forget tasks), `engines/_bounds.write_backlogged`,
+  `engines/conn_limit` (per-IP cap, idle and lifetime timeouts, `extract_lines`, `LineWorker`, `UdpReplyLimiter`,
+  `close_after_error`, `shutdown_server`), `secure_io`, `_loop_bound.LoopBound` (loop-safe locks).
+- **UDP replies are bounded to a small multiple of the request** (SNMP 4x, SIP 3x, DNS 2x) and rate limited per source; the
+  event is recorded either way. Not 1x: a plain `snmpget` would come back `tooBig` and a short REGISTER would get no digest
+  challenge, both of which identify the decoy.
 
 ### Packaging
 
-Non-Python assets must be declared in `pyproject.toml`'s
-`tool.hatch.build.targets.wheel.artifacts` **and** loaded through
-`importlib.resources`, never by walking up from `__file__`. Three things live
-inside the package for this reason:
+Non-Python assets must be declared in `pyproject.toml`'s `tool.hatch.build.targets.wheel.artifacts` **and** loaded through
+`importlib.resources`, never by walking up from `__file__`. In the package: `console/static/index.html`, `presets/*.yaml`
+(bundled suppression presets; config-dir overrides are gitignored), `grafana_assets/{provisioning,dashboards}` (the one
+copy read by compose files, dashboard generators and `grafana.py`). Failure is silent (wheel builds and imports, then
+misbehaves): `tests/unit/test_operational.py` asserts the resources resolve and the release workflow installs the wheel
+into a clean environment outside the source tree. The version lives in `pyproject.toml` and `__init__.py`; a test asserts
+they agree and the release workflow refuses a mismatched tag.
 
-- `console/static/index.html` — the console 500s without it.
-- `presets/*.yaml` — bundled suppression presets. These previously sat in
-  `config/suppression_presets/` beside the source tree with a fallback that
-  resolved to a path inside site-packages that never exists, so a pip-installed
-  user saw an empty preset list for a feature the README advertises. Nothing
-  failed loudly; the list was just empty.
-- `grafana_assets/{provisioning,dashboards}` — the Grafana provisioning and the five dashboards. They
-  used to sit in `docker/grafana/`, outside the package, so a pip-installed server could not start
-  Grafana. The compose files, the dashboard generators and `grafana.py` all read this one copy.
+### Testing gotchas
 
-The failure mode is identical in both cases: the wheel builds, installs and
-imports cleanly, then misbehaves at runtime. `tests/unit/test_operational.py`
-asserts both resources resolve, and the release workflow installs the wheel
-into a clean environment *outside the source tree* and checks them again —
-running from the repo root hides the bug entirely.
-
-Version lives in two places (`pyproject.toml` and `__init__.py`); a test
-asserts they agree and the release workflow refuses a mismatched git tag.
-
-### Ingest throughput and the one way data is lost
-
-Measured, not estimated (SQLite, batch=50, flush_interval=1.0):
-
-| | |
-|---|---|
-| Sustained commit rate | ~1,550 events/sec |
-| 20,000-event burst | zero loss, drains in 12.9s |
-| 200 events/sec sustained | zero loss, queue depth stays at ~200 |
-| Storage | 477 bytes/event |
-
-The queue is **unbounded**, so nothing is ever dropped on the way in and
-`submit_event` never blocks — enqueue benchmarks around 149k/sec and that
-number means nothing. Commit rate is the real ceiling.
-
-That leaves exactly one path where a captured event disappears: `stop()` drains
-for `shutdown_drain_seconds` (default 5) and discards whatever is still queued.
-A load test queued 50,000 events and lost 40,850 that way while logging only
-"flusher did not exit cleanly" — no count, no cause. It now logs at ERROR with
-the number discarded and names the setting that fixes it, and
-`honeypot_event_queue_depth` exposes the backlog as a Prometheus gauge so the
-condition is visible before a restart converts it into loss. Depth should
-oscillate around one flush interval's worth of traffic; a number that climbs
-means ingest is outrunning the database.
-
-Raise `shutdown_drain_seconds` for a slow or remote database — the same backlog
-takes proportionally longer there.
-
-### Test timing
-
-`tests/conftest.py` sets `EVENT_FLUSH_INTERVAL_SECONDS=0.05`. This is not
-cosmetic: the suite contains ~44 `await asyncio.sleep(1.0)` calls followed
-immediately by a query for rows the event buffer wrote, and the buffer's
-default `flush_interval` is also 1.0 second. Those waits sit exactly on the
-boundary — they win on an idle laptop and lose on a loaded CI runner, so the
-failure appears on whichever engine test lost the race that run, in whichever
-Python version happened to be slow. Two separate CI failures were traced to it.
-
-Shortening the interval for tests gives a 20x margin without rewriting the
-assertions, and made the unit suite ~26% faster as a side effect. If you add a
-test that waits for a flush, prefer polling until the row appears (see
-`tests/integration/test_pipeline.py:_alerts_after_flush`) over a fixed sleep.
-
-The interval is a real setting, not a test-only hook — operators can lower it
-to reduce alert latency.
-
-### Audit hardening invariants (2026-10)
-
-- **Nothing parses attacker bytes without a bound.** Every length field is
-  checked against the buffer and a hard cap before use, loops must advance
-  `pos` strictly, and regexes run only over clipped input with bounded gaps
-  (`.{0,40}`, never `.*`). `contextlib.suppress(Exception)` cannot catch an
-  infinite loop; a regex cannot be interrupted either.
-- **Shared helpers:** `engines/_tasks.spawn` (retained fire-and-forget tasks),
-  `engines/_bounds.write_backlogged`, `engines/conn_limit` (per-IP cap, idle and
-  lifetime timeouts, `extract_lines`, `LineWorker`, `UdpReplyLimiter`,
-  `close_after_error`, `shutdown_server`), `secure_io` (private files are created
-  0600, never chmod'd afterwards) and `_loop_bound.LoopBound` (loop-safe locks).
-- **UDP replies are bounded to a small multiple of the request** (SNMP 4x, SIP
-  3x, DNS 2x) and rate limited per source; the event is recorded either way. The
-  multiple is not 1x on purpose: at 1x an ordinary `snmpget` (40 B in, ~140 B out)
-  comes back `tooBig` and a short REGISTER gets a 401 with no digest challenge —
-  both identify the decoy and capture nothing. With the per-source limiter the
-  platform adds a few KB/s to a reflection, which is noise.
-- **Write helpers that return `{"error": ...}` do not raise.** Callers must
-  check the result (`alerts_prune` deletes nothing unless the archive succeeded);
-  caller-named artifact paths refuse to overwrite.
-- **Webhook destinations are policed** (`webhook_allow_private_destinations`,
-  default off) at subscribe and delivery time; `alert_subscribe` is admin-tier.
-- Canary/token triggers are submitted through the event buffer so they reach
-  webhook delivery; the metrics/console servers bind loopback by default.
-- **Tests run on SQLite by default; `TEST_DATABASE_URL=postgresql+asyncpg://...`
-  runs the same suite on PostgreSQL** (each test gets an empty schema). Test
-  modules must read that variable rather than hard-assigning a URL, or the CI
-  PostgreSQL job silently tests SQLite again.
-- Launch with `honeypot-mcp` or `python -m honeypot_mcp.server`; the latter
-  delegates to the canonical module because the tool modules register on
-  `honeypot_mcp.server.mcp`, not on `__main__.mcp`.
-- Cowrie's root filesystem is read-only. Its wget/curl/tftp/nc emulation makes
-  real outbound requests, so `COWRIE_HONEYPOT_OUT_ADDR=127.0.0.1` (default;
-  `cowrie_allow_egress` / `COWRIE_OUT_ADDR=0.0.0.0` to opt out) makes every such
-  connect fail in-process — no host firewall needed.
-- **Honeytoken matching runs on the payload before it is clamped** (the clamp
-  drops whole keys over budget, and a planted credential inside a dropped
-  `post_data` must still escalate). The HTTP engine keeps credential-aliased form
-  fields however much junk precedes them.
-- **The webhook destination policy is enforced on every delivery**
-  (`WebhookDelivery._dispatch` → `check_destination`, 10 s cache), not only in
-  `alert_subscribe`; syslog connects to the validated address.
-- **The canary's global rate ceiling applies only to requests that matched a
-  token**, so a flood of random ids cannot starve a real trigger.
-- **Fidelity invariants.** Listing, size and bytes come from one source (FTP file
-  tree; HTTP backups reuse it). SMTP/FTP/HTTP/RDP answer in the dialect of the product
-  they claim, verified with the real client (`ftplib`, `smtplib`, `httpx`, `nmap`,
-  pyspnego), not only unit-level parsers. A new engine behaviour should be checked
-  with the tool an attacker would use.
-- **Cowrie persona = env vars + a rewritten `fs.pickle`.** Kernel/OS/platform are
-  `[shell]` settings (`COWRIE_SHELL_*`); everything else an attacker `cat`s comes from
-  `engines/cowrie_fs.py`. Do not write `/etc/issue.net` (non-empty = pre-auth banner).
-  `ssh.py` creates the container, extracts the rewritten pickle into an anonymous
-  volume at `/cowrie/persona`, then starts it; failure falls back to Cowrie's default
-  with a warning. The compose stack builds the same file in `cowrie-persona-init`.
-- **Cowrie's fingerprint is patched from inside the container.** nmap names a telnet
-  service that opens `IAC DO NAWS` + `login:` "Cowrie Honeypot telnetd", and Twisted's SSH
-  offer (3des-cbc, cast128-cbc, hmac-md5, group14-sha1, bare `ssh-rsa`) contradicts the
-  OpenSSH banner. `cowrie_env_vars` sets `COWRIE_SSH_CIPHERS/MACS/COMPRESSION` (real `[ssh]`
-  options) plus `HONEYPOT_SSH_KEX/HOSTKEYS/TELNET_ISSUE`, and `engines/cowrie_sitecustomize.py`
-  (a plain file, imported by Python as `sitecustomize` via `PYTHONPATH=/cowrie/persona/patch:
-  /cowrie/cowrie-git/src`, delivered by `persona_tar` with the persona filesystem) installs an
-  import hook that patches `cowrie.ssh.factory` (narrow the KEXINIT offer) and
-  `cowrie.telnet.userauth` (open with `DO TTYPE/TSPEED/XDISPLOC/NEW-ENVIRON`, then the issue
-  and `<host> login: `). The offer is a strict *subset* of the persona's real OpenSSH (Twisted
-  has no chacha20/GCM/`-etm`/sntrup). `PYTHONPATH` replaces the image's, so it must keep
-  `/cowrie/cowrie-git/src`. If the persona filesystem cannot be delivered the container falls
-  back without the patch and a warning says so. The compose values are literals pinned to
-  `cowrie_env_vars` by `test_compose_sensor_carries_the_same_algorithm_environment_as_the_engine`;
-  `tests/integration/test_cowrie_fingerprint.py` reads the wire of the real image.
-- **Cowrie behaves like coreutils where scripts lean on it.** `cowrie_sitecustomize` also patches
-  `head`/`tail` (legacy `-N` form to `-n N`, which stock Cowrie rejects with "invalid option -- '2'") and
-  `uptime`/`w`/`/proc/uptime` (a per-hostname boot offset of 3-27 days plus real elapsed time; stock Cowrie
-  counted from container start, so every restart read "up 11 min"). The persona filesystem carries a
-  **tracked credential** as bait: `~/.bash_history` has a `mysql -u USER '-pPASS' -h db1.internal` line and
-  `~/.my.cnf` the same pair (mode 600), resolved in `ssh.py:start` from `planted_credential("mysql")` (a
-  deterministic untracked decoy when no token exists). It is written to **both** `/root` and the persona's
-  own user: 105k of the first run's successful logins were `root` and 70k `admin`, and never the persona's
-  user, so bait only under `/home/<persona-user>` was never read. A Cowrie container only picks all of this up
-  when it is recreated (`honeypot_stop remove=True`, then deploy).
-- **Transient DB errors are retried, permanent ones are not.** `EventBuffer._write_retrying`.
-- `tls_dir` / `reports_dir` are settings; tests redirect both to `tmp_path` (conftest).
-
+- Test modules set `DATABASE_URL=sqlite+aiosqlite:///:memory:` (or read `TEST_DATABASE_URL`) at module top BEFORE importing
+  anything from `honeypot_mcp.*`: `config.get_settings()` is cached.
+- `EventBuffer` is a process-lifetime singleton: fixtures that touch it call `event_buffer.reset_for_tests()` in setup AND
+  teardown (`asyncio.Queue` is bound to its loop).
+- `tests/conftest.py` sets `EVENT_FLUSH_INTERVAL_SECONDS=0.05` because fixed `asyncio.sleep(1.0)` waits sit on the default
+  flush boundary and lose on a loaded runner. Poll until the row appears (`test_pipeline.py:_alerts_after_flush`) instead of
+  sleeping. The interval is a real setting.
+- Schema changes need a migration. `.env` and `tls/` hold secrets and are gitignored.

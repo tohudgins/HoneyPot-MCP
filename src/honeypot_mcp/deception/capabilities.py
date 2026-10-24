@@ -1,9 +1,9 @@
 """What each engine actually is, in one place.
 
 Three separate features need to reason about engines rather than just run them:
-`honeypot_templates` lists them, `planner` picks a coherent set, and `coverage`
+`deception_profiles` lists them, `planner` picks a coherent set, and `coverage`
 works out what they can detect. Before this registry each of those carried its
-own copy of the facts, and `honeypot_templates` had already drifted — it still
+own copy of the facts, and the old sensor-type listing had already drifted — it still
 described fourteen types after five more had shipped, so a model asking "what
 can I deploy?" was told a stale answer with no error anywhere.
 

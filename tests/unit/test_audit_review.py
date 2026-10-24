@@ -801,74 +801,24 @@ async def test_triage_is_attributed_to_the_caller_not_to_a_name_they_supply(monk
 
 async def test_exports_honour_the_never_block_allowlist(monkeypatch, tmp_path):
     from honeypot_mcp.config import get_settings
-    from honeypot_mcp.tools.analysis import export_blocklist
+    from honeypot_mcp.tools.analysis import export_indicators
 
     monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
     monkeypatch.setattr(get_settings(), "blocklist_allowlist", "8.8.4.4")
     await _alerts_for(["8.8.4.4", "9.9.9.9"], count=10)
-    result = await export_blocklist(hours=24, min_hits=5)
+    result = await export_indicators(hours=24, min_hits=5)
     text = Path(result["path"]).read_text()
     assert "9.9.9.9" in text and "8.8.4.4" not in text
 
 
 async def test_exports_refuse_a_malformed_allowlist_instead_of_ignoring_it(monkeypatch, tmp_path):
     from honeypot_mcp.config import get_settings
-    from honeypot_mcp.tools.analysis import export_blocklist
+    from honeypot_mcp.tools.analysis import export_indicators
 
     monkeypatch.setattr(get_settings(), "reports_dir", tmp_path, raising=False)
     monkeypatch.setattr(get_settings(), "blocklist_allowlist", "not-an-ip")
     await _alerts_for(["9.9.9.9"], count=10)
-    assert "error" in await export_blocklist(hours=24, min_hits=5)
-
-
-async def test_waf_push_sends_only_the_address_family_the_ip_set_holds():
-    from unittest.mock import MagicMock, patch
-
-    from honeypot_mcp.tools import blocklist_push
-
-    await _alerts_for(["1.1.1.1", "2606:4700:4700::1111"], count=10)
-    client = MagicMock()
-    client.get_ip_set.return_value = {
-        "IPSet": {"Addresses": [], "IPAddressVersion": "IPV4"},
-        "LockToken": "l",
-    }
-    with patch("boto3.client", return_value=client):
-        result = await blocklist_push.blocklist_push_aws_waf(
-            ip_set_id="x", ip_set_name="x", region="us-east-1", dry_run=False
-        )
-    assert result["added"] == ["1.1.1.1/32"]
-    assert [f["ip"] for f in result["failed"]] == ["2606:4700:4700::1111/128"]
-    sent = client.update_ip_set.call_args.kwargs["Addresses"]
-    assert sent == ["1.1.1.1/32"], "a WAFv2 IPv4 set would reject the whole update"
-
-
-async def test_a_network_error_during_a_push_is_reported_and_audited_not_raised():
-    from unittest.mock import patch
-
-    import httpx
-
-    from honeypot_mcp.tools import blocklist_push
-
-    await _alerts_for(["1.1.1.1"], count=10)
-
-    class _Boom:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_a):
-            return None
-
-        async def get(self, *_a, **_k):
-            raise httpx.ConnectError("https://user:hunter2@cf.example/ refused")
-
-    with patch("httpx.AsyncClient", return_value=_Boom()):
-        result = await blocklist_push.blocklist_push_cloudflare(
-            account_id="acct", list_id="lst", api_token="tok", dry_run=False
-        )
-    assert result["failed"] and result["added"] == []
-    assert "hunter2" not in str(result)
-    rows = await _audit("blocklist_push_cloudflare")
-    assert len(rows) == 1 and "hunter2" not in f"{rows[0].summary} {rows[0].error}"
+    assert "error" in await export_indicators(hours=24, min_hits=5)
 
 
 # ── Collector mode ignores control-plane token config ───────────────────────

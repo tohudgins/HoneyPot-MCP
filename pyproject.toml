@@ -58,10 +58,6 @@ dependencies = [
     "alembic>=1.13.0",
     # Docker
     "docker>=7.1.0",
-    # AWS — used by tools/blocklist_push.py for WAFv2 IPSet updates.
-    # Optional in practice (the WAF tool gates the import), but pinning it
-    # in deps makes the blocklist-push feature work out of the box.
-    "boto3>=1.34.0",
     # Threat intel
     "geoip2>=4.8.0",
     # Honeypot protocols. Only DNS needs a library — every other engine is a
@@ -80,7 +76,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.1",
     # Security floors for transitive dependencies (pulled in via fastmcp/mcp and
-    # boto3/httpx/docker). Not imported directly: they exist so resolvers —
+    # httpx/docker). Not imported directly: they exist so resolvers —
     # including plain `pip install` — cannot pick a release with known CVEs.
     "pyjwt>=2.15.0",
     "urllib3>=2.8.0",

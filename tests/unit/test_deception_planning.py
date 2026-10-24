@@ -44,7 +44,7 @@ async def setup_db():
 async def test_every_deployable_type_has_a_capability_entry():
     """A type you can deploy but cannot plan for is invisible to the planner.
 
-    `honeypot_templates` previously carried its own hand-maintained copy of this
+    `deception_profiles` previously carried its own hand-maintained copy of this
     list and silently described fourteen types after five more had shipped.
     """
     from honeypot_mcp.deception.capabilities import BY_TYPE
@@ -57,13 +57,16 @@ async def test_every_deployable_type_has_a_capability_entry():
     )
 
 
-async def test_honeypot_templates_reads_from_the_registry():
+async def test_deception_profiles_lists_sensor_types_from_the_registry():
     from honeypot_mcp.deception.capabilities import BY_TYPE
-    from honeypot_mcp.tools.honeypot import honeypot_templates
+    from honeypot_mcp.tools.deception import deception_profiles
 
-    templates = await honeypot_templates()
-    assert templates["count"] == len(BY_TYPE)
-    assert {t["type"] for t in templates["types"]} == set(BY_TYPE)
+    listing = await deception_profiles()
+    assert {t["type"] for t in listing["sensor_types"]} == set(BY_TYPE)
+    assert listing["profiles"]
+    detail = await deception_profiles(type="postgres")
+    assert detail["type"] == "postgresql" and "settings" in detail
+    assert "error" in await deception_profiles(type="nonsense")
 
 
 async def test_profiles_only_reference_real_sensor_types():

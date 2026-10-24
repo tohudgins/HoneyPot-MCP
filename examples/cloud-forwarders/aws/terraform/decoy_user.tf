@@ -10,7 +10,7 @@
 #   terraform output -raw decoy_access_key_id
 #   terraform output -raw decoy_secret_access_key
 #
-# then, in your agent:  honeytoken_generate_aws(label=..., access_key_id=..., secret_access_key=...)
+# then, in your agent:  honeytoken_create(type="api_key", label=..., metadata={"access_key_id": ..., "secret_access_key": ...})
 #
 # The secret lands in Terraform state: keep the state private, and do not commit it.
 
