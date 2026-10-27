@@ -75,8 +75,8 @@ things were done to the capture, and nothing else:
 
 The grey text in the prompt box at the bottom of some images is Claude Code's own follow-up
 suggestion, not something typed. The model's prose includes its own inferences (for example "looks
-like an authorised tester" or "the same operator"), which are not facts the tools return. Two sessions
-ran on slightly different Claude Code versions; the banner shows which.
+like an authorised tester" or "the same operator"), which are not facts the tools return. The
+banner shows the Claude Code version and model used.
 
 | File | Question (and the tool that answers it; Claude Code collapses its calls to "Called honeypot") |
 |---|---|
