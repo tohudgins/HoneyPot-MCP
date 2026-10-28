@@ -6,7 +6,7 @@
     "layer": "4.5"
   },
   "domain": "enterprise-attack",
-  "description": "ATT&CK techniques HoneyPot-MCP sensors observed, all time. Score = alerts whose event type maps to the technique (an alert counts under every technique it maps to). 16,710,164 of 17,726,494 alerts mapped; the rest are connection bookkeeping.",
+  "description": "ATT&CK techniques HoneyPot-MCP sensors observed, all time. Score = alerts whose event type maps to the technique (an alert counts under every technique it maps to). 16,710,164 of 17,726,494 alerts mapped; the rest are connection bookkeeping. Colour is by order of magnitude of alerts (see the legend), because counts span too wide a range for a linear scale.",
   "sorting": 3,
   "layout": {
     "layout": "side",
@@ -24,21 +24,24 @@
       "tactic": "collection",
       "score": 15,
       "comment": "15 alert(s): postgresql_file_access (15)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1039",
       "tactic": "collection",
       "score": 99,
       "comment": "99 alert(s): rsync_anonymous_access (67), rsync_file_request (21), nfs_mount_attempt (10), imap_mailbox_access (1)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1213",
       "tactic": "collection",
       "score": 781,
       "comment": "781 alert(s): elasticsearch_query_probe (386), elasticsearch_recon_probe (309), elasticsearch_data_access (53), nfs_portmap_dump (29), elasticsearch_health_probe (4)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1602",
@@ -53,7 +56,8 @@
       "tactic": "collection",
       "score": 126,
       "comment": "126 alert(s): snmp_default_community (121), snmp_community_attempt (5)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1071",
@@ -68,21 +72,24 @@
       "tactic": "command-and-control",
       "score": 3,
       "comment": "3 alert(s): honeytoken_triggered_canary_url (3)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1090",
       "tactic": "command-and-control",
       "score": 994,
       "comment": "994 alert(s): ssh_port_forward (442), ssh_port_forward_data (276), ssh_port_forward_ja4h (276)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1105",
       "tactic": "command-and-control",
       "score": 1208,
       "comment": "1,208 alert(s): ssh_file_download (1,175), ftp_file_upload (13), telnet_file_download (10), ssh_file_upload (9), ldap_jndi_lookup (1)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1110",
@@ -97,14 +104,16 @@
       "tactic": "credential-access",
       "score": 4988588,
       "comment": "4,988,588 alert(s): sip_register_attempt (4,517,777), telnet_login_success (291,339), vnc_auth_attempt (66,682), smb_ntlm_auth (58,712), ssh_login_success (19,993)",
-      "enabled": true
+      "enabled": true,
+      "color": "#a8232b"
     },
     {
       "techniqueID": "T1528",
       "tactic": "credential-access",
       "score": 12,
       "comment": "12 alert(s): kubernetes_secret_access (12)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1552",
@@ -119,35 +128,40 @@
       "tactic": "credential-access",
       "score": 12,
       "comment": "12 alert(s): kubernetes_secret_access (12)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1555",
       "tactic": "credential-access",
       "score": 176,
       "comment": "176 alert(s): http_credential_submit (160), honeytoken_triggered_credential_via_mysql_login_attempt (10), honeytoken_triggered_credential_via_ssh_login_success (6)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1046",
       "tactic": "discovery",
       "score": 165164,
       "comment": "165,164 alert(s): smb_negotiate (59,391), sip_request (53,517), sip_invite (49,707), nfs_unknown_program (2,223), docker_api_recon (286)",
-      "enabled": true
+      "enabled": true,
+      "color": "#e04f4f"
     },
     {
       "techniqueID": "T1069",
       "tactic": "discovery",
       "score": 6,
       "comment": "6 alert(s): kubernetes_rbac_enumerate (6)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1082",
       "tactic": "discovery",
       "score": 303,
       "comment": "303 alert(s): mysql_recon_query (98), redis_info_probe (76), postgresql_recon_query (72), redis_config_get (42), memcached_version_probe (11)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1087",
@@ -155,6 +169,7 @@
       "score": 8677807,
       "comment": "8,677,807 alert(s): sip_extension_probe (8,677,807)",
       "enabled": true,
+      "color": "#a8232b",
       "showSubtechniques": true
     },
     {
@@ -162,21 +177,24 @@
       "tactic": "discovery",
       "score": 94,
       "comment": "94 alert(s): ldap_search (50), ldap_anonymous_bind (44)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1135",
       "tactic": "discovery",
       "score": 118,
       "comment": "118 alert(s): rsync_module_access (40), rsync_module_enumeration (30), nfs_portmap_dump (29), nfs_export_enumeration (8), nfs_mount_probe (6)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1613",
       "tactic": "discovery",
       "score": 1317,
       "comment": "1,317 alert(s): docker_api_probe (885), kubernetes_probe (216), docker_api_enumerate (111), kubernetes_recon (54), kubernetes_enumerate (51)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1059",
@@ -184,6 +202,7 @@
       "score": 223,
       "comment": "223 alert(s): mysql_udf_rce (118), redis_eval (34), redis_rogue_replica (23), postgresql_copy_program_rce (22), redis_module_load (18)",
       "enabled": true,
+      "color": "#ec835a",
       "showSubtechniques": true
     },
     {
@@ -191,42 +210,48 @@
       "tactic": "execution",
       "score": 2813998,
       "comment": "2,813,998 alert(s): telnet_command_input (2,792,024), ssh_command_input (21,974)",
-      "enabled": true
+      "enabled": true,
+      "color": "#a8232b"
     },
     {
       "techniqueID": "T1609",
       "tactic": "execution",
       "score": 63,
       "comment": "63 alert(s): docker_api_exec (32), docker_api_exec_start (25), kubernetes_pod_exec (6)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1610",
       "tactic": "execution",
       "score": 100,
       "comment": "100 alert(s): docker_api_container_start (52), docker_api_container_create (32), docker_api_image_pull (16)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1485",
       "tactic": "impact",
       "score": 59,
       "comment": "59 alert(s): mongodb_destructive (50), memcached_flush_all (9)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1486",
       "tactic": "impact",
       "score": 20,
       "comment": "20 alert(s): mongodb_ransom_note (20)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1496",
       "tactic": "impact",
       "score": 25880,
       "comment": "25,880 alert(s): sip_toll_fraud_attempt (25,880)",
-      "enabled": true
+      "enabled": true,
+      "color": "#e04f4f"
     },
     {
       "techniqueID": "T1498",
@@ -241,35 +266,40 @@
       "tactic": "impact",
       "score": 118,
       "comment": "118 alert(s): snmp_bulk_request (70), memcached_stats_probe (30), memcached_amplification_attempt (9), memcached_large_set (9)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1565",
       "tactic": "impact",
       "score": 4,
       "comment": "4 alert(s): snmp_set_request (4)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1078",
       "tactic": "initial-access",
       "score": 311351,
       "comment": "311,351 alert(s): telnet_login_success (291,339), ssh_login_success (19,993), honeytoken_triggered_credential_via_mysql_login_attempt (10), honeytoken_triggered_credential_via_ssh_login_success (6), honeytoken_triggered_canary_url (3)",
-      "enabled": true
+      "enabled": true,
+      "color": "#e04f4f"
     },
     {
       "techniqueID": "T1133",
       "tactic": "initial-access",
       "score": 26636,
       "comment": "26,636 alert(s): rdp_connection (13,438), rdp_handshake (13,099), rdp_nla_negotiate (54), rdp_nla_probe (36), rdp_mcs_handshake (9)",
-      "enabled": true
+      "enabled": true,
+      "color": "#e04f4f"
     },
     {
       "techniqueID": "T1190",
       "tactic": "initial-access",
       "score": 267,
       "comment": "267 alert(s): http_exploit_attempt (124), redis_config_set (102), redis_key_set (40), ldap_jndi_lookup (1)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     },
     {
       "techniqueID": "T1021",
@@ -284,7 +314,8 @@
       "tactic": "lateral-movement",
       "score": 15,
       "comment": "15 alert(s): rdp_session (15)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1505",
@@ -299,14 +330,16 @@
       "tactic": "persistence",
       "score": 8,
       "comment": "8 alert(s): mysql_outfile_write (8)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1611",
       "tactic": "privilege-escalation",
       "score": 42,
       "comment": "42 alert(s): docker_api_container_escape (36), kubernetes_pod_escape (6)",
-      "enabled": true
+      "enabled": true,
+      "color": "#f6c453"
     },
     {
       "techniqueID": "T1595",
@@ -314,6 +347,7 @@
       "score": 8680328,
       "comment": "8,680,328 alert(s): sip_extension_probe (8,677,807), http_probe (929), sip_scan (656), sip_options_probe (439), rdp_invalid_probe (197)",
       "enabled": true,
+      "color": "#a8232b",
       "showSubtechniques": true
     },
     {
@@ -321,19 +355,37 @@
       "tactic": "reconnaissance",
       "score": 3559,
       "comment": "3,559 alert(s): http_active_recon (3,559)",
-      "enabled": true
+      "enabled": true,
+      "color": "#ec835a"
     }
   ],
   "gradient": {
     "colors": [
-      "#fee5d9",
-      "#fb6a4a",
-      "#a50f15"
+      "#f6c453",
+      "#ec835a",
+      "#a8232b"
     ],
     "minValue": 0,
     "maxValue": 8680328
   },
-  "legendItems": [],
+  "legendItems": [
+    {
+      "label": "1 to 99",
+      "color": "#f6c453"
+    },
+    {
+      "label": "100 to 9.9k",
+      "color": "#ec835a"
+    },
+    {
+      "label": "10k to 999k",
+      "color": "#e04f4f"
+    },
+    {
+      "label": "1M or more",
+      "color": "#a8232b"
+    }
+  ],
   "metadata": [],
   "links": [],
   "showTacticRowBackground": false,

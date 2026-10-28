@@ -4,6 +4,16 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The ATT&CK Navigator layer stays readable on any theme
+
+**The Navigator was white and nearly every technique was the same pale peach.** The white is MITRE's page following
+the browser's light theme (it has its own dark theme, under `?` then `theme`, and the choice is saved), which this
+project cannot set from a local launcher page. The peach was ours: scores were coloured on a linear gradient, and
+counts in the real run span 3 to 8.7 million, so 31 of 35 scored techniques sat in the bottom tenth of the scale. Each technique now
+gets a yellow, orange, red or dark red by order of magnitude (1 to 99, 100 to 9.9k, 10k to 999k, 1M or more) with a
+matching legend. The ramp is saturated, so it reads on both themes. The score is still the exact alert count and
+is unchanged in the tooltip and in `attack_summary`.
+
 ## The Grafana dashboards look like the console
 
 **Same palette, same row style, no SQL change.** Stat tiles are plain numbers (CRITICAL in red), severity uses the

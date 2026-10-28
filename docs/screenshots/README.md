@@ -42,7 +42,7 @@ the project's own tools against it (`grafana_start`, `generate_report`, the cons
 | `real-run/final-mitre-coverage.png` | Grafana ATT&CK dashboard: tactic bars, event types, tactic timeline |
 | `real-run/final-alerts.png` | Grafana alert browser (filters and newest alerts) |
 | `real-run/final-query.png` | Grafana **Query** dashboard: ad-hoc SQL over `alert_rollups` (the same read-only SQL surface as the `sql_query` tool) |
-| `real-run/final-attack-navigator.png` | The ATT&CK Navigator with the whole run's layer loaded by `generate_report(format="attack_navigator")`, opened from the launcher page the tool writes (the layer travels inside the link; nothing is uploaded) |
+| `real-run/final-attack-navigator.png` | The ATT&CK Navigator with the whole run's layer loaded by `generate_report(format="attack_navigator")`, opened from the launcher page the tool writes (the layer travels inside the link; nothing is uploaded). Taken with the browser in dark mode: the Navigator follows the system theme, and its `?` menu has a `theme` switch (dark, light, use system) that it remembers for 180 days |
 | `real-run/attack-navigator-layer.json` | The layer file for that capture (17,726,494 alerts, current mapping) |
 | `real-run/final-console.png` | The built-in operations console on the saved run: tiles, attack volume by 6-hour bar, the 23 sensors, top attackers. The header reads "saved run · data ends 2026-10-16 14:42 UTC" because the console measures its window from the newest alert in a restored backup |
 | `real-run/final-html-report.png` | The top of the HTML report `generate_report` writes for the whole run: whole-window totals, the 36 ATT&CK techniques and a line saying the timeline is read from the newest 1,000 alerts |

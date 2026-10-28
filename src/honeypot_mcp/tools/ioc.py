@@ -48,6 +48,23 @@ from honeypot_mcp.tools._scan import (
 )
 from honeypot_mcp.tools._window import annotate_window, window_bounds
 
+# Alert counts span six orders of magnitude (3 to 8.7M in the real run), so a linear gradient paints
+# nearly every technique the same pale colour. Each scored technique gets one of these decade buckets
+# as its own colour instead, and the legend says what each means. The yellow-orange-red ramp stays
+# readable on both the Navigator's light and dark themes (a pale low end vanishes on dark).
+_HEAT_BUCKETS: tuple[tuple[int, str, str], ...] = (
+    (100, "1 to 99", "#f6c453"),
+    (10_000, "100 to 9.9k", "#ec835a"),
+    (1_000_000, "10k to 999k", "#e04f4f"),
+    (10**18, "1M or more", "#a8232b"),
+)
+
+
+def _heat_bucket(alerts: int) -> tuple[int, str, str]:
+    """The decade bucket (upper bound, label, colour) an alert count falls into."""
+    return next(b for b in _HEAT_BUCKETS if alerts < b[0])
+
+
 _NAVIGATOR_URL = "https://mitre-attack.github.io/attack-navigator/"
 # A page that forwards to the Navigator with the layer in the link (see write_navigator_layer).
 _NAVIGATOR_LAUNCHER = """<!doctype html>
@@ -776,6 +793,7 @@ async def build_navigator_layer(
             "score": total,
             "comment": f"{total:,} alert(s): " + ", ".join(f"{t} ({c:,})" for t, c in top),
             "enabled": True,
+            "color": _heat_bucket(total)[2],
         }
     # A sub-technique only shows under an expanded parent, so every scored sub-technique gets its
     # parent in the same tactic. A parent no event type maps to directly scores 0 and says so.
@@ -809,7 +827,8 @@ async def build_navigator_layer(
             f"ATT&CK techniques HoneyPot-MCP sensors observed, {window}. Score = alerts whose "
             "event type maps to the technique (an alert counts under every technique it maps to). "
             f"{mapped:,} of {sum(counts.values()):,} alerts mapped; the rest are connection "
-            "bookkeeping."
+            "bookkeeping. Colour is by order of magnitude of alerts (see the legend), because "
+            "counts span too wide a range for a linear scale."
         ),
         "sorting": 3,
         "layout": {
@@ -824,11 +843,15 @@ async def build_navigator_layer(
         "hideDisabled": False,
         "techniques": techniques,
         "gradient": {
-            "colors": ["#fee5d9", "#fb6a4a", "#a50f15"],
+            "colors": [_HEAT_BUCKETS[0][2], _HEAT_BUCKETS[1][2], _HEAT_BUCKETS[3][2]],
             "minValue": 0,
             "maxValue": max(top_score, 1),
         },
-        "legendItems": [],
+        "legendItems": [
+            {"label": label, "color": color}
+            for _, label, color in _HEAT_BUCKETS
+            if any(t.get("color") == color for t in techniques)
+        ],
         "metadata": [],
         "links": [],
         "showTacticRowBackground": False,

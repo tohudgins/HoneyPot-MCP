@@ -187,6 +187,25 @@ async def test_scores_are_the_alert_counts_attack_summary_reports_for_the_same_d
     assert layer["gradient"]["maxValue"] == 40
 
 
+async def test_colour_follows_order_of_magnitude_so_a_huge_count_cannot_wash_out_the_rest():
+    from honeypot_mcp.tools.ioc import build_navigator_layer
+
+    colours = {}
+    for n in (3, 99, 100, 9_999, 10_000, 999_999, 1_000_000, 8_680_328):
+        layer, _ = await build_navigator_layer({"sip_request": n}, "all time")
+        by_id = {t["techniqueID"]: t for t in layer["techniques"]}
+        colours[n] = by_id["T1046"]["color"]
+        assert by_id["T1046"]["score"] == n, "the score stays the exact alert count"
+        assert [i["color"] for i in layer["legendItems"]] == [colours[n]], (
+            "the legend lists used buckets"
+        )
+
+    assert colours[3] == colours[99] != colours[100] == colours[9_999]
+    assert colours[9_999] != colours[10_000] == colours[999_999]
+    assert colours[999_999] != colours[1_000_000] == colours[8_680_328]
+    assert len(set(colours.values())) == 4
+
+
 async def test_a_sub_technique_carries_its_parent_so_it_shows_when_expanded():
     await _seed_run()
     by_id = {t["techniqueID"]: t for t in _layer(await attack_navigator_layer())["techniques"]}
