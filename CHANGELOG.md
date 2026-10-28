@@ -4,6 +4,15 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The Grafana dashboards look like the console
+
+**Same palette, same row style, no SQL change.** Stat tiles are plain numbers (CRITICAL in red), severity uses the
+console's four colours, the per-engine pie became ranked bars that fit every sensor, and the attacker, country and
+event-type tables are rank rows with a thin blue bar behind the count and plain column names. Map markers are
+translucent red; the tactic bars are blue. The tactic timeline keeps twelve distinct line colours because eleven
+tactics cannot share one. Edits are in the dashboard JSON; `test_mitre_dashboard.py` and `test_dashboard_rollups.py`
+still pin the SQL and pass.
+
 ## The console runs on a saved run, and the HTML report counts the whole run
 
 **Taking screenshots of every visual output found two real bugs and four presentation bugs.** All were visible in

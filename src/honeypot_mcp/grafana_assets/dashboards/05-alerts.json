@@ -200,20 +200,20 @@
                     "type": "value",
                     "options": {
                       "critical": {
-                        "color": "red",
-                        "text": "critical"
+                        "color": "#d03b3b",
+                        "text": "CRIT"
                       },
                       "high": {
-                        "color": "orange",
-                        "text": "high"
+                        "color": "#ec835a",
+                        "text": "HIGH"
                       },
                       "medium": {
-                        "color": "yellow",
-                        "text": "medium"
+                        "color": "#fab219",
+                        "text": "MED"
                       },
                       "low": {
-                        "color": "green",
-                        "text": "low"
+                        "color": "#0ca30c",
+                        "text": "LOW"
                       }
                     }
                   }
@@ -230,6 +230,18 @@
               {
                 "id": "custom.width",
                 "value": 520
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "time:YYYY-MM-DD HH:mm:ss"
               }
             ]
           }

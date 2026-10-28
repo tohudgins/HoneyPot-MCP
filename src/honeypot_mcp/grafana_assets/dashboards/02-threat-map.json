@@ -75,9 +75,9 @@
                   "field": "hits"
                 },
                 "color": {
-                  "fixed": "red"
+                  "fixed": "#e66767"
                 },
-                "opacity": 0.6,
+                "opacity": 0.55,
                 "symbol": {
                   "fixed": "img/icons/marker/circle.svg",
                   "mode": "fixed"
@@ -125,8 +125,11 @@
       "fieldConfig": {
         "defaults": {
           "custom": {
-            "align": "left",
-            "displayMode": "auto"
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
           }
         },
         "overrides": [
@@ -139,21 +142,89 @@
               {
                 "id": "custom.cellOptions",
                 "value": {
-                  "type": "color-background"
+                  "type": "gauge",
+                  "mode": "gradient",
+                  "valueDisplayMode": "text"
                 }
               },
               {
                 "id": "color",
                 "value": {
-                  "mode": "continuous-reds"
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
                 }
+              },
+              {
+                "id": "unit",
+                "value": "locale"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "country"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Country"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hits"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Critical alerts"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unique_ips"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Sources"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "country"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unique_ips"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
               }
             ]
           }
         ]
       },
       "options": {
-        "showHeader": true
+        "showHeader": true,
+        "cellHeight": "sm"
       }
     },
     {
@@ -185,13 +256,13 @@
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineInterpolation": "smooth",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
             "lineWidth": 2
           },
           "color": {
             "mode": "fixed",
-            "fixedColor": "purple"
+            "fixedColor": "#3987e5"
           },
           "unit": "short"
         }
