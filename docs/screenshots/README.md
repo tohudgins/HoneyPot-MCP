@@ -1,26 +1,21 @@
 # Screenshots
 
-Two sets live here. They answer different questions and are produced differently.
+The committed screenshots are all captured from the real run: Grafana and the console on the finished
+17.7M-alert database, and real Claude Code sessions. Nothing here is generated.
 
-| Set | Where | Source | Used by |
-|---|---|---|---|
-| Demo stack | `docs/screenshots/*.png` | **Generated** from the demo compose stack and seeded demo data | The project documentation (see the [README](../../README.md)) |
-| Real run | `docs/screenshots/real-run/` | **Captured** from a live public-IP deployment (5 days) | [RESULTS.md](../RESULTS.md) |
-
-## Demo stack (generated)
-
-Regenerate these rather than replacing them by hand, so they cannot drift from what the software
-renders.
-
-| File | What it shows |
-|---|---|
-| `console.png` | The built-in operations console (`:8090`): live attack feed, sensor health, volume by severity |
-| `overview.png` | Grafana: severity over time, top attackers, per-engine breakdown |
-| `threat-map.png` | Grafana: geo-located attacker origins |
-| `mitre.png` | Grafana: MITRE ATT&CK tactic coverage |
+`scripts/capture_screenshots.sh` can still render the console and three Grafana dashboards from the demo
+compose stack and seeded demo data (`console.png`, `overview.png`, `threat-map.png`, `mitre.png`). Those
+outputs are not committed, because the real-run captures below replace them.
 
 ```bash
 ./scripts/capture_screenshots.sh
+```
+
+It needs Docker and brings up a ~400 MB headless-Chromium renderer sidecar. Tear it down afterwards:
+
+```bash
+docker compose -f docker/docker-compose.yml \
+               -f docker/docker-compose.screenshots.yml down
 ```
 
 That brings the demo stack up with a headless-Chromium renderer sidecar, seeds demo data if the last
@@ -54,11 +49,10 @@ the project's own tools against it (`grafana_start`, `generate_report`, the cons
 | `real-run/bait-documents.png` | The PDF and Word honeytokens from `honeytoken_create(type="file")`, rendered with macOS Quick Look. These are not from the run: they are made in a scratch database. The PDF has an `/OpenAction` URI that fires on opening, the Word file a linked remote 1×1 image (checked in the files) |
 
 The dashboards are whole pages from `grafana_start` on the finished database, rendered by headless
-Chromium after every panel had loaded. They were re-taken after the dashboards were changed to read the
-hourly rollups instead of scanning the alerts table: all five now load in 17 seconds in total (1.6 to
-2.6 s each), where before the Overview, Threat Map, MITRE and Alerts dashboards took 45 seconds to over
-two and a half minutes each. The time-series bars are therefore hourly for windows over six hours
-(finer below that). Attacker addresses in these captures are masked to their first two octets.
+Chromium after every panel had loaded. They read the hourly rollups instead of scanning the alerts table,
+so all five load in 17 seconds in total, and they use the console's palette and ranked-row tables. The
+time-series bars are hourly for windows over six hours (finer below that). Attacker addresses in these
+captures are masked to their first two octets.
 
 ## Claude Code sessions (captured)
 
@@ -91,10 +85,10 @@ banner shows the Claude Code version and model used.
 | `claude-code/pcap-suricata-replay.png` | "Replay the attacker packet capture … through Suricata and tell me what it found." (`pcap_detect`; 57 alerts read as a SIP login flood plus toll-fraud probing) |
 | `claude-code/open-navigator-and-grafana.png` | "Open the ATT&CK Navigator for the whole run, then show me the Grafana dashboards." (`generate_report`, `grafana_start`: both opened in the browser, Grafana already signed in) |
 
-**Source addresses.** The older `real-run/` crops show counts and countries only. The `final-*`
-captures contain attacker addresses **masked to their first two octets** (`103.132.x.x`), including
-inside the Grafana tables (masked in the page before capture); the `claude-code/` images mask the
-last two octets as above. Check a new capture for source addresses and credentials before committing it.
+**Source addresses.** The `final-*` captures contain attacker addresses **masked to their first two
+octets** (`103.132.x.x`), including inside the Grafana tables (masked in the page before capture); the
+`claude-code/` images mask the last two octets as above. Check a new capture for source addresses and
+credentials before committing it.
 
 ## Notes for whoever touches this next
 
