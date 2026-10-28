@@ -502,11 +502,14 @@ async def test_wal_database_nobody_has_open_is_read_as_immutable(
 async def test_password_is_in_a_private_file_and_nowhere_else(
     database, docker_client, healthy_probe
 ):
+    from honeypot_mcp.config import get_settings
     from honeypot_mcp.tools.grafana import grafana_start
 
     result = await grafana_start(port=3300)
     password = docker_client.created[0].spec["environment"]["GF_SECURITY_ADMIN_PASSWORD"]
-    pw_file = Path(result["password_file"])
+    pw_file = get_settings().grafana_dir / "admin_password"
+    # The person is signed in by a link, so nothing in the result sends them to the file or the secret.
+    assert result["signed_in_url"].startswith("http://127.0.0.1:") and "password_file" not in result
 
     assert len(password) >= 24
     assert pw_file.read_text().strip() == password

@@ -39,10 +39,29 @@ DASHBOARD = (
     ROOT / "src" / "honeypot_mcp" / "grafana_assets" / "dashboards" / "03-mitre-coverage.json"
 )
 
-_WINDOW = (
-    "timestamp BETWEEN datetime($__from / 1000, 'unixepoch') "
-    "AND datetime($__to / 1000, 'unixepoch')"
-)
+OVERVIEW = ROOT / "src" / "honeypot_mcp" / "grafana_assets" / "dashboards" / "01-overview.json"
+
+
+def _series_source() -> tuple[str, str]:
+    """(the `WITH b AS ..., w AS (...)` text, the bucket expression) the overview's time series use.
+
+    The tactic panels count what the overview panels count, from the same place: the hourly
+    rollups plus raw rows only at the window's edges (and for a short window, where nothing is
+    rolled up yet). Reading them back out of the overview dashboard means there is one copy of that
+    SQL to get wrong, and `test_dashboard_rollups` holds it to the raw table.
+    """
+    import re
+
+    dashboard = json.loads(OVERVIEW.read_text())
+    panel = next(p for p in dashboard["panels"] if p.get("title") == "Alerts over time by severity")
+    sql = panel["targets"][0]["queryText"]
+    source = re.match(r"^(WITH b AS .*?\) )SELECT ", sql, re.S)
+    width = re.search(r"AS INTEGER\) \* (\(CASE WHEN .*? END\)), 'unixepoch'", sql)
+    if source is None or width is None:
+        raise SystemExit(
+            f"{OVERVIEW.name}: 'Alerts over time by severity' no longer has the shape this generator reads"
+        )
+    return source.group(1).rstrip(), width.group(1)
 
 
 async def tactic_event_types() -> dict[str, list[str]]:
@@ -139,46 +158,33 @@ def build_observed_tactics_sql(
     """Bar gauge: one row per tactic, counted over the dashboard window."""
     from honeypot_mcp.intel.mitre import tactic_label
 
+    cte, _ = _series_source()
     selects = [
-        f"SELECT '{tactic_label(tactic)}' AS tactic, COUNT(*) AS count "
-        f"FROM alerts WHERE {predicate} AND {_WINDOW}"
+        f"SELECT '{tactic_label(tactic)}' AS tactic, COALESCE(SUM(n), 0) AS count "
+        f"FROM w WHERE {predicate}"
         for tactic, predicate in _tactics(by_tactic, prefixes or {})
     ]
-    return "\n  UNION ALL\n".join(selects) + "\n  ORDER BY count DESC"
-
-
-# ~240 buckets across whatever window the viewer selected, floored at 60s.
-# Derived from $__from/$__to (epoch milliseconds) rather than $__interval_ms so
-# it depends only on the macros these dashboards already prove are interpolated.
-# A fixed bucket width is wrong in both directions: hourly over a year is 8,760
-# points per series, and hourly over a five-minute window is a single column.
-_BUCKET = "MAX((($__to) - ($__from)) / 240000, 60)"
+    return cte + "\n" + "\n  UNION ALL\n".join(selects) + "\n  ORDER BY count DESC"
 
 
 def build_tactic_timeline_sql(
     by_tactic: dict[str, list[str]], prefixes: dict[str, list[str]] | None = None
 ) -> str:
     """Timeseries: one column per tactic, bucketed to fit the selected window."""
+    cte, width = _series_source()
     columns = [
-        f'SUM(CASE WHEN {predicate} THEN 1 ELSE 0 END) AS "{tactic}"'
+        f'SUM(CASE WHEN {predicate} THEN n ELSE 0 END) AS "{tactic}"'
         for tactic, predicate in _tactics(by_tactic, prefixes or {})
     ]
-    bucket = f"CAST(strftime('%s', timestamp) / ({_BUCKET}) AS INTEGER)"
+    bucket = f"CAST(strftime('%s', ts) / {width} AS INTEGER)"
     return (
-        f"SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime({bucket} * ({_BUCKET}), "
-        "'unixepoch')) AS time,\n  "
+        cte
+        + f"\nSELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime({bucket} * {width}, 'unixepoch')) AS time,\n  "
         + ",\n  ".join(columns)
-        + f"\nFROM alerts WHERE {_WINDOW}"
-        + f"\nGROUP BY {bucket} ORDER BY time"
+        + f"\nFROM w GROUP BY {bucket} ORDER BY time"
     )
 
 
-# frser-sqlite-datasource carries the query twice: `rawQueryText` is the editor
-# buffer, `queryText` is what the backend actually runs. Writing only the former
-# leaves the panel *executing* the old SQL while the editor shows the new — the
-# fix silently does nothing, and reading the JSON suggests it worked. Every
-# hand-written panel in these dashboards keeps the two identical;
-# `test_dashboard_query_fields_agree` holds that invariant.
 _SQL_FIELDS = ("queryText", "rawQueryText", "rawSql")
 
 

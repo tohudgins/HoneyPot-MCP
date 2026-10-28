@@ -423,10 +423,22 @@ def _expected_tactic_counts(event_types) -> dict[str, int]:
 
 
 def _one_alert_per(event_types) -> sqlite3.Connection:
+    """One alert per name, in the raw table and in its hourly rollup, as the server writes them."""
     con = sqlite3.connect(":memory:")
-    con.execute("CREATE TABLE alerts (event_type TEXT, timestamp TEXT)")
+    con.execute(
+        "CREATE TABLE alerts (event_type TEXT, timestamp TEXT, severity TEXT, source_ip TEXT, honeypot_id INTEGER)"
+    )
+    con.execute(
+        "CREATE TABLE alert_rollups (bucket TEXT, severity TEXT, event_type TEXT, source_ip TEXT, "
+        "honeypot_id INTEGER, count INTEGER)"
+    )
     con.executemany(
-        "INSERT INTO alerts VALUES (?, '2026-10-16 12:00:00.000000')", [(n,) for n in event_types]
+        "INSERT INTO alerts VALUES (?, '2026-10-16 12:00:00.000000', 'low', '203.0.113.5', 1)",
+        [(n,) for n in event_types],
+    )
+    con.executemany(
+        "INSERT INTO alert_rollups VALUES ('2026-10-16 12:00:00.000000', 'low', ?, '203.0.113.5', 1, 1)",
+        [(n,) for n in event_types],
     )
     return con
 
@@ -436,7 +448,8 @@ def test_every_event_type_seen_on_a_real_run_is_counted_under_its_tactics():
     syntax slip in the honeytoken prefix match all fail here.
 
     One alert per pinned name, no other rows: every tactic's total must equal the number of
-    pinned names the mapper files under it, in both panels.
+    pinned names the mapper files under it, in both panels. Each alert is in the raw table AND in
+    its hourly rollup, as the server writes them, so a panel that read both would double count.
     """
     from honeypot_mcp.intel.mitre import tactic_label
 

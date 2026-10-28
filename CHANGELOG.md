@@ -4,6 +4,32 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The dashboards no longer take minutes to load
+
+**Opening Grafana on the real 17.7M-alert run looked broken**: the Overview, Threat Map, MITRE ATT&CK Coverage
+and Alerts dashboards each took 45 seconds to over two and a half minutes to fill, and the SQLite datasource
+answers one query at a time, so clicking on to another dashboard while the first was still loading queued behind
+it and the page seemed stuck on the overview. Measured in a real browser with the signed-in link; nothing was
+wrong with the navigation (the left menu and the "HoneyPot dashboards" button both list all five).
+
+- **They broke the project's own rule** (statistics read the hourly rollups, never the alert table): the severity
+  and unique-source time series, the three tactic panels and the alert browser scanned all 17.7M rows. The time
+  series and tactic panels now read the rollups, with raw rows only at a window's edges and for windows under six
+  hours (so a five-minute window keeps its detail; longer windows are hourly). `generate_mitre_dashboard.py`
+  derives its SQL from the overview's, so there is one copy to get wrong.
+- **The map reads only the rows it can count**: GeoIP enrichment is only ever written onto CRITICAL alerts, so
+  the origins and countries panels name that (plus the partial index's own predicate, which SQLite needs to see
+  to use `ix_alerts_urgent`) and read about 28,000 rows instead of running `json_extract` on every payload.
+- **The alert browser** turns its window into an id range with two index seeks and walks the primary key newest
+  first (alert ids are chronological), instead of sorting every alert in the window to take 200: 46 s to 0.00 s,
+  the identical 200 rows.
+- **Result:** all five dashboards load in 17 seconds in total (1.6 to 2.6 s each) on the real database, with the
+  same numbers as before (Discovery 8,844,809, Reconnaissance 8,683,887, Credential Access 4,988,776, 17,726,494
+  alerts). New tests hold every changed panel to the raw table, bucket by bucket, on windows that start
+  mid-hour, on the hour, run past the data or fit inside one hour, and check the query plans.
+- **`grafana_start` no longer returns `password_file`** when it hands back a signed-in link, so a model does not
+  send the person to read a file.
+
 ## Every tool reads its own result, and shows you the thing
 
 **A tool that answers with rows, or with "go to this site and upload the file", makes the person do the work.**

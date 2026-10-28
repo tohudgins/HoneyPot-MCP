@@ -129,6 +129,7 @@ def running_result():
         "port": 3001,
         "dashboard_urls": {"Overview": "http://127.0.0.1:3001/d/honeypot-overview"},
         "read_password_with": "cat /x/admin_password",
+        "password_file": "/x/admin_password",
         "datasource_ok": True,
         "dashboards": ["Overview"],
     }
@@ -184,6 +185,7 @@ async def test_start_opens_the_signed_in_page_and_every_link_carries_the_data_ra
         "http://127.0.0.1:50000/tok"
     ]
     assert "read_password_with" not in running_result  # nobody is told to go read a file
+    assert "password_file" not in running_result and "cat " not in str(running_result)
     # a frozen run opens on the days the data covers, not on "the last 6 hours" (empty)
     # the oldest hour (rollups are hourly), whatever order the rows were inserted in
     start_ms = int((newest - timedelta(hours=100)).replace(minute=0).timestamp() * 1000)
@@ -216,6 +218,9 @@ async def test_without_a_password_file_the_plain_urls_and_password_file_are_kept
 
     assert "signed_in_url" not in running_result
     assert running_result["read_password_with"] == "cat /x/admin_password"
+    assert (
+        running_result["password_file"] == "/x/admin_password"
+    )  # no link: the file is the only way in
 
 
 def test_the_headline_says_what_the_person_can_do_now():

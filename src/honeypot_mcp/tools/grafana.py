@@ -64,7 +64,10 @@ async def _add_links(result: dict[str, Any], *, open_now: bool) -> None:
     except (OSError, ValueError):
         return  # no sign-in link: the plain URLs and the password file are still returned
     result["signed_in_url"] = link
+    # Nothing in the result sends the person to a file: the link signs them in, and a fresh one
+    # is a `grafana_status` away. (The password file stays on disk, 0600.)
     result.pop("read_password_with", None)
+    result.pop("password_file", None)
     result["summary"] = (
         f"Grafana is running at {result.get('url')} (loopback only); sign-in is handled by `signed_in_url`."
     )
