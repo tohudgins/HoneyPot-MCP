@@ -18,6 +18,8 @@ import pytest
 # Shortening the interval for tests turns those exact-boundary waits into a
 # 20x margin without rewriting 40-odd assertions.
 os.environ.setdefault("EVENT_FLUSH_INTERVAL_SECONDS", "0.05")
+# A test must never open a browser on the developer's machine.
+os.environ.setdefault("OPEN_IN_BROWSER", "false")
 
 
 @pytest.fixture(autouse=True)

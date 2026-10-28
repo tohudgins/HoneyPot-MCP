@@ -279,3 +279,53 @@ async def test_an_ip_is_ignored_with_a_note_and_a_wrong_extension_is_refused():
 
     wrong = await write_report(None, None, "attack_navigator", None, output_path="layer.md")
     assert "must end in .json" in wrong["error"]
+
+
+async def test_the_launcher_page_loads_the_layer_into_the_navigator_without_a_server(monkeypatch):
+    """`localhost` links are blocked by the browser (CORS), so the layer rides in the link itself."""
+    import base64
+    from urllib.parse import unquote
+
+    await _seed_run()
+    out = await attack_navigator_layer()
+
+    launcher = Path(out["open_in_navigator"].removeprefix("file://"))
+    page = launcher.read_text(encoding="utf-8")
+    link = json.loads(re.search(r"location\.replace\((\".*?\")\);", page).group(1))
+    assert link.startswith("https://mitre-attack.github.io/attack-navigator/#layerURL=data%3A")
+    encoded = unquote(link.split("#layerURL=", 1)[1]).split(",", 1)[1]
+    assert json.loads(base64.b64decode(encoded)) == _layer(
+        out
+    )  # the same layer, not a copy that drifted
+    assert out["opened_in_browser"] is False  # tests never open a browser
+
+
+async def test_the_reading_says_whether_it_opened_or_where_to_open_it(monkeypatch):
+    from honeypot_mcp.tools import ioc
+
+    await _seed_run()
+    closed = await attack_navigator_layer()
+    assert (
+        "Open file://" in closed["headline"]
+        and "to load the layer into the ATT&CK Navigator" in closed["headline"]
+    )
+    assert "94 of 74" not in closed["headline"]
+    # 40+7+12 mapped of 74 alerts (15 are connection bookkeeping): 59 of 74 = 80%
+    assert closed["headline"].startswith("59 of 74 alerts (80%) map to ")
+
+    async def fake_open(_url):
+        return True
+
+    monkeypatch.setattr(ioc, "open_page", fake_open)
+    opened = await attack_navigator_layer()
+    assert opened["opened_in_browser"] is True
+    assert opened["headline"].endswith("The layer is open in the ATT&CK Navigator in your browser.")
+    # the technique the most alerts map to is named, from the built-in mapping
+    assert "T1046" in opened["headline"].split(";")[1] or "T1046" in opened["headline"]
+
+
+async def test_an_empty_window_says_there_is_nothing_to_map():
+    out = await attack_navigator_layer()
+
+    assert out["headline"].startswith("No alerts in all time")
+    assert out["techniques"] == 0

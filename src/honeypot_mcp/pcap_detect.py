@@ -1671,8 +1671,234 @@ async def _write_artifact(
     return out
 
 
+# ── the plain-language reading ──────────────────────────────────────────────────────────────
+
+_RULES_STALE_DAYS = 30
+_SEVERITY_NAMES = {1: "high", 2: "medium", 3: "low"}
+# Signature text first, because ET categories mislead: a Sipvicious scan is filed under
+# "Attempted Information Leak" and a MySQL `show databases` under "Generic Protocol Command Decode".
+_SIGNATURE_READINGS: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        "exploit",
+        re.compile(r"\bET (EXPLOIT|WEB_|CVE|ACTIVEX|SHELLCODE)|\bCVE-\d|\bexploit\b", re.I),
+        "an exploitation attempt",
+    ),
+    (
+        "malware",
+        re.compile(r"\bET (MALWARE|TROJAN|CNC|BOTCC|MOBILE_MALWARE)\b|\bC2\b", re.I),
+        "malware or command-and-control traffic",
+    ),
+    (
+        "blocklist",
+        re.compile(r"\bET (DROP|CINS|DSHIELD|COMPROMISED)\b|Dshield|Block Listed", re.I),
+        "a source on a known-bad list",
+    ),
+    (
+        "scan",
+        re.compile(r"\bscan(ner|ning)?\b|sipvicious|friendly-scanner|nmap|masscan", re.I),
+        "scanning or reconnaissance",
+    ),
+    (
+        "sip",
+        re.compile(r"\b(VOIP|SIP)\b.*\b(flood|unauthorized)", re.I),
+        "a SIP login flood, consistent with password guessing (the 'Denial of Service' label is "
+        "the honeypot's own 401 'Unauthorized' replies, not an attack on you)",
+    ),
+    (
+        "database",
+        re.compile(r"\b(GPL|ET) SQL\b|\bMYSQL\b|\bMSSQL\b|\bPOSTGRES", re.I),
+        "database commands sent to the decoy",
+    ),
+    ("info", re.compile(r"\b(ET|GPL) INFO\b", re.I), "informational matches only"),
+)
+_CATEGORY_READINGS: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        "exploit",
+        re.compile(r"web application attack|privilege gain|misc attack|exploit kit", re.I),
+        "an exploitation attempt",
+    ),
+    (
+        "malware",
+        re.compile(r"trojan|executable code|malware|command and control", re.I),
+        "malware or command-and-control traffic",
+    ),
+    ("dos", re.compile(r"denial of service", re.I), "a denial-of-service attempt"),
+    ("scan", re.compile(r"network scan", re.I), "scanning or reconnaissance"),
+    ("info", re.compile(r"misc activity|not suspicious", re.I), "informational matches only"),
+)
+_PHRASES = {tag: phrase for tag, _rx, phrase in (*_SIGNATURE_READINGS, *_CATEGORY_READINGS)}
+_PRIORITY = ("exploit", "malware", "blocklist", "scan", "sip", "dos", "database", "info")
+
+
+def _word(value: Any, limit: int = 16) -> str:
+    """An engine protocol name reduced to `[a-z0-9_-]`."""
+    return re.sub(r"[^a-z0-9_.-]", "", str(value).lower())[:limit]
+
+
+def _ruleset_staleness(result: dict[str, Any]) -> str | None:
+    """Why the ruleset is old, in a few words, or None when it is current enough."""
+    rules = result.get("rules") or {}
+    validated = rules.get("validated_with")
+    running = result.get("engine_version")
+    if validated and running and validated != running:
+        return f"validated with Suricata {_word(validated, 12)}, run with {_word(running, 12)}"
+    retrieved = rules.get("retrieved_at")
+    if isinstance(retrieved, str):
+        try:
+            when = datetime.fromisoformat(retrieved)
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - when).days
+        if age > _RULES_STALE_DAYS:
+            return f"downloaded {age} days ago"
+    return None
+
+
+def _app_protocols(flows_by_app: dict[str, int]) -> str:
+    """The recognised application protocols in the flows, by volume (engine vocabulary)."""
+    ranked = sorted(flows_by_app.items(), key=lambda kv: (-kv[1], kv[0]))
+    names = [_word(n) for n, _c in ranked if n not in ("failed", "unrecognised")]
+    return ", ".join([n for n in names if n][:3])
+
+
+def suricata_headline(result: dict[str, Any]) -> str:
+    """Read a Suricata digest in plain words from fields it already holds."""
+    alerts = result.get("alerts") or {}
+    protocols = result.get("protocols") or {}
+    rules_loaded = int(result.get("rules_loaded") or 0)
+    total = int(alerts.get("total") or 0)
+    artifacts = int(alerts.get("checksum_artifacts") or 0)
+    real = int(alerts.get("excluding_checksum_artifacts", total - artifacts) or 0)
+    flows = int(protocols.get("flows") or 0)
+    protos = _app_protocols(protocols.get("flows_by_app_proto") or {})
+    seen = ""
+    if flows:
+        seen = f"It followed {flows:,} flow(s)" + (f" ({protos})." if protos else ".")
+    artifact_note = (
+        f"{artifacts:,} 'invalid checksum' alert(s) are capture artifacts, not attacks."
+        if artifacts
+        else ""
+    )
+    if rules_loaded == 0:
+        return pcap_analysis.fit_headline(
+            "Suricata loaded 0 rules, so no alert here is NOT a clean result: nothing was "
+            "checked against signatures. Call detection_rules_update() (admin), then replay.",
+            [seen],
+        )
+    stale = _ruleset_staleness(result)
+    stale_note = (
+        f"The ruleset is stale ({stale}), so a quiet result is weak: call detection_rules_update()."
+        if stale
+        else ""
+    )
+    if real == 0:
+        core = (
+            f"Suricata ({rules_loaded:,} rules) matched no attack signature."
+            + (f" {artifact_note}" if artifact_note else "")
+            + " That means no known signature matched, not that the traffic was benign."
+        )
+        return pcap_analysis.fit_headline(core, [stale_note, seen])
+
+    tags: set[str] = set()
+    unread = 0
+    for sig in alerts.get("by_signature") or []:
+        if sig.get("capture_artifact"):
+            continue
+        text = str(sig.get("signature") or "")
+        hit = next((t for t, rx, _p in _SIGNATURE_READINGS if rx.search(text)), None)
+        if hit is None:
+            category = str(sig.get("category") or "")
+            hit = next((t for t, rx, _p in _CATEGORY_READINGS if rx.search(category)), None)
+        if hit is None:
+            unread += 1
+        else:
+            tags.add(hit)
+    ordered = [t for t in _PRIORITY if t in tags]
+    reading = "; ".join(_PHRASES[t] for t in ordered[:2]) or "signatures with no standard meaning"
+    more = max(len(ordered) - 2, 0) + (unread if ordered else 0)
+    if more:
+        reading += f" (+{more} other kind(s))"
+    ratings = [int(s) for s in (alerts.get("by_severity") or {}) if str(s).isdigit()]
+    severity = ""
+    if ratings:
+        worst = min(ratings)
+        severity = f" Worst severity {worst} ({_SEVERITY_NAMES.get(worst, 'unrated')})."
+    core = (
+        f"Suricata ({rules_loaded:,} rules) raised {real:,} real alert(s), reading as "
+        f"{reading}.{severity}"
+    )
+    return pcap_analysis.fit_headline(
+        core,
+        [
+            stale_note,
+            artifact_note,
+            "A replay shows which signatures match, not whether the attack worked.",
+            seen,
+        ],
+    )
+
+
+def zeek_headline(result: dict[str, Any]) -> str:
+    """Read a Zeek digest in plain words: connection and protocol counts, notices, oddities."""
+    conns = result.get("connections") or {}
+    total = int(conns.get("total") or 0)
+    if not total:
+        return (
+            "Zeek found no IP connections to follow in the capture, so it says nothing about "
+            "the traffic; try pcap_analyze on the same file."
+        )
+    ranked = sorted((conns.get("by_service") or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+    services = [w for n, _c in ranked if n != "-" and (w := _word(n))][:3]
+    anomalies = conns.get("anomalies") or {}
+    unanswered = int(anomalies.get("S0", 0)) + int(anomalies.get("REJ", 0))
+    notices = result.get("notices") or {}
+    notice_total = int(notices.get("total") or 0)
+    weird = int((result.get("weird") or {}).get("total") or 0)
+    core = f"Zeek logged {total:,} connection(s)" + (
+        f" ({', '.join(services)})" if services else ""
+    )
+    if unanswered:
+        core += (
+            f"; {unanswered:,} got no answer or were refused, which is what probing closed or "
+            "filtered ports looks like"
+        )
+    elif anomalies:
+        odd = sum(int(v) for v in anomalies.values())
+        core += f"; {odd:,} ended abnormally (resets or half-open)"
+    else:
+        core += "; every one completed normally"
+    if notice_total:
+        names = [
+            pcap_analysis.quote_value(g.get("note")) for g in (notices.get("groups") or [])[:2]
+        ]
+        core += f"; {notice_total:,} notice(s), led by {', '.join(names)}"
+    else:
+        core += "; no notices"
+    core += "."
+    return pcap_analysis.fit_headline(
+        core,
+        [
+            f"{weird:,} protocol oddity log(s) in `weird`." if weird else "",
+            "Zeek raises notices only for a few behaviours (scans, SSH guessing, some exploits), "
+            "so no notice is not a clean bill; pcap_detect with Suricata checks signatures.",
+        ],
+    )
+
+
+def _with_headline(result: dict[str, Any], headline: str) -> dict[str, Any]:
+    """`result` with `headline` as its first key."""
+    return {"headline": headline, **result}
+
+
 def _empty_result(engine: str, scan: CaptureScan, size: int) -> dict[str, Any]:
     return {
+        "headline": (
+            "The capture holds no packets, so nothing was replayed. That says nothing about the "
+            "attacker: its traffic was probably older than the ring buffer. Try another file "
+            "from pcap_files."
+        ),
         "engine": engine,
         "ran": False,
         "count": 0,
@@ -1741,12 +1967,14 @@ async def _detect(path: str | None, engine: str, top: int) -> dict[str, Any]:
         if scan.problem:
             return {"error": scan.problem, "file": file_info}
         if scan.packets == 0:
-            return {"file": file_info, **_empty_result(engine, scan, size)}
+            empty = _empty_result(engine, scan, size)
+            return {"headline": empty.pop("headline"), "file": file_info, **empty}
         try:
             result = await _run_engine(fh, engine, top, scan, resolved.name, settings)
         except DetectError as e:
             return {**e.as_dict(), "file": file_info}
-        return {"file": file_info, **result}
+        headline = result.pop("headline", None)
+        return {**({"headline": headline} if headline else {}), "file": file_info, **result}
     finally:
         fh.close()
 
@@ -1884,11 +2112,13 @@ async def _finish_suricata(
     if rules_loaded == 0:
         notes.append(
             "rules_loaded is 0: no detection rules were available, so there are no signature "
-            "alerts, only protocol, flow and anomaly events. Run detection_rules_update (admin; "
-            "downloads the Emerging Threats Open ruleset) and replay again."
+            "alerts, only protocol, flow and anomaly events. Call detection_rules_update() "
+            "(admin, needs internet and Docker; about 15 s once the image is present, downloads "
+            f"~45 MB of Emerging Threats Open rules), then pcap_detect(path={file_name!r}) again."
             if not rules.present and not rules.custom
             else "rules_loaded is 0: the rules files in the cache could not be loaded, so there "
-            "are no signature alerts. Run detection_rules_update to replace them."
+            "are no signature alerts. Call detection_rules_update() (admin) to replace them, "
+            "then replay; it reports rules_loaded when it is done."
         )
     if rules_failed:
         notes.append(f"{rules_failed} rule(s) failed to load (check {CUSTOM_RULES_FILE}).")
@@ -1900,7 +2130,8 @@ async def _finish_suricata(
     ):
         notes.append(
             f"The ruleset was validated with Suricata {meta['suricata_version']} but this run "
-            f"used {version}; run detection_rules_update to refresh it."
+            f"used {version}; call detection_rules_update() (admin) to re-download rules "
+            "that match, then replay."
         )
     if sections["alerts"]["checksum_artifacts"]:
         notes.append(
@@ -1943,7 +2174,7 @@ async def _finish_suricata(
         "events": stats.rows,
     }
     result["artifact"] = await _write_artifact(artifact, header, "suricata", file_name)
-    return _finalize(result, notes, truncated)
+    return _finalize(_with_headline(result, suricata_headline(result)), notes, truncated)
 
 
 async def _finish_zeek(
@@ -1990,7 +2221,7 @@ async def _finish_zeek(
         "logs": {name: s.rows for name, s in per_log.items()},
     }
     result["artifact"] = await _write_artifact(artifact, header, "zeek", file_name)
-    return _finalize(result, notes, truncated)
+    return _finalize(_with_headline(result, zeek_headline(result)), notes, truncated)
 
 
 # ── the ruleset ─────────────────────────────────────────────────────────────────────────────

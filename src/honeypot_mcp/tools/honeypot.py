@@ -359,6 +359,56 @@ async def honeypot_deploy(
     return result
 
 
+def _row_verdict(status: HoneypotStatus, hits: int, total_hits: int) -> str:
+    """A plain reading of one sensor row. In analysis mode nothing runs, so a row is only what the
+    original server last recorded."""
+    share = f"{round(100 * hits / total_hits)}% of the listed alerts" if total_hits else "no alerts"
+    if instance_lock.in_analysis_mode():
+        return f"Last recorded as {status.value} on the original server, {hits:,} alerts."
+    if status == HoneypotStatus.ERROR:
+        return "In error and not capturing: honeypot_status(name) shows why."
+    if status == HoneypotStatus.PAUSED:
+        return "Paused, so not capturing: honeypot_resume(name) restarts it."
+    if status == HoneypotStatus.STOPPED:
+        return f"Stopped; not capturing, history kept ({hits:,} alerts)."
+    if hits == 0:
+        return (
+            "Running but has captured nothing: quiet, or not reachable by attackers; "
+            "honeypot_status(name) probes it."
+        )
+    return f"Running; {hits:,} alerts ({share})."
+
+
+def _list_headline(rows: list[dict[str, Any]], total: int, by_status: dict[str, int]) -> str:
+    """One sentence for a sensor list: how many, in what state, busiest, and any silent ones."""
+    if not rows:
+        return "No honeypots match; honeypot_deploy or deception_plan creates some."
+    n = f"{total} sensor{'s' if total != 1 else ''}"
+    if len(by_status) == 1:
+        state = f"all {next(iter(by_status))}"
+    else:
+        state = ", ".join(f"{c} {s}" for s, c in sorted(by_status.items()))
+    if instance_lock.in_analysis_mode():
+        text = (
+            f"Analysis copy, nothing runs here: {n} as the original server last recorded ({state})"
+        )
+    else:
+        text = f"{n}, {state}"
+    total_hits = sum(int(r["hits"]) for r in rows)
+    if total_hits:
+        busiest = max(rows, key=lambda r: int(r["hits"]))
+        pct = round(100 * int(busiest["hits"]) / total_hits)
+        text += f"; busiest {busiest['name']} with {pct}% of alerts"
+    if not instance_lock.in_analysis_mode():
+        silent = [r["name"] for r in rows if r["status"] == "running" and not r["hits"]]
+        if silent:
+            text += f"; {len(silent)} running with zero events: check with honeypot_status(name)"
+    other = [r["name"] for r in rows if r["status"] in ("error", "paused")]
+    if other:
+        text += f"; {len(other)} in error or paused: honeypot_status(name) says why"
+    return text + "."
+
+
 @mcp.tool(**hints("honeypot_list"))
 async def honeypot_list(status: str | None = None, type: str | None = None) -> dict[str, Any]:
     """Which honeypots are deployed, and how busy is each?
@@ -390,6 +440,7 @@ async def honeypot_list(status: str | None = None, type: str | None = None) -> d
         shown = honeypots[:_LIST_CAP]
         ids = [hp.id for hp in shown]
         counts = await queries.get_hit_counts(session, ids) if ids else {}
+        total_hits = sum(counts.get(i, 0) for i in ids)
         rows = [
             {
                 "id": hp.id,
@@ -399,6 +450,7 @@ async def honeypot_list(status: str | None = None, type: str | None = None) -> d
                 "status": hp.status.value,
                 "hits": counts.get(hp.id, 0),
                 "created_at": hp.created_at.isoformat() if hp.created_at else None,
+                "verdict": _row_verdict(hp.status, counts.get(hp.id, 0), total_hits),
             }
             for hp in shown
         ]
@@ -413,7 +465,13 @@ async def honeypot_list(status: str | None = None, type: str | None = None) -> d
         note = f"Showing {len(rows)} of {total}; ask for one status or type to narrow it."
     else:
         note = "`hits` is the number of alerts each captured, lifetime."
-    return {"count": total, "by_status": by_status, "honeypots": rows, "note": note}
+    return {
+        "headline": _list_headline(rows, total, by_status),
+        "count": total,
+        "by_status": by_status,
+        "honeypots": rows,
+        "note": note,
+    }
 
 
 def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
@@ -446,6 +504,44 @@ def _owned_elsewhere(hp: Honeypot) -> dict[str, Any] | None:
         "alive": None,
         "method": "not-probed",
     }
+
+
+def _status_headline(
+    hp: Honeypot, hits: int, engine_status: dict[str, Any], log_lines: list[str]
+) -> str:
+    """One sentence for a named sensor: alive/dead/not probed, port, log in a few words, hits."""
+    where = f"{hp.name} ({hp.type.value}, port {hp.port})"
+    recorded = hp.status.value
+    if engine_status.get("method") == "not-probed":
+        if instance_lock.in_analysis_mode():
+            state = (
+                f"was last recorded as {recorded} by the original server; nothing runs in this copy"
+            )
+        else:
+            state = f"was last recorded as {recorded}; its live state belongs to another process"
+    elif hp.status == HoneypotStatus.PAUSED:
+        state = "is paused, so it captures nothing until honeypot_resume"
+    elif hp.status == HoneypotStatus.STOPPED:
+        state = "is stopped; it captures nothing and keeps its history"
+    elif hp.status == HoneypotStatus.ERROR:
+        state = "is in ERROR and not capturing"
+    elif "error" in engine_status or engine_status.get("available") is False:
+        state = "is recorded as running but its engine state could not be read"
+    elif engine_status.get("running") is False:
+        state = "is recorded as running but its engine reports it is not: likely it died"
+    elif engine_status.get("running") is True:
+        state = "is running"
+    else:
+        state = f"is recorded as {recorded}"
+    log = ""
+    if log_lines:
+        low = " ".join(log_lines).lower()
+        if "traceback" in low or "error" in low or "exception" in low:
+            log = " Its log mentions errors."
+        else:
+            log = " Its log looks routine."
+    got = f"{hits:,} alerts captured" if hits else "no alerts captured yet"
+    return f"{where} {state}; {got}.{log}"
 
 
 @mcp.tool(**hints("honeypot_status"))
@@ -499,6 +595,7 @@ async def honeypot_status(name: str | None = None) -> dict[str, Any]:
             config["endpoints_note"] = f"first 10 of {len(endpoints)}"
 
         result: dict[str, Any] = {
+            "headline": _status_headline(hp, hits, engine_status, log_lines),
             "id": hp.id,
             "name": hp.name,
             "type": hp.type.value,
@@ -999,6 +1096,50 @@ async def _probe_health(hp: Honeypot) -> dict[str, Any]:
     return entry
 
 
+def _down_reason(entry: dict[str, Any]) -> str:
+    """A plain reason a sensor does not answer, from fixed vocabulary only."""
+    if str(entry.get("detail", "")).startswith("Not started"):
+        return "never started"
+    if entry.get("method") == "error":
+        return "the health check itself failed"
+    return "nothing is listening on its port"
+
+
+def _probe_headline(
+    results: list[dict[str, Any]], up: int, down: list[str], unknown: list[str]
+) -> str:
+    """One sentence for the probe-all answer: how many answer, which do not and why."""
+    n = len(results)
+    if not n:
+        return (
+            "No honeypot is running, so nothing was probed; honeypot_list shows what is deployed."
+        )
+    if down:
+        by_name = {r["name"]: r for r in results}
+        shown = [f"{d} ({_down_reason(by_name[d])})" for d in down[:3]]
+        more = f" and {len(down) - 3} more" if len(down) > 3 else ""
+        return (
+            f"{up} of {n} sensors answer; {len(down)} do not: {', '.join(shown)}{more}. "
+            "A sensor that is down captures nothing: honeypot_status(name) shows its log."
+        )
+    if unknown and len(unknown) == n:
+        if instance_lock.in_analysis_mode():
+            return (
+                f"Analysis copy: nothing runs here, so none of the {n} sensors was probed; the "
+                "rows are what the original server last recorded."
+            )
+        return (
+            f"None of the {n} running sensors could be probed from this session: another "
+            "process owns them (honeypot_list shows their last recorded state)."
+        )
+    if unknown:
+        return (
+            f"{up} of {n} sensors answer; {len(unknown)} belong to another process and were "
+            "not probed from this session."
+        )
+    return f"All {n} sensors answer on their ports."
+
+
 async def _health_of_running() -> dict[str, Any]:
     """Probe every running honeypot: who answers, who does not, who cannot be probed from here."""
     async with get_session() as session:
@@ -1028,6 +1169,7 @@ async def _health_of_running() -> dict[str, Any]:
     else:
         note = f"All {len(results)} answering."
     return {
+        "headline": _probe_headline(results, up, down, unknown),
         "count": len(results),
         "answering": up,
         "not_probed": len(unknown),

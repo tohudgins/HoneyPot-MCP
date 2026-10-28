@@ -134,6 +134,12 @@ class Settings(BaseSettings):
     # Use this on a restored backup, where the recorded sensors must not be launched on your laptop.
     analysis_mode: bool = False
 
+    # When the server runs on the user's own machine (stdio transport), tools that produce something
+    # to look at (a dashboard, a report, an ATT&CK Navigator layer) open it in the default browser
+    # as well as returning where it is. Off for a networked server, which cannot know whose screen
+    # that would be; set false to never open anything.
+    open_in_browser: bool = True
+
     # Ports the FTP honeypot opens passive data listeners in (inclusive). 0 = any ephemeral port,
     # which is fine on a laptop and silently useless behind a default-drop firewall: a client logs
     # in, is told to open a data connection to a port the firewall refuses, and every LIST/RETR times

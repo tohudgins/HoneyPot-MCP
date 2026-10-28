@@ -13,11 +13,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.storage.database import get_session
-from honeypot_mcp.storage.models import Alert
+from honeypot_mcp.storage.models import Alert, AlertRollup
 
 _cached: tuple[str, datetime | None] | None = None
 
@@ -48,6 +48,23 @@ async def window_end() -> datetime:
         _cached = (settings.database_url, await _newest_alert())
     newest = _cached[1]
     return newest if newest is not None else datetime.now(UTC)
+
+
+async def data_span(max_days: int = 30) -> tuple[datetime, datetime]:
+    """The time range the data covers, for a link that must open on it: oldest hour to `window_end`.
+
+    A saved run's dashboards opened on "the last 6 hours" are empty, so a link carries this range.
+    The oldest hour comes from the hourly rollups (thousands of rows, exact to the hour, and not
+    hidden by pruning old alerts), never from ordering millions of alert rows. Capped at `max_days`
+    back from the end so a long-lived server does not open on years.
+    """
+    end = await window_end()
+    async with get_session() as session:
+        oldest = (await session.execute(select(func.min(AlertRollup.bucket)))).scalar_one_or_none()
+    if oldest is not None and oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=UTC)
+    start = min(oldest, end) if oldest is not None else end - timedelta(hours=24)
+    return max(start, end - timedelta(days=max_days)), end
 
 
 async def window_anchor() -> dict[str, Any] | None:

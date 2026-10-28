@@ -16,6 +16,8 @@ fetch: nothing here ever connects to an extracted URL.
 from __future__ import annotations
 
 import asyncio
+import base64
+import html as _html
 import ipaddress
 import json
 import re
@@ -25,7 +27,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from sqlalchemy import func, select
 
@@ -36,6 +38,7 @@ from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.storage.models import Alert
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._format import mark_untrusted, write_artifact
+from honeypot_mcp.tools._open import file_url, open_page
 from honeypot_mcp.tools._scan import (
     _expired,
     _first_id_since,
@@ -44,6 +47,15 @@ from honeypot_mcp.tools._scan import (
     _slice_plan,
 )
 from honeypot_mcp.tools._window import annotate_window, window_bounds
+
+_NAVIGATOR_URL = "https://mitre-attack.github.io/attack-navigator/"
+# A page that forwards to the Navigator with the layer in the link (see write_navigator_layer).
+_NAVIGATOR_LAUNCHER = """<!doctype html>
+<meta charset="utf-8"><title>Opening the ATT&amp;CK Navigator</title>
+<p style="font:16px sans-serif">Opening your layer in the ATT&amp;CK Navigator. If nothing happens,
+<a href="{url}">open it here</a>.</p>
+<script>location.replace({js});</script>
+"""
 
 # ── extract_iocs ──────────────────────────────────────────────────────────────
 
@@ -487,6 +499,115 @@ def _minute(moment: datetime | None) -> str | None:
     return aware.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _quote(value: object, limit: int = 60) -> str:
+    """A captured or third-party value, on one line, clipped and in backticks: data, not wording."""
+    text = " ".join(str(value).split()).replace("`", "'")
+    return f"`{text[:limit]}{'…' if len(text) > limit else ''}`"
+
+
+def _private_urls(urls: Any) -> int:
+    """How many extracted URLs name a private/loopback address (a bot naming its own network).
+
+    `hosts` already leaves such addresses out; the URLs are where they show up.
+    """
+    count = 0
+    for url in urls:
+        try:
+            ip = ipaddress.ip_address(urlsplit(str(url)).hostname or "")
+        except ValueError:
+            continue
+        count += ip.is_private or ip.is_loopback or ip.is_link_local
+    return count
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n:,} {word}" + ("" if n == 1 else "s")
+
+
+def _ioc_headline(window: str, coll: Any, scanned: int, complete: bool) -> str:
+    urls, hosts, hashes = len(coll.urls), len(coll.hosts), len(coll.hashes)
+    if not (urls or hosts or hashes):
+        return (
+            f"No download URLs, hosts or file hashes were found in {window} "
+            f"({scanned:,} alerts read)."
+        )
+    text = (
+        f"{_plural(urls, 'distinct download URL')} on {_plural(hosts, 'public host')} and "
+        f"{_plural(hashes, 'captured file hash').replace('hashs', 'hashes')} in {window}."
+    )
+    if coll.urls:
+        value, agg = max(coll.urls.items(), key=lambda kv: (kv[1].alerts, kv[0]))
+        text += (
+            f" Most used: {_quote(value)} ({agg.alerts:,} alerts from "
+            f"{_plural(len(agg.sources), 'source')})."
+        )
+    private = _private_urls(coll.urls)
+    if private:
+        text += (
+            f" {_plural(private, 'URL')} {'names' if private == 1 else 'name'} a private address "
+            "(a bot naming its own network), "
+            "which does not belong on a blocklist."
+        )
+    if hashes:
+        text += " `lookup_hash` checks a hash against MalwareBazaar."
+    if not complete:
+        text += " The scan was capped, so counts are lower bounds."
+    return text
+
+
+def _hash_headline(result: dict[str, Any]) -> str:
+    if result.get("available") is False:
+        reason = result.get("note") or result.get("error") or "the lookup did not run"
+        return (
+            f"MalwareBazaar could not be checked ({_quote(reason, 80)}): this hash is UNKNOWN, "
+            "not known to be clean."
+        )
+    if not result.get("known"):
+        return (
+            "MalwareBazaar has no sample with this hash. That does not make it harmless: scripts an "
+            "attacker typed on the sensor, and fresh builds, are rarely submitted there."
+        )
+    family = _quote(result["signature"]) if result.get("signature") else "family not named"
+    kind = f", {_quote(result['file_type'], 20)}" if result.get("file_type") else ""
+    seen = f", first seen {_quote(result['first_seen'], 20)}" if result.get("first_seen") else ""
+    via = (
+        f", delivered by {_quote(result['delivery_method'], 20)}"
+        if result.get("delivery_method")
+        else ""
+    )
+    return f"Known malware sample on MalwareBazaar: {family}{kind}{seen}{via}."
+
+
+def _navigator_headline(
+    window: str,
+    total: int,
+    mapped: int,
+    layer: dict[str, Any],
+    top: list[dict[str, Any]],
+    opened: bool,
+    launcher_url: str | None,
+) -> str:
+    if not total:
+        return f"No alerts in {window}, so there is nothing to map."
+    scored = [t for t in layer["techniques"] if t["score"]]
+    tactics = {t["tactic"] for t in scored}
+    leaders = "; ".join(
+        f"{t['technique']} {_TECHNIQUE_NAMES.get(t['technique'], '')} ({t['alerts']:,})".replace(
+            "  ", " "
+        )
+        for t in top[:3]
+    )
+    text = (
+        f"{mapped:,} of {total:,} alerts ({round(100 * mapped / total)}%) map to {len(scored)} ATT&CK "
+        f"techniques across {len(tactics)} tactics; most seen: {leaders}."
+    )
+    if opened:
+        return text + " The layer is open in the ATT&CK Navigator in your browser."
+    if launcher_url:
+        return text + f" Open {launcher_url} to load the layer into the ATT&CK Navigator."
+    return text
+
+
 @mcp.tool(**hints("extract_iocs"))
 async def extract_iocs(
     since_hours: float | None = None,
@@ -595,6 +716,12 @@ async def extract_iocs(
             more = "" if kind else f" Ask for just the {label} to see more."
             notes.append(f"{limit} of {len(table):,} {label} shown, most-seen first.{more}")
     result["note"] = " ".join(notes) or None
+    result = {
+        "headline": _ioc_headline(
+            result["window"], coll, scanned, bool(result["scan"]["complete"])
+        ),
+        **result,
+    }
     return mark_untrusted(await annotate_window(result))
 
 
@@ -606,6 +733,9 @@ _ATTACK_VERSION = "18"
 _NAVIGATOR_VERSION = "5.3.2"
 _LAYER_VERSION = "4.5"
 _MAX_COMMENT_TYPES = 5
+# Technique names seen while building a layer (static MITRE data), so a reading can say
+# "T1110.001 Brute Force: Password Guessing" without the optional STIX file.
+_TECHNIQUE_NAMES: dict[str, str] = {}
 
 
 def _tactic_shortname(tactic: str) -> str:
@@ -632,6 +762,7 @@ async def build_navigator_layer(
             unmapped[event_type] = n
             continue
         for ttp in ttps:
+            _TECHNIQUE_NAMES.setdefault(ttp["technique_id"], ttp.get("technique_name") or "")
             key = (ttp["technique_id"], _tactic_shortname(ttp["tactic"]))
             scored.setdefault(key, {})[event_type] = n
 
@@ -734,18 +865,60 @@ async def write_navigator_layer(
     if "error" in written:
         return written
     total = sum(counts.values())
+    # The layer opens in MITRE's hosted Navigator from a self-contained link: a `data:` URL carries
+    # the whole layer, so it needs no web server (a `localhost` link is refused by the browser's
+    # cross-origin rules) and nothing leaves the machine but the layer's technique counts. The link
+    # is far too long to hand a model to repeat, so it lives in a one-line launcher page.
+    compact = json.dumps(layer, separators=(",", ":"))
+    link = (
+        _NAVIGATOR_URL
+        + "#layerURL="
+        + quote(
+            "data:application/json;base64," + base64.b64encode(compact.encode()).decode(), safe=""
+        )
+    )
+    launcher = write_artifact(
+        _NAVIGATOR_LAUNCHER.format(
+            url=_html.escape(link, quote=True), js=json.dumps(link).replace("</", "<\\/")
+        ),
+        prefix="attack-navigator",
+        extension="html",
+    )
+    top = [
+        {"technique": t["techniqueID"], "alerts": t["score"], "evidence": t["comment"]}
+        for t in sorted(layer["techniques"], key=lambda t: -t["score"])[:5]
+    ]
+    mapped = total - sum(unmapped.values())
+    result: dict[str, Any] = {
+        **written,
+        "window": window,
+        "techniques": len(layer["techniques"]),
+        "total_alerts": total,
+        "mapped_alerts": mapped,
+        "unmapped": [
+            {"type": t, "alerts": n}
+            for t, n in sorted(unmapped.items(), key=lambda kv: -kv[1])[:10]
+        ],
+        "top_techniques": top,
+    }
+    launcher_url = None
+    opened = False
+    if "error" in launcher:
+        result["note"] = (
+            "The layer file was written, but the Navigator launcher page could not be: "
+            + str(launcher["error"])
+        )
+    else:
+        launcher_url = file_url(launcher["path"])
+        opened = await open_page(launcher_url)
+        result["open_in_navigator"] = launcher_url
+        result["opened_in_browser"] = opened
     return await annotate_window(
         {
-            **written,
-            "window": window,
-            "techniques": len(layer["techniques"]),
-            "total_alerts": total,
-            "mapped_alerts": total - sum(unmapped.values()),
-            "unmapped": [
-                {"type": t, "alerts": n}
-                for t, n in sorted(unmapped.items(), key=lambda kv: -kv[1])[:10]
-            ],
-            "note": None if total else "No alerts in this window, so the layer has no techniques.",
+            "headline": _navigator_headline(
+                window, total, mapped, layer, top, opened, launcher_url
+            ),
+            **result,
         }
     )
 
@@ -780,4 +953,4 @@ async def lookup_hash(sha256: str) -> dict[str, Any]:
             "Get a free key at https://auth.abuse.ch/, add ABUSECH_AUTH_KEY=<key> to the server's "
             ".env file and restart the server; then ask again."
         )
-    return result
+    return {"headline": _hash_headline(result), **result}

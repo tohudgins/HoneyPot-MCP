@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from honeypot_mcp import instance_lock, pcap_analysis
 from honeypot_mcp import pcap as pcap_module
+from honeypot_mcp import pcap_detect as detection
 from honeypot_mcp._loop_bound import LoopBound
 from honeypot_mcp.config import get_settings
 from honeypot_mcp.rbac import require_role
@@ -25,6 +26,7 @@ from honeypot_mcp.server import mcp
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools import _audit
 from honeypot_mcp.tools._format import validate_ip
+from honeypot_mcp.tools._open import file_url
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +59,33 @@ def _capture_section() -> dict[str, Any]:
     return status
 
 
+def _extract_headline(source_ip: str, result: dict[str, Any]) -> str:
+    """One sentence on what an extract found. Blocking (reads the new file's record headers)."""
+    packets = int(result.get("packets") or 0)
+    searched = int(result.get("searched_files") or 0)
+    if not packets:
+        return (
+            f"No packets from or to {source_ip} in the ring ({searched} file(s) searched): its "
+            "traffic is older than the oldest ring file, or capture was off then. "
+            "pcap_files shows how far back capture reaches."
+        )
+    span = None
+    try:
+        path = Path(str(result["path"]))
+        with path.open("rb") as fh:
+            scan = detection.scan_capture(fh, path.stat().st_size)
+        if scan.first is not None and scan.last is not None:
+            span = max(0.0, scan.last - scan.first)
+    except (OSError, KeyError):
+        span = None
+    name = Path(str(result.get("path", ""))).name
+    return (
+        f"{packets:,} packet(s) from or to {source_ip} over {pcap_analysis.format_span(span)} "
+        f"({pcap_analysis.format_size(int(result.get('bytes') or 0))}), saved as {name}. Read them "
+        f"with pcap_analyze(path={name!r}) or replay through Suricata with pcap_detect."
+    )
+
+
 @mcp.tool(auth=require_role("operator"), **hints("pcap_extract"))
 async def pcap_extract(source_ip: str) -> dict[str, Any]:
     """Pull every captured packet from or to one attacker IP into a pcap file.
@@ -81,6 +110,11 @@ async def pcap_extract(source_ip: str) -> dict[str, Any]:
 
     result = await pcap_module.get_capture().extract(source_ip, output_path)
     if "error" not in result:
+        result = {
+            "headline": await asyncio.to_thread(_extract_headline, source_ip, result),
+            "url": file_url(result["path"]),
+            **result,
+        }
         await _audit.record_action(
             "pcap_extract",
             f"extracted {result.get('packets', 0)} packet(s) for {source_ip}",
@@ -139,6 +173,46 @@ def _describe_files(ring: list[Path], extracts: list[Path], now: float) -> list[
     return rows
 
 
+def _files_headline(
+    capture: dict[str, Any],
+    reaches_back_to: str | None,
+    ring_files: int,
+    ring_bytes: int,
+    extracts: int,
+    wanted: str | None,
+    now: float,
+) -> str:
+    """Is capture running, how far back the ring reaches, and why it is off when it is."""
+    reach = ""
+    if ring_files and reaches_back_to:
+        hours = max(0.0, (now - datetime.fromisoformat(reaches_back_to).timestamp()) / 3600)
+        reach = (
+            f" The ring holds {ring_files} file(s) ({pcap_analysis.format_size(ring_bytes)}) "
+            f"whose oldest was last written {pcap_analysis.format_span(hours * 3600)} ago, so an "
+            "extract finds traffic from about then on."
+        )
+    saved = (
+        f" {extracts} saved extract(s) for {wanted}."
+        if wanted
+        else f" {extracts} saved extract(s) can be read with pcap_analyze."
+    )
+    if capture.get("running"):
+        return "Packet capture is running." + reach + saved
+    capability = capture.get("capability") or {}
+    if capability.get("reason"):
+        why = str(capability["reason"])
+    elif capture.get("last_error"):
+        why = str(capture["last_error"])
+    elif capture.get("enabled") is False:
+        why = "PCAP_ENABLED is false"
+    else:
+        why = "it has not been started; pcap_control(action='start') starts it"
+    first_sentence = why.split(". ")[0].rstrip(".")
+    return pcap_analysis.fit_headline(
+        f"Packet capture is off: {first_sentence[:160]}.", [reach.strip(), saved.strip()]
+    )
+
+
 @mcp.tool(**hints("pcap_files"))
 async def pcap_files(source_ip: str | None = None) -> dict[str, Any]:
     """List the saved packet captures, how far back capture reaches and whether it is running.
@@ -185,11 +259,17 @@ async def pcap_files(source_ip: str | None = None) -> dict[str, Any]:
     notes: list[str] = []
     if wanted and not extract_total:
         notes.append(f"No extract exists for {wanted}.")
-        notes.append("On a live server pcap_extract(source_ip=...) makes one from the ring buffer.")
+        notes.append(
+            f"On a live server with capture running, pcap_extract(source_ip={wanted!r}) writes "
+            f"pcap-{wanted}-<time>.pcap from the ring buffer and reports its packet count; "
+            "with capture off or in analysis mode, copy that file into the reports directory."
+        )
     elif not extract_total and not ring:
         notes.append(
-            "No capture files yet. On a live server with capture running, pcap_extract makes one "
-            "per attacker; on a restored backup, copy .pcap files into the reports directory."
+            "No capture files yet. On a live server with capture running, "
+            "pcap_extract(source_ip=<attacker address>) writes one per attacker and reports its "
+            "packet count; on a restored backup (analysis mode), copy the .pcap files into the "
+            "reports directory, then call pcap_files again to see them listed."
         )
     if extract_total > len(extract_rows):
         notes.append(
@@ -203,19 +283,24 @@ async def pcap_files(source_ip: str | None = None) -> dict[str, Any]:
         )
     if rows:
         notes.append("Analyse one with pcap_analyze(path=<name>) or pcap_detect(path=<name>).")
+    capture = _capture_section()
+    reaches = (
+        datetime.fromtimestamp(ring[0].stat().st_mtime, UTC).isoformat()
+        if ring and ring[0].exists()
+        else None
+    )
     return {
+        "headline": _files_headline(
+            capture, reaches, len(ring), sum(ring_stats), extract_total, wanted, now
+        ),
         "count": len(rows),
         "extract_count": extract_total,
         "ring_count": len(ring),
         "files": rows,
         "extract_bytes": extract_bytes,
         "ring_bytes": sum(ring_stats),
-        "capture": _capture_section(),
-        "capture_reaches_back_to": (
-            datetime.fromtimestamp(ring[0].stat().st_mtime, UTC).isoformat()
-            if ring and ring[0].exists()
-            else None
-        ),
+        "capture": capture,
+        "capture_reaches_back_to": reaches,
         "note": " ".join(notes),
     }
 
@@ -287,7 +372,7 @@ async def pcap_analyze(path: str | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {"file": {"name": resolved.name, "kind": kind, "bytes": size}}
     if how:
         result["note"] = pcap_analysis.describe_choice(how, resolved.name)
-    return {**result, **digest}
+    return {"headline": pcap_analysis.capture_headline(digest, size), **result, **digest}
 
 
 @mcp.tool(auth=require_role("operator"), **hints("pcap_control"))

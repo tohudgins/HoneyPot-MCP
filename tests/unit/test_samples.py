@@ -1778,3 +1778,38 @@ async def test_a_swap_for_a_symlink_after_the_inspection_never_chmods_the_target
     with pytest.raises(samples.SkipFile):
         samples.read_sample(path, 1 << 20)
     assert stat.S_IMODE(target.stat().st_mode) == 0o640, "the link's target must be left alone"
+
+
+def test_the_scan_reading_tells_scripts_from_compiled_malware():
+    """The real quarantine was 159 scripts and recordings and no binary: the reading must say so,
+    and must send a compiled file to an isolated VM instead."""
+    from honeypot_mcp.tools.samples import _scan_headline
+
+    scripts_only = _scan_headline(
+        {
+            "files_scanned": 159,
+            "distinct_hashes": 94,
+            "by_type": {"tty_recording": 86, "text": 55, "empty": 14, "script": 4},
+            "files_with_hits": 46,
+            "hits_by_family": {"dropper": 42, "iot-dropper": 41, "reverse-shell": 1},
+        }
+    )
+    assert "159 files scanned (94 distinct): 86 tty recording, 55 text" in scripts_only
+    assert (
+        "46 matched a YARA rule: dropper (42), iot-dropper (41), reverse-shell (1)" in scripts_only
+    )
+    assert "None is a compiled program" in scripts_only and "isolated VM" not in scripts_only
+
+    with_binary = _scan_headline(
+        {
+            "files_scanned": 3,
+            "distinct_hashes": 3,
+            "by_type": {"elf": 2, "text": 1},
+            "files_with_hits": 0,
+        }
+    )
+    assert "No YARA rule matched" in with_binary
+    assert "2 are compiled or packed files: handle only in an isolated VM" in with_binary
+    assert "None is a compiled program" not in with_binary
+
+    assert _scan_headline({"files_scanned": 0}) == "No sample files were scanned."

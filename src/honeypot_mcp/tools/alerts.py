@@ -35,6 +35,185 @@ _TRIAGE_CAP = 500
 _SINCE_HINT = (
     "Use a number of hours, e.g. 1 for 'the last hour', 24 for 'today', 168 for 'this week'."
 )
+_QUOTE_CLIP = 60
+
+
+def _quote(value: Any) -> str:
+    """A captured value as a one-line inline-code span of at most 60 characters.
+
+    Headlines are prose a model reads as the answer, and everything captured from the network is
+    attacker-written: a quoted value is clipped, flattened to one line and fenced in backticks so
+    it reads as evidence, never as a sentence of the headline."""
+    text = " ".join(str(value).replace("`", "'").split())
+    if len(text) > _QUOTE_CLIP:
+        text = text[: _QUOTE_CLIP - 1] + "…"
+    return f"`{text}`"
+
+
+def _pct(part: int, whole: int) -> str:
+    if whole <= 0 or part <= 0:
+        return "0%"
+    share = 100 * part / whole
+    if share < 1:
+        return "<1%"
+    return f"{round(share)}%"
+
+
+def _is_trip(event_type: str, payload: dict[str, Any] | None = None) -> bool:
+    return event_type.startswith("honeytoken_") or bool((payload or {}).get("honeytoken_id"))
+
+
+# What an event type means in plain words, first match wins. Fixed vocabulary only.
+_MEANINGS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("honeytoken",), "planted bait was used, so someone is using stolen or scraped material"),
+    (("exploit", "escape", "ransom", "amplification", "toll_fraud"), "an attack attempt"),
+    (("command", "download", "upload", "file_"), "activity inside a session or a file transfer"),
+    (("login", "auth", "ntlm", "bind", "credential"), "a login attempt with captured credentials"),
+    (("scan", "probe", "sweep", "enumeration", "recon"), "reconnaissance"),
+    (("connection", "handshake"), "a bare connection, usually internet-wide scanning"),
+)
+
+
+def _meaning(event_type: str) -> str:
+    low = event_type.lower()
+    for words, meaning in _MEANINGS:
+        if any(w in low for w in words):
+            return meaning
+    return "an event this sensor recorded"
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return f"{n:,} {one if n == 1 else (many or one + 's')}"
+
+
+def _stats_headline(stats: dict[str, Any], since_hours: float | None) -> str:
+    """The reading of `alerts_stats`: volume, how much is noise, concentration, what needs a look."""
+    total = int(stats.get("total_alerts") or 0)
+    where = f"in the last {since_hours:g} h" if since_hours is not None else "recorded"
+    if not total:
+        return f"No alerts {where}."
+    by_sev = stats.get("by_severity") or {}
+    low = int(by_sev.get("low", 0)) + int(by_sev.get("medium", 0))
+    crit = int(by_sev.get("critical", 0))
+    high = int(by_sev.get("high", 0))
+    unique = int(stats.get("unique_source_ips") or 0)
+    parts = [f"{total:,} alerts {where} from {_plural(unique, 'source')}"]
+    mix = f"{_pct(low, total)} LOW/MEDIUM"
+    top_types = stats.get("top_event_types") or []
+    if top_types and low * 2 >= total:
+        mix += f" (mostly {_quote(top_types[0]['type'])})"
+    parts.append(mix)
+    top_ips = stats.get("top_source_ips") or []
+    if len(top_ips) >= 3 and unique > 3:
+        share = sum(int(r["count"]) for r in top_ips[:3])
+        if share * 2 >= total:
+            parts.append(f"3 sources account for {_pct(share, total)} of events")
+    trips = sum(int(t["count"]) for t in top_types if _is_trip(str(t["type"])))
+    look: list[str] = []
+    if trips:
+        look.append(f"{_plural(trips, 'honeytoken trip')} (bait_trips)")
+    other_crit = max(crit - trips, 0)
+    if other_crit:
+        look.append(f"{other_crit:,} CRITICAL")
+    if high:
+        look.append(f"{high:,} HIGH")
+    text = ": ".join([parts[0], ", ".join(parts[1:])]) if len(parts) > 1 else parts[0]
+    if look:
+        text += "; needs a look: " + ", ".join(look) + " (alerts_recent with severity)"
+    else:
+        text += "; nothing CRITICAL or HIGH"
+    return text + "."
+
+
+def _narrowing(
+    alerts: list[Alert], *, severity: str | None, source_ip: str | None, event_type: str | None
+) -> str:
+    """The one extra filter most likely to shrink a truncated list, as exact arguments."""
+    sevs = {a.severity.value for a in alerts}
+    if not severity and len(sevs) > 1:
+        top = next(s for s in ("critical", "high", "medium", "low") if s in sevs)
+        return f"severity='{top}'"
+    if not source_ip and alerts:
+        counts: dict[str, int] = {}
+        for a in alerts:
+            counts[a.source_ip] = counts.get(a.source_ip, 0) + 1
+        ip, n = max(counts.items(), key=lambda kv: kv[1])
+        if len(counts) > 1 and n * 2 >= len(alerts):
+            return f"source_ip={_quote(ip)}"
+    if not event_type and alerts:
+        kinds: dict[str, int] = {}
+        for a in alerts:
+            kinds[a.event_type] = kinds.get(a.event_type, 0) + 1
+        if len(kinds) > 1:
+            return f"event_type={_quote(max(kinds, key=lambda k: kinds[k]))}"
+    return "since_hours=1 (or the window you care about)"
+
+
+def _list_headline(
+    alerts: list[Alert], shown: int, total: int | None, *, narrow: str | None, ordered: str
+) -> str:
+    """One line for a list of alerts: how many of how many, severity, type and source mix."""
+    sample = alerts[:shown]
+    sevs: dict[str, int] = {}
+    kinds: dict[str, int] = {}
+    for a in sample:
+        sevs[a.severity.value] = sevs.get(a.severity.value, 0) + 1
+        kinds[a.event_type] = kinds.get(a.event_type, 0) + 1
+    sources = len({a.source_ip for a in sample})
+    if len(sevs) == 1:
+        sev = f"all {next(iter(sevs)).upper()}"
+    else:
+        sev = ", ".join(
+            f"{n} {s.upper()}"
+            for s, n in sorted(
+                sevs.items(),
+                key=lambda kv: ("critical", "high", "medium", "low").index(kv[0]),
+            )
+        )
+    top_kind = max(kinds, key=lambda k: kinds[k])
+    what = (
+        _quote(top_kind)
+        if len(kinds) == 1
+        else f"{len(kinds)} event types, mostly {_quote(top_kind)}"
+    )
+    if total is None:
+        count = f"first {shown} matches"
+    elif total > shown:
+        count = f"{shown} of {total:,} matches"
+    else:
+        count = _plural(shown, "match", "matches")
+    text = f"{count} ({ordered}): {sev}, {what}, from {_plural(sources, 'source')}."
+    if (total is None or total > shown) and narrow:
+        text += f" Truncated: narrow with {narrow}."
+    return text
+
+
+def _alert_headline(a: Alert, honeypot: str | None) -> str:
+    """What one alert is, in plain words, with the enrichment verdict when it has one."""
+    payload = a.payload or {}
+    text = (
+        f"Alert {a.id} is a {a.severity.value.upper()} {_quote(a.event_type)} from "
+        f"{_quote(a.source_ip)}"
+        + (f" on sensor {_quote(honeypot)}" if honeypot else "")
+        + f": {_meaning(a.event_type)}."
+    )
+    if _is_trip(a.event_type, payload):
+        text += " It is a honeytoken trip: see bait_trips."
+    enrich = payload.get("enrichment")
+    if isinstance(enrich, dict):
+        abuse = enrich.get("abuseipdb")
+        vt = enrich.get("virustotal")
+        bits: list[str] = []
+        if isinstance(abuse, dict) and isinstance(abuse.get("abuse_confidence_score"), int | float):
+            bits.append(f"AbuseIPDB confidence {int(abuse['abuse_confidence_score'])}/100")
+        if isinstance(vt, dict) and isinstance(vt.get("malicious_votes"), int | float):
+            bits.append(f"{int(vt['malicious_votes'])} VirusTotal engines flag it")
+        if bits:
+            text += " Enrichment: " + ", ".join(bits) + "."
+    if a.acknowledged:
+        verdict = a.disposition.value.replace("_", " ") if a.disposition else "acknowledged"
+        text += f" Already triaged ({verdict})."
+    return text
 
 
 def _fit(rows: list[dict[str, Any]], budget: int = _ROWS_BUDGET) -> list[dict[str, Any]]:
@@ -167,13 +346,23 @@ async def alerts_recent(
             )
         else:
             result["note"] = "No alerts have been recorded yet."
-    elif len(rows) < result["total_matching"]:
+    narrow = (
+        _narrowing(alerts, severity=severity, source_ip=source_ip, event_type=event_type)
+        if rows
+        else None
+    )
+    if rows and len(rows) < result["total_matching"]:
         result["note"] = (
             f"Showing the newest {len(rows)} of {result['total_matching']:,} matching alerts. "
-            "To see others, narrow by time ('last 24 hours'), source address, severity, "
-            "event type or sensor."
+            f"To see others, narrow with {narrow}."
         )
-    return mark_untrusted(result)
+    if rows:
+        headline = _list_headline(
+            alerts, len(rows), result["total_matching"], narrow=narrow, ordered="newest first"
+        )
+    else:
+        headline = result["note"]
+    return mark_untrusted({"headline": headline, **result})
 
 
 @mcp.tool(**hints("alerts_get"))
@@ -209,6 +398,9 @@ async def alerts_get(alert_id: int) -> dict[str, Any]:
 
         return mark_untrusted(
             {
+                "headline": _alert_headline(
+                    alert, names.get(alert.honeypot_id) if alert.honeypot_id else None
+                ),
                 "id": alert.id,
                 "honeypot": names.get(alert.honeypot_id) if alert.honeypot_id else None,
                 "honeypot_id": alert.honeypot_id,
@@ -265,11 +457,17 @@ async def alerts_search(
         result["window"] = f"last {since_hours}h (since {since.isoformat()})"
         await annotate_window(result)
     notes: list[str] = []
-    if len(rows) < len(found.alerts) or found.more:
+    truncated = len(rows) < len(found.alerts) or found.more
+    narrow = _narrowing(found.alerts, severity=None, source_ip=None, event_type=None)
+    search_narrow = (
+        "since_hours=1 (or the window you care about) or a longer phrase"
+        if narrow.startswith("since_hours")
+        else f"a longer phrase, since_hours, or alerts_recent({narrow})"
+    )
+    if truncated:
         notes.append(
-            f"Showing the newest {len(rows)} matches; there are more. To see others, narrow by "
-            "time ('last 24 hours'), or search a more specific phrase, or use alerts_recent "
-            "with a source address."
+            f"Showing the newest {len(rows)} matches; there are more. To see others, narrow with "
+            f"{search_narrow}."
         )
     if not found.complete:
         back = found.searched_back_to.isoformat() if found.searched_back_to else "an earlier time"
@@ -285,7 +483,24 @@ async def alerts_search(
         )
     if notes:
         result["note"] = " ".join(notes)
-    return mark_untrusted(result)
+    if rows:
+        headline = f"Search for {_quote(query)}: " + _list_headline(
+            found.alerts,
+            len(rows),
+            None if truncated else len(rows),
+            narrow=search_narrow,
+            ordered="newest first",
+        )
+        if not found.complete:
+            headline += " The search timed out, so older alerts were not read."
+    elif found.complete:
+        headline = f"No alert contains {_quote(query)}; the match is literal and case-sensitive."
+    else:
+        headline = (
+            f"No match for {_quote(query)} yet, but the search timed out before reading all "
+            "alerts: retry with since_hours."
+        )
+    return mark_untrusted({"headline": headline, **result})
 
 
 @mcp.tool(**hints("alerts_stats"))
@@ -309,7 +524,7 @@ async def alerts_stats(since_hours: float | None = None) -> dict[str, Any]:
         await annotate_window(stats)
     if not stats.get("total_alerts"):
         stats["note"] = "No alerts in this period." if since is not None else "No alerts recorded."
-    return stats
+    return {"headline": _stats_headline(stats, since_hours), **stats}
 
 
 @mcp.tool(auth=require_role("operator"), **hints("alerts_acknowledge"))
@@ -407,7 +622,8 @@ async def alerts_acknowledge(
     elif result.get("capped"):
         result["note"] = (
             f"Triaged the newest {_TRIAGE_CAP}; more alerts still match. "
-            "Run the same request again to continue, or narrow it."
+            f"Repeating the same call triages the next {_TRIAGE_CAP} (already-triaged alerts are "
+            "skipped); or narrow with source_ip, event_type, severity or since_hours."
         )
     elif result.get("not_matched_ids"):
         result["note"] = "Some ids were not found or did not match the other filters."

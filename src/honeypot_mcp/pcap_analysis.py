@@ -2467,6 +2467,181 @@ def analyze_capture(
     return digest
 
 
+# ── Reading a digest in plain words ─────────────────────────────────────────
+
+HEADLINE_MAX = 350
+
+
+def fit_headline(core: str, extras: list[str]) -> str:
+    """`core` plus as many `extras` (most important first) as fit the headline budget."""
+    text = core
+    for extra in extras:
+        if extra and len(text) + 1 + len(extra) <= HEADLINE_MAX:
+            text += " " + extra
+    if len(text) > HEADLINE_MAX:
+        text = text[: HEADLINE_MAX - 1].rstrip() + "…"
+    return text
+
+
+def quote_value(value: Any, limit: int = 60) -> str:
+    """A captured value cleaned, clipped to `limit` characters and wrapped in backticks."""
+    return "`" + (_clean(str(value), limit).replace("`", "'") or "?") + "`"
+
+
+def format_span(seconds: float | None) -> str:
+    if seconds is None:
+        return "an unknown span"
+    s = int(seconds)
+    if s < 1:
+        return "<1s"
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{round(s / 60)}m"
+    hours, minutes = divmod(s // 60, 60)
+    if hours < 48:
+        return f"{hours}h{minutes:02d}m"
+    return f"{hours // 24}d{hours % 24}h"
+
+
+def format_size(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+def _sip_reading(sip: dict[str, Any]) -> str:
+    requests = sip.get("requests") or {}
+    responses = sip.get("responses") or {}
+    registers = int(requests.get("REGISTER", 0))
+    invites = int(requests.get("INVITE", 0))
+    options = int(requests.get("OPTIONS", 0))
+    guessed = int((sip.get("digest") or {}).get("responses_with_digest") or 0)
+    parts: list[str] = []
+    if registers:
+        text = f"{registers:,} REGISTER"
+        if guessed:
+            text += f" ({guessed:,} answered the digest challenge, i.e. password guesses)"
+        else:
+            text += " (extension enumeration)"
+        parts.append(text)
+    if invites:
+        text = f"{invites:,} INVITE"
+        groups = sip.get("dialled_groups") or []
+        top = groups[0] if groups else None
+        dialled = sum(int(g.get("calls", 0)) for g in groups)
+        if top and int(top.get("distinct_variants", 0)) >= 3:
+            share = round(100 * int(top["calls"]) / max(dialled, 1))
+            text += (
+                f", {share}% aimed at one number cycled through {top['distinct_variants']} dial "
+                "prefixes (toll-fraud probing for a prefix the dial plan routes)"
+            )
+        else:
+            text += " (call attempts)"
+        parts.append(text)
+    if options and not (registers or invites):
+        parts.append(f"{options:,} OPTIONS (a scanner looking for SIP servers)")
+    elif options:
+        parts.append(f"{options:,} OPTIONS")
+    if not parts:
+        return "SIP traffic with no REGISTER, INVITE or OPTIONS requests"
+    connected = any(str(code).startswith("2") for code in responses)
+    tail = "" if connected else "; no call or registration succeeded"
+    return ", ".join(parts) + tail
+
+
+def _tcp_reading(tcp: dict[str, Any]) -> str:
+    total = int(tcp.get("connections") or 0)
+    if not total:
+        return ""
+    unanswered = int(tcp.get("syn_only_unanswered") or 0)
+    refused = int(tcp.get("refused_by_rst") or 0)
+    answered = int(tcp.get("answered") or 0)
+    with_data = int(tcp.get("with_payload") or 0)
+    scanners = tcp.get("port_scan_sources") or []
+    if scanners:
+        ports = max(int(s.get("distinct_ports_probed", 0)) for s in scanners)
+        sweep = (unanswered + refused) * 2 >= total
+        return (
+            f"{total:,} TCP connection(s): "
+            + ("a port sweep" if sweep else "a multi-port probe")
+            + f" ({len(scanners)} source(s) touched up to {ports} ports), {answered:,} answered, "
+            f"{with_data:,} carried data"
+        )
+    if (unanswered + refused) * 5 >= total * 4 and not with_data:
+        return (
+            f"{total:,} TCP connection attempt(s) and {unanswered + refused:,} never completed a "
+            "handshake: probing, no session"
+        )
+    return f"{total:,} TCP connection(s), {answered:,} answered, {with_data:,} carried data"
+
+
+def capture_headline(digest: dict[str, Any], file_bytes: int | None = None) -> str:
+    """Read a `pcap_analyze` digest in plain words, from fields it already holds."""
+    packets = digest.get("packets") or {}
+    analysed = int(packets.get("analysed") or 0)
+    if not analysed:
+        return (
+            "The capture holds no complete packets, so there is nothing to read. Try another "
+            "file from pcap_files, or pcap_extract again once traffic has arrived."
+        )
+    window = digest.get("window") or {}
+    size = file_bytes if file_bytes is not None else digest.get("file_bytes")
+    lead = (
+        f"{analysed:,} packets over {format_span(window.get('duration_seconds'))}"
+        + (f" ({format_size(int(size))})" if size else "")
+        + (", cut short at the analysis limit" if digest.get("truncated") else "")
+    )
+    services = digest.get("services") or {}
+    readings: list[str] = []
+    if "sip" in services:
+        transports = "/".join(sorted(services["sip"].get("transports") or {})) or "udp"
+        lead = f"SIP over {transports.upper()}, " + lead
+        readings.append(_sip_reading(services["sip"]))
+    tcp = _tcp_reading(digest.get("tcp") or {})
+    if tcp:
+        readings.append(tcp)
+    http = services.get("http")
+    if http:
+        paths = http.get("paths") or []
+        top = f", most often {quote_value(paths[0]['value'])}" if paths else ""
+        readings.append(f"{int(http.get('requests', 0)):,} HTTP request(s){top}")
+    others = [
+        f"{int(services[name].get('sessions', 0)):,} {name} session(s)"
+        for name in ("ssh", "telnet", "ftp", "smtp", "redis", "mysql", "pop3", "imap")
+        if name in services
+    ]
+    if "dns" in services:
+        others.append(f"{int(services['dns'].get('queries', 0)):,} DNS quer(ies)")
+    if "tls" in services:
+        others.append(f"{int(services['tls'].get('client_hellos', 0)):,} TLS hello(s)")
+    attempts = int((digest.get("credentials") or {}).get("attempts") or 0)
+    if attempts:
+        others.append(f"{attempts:,} cleartext login attempt(s)")
+    # Most specific first; drop the long tail rather than cut a sentence in half.
+    candidates: list[str] = []
+    body = "; ".join(readings)
+    tail = ", ".join(others)
+    if readings and others:
+        candidates.append(f"{lead}: {body}; also {tail}.")
+    if readings:
+        candidates.append(f"{lead}: {body}.")
+    elif others:
+        candidates.append(f"{lead}: {tail}.")
+    candidates.append(f"{lead}.")
+    core = next((c for c in candidates if len(c) <= HEADLINE_MAX), candidates[-1])
+    return fit_headline(
+        core,
+        [
+            "This is the wire as the sensor saw it; pcap_detect adds signature matches."
+            if readings or others
+            else "No recognised service traffic: pcap_detect may still name it.",
+        ],
+    )
+
+
 def list_capture_files(
     directory: Path, patterns: Sequence[str], *, limit: int = 500
 ) -> tuple[list[Path], bool]:

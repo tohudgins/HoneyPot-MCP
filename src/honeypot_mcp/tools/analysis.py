@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 from honeypot_mcp.rbac import require_role
@@ -14,10 +16,115 @@ from honeypot_mcp.storage.database import get_session
 from honeypot_mcp.tool_hints import hints
 from honeypot_mcp.tools._audit import record_action
 from honeypot_mcp.tools._format import mark_untrusted, validate_ip, write_artifact
+from honeypot_mcp.tools._open import file_url, open_page
 from honeypot_mcp.tools._window import annotate_window, window_bounds, window_end
 
 _MAX_ABUSE_COMMENT_CHARS = 500
 _MAX_REPORT_ALERTS = 1000
+_HEADLINE_CHARS = 350
+_QUOTED_CHARS = 60
+
+
+def _quote(value: Any, limit: int = _QUOTED_CHARS) -> str:
+    """A captured or third-party value for a headline: one line, clipped, in backticks."""
+    text = " ".join(str(value).replace("`", "'").split())
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return f"`{text}`"
+
+
+def _cap_headline(text: str) -> str:
+    """A headline held to its length budget."""
+    return text if len(text) <= _HEADLINE_CHARS else text[: _HEADLINE_CHARS - 1] + "…"
+
+
+_ABUSE_FLAG_SCORE = 25
+
+
+def _enrich_headline(out: dict[str, Any]) -> str:
+    """One verdict from what the providers returned; a provider that did not answer is unknown."""
+    flagged: list[str] = []
+    benign: list[str] = []
+    clear: list[str] = []
+    unknown: list[str] = []
+    scanner = False
+
+    abuse = out.get("abuseipdb") or {}
+    if abuse.get("available") is True and "abuse_confidence_score" in abuse:
+        score = int(abuse.get("abuse_confidence_score") or 0)
+        reports = int(abuse.get("total_reports") or 0)
+        text = f"AbuseIPDB {score}% confidence from {reports} reports"
+        (flagged if score >= _ABUSE_FLAG_SCORE else clear).append(text)
+    else:
+        unknown.append("AbuseIPDB")
+
+    vt = out.get("virustotal") or {}
+    if vt.get("available") is True and "malicious_votes" in vt:
+        malicious = int(vt.get("malicious_votes") or 0)
+        total = int(vt.get("total_engines") or 0)
+        if malicious:
+            flagged.append(f"VirusTotal {malicious} of {total} engines malicious")
+        else:
+            clear.append("VirusTotal 0 malicious")
+    elif vt.get("available") is True:
+        clear.append("VirusTotal has no record")
+    else:
+        unknown.append("VirusTotal")
+
+    gn = out.get("greynoise") or {}
+    if gn.get("available") is True:
+        classification = gn.get("classification")
+        if classification == "malicious":
+            flagged.append("GreyNoise classifies it malicious")
+            scanner = bool(gn.get("noise"))
+        elif classification == "benign" or gn.get("riot"):
+            benign.append("GreyNoise lists it as benign or a known service")
+        elif gn.get("noise"):
+            flagged.append("GreyNoise sees it scanning the internet")
+            scanner = True
+        else:
+            clear.append("GreyNoise has not seen it scanning")
+    else:
+        unknown.append("GreyNoise")
+
+    otx = out.get("otx") or {}
+    if otx.get("available") is True and "pulse_count" in otx:
+        pulses = int(otx.get("pulse_count") or 0)
+        if pulses:
+            flagged.append(f"in {pulses} OTX pulses")
+        else:
+            clear.append("no OTX pulses")
+
+    where = ""
+    geo = out.get("geoip") or {}
+    vt_ok = vt.get("available") is True
+    country = (
+        geo.get("country") or abuse.get("country_name") or (vt.get("country") if vt_ok else None)
+    )
+    owner = (vt.get("as_owner") if vt_ok else None) or abuse.get("isp")
+    asn = vt.get("asn") if vt_ok else None
+    bits = [b for b in (country, f"AS{asn}" if asn else None, owner) if b]
+    if bits:
+        where = " Located: " + ", ".join(_quote(b, 40) for b in bits) + "."
+
+    checked = len(flagged) + len(benign) + len(clear)
+    if not checked:
+        verdict = "No reputation provider answered, so the address is unknown, not clean."
+    elif flagged and scanner:
+        verdict = "Almost certainly commodity internet scanning, safe to block: " + "; ".join(
+            flagged
+        )
+        verdict += "."
+    elif flagged:
+        verdict = "Flagged, treat as hostile: " + "; ".join(flagged) + "."
+    elif benign:
+        verdict = "Looks benign: " + "; ".join(benign) + "; check before blocking."
+    else:
+        verdict = "No provider that answered flags it: " + "; ".join(clear) + "."
+    if unknown:
+        label = "Not checked (unknown)" if checked else "Unavailable"
+        verdict += f" {label}: {', '.join(unknown)}."
+    return _cap_headline(verdict + where)
 
 
 @mcp.tool(**hints("enrich_ip"))
@@ -63,7 +170,7 @@ async def enrich_ip(ip: str) -> dict[str, Any]:
     }
     if isinstance(extra, dict):
         out.update(extra)
-    return out
+    return {"headline": _enrich_headline(out), **out}
 
 
 @mcp.tool(auth=require_role("operator"), **hints("report_ip_abuse"))
@@ -363,6 +470,7 @@ async def _map_ttps(
         entry["evidence_count"] = len(evidence)
         techniques.append(entry)
     result: dict[str, Any] = {
+        "headline": _ttp_headline(found, ip, event_types, raw_text),
         "count": len(techniques),
         "techniques_total": len(found),
         "techniques": techniques,
@@ -381,6 +489,64 @@ async def _map_ttps(
 
 _ATTACK_TYPES_SHOWN = 3
 _ATTACK_UNMAPPED_SHOWN = 10
+_POST_COMPROMISE_TACTICS = (
+    "Persistence",
+    "Privilege Escalation",
+    "Lateral Movement",
+    "Exfiltration",
+    "Impact",
+    "Command and Control",
+)
+
+
+def _ttp_headline(
+    found: list[dict[str, Any]], ip: str | None, event_types: list[str] | None, raw_text: str | None
+) -> str:
+    """What a mapped input amounts to: technique and tactic counts, post-compromise or not."""
+    if ip:
+        subject = f"The activity of {_quote(ip.strip())}"
+    elif event_types:
+        subject = f"The {len(event_types)} event type(s) given"
+        if raw_text:
+            subject += " plus the text"
+    else:
+        subject = "That text"
+    if not found:
+        return _cap_headline(
+            f"{subject} matches no ATT&CK technique; connection bookkeeping maps to nothing by "
+            "design, so give commands, paths or payload text for a real answer."
+        )
+    tactics = list(dict.fromkeys(str(t.get("tactic")) for t in found if t.get("tactic")))
+    post = [t for t in _POST_COMPROMISE_TACTICS if t in tactics]
+    text = (
+        f"{subject} matches {len(found)} technique(s) across {len(tactics)} tactic(s): "
+        f"{', '.join(tactics[:4])}."
+    )
+    if post:
+        text += f" Includes post-compromise behaviour ({', '.join(post)}): treat as serious."
+    else:
+        text += " No post-compromise tactic, consistent with reconnaissance or initial access."
+    return _cap_headline(text)
+
+
+def _summary_headline(
+    tactics: list[dict[str, Any]], total: int, unmapped_total: int, window: str
+) -> str:
+    """The dominant tactics with their share of all alerts, post-compromise or not, unmapped share."""
+    if not total:
+        return f"No alerts in this window ({window}), so there is nothing to map to ATT&CK."
+    ranked = sorted(tactics, key=lambda t: -t["alerts"])[:3]
+    lead = ", ".join(f"{t['tactic']} {t['alerts'] / total:.0%}" for t in ranked)
+    seen = [t["tactic"] for t in tactics if t["tactic"] in _POST_COMPROMISE_TACTICS]
+    if seen:
+        post = f"Post-compromise tactics seen: {', '.join(seen)}; check them first."
+    else:
+        post = (
+            "No post-compromise tactic (persistence, lateral movement, exfiltration, impact, "
+            "command and control): attackers stayed at the front door."
+        )
+    text = f"{window}: dominated by {lead or 'nothing mapped'} of {total:,} alerts. {post}"
+    return _cap_headline(f"{text} {unmapped_total / total:.0%} of alerts are unmapped.")
 
 
 @mcp.tool(**hints("attack_summary"))
@@ -475,6 +641,12 @@ async def attack_summary(
     total = sum(counts.values())
     unmapped_total = sum(unmapped.values())
     summary: dict[str, Any] = {
+        "headline": _summary_headline(
+            tactics,
+            total,
+            unmapped_total,
+            f"last {since_hours:g}h" if since_hours is not None else "all time",
+        ),
         "window": f"last {since_hours:g}h" if since_hours is not None else "all time",
         "total_alerts": total,
         "mapped_alerts": total - unmapped_total,
@@ -535,12 +707,41 @@ async def _reputation_lookups(
     return geo, vt, abuse, notes
 
 
+_SEVERITY_ORDER_DESC = ("critical", "high", "medium", "low")
+
+
+def _report_headline(
+    format: str, ip: str | None, since_hours: float | None, alerts: int, stats: dict[str, Any]
+) -> str:
+    """One sentence: which report, for what window, how big, and its top finding."""
+    label = "HTML" if format == "html" else "Markdown"
+    scope = f"{_quote(ip)}, " if ip else ""
+    window = f"last {since_hours:g} h" if since_hours is not None else "the whole capture"
+    total = int(stats.get("total_alerts") or 0)
+    if not total and not alerts:
+        return f"{label} report for {scope}{window} is empty: no alerts matched."
+    sources = int(stats.get("unique_source_ips") or 0)
+    text = f"{label} report for {scope}{window}: {total:,} alerts, {sources:,} sources"
+    severity = stats.get("by_severity") or {}
+    top = next(((s, severity[s]) for s in _SEVERITY_ORDER_DESC if severity.get(s)), None)
+    types = stats.get("top_event_types") or []
+    finding = []
+    if top:
+        finding.append(f"{top[1]:,} {top[0]}")
+    if types:
+        finding.append(f"most common event {_quote(types[0]['type'])}")
+    if finding:
+        text += "; top finding: " + ", ".join(finding)
+    return _cap_headline(text + ".")
+
+
 async def write_report(
     title: str | None,
     ip: str | None,
     format: str,
     since_hours: float | None,
     output_path: str | None = None,
+    open_in_browser: bool = False,
 ) -> dict[str, Any]:
     """Write the report file; `generate_report` is this with an automatic title and file name."""
     from honeypot_mcp.analysis.reporter import generate
@@ -638,7 +839,9 @@ async def write_report(
         target=ip or written["path"],
     )
     generated: dict[str, Any] = {
+        "headline": _report_headline(format, ip, since_hours, len(alerts), stats),
         **written,
+        "url": file_url(written["path"]),
         "title": title,
         "format": format,
         "alerts_analysed": len(alerts),
@@ -661,6 +864,10 @@ async def write_report(
         generated["note"] = " ".join(notes)
     if since is not None:
         await annotate_window(generated)
+    if format == "html":
+        generated["opened_in_browser"] = (
+            await open_page(generated["url"]) if open_in_browser else False
+        )
     return generated
 
 
@@ -681,9 +888,9 @@ async def generate_report(
         ip: Report on this source address only. Default: all activity. Ignored for attack_navigator.
         since_hours: Only the last N hours ("today" 24, "this week" 168). Default: everything.
         format: html (default), markdown, or attack_navigator (a MITRE ATT&CK Navigator layer
-            JSON scored by alert count; open it at mitre-attack.github.io/attack-navigator).
+            JSON scored by alert count; it opens in the Navigator itself).
     """
-    return await write_report(None, ip, format, since_hours)
+    return await write_report(None, ip, format, since_hours, open_in_browser=True)
 
 
 # MITRE kill-chain order — used to lay out journey phases left-to-right.
@@ -1272,6 +1479,62 @@ _SESSION_LOGINS_SHOWN = 10
 _SESSION_TEXT_CHARS = 200
 
 
+_SESSION_RECON_RE = re.compile(
+    r"(?:^|[;&|]\s{0,3})(?:uname|whoami|id|hostname|uptime|lscpu|nproc|free|ps|w|who|ifconfig|"
+    r"netstat|df|cat\s{1,3}/proc/\S{1,40}|cat\s{1,3}/etc/(?:passwd|issue|os-release))(?:\s|;|&|\||$)"
+)
+_SESSION_FETCH_RE = re.compile(r"\b(wget|curl|tftp|ftpget|scp|busybox\s+wget)\b")
+_SESSION_PERSIST_RE = re.compile(
+    r"(crontab|authorized_keys|rc\.local|systemctl\s+enable|chattr|\.bashrc|/etc/cron)"
+)
+_SESSION_HUMAN_GAP_SECONDS = 3.0
+
+
+def _session_headline(
+    login_attempts: list[dict[str, Any]],
+    successful: dict[str, Any] | None,
+    commands: list[str],
+    downloads: int,
+    command_times: list[datetime],
+) -> str:
+    """How the session got in, what it ran by category, and an automated-or-hands-on reading."""
+    if successful:
+        user = successful.get("username")
+        entry = f"Got in after {len(login_attempts)} login attempt(s)"
+        if user:
+            entry += f" (accepted login as {_quote(user, 30)})"
+    elif login_attempts:
+        entry = f"Tried {len(login_attempts)} login(s) and never got in"
+    else:
+        entry = "Connected without a recorded login"
+    texts = [str(c) for c in commands]
+    recon = sum(1 for c in texts if _SESSION_RECON_RE.search(c))
+    fetch = sum(1 for c in texts if _SESSION_FETCH_RE.search(c))
+    persist = sum(1 for c in texts if _SESSION_PERSIST_RE.search(c))
+    if not commands and not downloads:
+        return _cap_headline(
+            f"{entry}; ran no commands, consistent with credential guessing and nothing more."
+        )
+    ran = [f"{len(commands)} command(s)"]
+    if recon:
+        ran.append(f"{recon} recon")
+    if fetch or downloads:
+        ran.append(f"{max(fetch, downloads)} download attempt(s)")
+    if persist:
+        ran.append(f"{persist} persistence")
+    gaps = [(b - a).total_seconds() for a, b in zip(command_times, command_times[1:], strict=False)]
+    typed = bool(gaps) and sum(gaps) / len(gaps) >= _SESSION_HUMAN_GAP_SECONDS
+    if persist:
+        verdict = "Verdict: payload and persistence, treat the host image as hostile."
+    elif fetch or downloads:
+        verdict = "Verdict: payload fetch, collect the URL with `extract_iocs`."
+    elif typed:
+        verdict = "Verdict: commands arrive at human pace, possibly hands-on."
+    else:
+        verdict = "Verdict: fast scripted recon, consistent with automation."
+    return _cap_headline(f"{entry}; ran {', '.join(ran)}. {verdict}")
+
+
 def _planted_safe(planted: Any, value: Any) -> Any:
     """`value` with every planted honeytoken secret in its strings masked, clipped for a digest."""
     if isinstance(value, str):
@@ -1345,6 +1608,8 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
 
     timeline: list[dict[str, Any]] = []
     commands: list[str] = []
+    command_times: list[datetime] = []
+    downloads = 0
     login_attempts: list[dict[str, Any]] = []
     successful_login: dict[str, Any] | None = None
     protocol = None
@@ -1361,6 +1626,7 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
         if kind == "command_input":
             cmd = _planted_safe(planted, p.get("input", ""))
             commands.append(cmd)
+            command_times.append(a.timestamp)
             entry["command"] = cmd
         elif kind in ("login_failed", "login_success"):
             attempt = {
@@ -1373,12 +1639,16 @@ async def analyze_session(session_id: str) -> dict[str, Any]:
                 successful_login = attempt
             entry["credentials"] = f"{attempt['username'] or ''}:{attempt['password'] or ''}"
         elif kind == "file_download":
+            downloads += 1
             entry["url"] = _planted_safe(planted, p.get("url", ""))
             entry["outfile"] = _planted_safe(planted, p.get("outfile", ""))
         timeline.append(entry)
 
     duration = (alerts[-1].timestamp - alerts[0].timestamp).total_seconds()
     out: dict[str, Any] = {
+        "headline": _session_headline(
+            login_attempts, successful_login, commands, downloads, command_times
+        ),
         "session_id": session_id,
         "source_ip": source_ip,
         "protocol": protocol,
@@ -1476,6 +1746,29 @@ async def _offenders_for_export(hours: int, min_hits: int) -> dict[str, Any] | l
         }
 
 
+def _export_headline(
+    kind: str,
+    count: int,
+    min_hits: int,
+    hours: int,
+    written: dict[str, Any] | None,
+    format: str | None = None,
+) -> str:
+    """One sentence: what was exported, under which threshold, and where it was written."""
+    unit = "indicators" if kind == "STIX bundle" else "addresses"
+    fmt = f" ({format})" if format and format != "plain" else ""
+    if not count:
+        return (
+            f"No address had at least {min_hits} hit(s) in the last {hours} h, so the "
+            f"{kind.lower()} is empty; try a longer window or a lower min_hits."
+        )
+    name = _quote(Path(str(written["path"])).name) if written else ""
+    return _cap_headline(
+        f"{kind}{fmt} of {count:,} {unit} with at least {min_hits} hit(s) in the last {hours} h "
+        f"written to {name}."
+    )
+
+
 async def write_blocklist(
     format: str, hours: int, min_hits: int, output_path: str | None = None
 ) -> dict[str, Any]:
@@ -1488,6 +1781,7 @@ async def write_blocklist(
     if not offenders:
         return await annotate_window(
             {
+                "headline": _export_headline("Blocklist", 0, min_hits, hours, None, format),
                 "ip_count": 0,
                 "window_hours": hours,
                 "min_hits": min_hits,
@@ -1519,7 +1813,11 @@ async def write_blocklist(
         return written
     return await annotate_window(
         {
+            "headline": _export_headline(
+                "Blocklist", len(offenders), min_hits, hours, written, format
+            ),
             **written,
+            "url": file_url(written["path"]),
             "format": format,
             "ip_count": len(offenders),
             "window_hours": hours,
@@ -1595,7 +1893,9 @@ async def write_stix_bundle(
     if "error" in written:
         return written
     result: dict[str, Any] = {
+        "headline": _export_headline("STIX bundle", len(objects), min_hits, hours, written),
         **written,
+        "url": file_url(written["path"]),
         "bundle_id": bundle["id"],
         "indicator_count": len(objects),
         "window_hours": hours,
@@ -1613,6 +1913,39 @@ async def write_stix_bundle(
 # event type, collapsed) it lists. A flood of one event from one source is one entry.
 _TIMELINE_ROWS = 1000
 _TIMELINE_ENTRIES = 40
+_TIMELINE_SHORT_HOURS = 3
+
+
+def _timeline_headline(rows: Sequence[Any], in_window: int, hours: float) -> str:
+    """The busiest period (hour, or 5 minutes in a short window) and what drove it."""
+    if not rows:
+        return "No events in this window, so there is no busiest period."
+    short = hours <= _TIMELINE_SHORT_HOURS
+
+    def bucket(ts: datetime) -> datetime:
+        minute = ts.minute - ts.minute % 5 if short else 0
+        return ts.replace(minute=minute, second=0, microsecond=0)
+
+    buckets: dict[datetime, int] = {}
+    for ts, *_ in rows:
+        buckets[bucket(ts)] = buckets.get(bucket(ts), 0) + 1
+    peak, peak_n = max(buckets.items(), key=lambda kv: (kv[1], kv[0]))
+    drivers: dict[tuple[str, str], int] = {}
+    for ts, source, event_type, *_ in rows:
+        if bucket(ts) == peak:
+            drivers[(source, event_type)] = drivers.get((source, event_type), 0) + 1
+    (source, event_type), driver_n = max(drivers.items(), key=lambda kv: kv[1])
+    period = "5 minutes" if short else "hour"
+    drive = f"driven by {_quote(source)} sending {_quote(event_type)} ({driver_n:,} times)"
+    if len(rows) >= _TIMELINE_ROWS:
+        return _cap_headline(
+            f"Among the newest {len(rows):,} of {in_window:,} events, the busiest {period} starts "
+            f"{peak:%Y-%m-%d %H:%M} UTC with {peak_n:,}, {drive}."
+        )
+    return _cap_headline(
+        f"Busiest {period} starts {peak:%Y-%m-%d %H:%M} UTC with {peak_n:,} of {len(rows):,} "
+        f"events, {drive}."
+    )
 
 
 @mcp.tool(**hints("threat_timeline"))
@@ -1714,6 +2047,7 @@ async def threat_timeline(
     )
 
     out: dict[str, Any] = {
+        "headline": _timeline_headline(rows, in_window, hours),
         "window": f"last {hours:g}h",
         "events_in_window": in_window,
         "count": len(shown),

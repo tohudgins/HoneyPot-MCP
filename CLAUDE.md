@@ -509,6 +509,25 @@ files go to `reports_dir` under generated names, tools that reach outside this s
 operator/admin gated, and an error carries a `hint` naming the next step. Logic two tools share lives in a helper
 (`cluster_ssh_clients`, `write_report`), never one tool calling another's public signature.
 
+**A result says what it means and puts the thing in front of the person.** Rows are not an answer.
+- A tool that reports on something returns a `headline` as its FIRST key: one or two plain sentences (about 350
+  characters at most) saying what the result means (the verdict, the likely explanation, what is normal, the safe next
+  tool call). It is deterministic wording computed only from fields the tool already holds: no extra network call, no
+  new parameter. Unknown is never clean: a provider that is not configured, a ruleset that loaded 0 rules or an
+  empty capture reads as "this says nothing", not as "all clear".
+- **Captured text is attacker-written, so a headline is built from counts and fixed vocabulary.** A quoted value
+  (a path, a command, a family name, a URL) is flattened to one line, clipped to 60 characters and put in backticks
+  (`_quote` in `ioc.py`/`analysis.py`/`alerts.py`). Every place that quotes has an injection test.
+- **Show, don't instruct.** A tool that makes a page or a file returns a `url` (`file_url` in `tools/_open.py`), and
+  `open_page` opens it in the default browser when the server runs on the person's own machine (stdio transport and
+  `OPEN_IN_BROWSER`, default true; `conftest.py` sets it false so a test never opens a browser). Never answer with
+  "open this file, then go to that site and upload it". Two patterns exist: the ATT&CK Navigator layer travels in a
+  `data:` URL inside a launcher page (`write_navigator_layer`; a `localhost` link is blocked by the browser's CORS
+  rules, verified), and Grafana opens signed in through `grafana_signin.mint` (a one-shot loopback link that logs in
+  server-side and sets Grafana's cookie, so the generated password is never returned, shown or put on a command
+  line). A dashboard link carries the span the data covers (`_window.data_span`, from the hourly rollups), because a
+  saved run opened on "the last 6 hours" is empty.
+
 ### Reports, console, Docker, settings
 
 - `analysis/reporter.py` uses Jinja2 with `autoescape=select_autoescape(["html", "xml"])`; Markdown cell values go

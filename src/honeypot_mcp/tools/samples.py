@@ -155,6 +155,42 @@ def _quarantine_entries() -> list[str]:
         return []
 
 
+_BINARY_KINDS = ("elf", "pe", "archive")
+
+
+def _scan_headline(summary: dict[str, Any]) -> str:
+    """What a scan of the captured files amounts to, in the order a person asks: what, matches, risk."""
+    scanned = int(summary.get("files_scanned") or 0)
+    if not scanned:
+        return "No sample files were scanned."
+    kinds: dict[str, int] = summary.get("by_type") or {}
+    mix = ", ".join(
+        f"{n} {k.replace('_', ' ')}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])
+    )
+    text = f"{scanned} files scanned ({summary.get('distinct_hashes', scanned)} distinct): {mix}."
+    hits = int(summary.get("files_with_hits") or 0)
+    families = summary.get("hits_by_family") or {}
+    if hits:
+        names = ", ".join(
+            f"{k} ({n})" for k, n in sorted(families.items(), key=lambda kv: -kv[1])[:4]
+        )
+        text += f" {hits} matched a YARA rule: {names}."
+    else:
+        text += " No YARA rule matched."
+    binaries = sum(kinds.get(k, 0) for k in _BINARY_KINDS)
+    if binaries:
+        text += (
+            f" {binaries} are compiled or packed files: handle only in an isolated VM, and ask "
+            "`lookup_hash` about their hashes."
+        )
+    else:
+        text += (
+            " None is a compiled program: these are the attackers' own scripts and session "
+            "recordings, so the text shows what they wanted and nothing here can run on its own."
+        )
+    return text
+
+
 @mcp.tool(auth=require_role("operator"), **hints("sample_scan"))
 async def sample_scan(path: str | None = None) -> dict[str, Any]:
     """Hash, type and YARA-scan the malware samples the honeypots captured.
@@ -247,6 +283,7 @@ async def sample_scan(path: str | None = None) -> dict[str, Any]:
             "events. Scan one sensor's folder at a time to look them all up."
         )
     result: dict[str, Any] = {
+        "headline": _scan_headline(summary),
         "available": True,
         "engine": status["engine"],
         "scope": path or ".",

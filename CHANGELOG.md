@@ -4,6 +4,33 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## Every tool reads its own result, and shows you the thing
+
+**A tool that answers with rows, or with "go to this site and upload the file", makes the person do the work.**
+
+- **A `headline` on the tools that report.** `alerts_stats`/`recent`/`search`/`get`, `honeypot_list`/`status`,
+  `attack_summary`, `enrich_ip`, `analyze_session`, `threat_timeline`, `generate_report`, `export_indicators`,
+  `pcap_analyze`/`detect`/`extract`/`files`, `extract_iocs`, `lookup_hash`, `sample_scan` and `grafana_*` now begin
+  with one or two plain sentences saying what the result means, e.g. a SIP flood "reads as password guessing (the
+  'Denial of Service' label is the honeypot's own 401 replies)", a hash with no match "does not make it harmless",
+  a quarantine of scripts "is the attackers' own text and nothing here can run on its own". Unknown is never clean
+  (an unconfigured provider, 0 loaded rules and an empty capture each say so). Captured text is quoted, clipped to 60
+  characters and put in backticks, and each place that quotes has an injection test.
+- **The ATT&CK Navigator opens itself.** `generate_report(format="attack_navigator")` writes a launcher page that
+  loads the layer into MITRE's hosted Navigator from a `data:` link and opens it in the browser. A `localhost` link
+  does not work (the browser blocks it: checked), and the old reply was "go to the site and upload this file".
+- **Grafana opens signed in.** `grafana_start` returns `signed_in_url`, a single-use loopback link that logs in to
+  Grafana server-side, so the password is never shown (before: "the password is in this file"), and every dashboard
+  link carries the time range of the data (a saved run opened on "the last 6 hours" was empty). Checked live on the
+  real data: first use lands on panels, the second is refused.
+- **`OPEN_IN_BROWSER`** (default true) controls whether a page is opened; it only ever opens when the server was
+  started by your own client over stdio, never for a networked server.
+- **Suricata replays now match inbound signatures** (see the live-exercise entry): `HOME_NET`/`EXTERNAL_NET` are
+  `any`.
+- **Found while building it:** a dashboard link's `from`/`to` came out swapped when the oldest alert was taken from
+  the lowest id; it now reads the hourly rollups. A reading of an extracted-URL list looked for private addresses in
+  `hosts`, which already excludes them, and found none in the real data where one URL carried 21,270 alerts.
+
 ## The tools run live: real data, real samples, real sinks, a real deployment
 
 **Everything that could be exercised without a third party was, on the real 17.7M-event database and
