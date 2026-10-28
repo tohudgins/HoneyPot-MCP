@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -24,8 +25,16 @@ async def generate(
     target_ip: str | None,
     format: str = "html",
     intel: dict[str, Any] | None = None,
+    window_event_types: Iterable[str] = (),
 ) -> str:
     """Generate an attack report from alert data.
+
+    `stats` is `rollups.stats` for the report's window: when it is given, every figure (totals, sources,
+    severity, top sources and event types) is the exact whole-window one. `alerts` is only the newest
+    sample, which supplies the timeline and the payload evidence for the techniques; a report of a
+    17.7M-alert run once said "1000 Total Alerts" because it counted the sample. Without `stats` the
+    figures fall back to the sample. `window_event_types` are every event type seen in the window, so the
+    technique list covers all of it and not just what the sample happened to contain.
 
     `intel` is an optional enrichment block (geo/ASN/reverse-DNS + VT/AbuseIPDB
     reputation + risk score + recommendations) for an IP-scoped report. When
@@ -34,6 +43,7 @@ async def generate(
     from honeypot_mcp.intel.mitre import map_to_attack
 
     event_terms = [a.event_type for a in alerts]
+    event_terms.extend(window_event_types)
     for a in alerts:
         event_terms.extend(str(v) for v in a.payload.values() if isinstance(v, str))
 
@@ -41,6 +51,18 @@ async def generate(
     event_counts = Counter(a.event_type for a in alerts)
     ip_counts = Counter(a.source_ip for a in alerts)
     sev_counts = Counter(a.severity.value for a in alerts)
+    whole = "total_alerts" in stats
+    if whole:
+        event_counts = Counter({r["type"]: r["count"] for r in stats["top_event_types"]})
+        ip_counts = Counter({r["ip"]: r["count"] for r in stats["top_source_ips"]})
+        sev_counts = Counter(stats["by_severity"])
+    severity_order = ["critical", "high", "medium", "low"]
+    severity_counts = dict(
+        sorted(
+            sev_counts.items(),
+            key=lambda kv: severity_order.index(kv[0]) if kv[0] in severity_order else 9,
+        )
+    )
 
     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -61,11 +83,15 @@ async def generate(
         "title": title,
         "generated_at": generated_at,
         "target_ip": target_ip,
-        "total_alerts": len(alerts),
-        "total_unique_ips": len({a.source_ip for a in alerts}),
+        "total_alerts": stats["total_alerts"] if whole else len(alerts),
+        "total_unique_ips": stats["unique_source_ips"]
+        if whole
+        else len({a.source_ip for a in alerts}),
+        "sample_size": len(alerts),
+        "whole_window": whole,
         "top_ips": ip_counts.most_common(10),
         "top_events": event_counts.most_common(10),
-        "severity_counts": dict(sev_counts),
+        "severity_counts": severity_counts,
         "ttps": ttps,
         "timeline": timeline,
         "intel": _flatten_intel(intel) if intel else None,
@@ -127,6 +153,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stat-card .num { font-size: 2rem; font-weight: bold; color: #58a6ff; }
   .ttp-tag { display: inline-block; background: #21262d; border: 1px solid #388bfd; border-radius: 4px; padding: 3px 8px; margin: 2px; font-size: .8rem; }
   .ttp-tag a { color: #58a6ff; text-decoration: none; }
+  .muted { color: #8b949e; font-size: .85rem; }
 </style>
 </head>
 <body>
@@ -135,11 +162,14 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <h2>Summary</h2>
 <div class="stat-grid">
-  <div class="stat-card"><div class="num">{{ total_alerts }}</div>Total Alerts</div>
-  <div class="stat-card"><div class="num">{{ total_unique_ips }}</div>Unique Attackers</div>
-  <div class="stat-card"><div class="num">{{ severity_counts.get('critical', 0) }}</div>Critical Events</div>
+  <div class="stat-card"><div class="num">{{ '{:,}'.format(total_alerts) }}</div>Total Alerts</div>
+  <div class="stat-card"><div class="num">{{ '{:,}'.format(total_unique_ips) }}</div>Unique Attackers</div>
+  <div class="stat-card"><div class="num">{{ '{:,}'.format(severity_counts.get('critical', 0)) }}</div>Critical Events</div>
   <div class="stat-card"><div class="num">{{ ttps|length }}</div>MITRE Techniques</div>
 </div>
+{% if whole_window and sample_size < total_alerts %}
+<p class="muted">These figures cover all {{ '{:,}'.format(total_alerts) }} alerts in the window. The timeline and the technique evidence from commands are read from the newest {{ '{:,}'.format(sample_size) }}.</p>
+{% endif %}
 
 {% if intel %}
 <h2>IP Intelligence</h2>
@@ -170,21 +200,21 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <h2>Top Attacker IPs</h2>
 <table><tr><th>IP Address</th><th>Alert Count</th></tr>
 {% for ip, cnt in top_ips %}
-<tr><td><code>{{ ip }}</code></td><td>{{ cnt }}</td></tr>
+<tr><td><code>{{ ip }}</code></td><td>{{ '{:,}'.format(cnt) }}</td></tr>
 {% endfor %}
 </table>
 
 <h2>Top Event Types</h2>
 <table><tr><th>Event Type</th><th>Count</th></tr>
 {% for evt, cnt in top_events %}
-<tr><td>{{ evt }}</td><td>{{ cnt }}</td></tr>
+<tr><td>{{ evt }}</td><td>{{ '{:,}'.format(cnt) }}</td></tr>
 {% endfor %}
 </table>
 
 <h2>Severity Breakdown</h2>
 <table><tr><th>Severity</th><th>Count</th></tr>
 {% for sev, cnt in severity_counts.items() %}
-<tr><td><span class="badge {{ sev }}">{{ sev|upper }}</span></td><td>{{ cnt }}</td></tr>
+<tr><td><span class="badge {{ sev }}">{{ sev|upper }}</span></td><td>{{ '{:,}'.format(cnt) }}</td></tr>
 {% endfor %}
 </table>
 
@@ -210,6 +240,16 @@ def _render_html(ctx: dict) -> str:
 # underscore as emphasis, so `ssh_login_failed` stays readable.
 _MD_ESCAPE = re.compile(r"([`\[\]!*|])")
 _MD_EDGE_UNDERSCORE = re.compile(r"(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])")
+
+
+def _sample_note_md(ctx: dict) -> str:
+    """One line saying which figures are the whole window and which are read from the newest sample."""
+    if not (ctx["whole_window"] and ctx["sample_size"] < ctx["total_alerts"]):
+        return ""
+    return (
+        f"_These figures cover all {ctx['total_alerts']:,} alerts in the window. The timeline and the "
+        f"technique evidence from commands are read from the newest {ctx['sample_size']:,}._\n"
+    )
 
 
 def _md_cell(value: Any) -> str:
@@ -293,11 +333,12 @@ def _render_markdown(ctx: dict) -> str:
 
 | Metric | Value |
 |---|---|
-| Total Alerts | {ctx["total_alerts"]} |
-| Unique Attacker IPs | {ctx["total_unique_ips"]} |
+| Total Alerts | {ctx["total_alerts"]:,} |
+| Unique Attacker IPs | {ctx["total_unique_ips"]:,} |
 | Critical Events | {ctx["severity_counts"].get("critical", 0)} |
 | MITRE Techniques Observed | {len(ctx["ttps"])} |
 
+{_sample_note_md(ctx)}
 ## MITRE ATT&CK Techniques
 
 | ID | Technique | Tactic |

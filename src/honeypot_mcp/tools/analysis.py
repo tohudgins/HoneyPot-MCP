@@ -788,6 +788,11 @@ async def write_report(
         # otherwise the whole window (the severity tiles of a 492-event attacker's report once showed
         # the whole run's 27,825 critical events).
         stats = await rollups.stats(session, since, ip=ip, now=window_to)
+        # Every event type in the window, so the technique list covers the whole run and not only the
+        # newest sample (an address-scoped report keeps to that address's own alerts).
+        window_types = (
+            [] if ip else list(await rollups.event_type_counts(session, since, window_to))
+        )
         totals, first_seen, last_seen = await _exact_totals(session, ip) if ip else ({}, None, None)
 
     # For an IP-scoped report, attach the full intelligence picture (geo/ASN/
@@ -817,6 +822,7 @@ async def write_report(
         target_ip=ip,
         format=format,
         intel=intel,
+        window_event_types=window_types,
     )
     written = write_artifact(
         content,

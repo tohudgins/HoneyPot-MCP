@@ -50,11 +50,18 @@ The project was run on a public-IP VPS for about five days (116 hours). It store
 
 <table>
 <tr>
-<td width="33%"><a href="docs/screenshots/real-run/overview.png"><img src="docs/screenshots/real-run/overview.png" alt="Grafana overview from the VPS run"></a><br><sub>Grafana overview: volume, sources and the per-engine split.</sub></td>
-<td width="33%"><a href="docs/screenshots/real-run/threat-map.png"><img src="docs/screenshots/real-run/threat-map.png" alt="Threat map of attacker origins"></a><br><sub>Threat map of attacker origins.</sub></td>
-<td width="33%"><a href="docs/screenshots/real-run/mitre-coverage.png"><img src="docs/screenshots/real-run/mitre-coverage.png" alt="MITRE ATT&CK tactic coverage"></a><br><sub>ATT&amp;CK tactic coverage from the same database.</sub></td>
+<td width="33%"><a href="docs/screenshots/real-run/final-overview.png"><img src="docs/screenshots/real-run/final-overview.png" alt="Grafana overview of the whole run: 17.7M alerts"></a><br><sub>Grafana overview of the whole run: volume, sources and the per-engine split.</sub></td>
+<td width="33%"><a href="docs/screenshots/real-run/final-threat-map.png"><img src="docs/screenshots/real-run/final-threat-map.png" alt="Threat map of attacker origins"></a><br><sub>Threat map of attacker origins.</sub></td>
+<td width="33%"><a href="docs/screenshots/real-run/final-mitre-coverage.png"><img src="docs/screenshots/real-run/final-mitre-coverage.png" alt="MITRE ATT&CK tactic coverage"></a><br><sub>ATT&amp;CK tactic coverage from the same database.</sub></td>
+</tr>
+<tr>
+<td width="33%"><a href="docs/screenshots/real-run/final-console.png"><img src="docs/screenshots/real-run/final-console.png" alt="Operations console on the saved run"></a><br><sub>The built-in operations console, on the saved run.</sub></td>
+<td width="33%"><a href="docs/screenshots/real-run/final-html-report.png"><img src="docs/screenshots/real-run/final-html-report.png" alt="HTML attack report from generate_report"></a><br><sub>The HTML report <code>generate_report</code> writes and opens.</sub></td>
+<td width="33%"><a href="docs/screenshots/claude-code/open-navigator-and-grafana.png"><img src="docs/screenshots/claude-code/open-navigator-and-grafana.png" alt="Claude Code opening the ATT&CK Navigator and Grafana"></a><br><sub>Asked in Claude Code: the Navigator and Grafana open themselves.</sub></td>
 </tr>
 </table>
+
+More captures, including real Claude Code sessions, are in [docs/screenshots](docs/screenshots/README.md).
 
 ## Get started
 

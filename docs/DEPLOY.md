@@ -536,7 +536,7 @@ claude mcp add honeypot-analysis \
   -- /path/to/HoneyPot-MCP/.venv/bin/python -m honeypot_mcp.server
 ```
 
-In analysis mode every `since_hours` window ends at the newest alert in the database, not at the current time, so "the last 12 hours" of a week-old backup describes the end of the run instead of coming back empty; results say so (`window_anchor`). Enrichment keys come from the environment or the `.env` in the server's working directory, as on a live server; a missing one makes `enrich_ip` or `lookup_hash` report `available: false` for that provider (add `-e ABUSECH_AUTH_KEY=...` to the `claude mcp add` command, for example).
+In analysis mode every `since_hours` window ends at the newest alert in the database, not at the current time, so "the last 12 hours" of a week-old backup describes the end of the run instead of coming back empty; results say so (`window_anchor`). The operations console follows the same rule: it starts on `CONSOLE_PORT` (default 8090, `0` disables it), shows "saved run · data ends …" in its header and reads the newest day, week or hour of the run, not of today. Enrichment keys come from the environment or the `.env` in the server's working directory, as on a live server; a missing one makes `enrich_ip` or `lookup_hash` report `available: false` for that provider (add `-e ABUSECH_AUTH_KEY=...` to the `claude mcp add` command, for example).
 
 | To answer | Tool |
 |---|---|

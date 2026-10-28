@@ -412,3 +412,27 @@ async def test_a_report_about_one_address_counts_that_address_not_the_whole_run(
     assert scoped["alerts_analysed"] == 3
     assert scoped["by_severity"] == {"high": 3} and scoped["unique_source_ips"] == 1
     assert whole["by_severity"] == {"high": 3, "critical": 80} and whole["unique_source_ips"] == 3
+
+
+@pytest.mark.asyncio
+async def test_generate_report_file_counts_the_window_when_the_sample_is_smaller(
+    reports_dir, monkeypatch
+):
+    """End to end: 12 alerts in the window, a report that reads only the newest 3. The HTML file must
+    say 12 (and name every event type), not 3."""
+    from pathlib import Path
+
+    from honeypot_mcp.tools import analysis
+    from honeypot_mcp.tools.analysis import generate_report
+
+    monkeypatch.setattr(analysis, "_MAX_REPORT_ALERTS", 3)
+    await _seed(ip="203.0.113.7", count=9, severity="high")
+    await _seed(ip="198.51.100.1", count=3, severity="critical")
+
+    out = await generate_report(format="html")
+    page = Path(out["path"]).read_text(encoding="utf-8")
+
+    assert out["alerts_analysed"] == 3 and "12" in out["headline"]
+    assert '<div class="num">12</div>Total Alerts' in page
+    assert '<div class="num">3</div>Critical Events' in page
+    assert "cover all 12 alerts in the window" in page and "newest 3" in page

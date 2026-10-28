@@ -229,9 +229,16 @@ async def lifespan(app: FastMCP):
             "are started; honeypot statuses are as of when the data was captured.",
             settings.database_url.split("///")[-1] or "the database",
         )
+        # The console only reads (GET routes, `test_console_is_read_only`), so it is the one owner
+        # service a saved run can have: it shows the run on a screen, measured to the newest alert.
+        console = None
+        if settings.console_port > 0:
+            console = await start_console_server(settings.console_host, settings.console_port)
         try:
             yield
         finally:
+            if console is not None:
+                await console.cleanup()
             await close_db()
         return
 

@@ -140,3 +140,81 @@ async def test_report_intel_reverse_dns_is_escaped():
     )
     assert "<script>alert(1)" not in html
     assert "&lt;script&gt;alert(1)" in html
+
+
+WHOLE_RUN = {
+    "total_alerts": 17_726_494,
+    "unique_source_ips": 3_340,
+    "by_severity": {"low": 1_072_000, "critical": 27_825, "medium": 8_830_000, "high": 7_796_236},
+    "top_source_ips": [
+        {"ip": "103.132.1.1", "count": 4_400_703},
+        {"ip": "87.246.1.1", "count": 3_854_264},
+    ],
+    "top_event_types": [{"type": "sip_extension_probe", "count": 8_677_807}],
+}
+
+
+@pytest.mark.asyncio
+async def test_a_report_counts_the_whole_window_not_the_sample_it_read():
+    """A report of a 17.7M-alert run said "1000 Total Alerts, 15 Unique Attackers, 1 Critical Event":
+    the figures of the newest-1000 sample, presented as the capture. The tiles, the top lists and the
+    severity table are the window's own exact counts; the sample only supplies the timeline."""
+    sample = [_alert("198.51.100.9", "ssh_login_failed", "low") for _ in range(1000)]
+
+    html = await generate(title="T", alerts=sample, stats=WHOLE_RUN, target_ip=None, format="html")
+
+    assert "17,726,494" in html and "3,340" in html and "27,825" in html
+    assert ">1,000<" not in html  # the sample size is not a tile
+    assert "103.132.1.1" in html and "4400703" in html.replace(",", "")
+    assert "sip_extension_probe" in html and "8677807" in html.replace(",", "")
+    # severity table in a fixed order, worst first, with the window's counts
+    order = [html.index(f"{s.upper()}</span>") for s in ("critical", "high", "medium", "low")]
+    assert order == sorted(order)
+    assert "cover all 17,726,494 alerts in the window" in html and "newest 1,000" in html
+
+
+@pytest.mark.asyncio
+async def test_without_window_stats_the_report_falls_back_to_what_it_was_given():
+    """A caller with no window figures still gets a correct report of the alerts it passed, with no claim
+    about a larger window."""
+    alerts = [
+        _alert("198.51.100.9", "ssh_login_failed", "low"),
+        _alert("198.51.100.8", "ssh_login_failed", "critical"),
+    ]
+
+    html = await generate(title="T", alerts=alerts, stats={}, target_ip=None, format="html")
+
+    assert ">2<" in html and "cover all" not in html
+
+
+@pytest.mark.asyncio
+async def test_techniques_come_from_every_event_type_in_the_window_not_just_the_sample():
+    """The newest alerts were all SSH logins; the run also held Redis config writes, which only the
+    window's own list of event types can bring in."""
+    sample = [_alert("198.51.100.9", "ssh_login_failed", "low")]
+
+    only_sample = await generate(
+        title="T", alerts=sample, stats={}, target_ip=None, format="markdown"
+    )
+    with_window = await generate(
+        title="T",
+        alerts=sample,
+        stats={},
+        target_ip=None,
+        format="markdown",
+        window_event_types=["ssh_login_failed", "redis_config_set"],
+    )
+
+    assert "T1190" not in only_sample and "T1190" in with_window
+
+
+@pytest.mark.asyncio
+async def test_the_markdown_report_says_what_the_figures_cover_too():
+    sample = [_alert("198.51.100.9", "ssh_login_failed", "low")] * 3
+
+    md = await generate(
+        title="T", alerts=sample, stats=WHOLE_RUN, target_ip=None, format="markdown"
+    )
+
+    assert "| Total Alerts | 17,726,494 |" in md and "| Unique Attacker IPs | 3,340 |" in md
+    assert "cover all 17,726,494 alerts in the window" in md and "newest 3" in md

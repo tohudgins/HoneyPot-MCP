@@ -498,3 +498,43 @@ def test_leaving_analysis_mode_restores_the_normal_read_only_message():
     assert "analysis mode" not in instance_lock.read_only_error()["error"]
     instance_lock.set_ownership(True)
     assert instance_lock.read_only_error() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("port", "expect_started"), [(8090, True), (0, False)])
+async def test_a_saved_run_gets_the_read_only_console_only_when_a_port_is_set(
+    monkeypatch, port, expect_started
+):
+    """The console only reads, so a saved run may show itself on a screen; CONSOLE_PORT=0 still means
+    "no console", and the listener is closed when the server stops."""
+    from honeypot_mcp import server
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.storage import event_buffer
+
+    started, cleaned = [], []
+
+    class Runner:
+        async def cleanup(self):
+            cleaned.append(True)
+
+    async def fake_start(host, bound_port):
+        started.append((host, bound_port))
+        return Runner()
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("a saved run started something that belongs to the sensor host")
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "analysis_mode", True)
+    monkeypatch.setattr(settings, "console_port", port)
+    monkeypatch.setattr(server, "start_console_server", fake_start)
+    monkeypatch.setattr(server._OwnerServices, "start", forbidden)
+    event_buffer.reset_for_tests()
+
+    async with server.lifespan(server.mcp):
+        assert bool(started) is expect_started
+        assert cleaned == []
+
+    assert bool(cleaned) is expect_started  # closed on the way out, not left listening
+    assert started == ([(settings.console_host, 8090)] if expect_started else [])
+    event_buffer.reset_for_tests()

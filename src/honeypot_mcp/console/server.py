@@ -27,6 +27,7 @@ from honeypot_mcp.storage.models import (
     HoneytokenStatus,
 )
 from honeypot_mcp.tools._format import digest_payload
+from honeypot_mcp.tools._window import window_end
 
 log = logging.getLogger(__name__)
 
@@ -193,7 +194,9 @@ async def _overview(hours: float) -> dict[str, Any]:
     rollups, partial edge hours from the raw table) yields the totals, unique sources, severity split,
     top sources and per-sensor counts; the chart reads the rollups (or one arithmetic GROUP BY for
     short windows); geography reads CRITICAL alerts only, the only ones that carry enrichment."""
-    now = datetime.now(UTC)
+    # "The last 24 hours" ends now on a live server and at the newest alert on a saved run: measured
+    # from the wall clock, a restored backup would show an empty window (the rule `_window` keeps).
+    now = await window_end()
     start = now - timedelta(hours=hours)
     bucket = _bucket_size(hours)
     ordered = _bucket_starts(start, now, bucket)
@@ -281,6 +284,8 @@ async def _overview(hours: float) -> dict[str, Any]:
 
     return {
         "generated_at": datetime.now(UTC).isoformat(),
+        "saved_run": get_settings().analysis_mode,
+        "data_ends": now.isoformat() if get_settings().analysis_mode else None,
         "window_hours": hours,
         "stats": {
             "events": events,

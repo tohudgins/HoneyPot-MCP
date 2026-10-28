@@ -121,7 +121,9 @@ main { padding: 18px 22px 40px; display: grid; gap: 16px; max-width: 1680px; mar
 .legend span { display: flex; align-items: center; gap: 6px; }
 .chart-wrap { position: relative; overflow-x: auto; }
 svg { display: block; width: 100%; height: auto; }
-.axis text { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
+/* `text.axis`, not `.axis text`: the labels ARE the .axis elements, so the descendant selector never
+   matched and they rendered black on the dark surface. */
+text.axis { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
 .gridline { stroke: var(--grid); stroke-width: 1; }
 .bar-routine { fill: var(--routine); }
 .bar-serious { fill: var(--serious); }
@@ -243,7 +245,7 @@ details.tableview summary { color: var(--muted); font-size: 11.5px; cursor: poin
       <div class="rank" id="countries"></div>
     </div>
     <div class="panel">
-      <h2>Live activity</h2>
+      <h2 id="feed-title">Live activity</h2>
       <div class="feed" id="feed" aria-live="polite"></div>
     </div>
   </section>
@@ -297,10 +299,12 @@ function renderChart(series) {
   const bw = Math.max(1, step - 2);          // 2px surface gap between bars
   const y = (v) => padT + plotH - (v / max) * plotH;
 
+  // 356,610 does not fit the 40px left margin (it was cut off); 357K does.
+  const short = (n) => n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "K" : String(n);
   const ticks = [0, Math.round(max / 2), max];
   let out = ticks.map((t) =>
     `<line class="gridline" x1="${padL}" x2="${W - padR}" y1="${y(t)}" y2="${y(t)}"/>
-     <text class="axis" x="${padL - 7}" y="${y(t) + 3.5}" text-anchor="end">${t}</text>`).join("");
+     <text class="axis" x="${padL - 7}" y="${y(t) + 3.5}" text-anchor="end">${short(t)}</text>`).join("");
 
   pts.forEach((p, i) => {
     const x = padL + i * step;
@@ -318,11 +322,18 @@ function renderChart(series) {
              data-i="${i}" tabindex="-1"></rect>`;
   });
 
+  // A window longer than a day repeats the same clock times (08:00 ... 08:00), so name the day too.
+  const multiDay = pts.length > 1 && new Date(pts[pts.length - 1].t) - new Date(pts[0].t) > 36 * 3600e3;
+  const when = (p) => multiDay
+    ? new Date(p.t).toLocaleDateString([], { day: "2-digit", month: "short" }) + " " + clock(p.t).slice(0, 5)
+    : clock(p.t);
   const labelEvery = Math.max(1, Math.ceil(pts.length / 8));
   pts.forEach((p, i) => {
     if (i % labelEvery) return;
     const x = padL + i * step + bw / 2;
-    out += `<text class="axis" x="${x}" y="${H - 7}" text-anchor="middle">${clock(p.t).slice(0, 5)}</text>`;
+    // the last label would run off the right edge when centred under the last bar
+    const anchor = x > W - 52 ? "end" : "middle";
+    out += `<text class="axis" x="${anchor === "end" ? W - padR : x}" y="${H - 7}" text-anchor="${anchor}">${esc(when(p).slice(0, 12))}</text>`;
   });
 
   svg.innerHTML = out;
@@ -330,7 +341,7 @@ function renderChart(series) {
     el.addEventListener("mousemove", (e) => {
       const p = pts[+el.dataset.i];
       tip.innerHTML =
-        `<div>${clock(p.t)}</div>
+        `<div>${esc(when(p))}</div>
          <div><span class="k">low+med</span> ${p.routine}</div>
          <div><span class="k">high+crit</span> ${p.serious}</div>`;
       tip.style.opacity = 1;
@@ -343,7 +354,7 @@ function renderChart(series) {
   $("chart-table").innerHTML =
     `<table class="data"><thead><tr><th>Time</th><th>Low &amp; medium</th><th>High &amp; critical</th></tr></thead><tbody>` +
     pts.filter((p) => p.routine + p.serious > 0)
-       .map((p) => `<tr><td>${clock(p.t)}</td><td>${p.routine}</td><td>${p.serious}</td></tr>`).join("") +
+       .map((p) => `<tr><td>${esc(when(p))}</td><td>${p.routine}</td><td>${p.serious}</td></tr>`).join("") +
     `</tbody></table>`;
 }
 
@@ -410,7 +421,10 @@ async function refresh() {
     renderPots(d.honeypots);
     renderFeed(d.feed);
     $("live").classList.remove("stale");
-    $("live-text").textContent = "live · " + clock(d.generated_at);
+    $("live-text").textContent = d.saved_run
+      ? "saved run · data ends " + new Date(d.data_ends).toISOString().slice(0, 16).replace("T", " ") + " UTC"
+      : "live · " + clock(d.generated_at);
+    $("feed-title").textContent = d.saved_run ? "Latest activity" : "Live activity";
   } catch (e) {
     $("live").classList.add("stale");
     $("live-text").textContent = "connection lost — retrying";

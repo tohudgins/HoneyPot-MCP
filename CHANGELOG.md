@@ -4,6 +4,28 @@ Reverse-chronological summary of meaningful changes. Not a release log —
 the project isn't on a version cadence — but each section represents a
 distinct iteration with a coherent goal.
 
+## The console runs on a saved run, and the HTML report counts the whole run
+
+**Taking screenshots of every visual output found two real bugs and four presentation bugs.** All were visible in
+the first capture and none in 2,900 unit tests.
+
+- **The HTML report said "1000 Total Alerts, 15 Unique Attackers, 1 Critical Event"** for a run of 17,726,494 alerts
+  from 3,340 sources with 27,825 critical. The report builder counted the newest-1,000 sample it reads for its
+  timeline and presented it as the capture; it was handed the exact whole-window figures and ignored them. Its
+  tiles, top-attacker and top-event tables and severity table now use the window's own counts (worst severity first,
+  thousands separated), the technique list covers every event type in the window, and a line says the timeline and
+  command evidence come from the newest 1,000. Address-scoped reports are unchanged.
+- **The operations console could not show a restored backup.** In analysis mode it was never started, and when it
+  was it measured "the last 24 hours" from the wall clock, so a month-old backup would show an empty page. It now
+  starts in analysis mode (it only reads; `CONSOLE_PORT=0` still disables it), measures its window to the newest
+  alert like every other tool, says "saved run · data ends …" instead of "live ·", and calls its feed "Latest
+  activity". On the real run: the last 24 hours in 0.23 s, the whole run in 1.6 s.
+- **The console's chart labels were black on a near-black surface.** The CSS rule was `.axis text`, a `text` element
+  inside `.axis`, while the labels are `<text class="axis">`, so it never matched. Also fixed: a 7-day chart now names
+  the day on its labels (it read "08:00 ... 08:00"), y-axis numbers are compact (`3.0M`, they were cut off at seven
+  digits) and the last label no longer runs off the edge.
+- `generate_report` is checked end to end: the file for a window larger than its sample says the window's total.
+
 ## The dashboards no longer take minutes to load
 
 **Opening Grafana on the real 17.7M-alert run looked broken**: the Overview, Threat Map, MITRE ATT&CK Coverage

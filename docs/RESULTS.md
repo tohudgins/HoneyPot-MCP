@@ -126,7 +126,7 @@ The top source accounts for 24.8% of all stored alerts; the top 3 for 64.9%, the
 
 Read this table narrowly. GeoIP runs only for CRITICAL alerts, so it describes 136 sources out of 3,337, and the country is where the address geolocates (mostly hosting providers), not where a person sits. The Philippines row is a single source: SIP toll-fraud INVITEs (the same source is 45.9% of all `sip_toll_fraud_attempt`). The United States row is 8,766 SIP toll-fraud alerts plus 345 SSH file writes.
 
-![Attacker origins and top countries, Grafana, snapshot of the live run ending 2026-10-16 10:00 UTC (counts are lower than the final tables)](screenshots/real-run/threat-map.png)
+![Attacker origins and top countries, Grafana, final database, window 2026-10-11 to 2026-10-16](screenshots/real-run/final-threat-map.png)
 
 ## 2. What attackers did
 
@@ -172,9 +172,9 @@ Each event type is mapped with the repository's own mapper (`intel.mitre.map_to_
 
 The two images below were re-rendered on the final database with the current mapping: the Grafana panel by `grafana_start` (the dashboard's tactic bars now equal `attack_summary` for every tactic), the Navigator view by loading the layer file into the ATT&CK Navigator.
 
-![ATT&CK tactics and event types, Grafana, final database, window 2026-10-11 to 2026-10-16](screenshots/real-run/mitre-coverage.png)
+![ATT&CK tactics and event types, Grafana, final database, window 2026-10-11 to 2026-10-16](screenshots/real-run/final-mitre-coverage.png)
 
-![ATT&CK Navigator layer produced by the attack_navigator_layer tool (since merged into generate_report format=attack_navigator; all time, 17.7M alerts)](screenshots/real-run/attack-navigator.png)
+![ATT&CK Navigator layer produced by generate_report format=attack_navigator (the tool opens it itself; all time, 17.7M alerts)](screenshots/real-run/final-attack-navigator.png)
 
 ### 2.2 SIP: the volume, and what it was
 

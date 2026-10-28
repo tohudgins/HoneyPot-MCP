@@ -179,3 +179,109 @@ async def test_the_critical_geography_lookup_seeks_the_partial_index():
 
     detail = " | ".join(str(row[-1]) for row in plan)
     assert "ix_alerts_urgent" in detail, f"the CRITICAL lookup lost its index: {detail}"
+
+
+async def _seed_a_run_that_ended_long_ago(days_ago: int = 30) -> datetime:
+    """Alerts only in the last two days of a run that finished `days_ago` days ago, as a restored backup."""
+    from honeypot_mcp.storage.database import get_session
+    from honeypot_mcp.storage.models import Alert, AlertSeverity
+
+    end = (datetime.now(UTC) - timedelta(days=days_ago)).replace(microsecond=0)
+    async with get_session() as session:
+        # Oldest first: alert ids are chronological on a real server, and the window's end is read from the
+        # highest id (an index seek) rather than by scanning for the largest timestamp.
+        for hours_back, severity in (
+            (40.0, "low"),
+            (20.0, "medium"),
+            (3.0, "low"),
+            (0.2, "critical"),
+        ):
+            session.add(
+                Alert(
+                    source_ip="203.0.113.9",
+                    event_type="probe",
+                    severity=AlertSeverity(severity),
+                    timestamp=end - timedelta(hours=hours_back),
+                    payload={},
+                )
+            )
+    return end - timedelta(hours=0.2)
+
+
+async def test_a_saved_run_is_shown_up_to_its_newest_alert_not_up_to_the_wall_clock(monkeypatch):
+    """A restored backup opened a month later: "the last 24 hours" ended now and held nothing, so the
+    console showed a blank page for a run with data. In analysis mode the window ends at the newest alert."""
+    from honeypot_mcp.config import get_settings
+    from honeypot_mcp.console.server import _overview
+    from honeypot_mcp.tools import _window
+
+    newest = await _seed_a_run_that_ended_long_ago()
+
+    monkeypatch.setattr(get_settings(), "analysis_mode", False)
+    _window.reset_for_tests()
+    live = await _overview(24)
+    assert live["stats"]["events"] == 0 and live["saved_run"] is False and live["data_ends"] is None
+
+    monkeypatch.setattr(get_settings(), "analysis_mode", True)
+    _window.reset_for_tests()
+    saved = await _overview(24)
+    # the three alerts inside 24 h of the newest one (the one 40 h back is outside), split by severity
+    assert saved["stats"]["events"] == 3
+    assert (saved["stats"]["critical"], saved["stats"]["medium"], saved["stats"]["low"]) == (
+        1,
+        1,
+        1,
+    )
+    assert saved["saved_run"] is True and saved["data_ends"] == newest.isoformat()
+    assert (
+        sum(p["routine"] + p["serious"] for p in saved["series"]["points"]) == 3
+    )  # the chart agrees
+    _window.reset_for_tests()
+
+
+async def test_the_page_calls_a_saved_run_a_saved_run():
+    """ "live · 10:25:58" on a month-old backup is a lie; the page switches on the server's flag."""
+    from honeypot_mcp.console import server as console
+
+    page = (console.Path(console.__file__).parent / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "d.saved_run" in page and "saved run · data ends" in page and '"live · "' in page
+
+
+def _page() -> str:
+    from honeypot_mcp.console import server as console
+
+    return (console.Path(console.__file__).parent / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_the_chart_labels_are_selected_by_a_rule_that_matches_them():
+    """The labels are `<text class="axis">`; the rule was `.axis text` (a `text` INSIDE `.axis`), which
+    matches nothing, so every axis label rendered black on the dark surface (found in a screenshot)."""
+    import re
+
+    page = _page()
+
+    assert re.search(r"text\.axis\s*\{[^}]*fill:\s*var\(--muted\)", page)
+    assert not re.search(r"(^|\n)\.axis text\s*\{", page)
+    assert '<text class="axis"' in page  # the element the rule has to match
+
+
+def test_a_chart_longer_than_a_day_names_the_day_and_a_saved_run_says_latest():
+    """Over 7 days with 6-hour bars the labels read "08:00 ... 08:00" with no way to tell the days apart."""
+    page = _page()
+
+    assert "toLocaleDateString" in page and "multiDay" in page
+    assert "Latest activity" in page and "Live activity" in page and "feed-title" in page
+
+
+def test_a_six_digit_axis_number_is_shortened_and_the_last_label_stays_inside_the_chart():
+    """`356610` is wider than the chart's 40px left margin and the last date label ran off the right edge:
+    both were cut off in a screenshot of a 17.7M-alert run."""
+    page = _page()
+
+    assert "const short = (n)" in page and "${short(t)}" in page
+    assert 'x > W - 52 ? "end" : "middle"' in page
