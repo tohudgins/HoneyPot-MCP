@@ -1580,6 +1580,13 @@ def _suricata_command(rules: RulesState, has_classification: bool) -> list[str]:
         "--runmode", "single",
         "-l", _OUT,
         "-S", f"{_RULES}/all.rules",
+        # The image's default HOME_NET is the private ranges only, and a honeypot has a public
+        # address, so the rules written "from outside to $HOME_NET" (most of the exploit and scan
+        # signatures) never matched inbound traffic: a Shellshock request and a SIPVicious scan
+        # replayed with no alert. A replayed capture has no known inside, so everything is both.
+        # EXTERNAL_NET must be set too: it is defined as !$HOME_NET, which would be empty.
+        "--set", "vars.address-groups.HOME_NET=any",
+        "--set", "vars.address-groups.EXTERNAL_NET=any",
     ]  # fmt: skip
     if has_classification:
         cmd += ["--set", f"classification-file={_RULES}/{CLASSIFICATION_FILE}"]

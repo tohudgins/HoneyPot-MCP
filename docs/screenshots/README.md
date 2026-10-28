@@ -83,7 +83,6 @@ banner shows the Claude Code version and model used.
 | `claude-code/shift-handover.png` | "Give me a shift handover for the whole run." (`soc_brief` and follow-ups) |
 | `claude-code/bait-credential.png` | "Who used the public bait credential, and what did they do first?" (`bait_trips`) |
 | `claude-code/is-this-a-botnet.png` | "Is 164.30.x.x part of a botnet, and what did it do?" (`fingerprint_clusters(ip=...)`, journey, patterns) |
-| `claude-code/pcap-suricata-replay.png` | "Replay the attacker packet capture … through Suricata and tell me what it found." (`pcap_detect`) |
 | `claude-code/malware-samples.png` | "What malware did attackers try to drop, and what is in the captured files?" (`extract_iocs`, `sample_scan`) |
 | `claude-code/decoy-plan.png` | "Design decoys for a small Windows domain with a Postgres warehouse behind it. Don't deploy anything." (`deception_plan`) |
 | `claude-code/sql-query.png` | "Use SQL to show how many alerts per day each of the three busiest source addresses sent." (`sql_query` over `alert_rollups`) |

@@ -570,6 +570,11 @@ async def test_suricata_container_is_sandboxed(docker_client, capture, rules_cac
     assert cmd[cmd.index("--runmode") + 1] == "single"
     assert cmd[cmd.index("-l") + 1] == "/out"
     assert cmd[cmd.index("-S") + 1] == "/rules/all.rules"
+    # Without these two, a public honeypot address is outside HOME_NET and inbound exploit and scan
+    # signatures never fire (found replaying real captures). Both are needed: EXTERNAL_NET defaults
+    # to !$HOME_NET, which Suricata refuses as an empty range.
+    sets = {cmd[i + 1] for i, a in enumerate(cmd) if a == "--set"}
+    assert {"vars.address-groups.HOME_NET=any", "vars.address-groups.EXTERNAL_NET=any"} <= sets
     modes = {v["bind"]: v["mode"] for v in spec["volumes"].values()}
     assert modes == {"/in": "ro", "/out": "rw", "/rules": "ro"}
     assert spec["mem_limit"] == f"{get_settings().detection_memory_mb}m"

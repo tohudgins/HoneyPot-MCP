@@ -16,8 +16,8 @@ its captured files, on copy-on-write clones so the original was never written.**
 - **Alert delivery to real sinks:** the JSON (signature verified), Slack, Teams, Splunk HEC, Elastic ECS,
   Loki, Datadog and email (a real SMTP conversation) formats each delivered 3 of 3.
 - **Real captures and samples:** `pcap_analyze` decoded the 11 MB SIP capture in under a second;
-  Suricata (53,257 rules) raised "GPL VOIP SIP 401 Unauthorized Flood" on it and separated 7,552 checksum
-  artifacts from 26 real alerts; Zeek produced the connection and SIP logs; `sample_scan` scanned 159 files
+  Suricata (53,269 rules) raised 57 real alerts on it (see the `HOME_NET` fix below) and separated 7,552 checksum
+  artifacts; Zeek produced the connection and SIP logs; `sample_scan` scanned 159 files
   (94 distinct hashes, dropper families found); `detection_rules_update` fetched and validated the ruleset.
 - **`database_backup` of the whole 12 GB database** took 202 s, verified (integrity `ok`), kept 17,726,494
   alerts, and wrote owner-only files.
@@ -30,6 +30,13 @@ its captured files, on copy-on-write clones so the original was never written.**
     attacker address to use as its subject (`source_ip=None` selects everything). Those checks now skip.
   - `api_key_list` said "no API keys have been created" when keys existed but all were revoked.
   - The field-test scripts hardcoded privileged public ports; they take `--port-offset` and `--ssh-port`.
+  - *Suricata replay missed inbound signatures on a public honeypot.* `pcap_detect` ran Suricata with the
+    image's default `HOME_NET` (192.168/16, 10/8, 172.16/12), so a honeypot with a public address was outside
+    it and every rule written "from `$EXTERNAL_NET` to `$HOME_NET`" never matched: a Shellshock request and a
+    SIPVicious scan replayed with zero alerts. `HOME_NET` and `EXTERNAL_NET` are now both `any` (setting only
+    `HOME_NET` makes Suricata refuse the empty `!$HOME_NET`). The real SIP capture went from 26 to 57
+    alerts, and the test capture now raises `ET WEB_SERVER Possible CVE-2014-6271` and both SIPVicious rules.
+    Unit tests could not see it: they check the command line, not what a replayed exploit triggers.
 - **Not exercised:** `report_ip_abuse` (files a real report), `pcap_control`/`pcap_extract` (live capture
   needs root), and delivery to a real Slack, Teams or mail service (only to local sinks speaking the same
   formats). Two of `field_test_ops.py`'s checks need real attackers and cannot pass on localhost.
